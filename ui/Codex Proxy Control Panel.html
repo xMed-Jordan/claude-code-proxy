@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Claude Code Codex Proxy — Control Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/ui/styles.css"/>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="/ui/vendor/react.development.js"></script>
+  <script src="/ui/vendor/react-dom.development.js"></script>
+  <script src="/ui/vendor/babel.min.js"></script>
+
+  <script type="text/babel" src="/ui/tweaks-panel.jsx"></script>
+  <script type="text/babel" src="/ui/icons.jsx"></script>
+  <script type="text/babel" src="/ui/data.jsx"></script>
+  <script type="text/babel" src="/ui/live-api.jsx"></script>
+  <script type="text/babel" src="/ui/screens-1.jsx"></script>
+  <script type="text/babel" src="/ui/screens-2.jsx"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "theme": "dark",
+      "proxyState": "running",
+      "density": "comfy"
+    }/*EDITMODE-END*/;
+
+    const NAV = [
+      { id: "dashboard", label: "Dashboard",       icon: "dashboard", kbd: "1" },
+      { id: "config",    label: "Configuration",   icon: "config",    kbd: "2" },
+      { id: "models",    label: "Models",          icon: "models",    kbd: "3", badge: "8" },
+      { id: "test",      label: "Test request",    icon: "test",      kbd: "4" },
+      { id: "logs",      label: "Logs",            icon: "logs",      kbd: "5", badge: "live" },
+      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "6" },
+    ];
+
+    function App() {
+      const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+      const [route, setRoute] = useState("dashboard");
+      const [toasts, setToasts] = useState([]);
+      const { data: liveStatus, refresh: refreshStatus } = usePolling("/ui/api/status", 2000);
+      const tIdRef = useRef(0);
+
+      useEffect(() => {
+        document.documentElement.dataset.theme = t.theme;
+        document.documentElement.dataset.density = t.density;
+      }, [t.theme, t.density]);
+
+      useEffect(() => {
+        if (!liveStatus || typeof liveStatus.proxy_running !== "boolean") return;
+        setTweak("proxyState", liveStatus.proxy_running ? "running" : "stopped");
+      }, [liveStatus?.proxy_running]);
+
+      // keyboard nav
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+          const idx = "123456".indexOf(e.key);
+          if (idx >= 0) { setRoute(NAV[idx].id); }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
+      const pushToast = (msg) => {
+        const id = ++tIdRef.current;
+        setToasts(ts => [...ts, { id, msg }]);
+        setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 2400);
+      };
+
+      const handleAction = async (action) => {
+        try {
+          if (action === "start") {
+            await api.post("/ui/api/proxy/start");
+            setTweak("proxyState", "running");
+            pushToast("Proxy endpoints started");
+          }
+          if (action === "stop") {
+            await api.post("/ui/api/proxy/stop");
+            setTweak("proxyState", "stopped");
+            pushToast("Proxy endpoints stopped · control panel stays online");
+          }
+          if (action === "restart") {
+            await api.post("/ui/api/proxy/restart");
+            pushToast("Proxy restarting");
+          }
+          if (action === "validate") {
+            const res = await api.get("/ui/api/validate");
+            const passed = res.steps.filter(s => s.ok).length;
+            pushToast(`Validation complete · ${passed}/${res.steps.length} checks passed`);
+          }
+          refreshStatus();
+        } catch (e) {
+          pushToast(`Action failed · ${e.message || e}`);
+        }
+      };
+
+      const stateMeta = {
+        running: { tone: "ok",   urlState: "ok",   label: "Running" },
+        warning: { tone: "warn", urlState: "warn", label: "Running · advisory" },
+        stopped: { tone: "err",  urlState: "err",  label: "Stopped" },
+      }[t.proxyState];
+
+      return (
+        <div className="app" data-sidebar="wide">
+          {/* HEADER */}
+          <header className="hdr">
+            <div className="hdr-traffic"><span></span><span></span><span></span></div>
+            <div className="hdr-brand">
+              <span className="brand-mark"></span>
+              Claude Code Codex Proxy
+              <span className="hdr-sep">·</span>
+              <span className="hdr-sub">Control Panel</span>
+            </div>
+
+            <div className="hdr-mid">
+              <span className="hdr-url" data-state={stateMeta.urlState}>
+                <span className="dot"></span>
+                {liveStatus?.local_url || "http://127.0.0.1:4000"}
+              </span>
+              <Pill tone={stateMeta.tone} pulse={t.proxyState !== "stopped"}>{stateMeta.label}</Pill>
+            </div>
+
+            <div className="hdr-right">
+              <span className="hdr-bind"><Icon name="lock" size={11}/>local-only</span>
+              <span className="hdr-kbd">⌘K</span>
+            </div>
+          </header>
+
+          {/* SIDEBAR */}
+          <aside className="side">
+            <div className="side-section">Navigate</div>
+            {NAV.map(n => (
+              <div
+                key={n.id}
+                className="side-item"
+                aria-current={route === n.id ? "page" : undefined}
+                onClick={() => setRoute(n.id)}
+              >
+                <Icon name={n.icon} size={14}/>
+                <span>{n.label}</span>
+                {n.badge ? <span className="badge">{n.badge}</span> : <span className="kbd">{n.kbd}</span>}
+              </div>
+            ))}
+
+            <div className="side-section" style={{marginTop: 8}}>Process</div>
+            <div className="side-item" style={{cursor:"default"}}>
+              <Icon name="terminal" size={14}/>
+              <span style={{color:"var(--fg-2)", fontSize: 11.5}}>pid</span>
+              <span className="badge">{t.proxyState === "stopped" ? "—" : (liveStatus?.pid || "—")}</span>
+            </div>
+            <div className="side-item" style={{cursor:"default"}}>
+              <Icon name="folder" size={14}/>
+              <span style={{color:"var(--fg-2)", fontSize: 11.5}}>~/.codex/auth.json</span>
+              <span className="badge" style={{background: liveStatus?.codex_auth?.exists ? "var(--ok-soft)" : "var(--err-soft)", color: liveStatus?.codex_auth?.exists ? "var(--ok)" : "var(--err)"}}>{liveStatus?.codex_auth?.exists ? "ok" : "missing"}</span>
+            </div>
+
+            <div className="side-foot">
+              <div className="side-foot-row"><span>build</span><span className="v">0.4.2-rc1</span></div>
+              <div className="side-foot-row"><span>upstream</span><span className="v">{liveStatus?.upstream || "codex"}</span></div>
+              <div className="side-foot-row"><span>bind</span><span className="v">127.0.0.1:{liveStatus?.port || "4000"}</span></div>
+            </div>
+          </aside>
+
+          {/* MAIN */}
+          <main className="main">
+            {route === "dashboard" && <Dashboard proxyState={t.proxyState} onAction={handleAction} liveStatus={liveStatus}/>}
+            {route === "config"    && <Configuration pushToast={pushToast}/>}
+            {route === "models"    && <Models/>}
+            {route === "test"      && <TestRequest/>}
+            {route === "logs"      && <Logs proxyState={t.proxyState}/>}
+            {route === "setup"     && <Setup/>}
+          </main>
+
+          {/* TOASTS */}
+          <div className="toast-wrap">
+            {toasts.map(t => (
+              <div key={t.id} className="toast"><span className="dot"></span>{t.msg}</div>
+            ))}
+          </div>
+
+          {/* TWEAKS */}
+          <TweaksPanel>
+            <TweakSection label="Proxy state"/>
+            <TweakRadio
+              label="Status"
+              value={t.proxyState}
+              options={[
+                { value: "running", label: "Running" },
+                { value: "warning", label: "Warning" },
+                { value: "stopped", label: "Stopped" },
+              ]}
+              onChange={v => setTweak("proxyState", v)}
+            />
+            <TweakSection label="Appearance"/>
+            <TweakRadio
+              label="Theme"
+              value={t.theme}
+              options={[
+                { value: "dark", label: "Dark" },
+                { value: "light", label: "Light" },
+              ]}
+              onChange={v => setTweak("theme", v)}
+            />
+            <TweakRadio
+              label="Density"
+              value={t.density}
+              options={[
+                { value: "compact", label: "Compact" },
+                { value: "regular", label: "Regular" },
+                { value: "comfy",   label: "Comfy" },
+              ]}
+              onChange={v => setTweak("density", v)}
+            />
+          </TweaksPanel>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App/>);
+  </script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+# Claude Code Codex Proxy
+
+Local Windows proxy that exposes Anthropic-compatible endpoints for Claude Code and forwards requests to Codex/ChatGPT subscription auth.
+
+It also includes a local control panel at `http://127.0.0.1:4000/`.
+
+## Endpoints
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+
+## Quick Start
+
+1. Copy `.env.example` to `.env`.
+2. Update `CODEX_AUTH_FILE`, `PROXY_API_KEY`, and any model mappings.
+3. Start the proxy:
+
+```powershell
+.\start-proxy.ps1
+```
+
+4. Start Claude Code in a fresh PowerShell session:
+
+```powershell
+.\start-claude-code.ps1
+```
+
+## Claude Code Settings
+
+Starting the proxy applies local Claude Code settings:
+
+- `ANTHROPIC_BASE_URL=http://127.0.0.1:4000`
+- `ANTHROPIC_AUTH_TOKEN=<PROXY_API_KEY>`
+- `API_TIMEOUT_MS=3000000`
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+
+Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
+
+## Safety
+
+Do not commit `.env`, Claude settings snapshots, logs, PID files, or built binaries. They are ignored by `.gitignore`.
+
+Codex auth is read from the local `CODEX_AUTH_FILE`. Tokens are never written to logs; diagnostics use masked fingerprints only.
+
+## Validation
+
+Run:
+
+```powershell
+.\validate-proxy.ps1
+```
+
+For fast checks, prefer:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:4000/health"
+```

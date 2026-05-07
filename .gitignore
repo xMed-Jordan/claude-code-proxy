@@ -1,0 +1,22 @@
+# Local secrets and machine-specific configuration
+.env
+.claude-settings.snapshot.json
+.claude-settings.snapshot.meta.json
+
+# Runtime state
+.proxy.pid
+.proxy.log
+.proxy.err.log
+.proxy.trace.log
+.proxy.trace.log.old
+*.log
+
+# Build outputs
+bin/
+*.exe
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
