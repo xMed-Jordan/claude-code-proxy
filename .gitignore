@@ -2,6 +2,8 @@
 .env
 .claude-settings.snapshot.json
 .claude-settings.snapshot.meta.json
+.claude-json.snapshot.json
+.claude-json.snapshot.meta.json
 
 # Runtime state
 .proxy.pid

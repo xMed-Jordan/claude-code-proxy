@@ -44,7 +44,7 @@ Starting the proxy applies local Claude Code settings:
 - `ANTHROPIC_AUTH_TOKEN=<PROXY_API_KEY>`
 - `API_TIMEOUT_MS=3000000`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
-- MCP server `antigravity-browser`, launched by `start-antigravity-browser-mcp.ps1`
+- MCP server `antigravity-browser` in `~/.claude.json`, launched by `start-antigravity-browser-mcp.ps1`
 - Claude Code isolation hooks for subagent worktrees and child Codex sessions
 
 Fast mode and web search are controlled by:
@@ -61,7 +61,7 @@ Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code
 
 When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting.
 
-Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
+Before applying settings, the proxy creates snapshots of the current Claude Code settings and root MCP config. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
 
 ## Antigravity Browser Bridge
 

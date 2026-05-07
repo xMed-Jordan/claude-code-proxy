@@ -9,8 +9,11 @@ $ErrorActionPreference = 'Stop'
 $basePath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $settingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
 $settingsDir = Split-Path -Parent $settingsPath
+$claudeJsonPath = Join-Path $env:USERPROFILE '.claude.json'
 $snapshotPath = Join-Path $basePath '.claude-settings.snapshot.json'
 $snapshotMetaPath = Join-Path $basePath '.claude-settings.snapshot.meta.json'
+$claudeJsonSnapshotPath = Join-Path $basePath '.claude-json.snapshot.json'
+$claudeJsonSnapshotMetaPath = Join-Path $basePath '.claude-json.snapshot.meta.json'
 $envFile = Join-Path $basePath '.env'
 $gatewayModelsCachePath = Join-Path $env:USERPROFILE '.claude\cache\gateway-models.json'
 
@@ -67,6 +70,37 @@ function Ensure-Snapshot {
     Write-Host "Created Claude Code settings snapshot: $snapshotPath"
 }
 
+function Ensure-ClaudeJsonSnapshot {
+    if (Test-Path $claudeJsonSnapshotPath) {
+        if (-not (Test-Path $claudeJsonSnapshotMetaPath)) {
+            [pscustomobject]@{
+                config_path = $claudeJsonPath
+                existed     = $true
+                saved_at    = $null
+                reused      = $true
+                note        = 'Existing Claude Code root config snapshot preserved; not overwritten during proxy start.'
+            } | ConvertTo-Json -Depth 4 | Set-Content -Path $claudeJsonSnapshotMetaPath -Encoding UTF8
+        }
+        Write-Host "Existing Claude Code root config snapshot preserved: $claudeJsonSnapshotPath"
+        return
+    }
+
+    $existed = Test-Path $claudeJsonPath
+    if ($existed) {
+        Copy-Item -Path $claudeJsonPath -Destination $claudeJsonSnapshotPath -Force
+    } else {
+        Set-Content -Path $claudeJsonSnapshotPath -Value "{}" -Encoding UTF8
+    }
+
+    [pscustomobject]@{
+        config_path = $claudeJsonPath
+        existed     = $existed
+        saved_at    = (Get-Date).ToString('o')
+        reused      = $false
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $claudeJsonSnapshotMetaPath -Encoding UTF8
+    Write-Host "Created Claude Code root config snapshot: $claudeJsonSnapshotPath"
+}
+
 function Set-JsonProperty {
     param(
         [Parameter(Mandatory = $true)] [object]$Object,
@@ -118,6 +152,34 @@ function Ensure-AntigravityBrowserMcp {
     }
 
     Set-JsonProperty -Object $Settings.mcpServers -Name 'antigravity-browser' -Value $server
+}
+
+function Ensure-AntigravityBrowserUserMcp {
+    Ensure-ClaudeJsonSnapshot
+
+    if (Test-Path $claudeJsonPath) {
+        $config = Get-Content $claudeJsonPath -Raw | ConvertFrom-Json
+    } else {
+        $config = [pscustomobject]@{}
+    }
+
+    if (-not ($config.PSObject.Properties.Name -contains 'mcpServers') -or $null -eq $config.mcpServers) {
+        Set-JsonProperty -Object $config -Name 'mcpServers' -Value ([pscustomobject]@{})
+    }
+
+    $launcherPath = Join-Path $basePath 'start-antigravity-browser-mcp.ps1'
+    $server = [pscustomobject]@{
+        type    = 'stdio'
+        command = 'pwsh'
+        args    = @('-NoProfile', '-File', $launcherPath)
+        env     = [pscustomobject]@{
+            CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
+        }
+    }
+
+    Set-JsonProperty -Object $config.mcpServers -Name 'antigravity-browser' -Value $server
+    $config | ConvertTo-Json -Depth 100 | Set-Content -Path $claudeJsonPath -Encoding UTF8
+    Write-Host "Applied Antigravity MCP to Claude Code root config: $claudeJsonPath"
 }
 
 function New-ProxyCommandHook {
@@ -263,6 +325,7 @@ function Apply-ProxySettings {
     Ensure-ClaudeIsolationHooks -Settings $settings
 
     $settings | ConvertTo-Json -Depth 100 | Set-Content -Path $settingsPath -Encoding UTF8
+    Ensure-AntigravityBrowserUserMcp
     Write-Host "Applied proxy env to Claude Code settings: $settingsPath"
     Write-Host "Snapshot path: $snapshotPath"
 }
@@ -294,8 +357,33 @@ function Restore-OriginalSettings {
     Remove-Item -Path $snapshotMetaPath -Force -ErrorAction SilentlyContinue
 }
 
+function Restore-ClaudeJsonConfig {
+    if (-not (Test-Path $claudeJsonSnapshotPath)) {
+        Write-Host 'No Claude Code root config snapshot found to restore.'
+        return
+    }
+
+    $existed = $true
+    if (Test-Path $claudeJsonSnapshotMetaPath) {
+        $meta = Get-Content $claudeJsonSnapshotMetaPath -Raw | ConvertFrom-Json
+        $existed = [bool]$meta.existed
+    }
+
+    if ($existed) {
+        Copy-Item -Path $claudeJsonSnapshotPath -Destination $claudeJsonPath -Force
+        Write-Host "Restored Claude Code root config from snapshot: $claudeJsonPath"
+    } else {
+        Remove-Item -Path $claudeJsonPath -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed Claude Code root config created for proxy: $claudeJsonPath"
+    }
+
+    Remove-Item -Path $claudeJsonSnapshotPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $claudeJsonSnapshotMetaPath -Force -ErrorAction SilentlyContinue
+}
+
 if ($Action -eq 'Apply') {
     Apply-ProxySettings
 } else {
     Restore-OriginalSettings
+    Restore-ClaudeJsonConfig
 }
