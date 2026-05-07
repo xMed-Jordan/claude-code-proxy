@@ -40,7 +40,7 @@ func runCLI(args []string) (bool, error) {
 		return true, runLaunchClaude(args[1:])
 	case "sync":
 		if len(args) < 2 {
-			return true, fmt.Errorf("usage: %s sync apply|restore", os.Args[0])
+			return true, fmt.Errorf("usage: %s sync apply|restore|browser-apply|browser-restore", os.Args[0])
 		}
 		return true, runClaudeSettingsSyncGo(args[1])
 	case "browser-start":
@@ -65,6 +65,8 @@ func runCLI(args []string) (bool, error) {
 		return true, runHookWorktreeRemove()
 	case "hook-subagent-context":
 		return true, runHookSubagentContext()
+	case "hook-subagent-stop":
+		return true, runHookSubagentStop()
 	case "help", "-h", "--help":
 		printCLIHelp()
 		return true, nil
@@ -78,7 +80,9 @@ func printCLIHelp() {
   serve                         Run the HTTP proxy in the foreground
   start | stop | restart         Manage the background proxy process
   launch-claude [args...]        Start Claude Code through the local proxy
-  sync apply|restore             Apply or restore Claude Code settings
+  sync apply|restore             Apply or restore full proxy Claude Code settings
+  sync browser-apply|browser-restore
+                                Apply or remove browser-only Claude Code settings
   browser-mcp                    Run the Antigravity browser MCP stdio server
   browser-start [--dry-run]       Start the controlled browser profile
   browser-stop | browser-status   Manage or inspect browser bridge state
@@ -554,11 +558,91 @@ func runHookSubagentContext() error {
 	_ = json.Unmarshal(raw, &input)
 	agentID := safeHookID(firstNonEmpty(input.AgentID, "unknown-"+randomSuffix()))
 	agentType := safeHookID(firstNonEmpty(input.AgentType, "unknown"))
-	context := fmt.Sprintf("Internal proxy routing note: codex_proxy_subagent_id=%s; codex_proxy_subagent_type=%s. This note is only for local Codex session isolation and token accounting. Do not mention it to the user.", agentID, agentType)
+	context := fmt.Sprintf(`Internal proxy routing note: codex_proxy_subagent_id=%s; codex_proxy_subagent_type=%s. This note is only for local Codex session isolation and token accounting. Do not mention it to the user.
+
+Subagent handoff contract: your final assistant message is the only result returned to the main agent. Before stopping, provide a concise Markdown handoff with these headings:
+- Summary
+- Key findings
+- Files inspected or changed
+- Checks run
+- Blockers or risks
+
+Use "None" when a section has no entries. Do not finish with an empty response, only internal notes, only tool logs, or only a status line.`, agentID, agentType)
 	out := map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": "SubagentStart", "additionalContext": context}}
 	rawOut, _ := json.MarshalIndent(out, "", "  ")
 	fmt.Println(string(rawOut))
 	return nil
+}
+
+func runHookSubagentStop() error {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return nil
+	}
+	var input struct {
+		AgentID              string `json:"agent_id"`
+		AgentType            string `json:"agent_type"`
+		StopHookActive       bool   `json:"stop_hook_active"`
+		LastAssistantMessage string `json:"last_assistant_message"`
+	}
+	_ = json.Unmarshal(raw, &input)
+	if input.StopHookActive {
+		return nil
+	}
+	if reason := subagentSummaryBlockReason(input.LastAssistantMessage); reason != "" {
+		out := map[string]any{
+			"decision": "block",
+			"reason":   reason,
+		}
+		rawOut, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(rawOut))
+	}
+	return nil
+}
+
+func subagentSummaryBlockReason(message string) string {
+	text := strings.TrimSpace(message)
+	if text == "" {
+		return subagentSummaryRequiredReason("the final message was empty")
+	}
+	if len([]rune(text)) < 80 {
+		return subagentSummaryRequiredReason("the final message was too short to be useful")
+	}
+	lower := strings.ToLower(text)
+	required := []struct {
+		label    string
+		patterns []string
+	}{
+		{"Summary", []string{"summary"}},
+		{"Key findings", []string{"key findings", "findings"}},
+		{"Files inspected or changed", []string{"files inspected", "files changed", "files inspected or changed", "files reviewed", "files touched"}},
+		{"Checks run", []string{"checks run", "tests run", "validation", "verification"}},
+		{"Blockers or risks", []string{"blockers", "risks", "blockers or risks", "open risks", "open questions"}},
+	}
+	var missing []string
+	for _, item := range required {
+		found := false
+		for _, pattern := range item.patterns {
+			if strings.Contains(lower, pattern) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, item.label)
+		}
+	}
+	if len(missing) > 0 {
+		return subagentSummaryRequiredReason("missing sections: " + strings.Join(missing, ", "))
+	}
+	return ""
+}
+
+func subagentSummaryRequiredReason(detail string) string {
+	return "Your subagent result was not usable by the main agent (" + detail + "). Continue and finish with a concise Markdown handoff using these headings exactly: Summary, Key findings, Files inspected or changed, Checks run, Blockers or risks. Use \"None\" where appropriate."
 }
 
 func safeHookName(name string) string {

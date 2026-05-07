@@ -1056,6 +1056,52 @@ func TestCodexSubagentMarkerGetsStableChildSession(t *testing.T) {
 	}
 }
 
+func TestSubagentSummaryBlockReasonRequiresUsableHandoff(t *testing.T) {
+	if reason := subagentSummaryBlockReason(""); !strings.Contains(reason, "empty") {
+		t.Fatalf("empty summary reason = %q, want empty", reason)
+	}
+	if reason := subagentSummaryBlockReason("Done."); !strings.Contains(reason, "too short") {
+		t.Fatalf("short summary reason = %q, want too short", reason)
+	}
+	incomplete := "Summary\nChecked the repository and found the service file. The work is described in prose, but the handoff omits the required headings."
+	if reason := subagentSummaryBlockReason(incomplete); !strings.Contains(reason, "missing sections") {
+		t.Fatalf("incomplete summary reason = %q, want missing sections", reason)
+	}
+}
+
+func TestSubagentSummaryBlockReasonAcceptsStructuredHandoff(t *testing.T) {
+	message := `Summary
+Reviewed the proxy startup and browser MCP setup.
+
+Key findings
+- Browser MCP is configured separately from the proxy.
+
+Files inspected or changed
+- cli.go
+- settings_sync.go
+
+Checks run
+- go test ./...
+
+Blockers or risks
+- None`
+	if reason := subagentSummaryBlockReason(message); reason != "" {
+		t.Fatalf("structured handoff was blocked: %q", reason)
+	}
+}
+
+func TestEnsureClaudeIsolationHooksAddsSubagentStop(t *testing.T) {
+	settings := map[string]any{}
+	ensureClaudeIsolationHooks(settings)
+	hooks := settings["hooks"].(map[string]any)
+	if _, ok := hooks["SubagentStart"]; !ok {
+		t.Fatal("SubagentStart hook was not configured")
+	}
+	if _, ok := hooks["SubagentStop"]; !ok {
+		t.Fatal("SubagentStop hook was not configured")
+	}
+}
+
 func TestRetryRemovesPromptCacheKeyWhenRejected(t *testing.T) {
 	out := responsesRequest{PromptCacheKey: "ccp_test"}
 	retry, ok := retryCodexRequestAfter400(out, http.StatusBadRequest, `{"error":{"message":"Unknown parameter: 'prompt_cache_key'."}}`)

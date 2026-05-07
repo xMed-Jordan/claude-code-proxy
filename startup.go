@@ -14,6 +14,8 @@ import (
 
 const startupName = "connect-ai-proxy"
 
+var windowsProxyStartupTaskNames = []string{"ConnectAIProxy", "ClaudeCodeCodexProxy"}
+
 func installStartup() error {
 	if err := ensureCurrentBinaryBuilt(); err != nil {
 		return err
@@ -33,7 +35,7 @@ func installStartup() error {
 func uninstallStartup() error {
 	switch runtime.GOOS {
 	case "windows":
-		return runCommand("schtasks.exe", "/Delete", "/TN", "ConnectAIProxy", "/F")
+		return uninstallWindowsStartup()
 	case "darwin":
 		path := filepath.Join(userHomeDir(), "Library", "LaunchAgents", "com.connect-ai-proxy.plist")
 		_ = runCommand("launchctl", "unload", path)
@@ -52,6 +54,9 @@ func uninstallStartup() error {
 }
 
 func installWindowsStartup() error {
+	if err := uninstallWindowsStartup(); err != nil {
+		return err
+	}
 	bin := preferredProxyBinaryPath()
 	psCommand := fmt.Sprintf("Set-Location -LiteralPath %s; & %s start", powershellQuote(mustGetwd()), powershellQuote(bin))
 	taskRun := `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "` + strings.ReplaceAll(psCommand, `"`, `\"`) + `"`
@@ -59,6 +64,42 @@ func installWindowsStartup() error {
 		return err
 	}
 	fmt.Println("Installed startup task 'ConnectAIProxy'.")
+	return nil
+}
+
+func uninstallWindowsStartup() error {
+	var errs []string
+	for _, name := range windowsProxyStartupTaskNames {
+		if err := deleteWindowsScheduledTask(name); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	fmt.Println("Removed Windows proxy startup tasks if present.")
+	return nil
+}
+
+func deleteWindowsScheduledTask(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "schtasks.exe", "/Delete", "/TN", name, "/F")
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		lower := strings.ToLower(text)
+		if strings.Contains(lower, "cannot find") || strings.Contains(lower, "does not exist") || strings.Contains(lower, "not found") {
+			return nil
+		}
+		if text == "" {
+			text = err.Error()
+		}
+		return fmt.Errorf("could not delete scheduled task %s: %s", name, text)
+	}
+	if text != "" {
+		fmt.Println(text)
+	}
 	return nil
 }
 

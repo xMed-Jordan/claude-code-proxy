@@ -198,9 +198,19 @@ Fast mode and web search are controlled by:
 
 Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
 
-When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting.
+When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting. A SubagentStop hook also blocks empty or incomplete subagent final messages so the main agent receives a usable handoff summary.
 
 Before applying settings, the proxy creates snapshots of the current Claude Code settings, Claude Code root MCP config, Claude Desktop MCP config, and user memory file. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
+
+## Live Server + Local Browser Mode
+
+Use this split when a VPS hosts the AI proxy and your local workstation should provide only the visible browser tools:
+
+- On the VPS, install with server defaults and browser tools disabled. The proxy should listen on `127.0.0.1:4000`, while Caddy owns public `80/443` and forwards the HTTPS domain to the local proxy.
+- On Windows, run `.\install-browser-startup.ps1`. It removes old full-proxy startup tasks such as `ConnectAIProxy` and `ClaudeCodeCodexProxy`, then applies only browser MCP settings and hooks. It does not rewrite `ANTHROPIC_BASE_URL`, so Claude Code can keep using the live endpoint such as `https://ai-api1.cus.cx/anthropic`.
+- To remove the local browser MCP wiring later, run `.\uninstall-browser-startup.ps1`.
+
+Equivalent CLI actions are `connect-ai-proxy sync browser-apply` and `connect-ai-proxy sync browser-restore`. Browser-only sync never starts the local proxy and never changes Claude Code API endpoint environment variables.
 
 ## Antigravity Browser Bridge
 
@@ -216,7 +226,7 @@ Set `ANTIGRAVITY_BROWSER_MODE=default` to prefer an already-running Chrome DevTo
 
 Set `ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1` only for older or custom Chrome builds where Default-profile DevTools still works. In that forced mode, `ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH=1` allows the bridge to close only background/proxy Chrome windows before trying to relaunch Default Chrome with DevTools. It will not close normal visible user tabs just to take control.
 
-Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. Claude Code launches the stdio MCP process itself; proxy startup normally only prepares the settings and does not open Chrome.
+Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. Claude Code launches the stdio MCP process itself; proxy startup normally only prepares the settings and does not open Chrome. This is the recommended local-browser mode when the AI proxy itself runs on a live server.
 
 Normal proxy start, dashboard checks, tests, and the `browser_status` MCP tool are passive and do not open Chrome. Set `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY=1` only if you explicitly want proxy startup to open the controlled browser ahead of the first Claude Code browser action. `browser_screenshot` saves PNG files under `Claude Code Screenshots` in the directory where Claude Code was launched and returns the local path by default; set `ANTIGRAVITY_SCREENSHOT_DIR` to override that folder. Inline image data is opt-in with `include_image=true`.
 

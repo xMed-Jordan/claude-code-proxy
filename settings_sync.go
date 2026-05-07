@@ -43,6 +43,10 @@ func runClaudeSettingsSyncGo(action string) error {
 		return applyProxySettingsGo()
 	case "restore":
 		return restoreProxySettingsGo()
+	case "browser-apply", "local-browser", "local-browser-apply":
+		return applyBrowserOnlySettingsGo()
+	case "browser-restore", "local-browser-restore":
+		return restoreBrowserOnlySettingsGo()
 	default:
 		return fmt.Errorf("unknown sync action %q", action)
 	}
@@ -90,19 +94,9 @@ func applyProxySettingsGo() error {
 	env["CLAUDE_CODE_EFFORT_LEVEL"] = firstNonEmpty(proxyEnv["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh")
 	settings["model"] = "opus[1m]"
 	ensureClaudeIsolationHooks(settings)
-	browserToolsEnabled := envFlagFromMap(proxyEnv, "ANTIGRAVITY_BROWSER_ENABLED", true)
-	if browserToolsEnabled {
-		ensurePermissionAllow(settings, antigravityPermissionTools)
-		objectMap(settings, "mcpServers")["antigravity-browser"] = mcpServerConfig(false)
-		if err := ensureClaudeBrowserMemory(); err != nil {
-			return err
-		}
-	} else {
-		removePermissionAllow(settings, antigravityPermissionTools)
-		removeMCPServer(settings, "antigravity-browser")
-		if err := removeClaudeBrowserMemory(); err != nil {
-			return err
-		}
+	browserToolsEnabled, err := applyBrowserSettingsToClaude(settings, proxyEnv)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(settingsDir, 0700); err != nil {
 		return err
@@ -127,6 +121,99 @@ func applyProxySettingsGo() error {
 	}
 	fmt.Printf("Applied proxy env to Claude Code settings: %s\n", settingsPath)
 	return nil
+}
+
+func applyBrowserOnlySettingsGo() error {
+	settingsPath := defaultClaudeSettingsPath()
+	settingsDir := filepath.Dir(settingsPath)
+	if err := ensureSnapshot(settingsPath, filepath.Join(mustGetwd(), claudeSettingsSnapshotPath), filepath.Join(mustGetwd(), claudeSettingsSnapshotMetaPath), "settings_path", "{}"); err != nil {
+		return err
+	}
+	settings, err := readJSONMap(settingsPath)
+	if err != nil {
+		return err
+	}
+	if _, ok := settings["$schema"]; !ok {
+		settings["$schema"] = "https://json.schemastore.org/claude-code-settings.json"
+	}
+	ensureClaudeIsolationHooks(settings)
+	proxyEnv := readEnvMap()
+	browserToolsEnabled, err := applyBrowserSettingsToClaude(settings, proxyEnv)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(settingsDir, 0700); err != nil {
+		return err
+	}
+	if err := writeJSONFile(settingsPath, settings); err != nil {
+		return err
+	}
+	if err := applyBrowserCompanionConfigs(browserToolsEnabled); err != nil {
+		return err
+	}
+	fmt.Printf("Applied browser-only Claude Code settings without changing AI endpoint env: %s\n", settingsPath)
+	return nil
+}
+
+func restoreBrowserOnlySettingsGo() error {
+	settingsPath := defaultClaudeSettingsPath()
+	if fileExists(settingsPath) {
+		settings, err := readJSONMap(settingsPath)
+		if err != nil {
+			return err
+		}
+		removePermissionAllow(settings, antigravityPermissionTools)
+		removeMCPServer(settings, "antigravity-browser")
+		if err := writeJSONFile(settingsPath, settings); err != nil {
+			return err
+		}
+	}
+	var errs []string
+	if err := removeClaudeBrowserMemory(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if err := removeAntigravityBrowserUserMCP(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if err := removeAntigravityBrowserDesktopMCP(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	fmt.Printf("Removed browser-only MCP settings without restoring AI endpoint env: %s\n", settingsPath)
+	return nil
+}
+
+func applyBrowserSettingsToClaude(settings map[string]any, proxyEnv map[string]string) (bool, error) {
+	browserToolsEnabled := envFlagFromMap(proxyEnv, "ANTIGRAVITY_BROWSER_ENABLED", true)
+	if browserToolsEnabled {
+		ensurePermissionAllow(settings, antigravityPermissionTools)
+		objectMap(settings, "mcpServers")["antigravity-browser"] = mcpServerConfig(false)
+		if err := ensureClaudeBrowserMemory(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	removePermissionAllow(settings, antigravityPermissionTools)
+	removeMCPServer(settings, "antigravity-browser")
+	if err := removeClaudeBrowserMemory(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func applyBrowserCompanionConfigs(browserToolsEnabled bool) error {
+	if browserToolsEnabled {
+		if err := ensureAntigravityBrowserUserMCP(); err != nil {
+			return err
+		}
+		return ensureAntigravityBrowserDesktopMCP()
+	}
+	if err := removeAntigravityBrowserUserMCP(); err != nil {
+		return err
+	}
+	return removeAntigravityBrowserDesktopMCP()
 }
 
 func restoreProxySettingsGo() error {
@@ -371,15 +458,23 @@ func ensureClaudeIsolationHooks(settings map[string]any) {
 	ensureHookEvent(settings, "WorktreeCreate", "hook-worktree-create", "", true)
 	ensureHookEvent(settings, "WorktreeRemove", "hook-worktree-remove", "", true)
 	ensureHookEvent(settings, "SubagentStart", "hook-subagent-context", "*", false)
+	ensureHookEvent(settings, "SubagentStop", "hook-subagent-stop", "*", false)
 }
 
 func ensureHookEvent(settings map[string]any, eventName, subcommand, matcher string, onlyWhenEmpty bool) {
 	hooks := objectMap(settings, "hooks")
 	current := hookGroupsFromAny(hooks[eventName])
 	command := hookCommandString(subcommand)
+	aliases := hookCommandAliases(subcommand)
 	for _, group := range current {
 		for _, hook := range hookListFromAny(group["hooks"]) {
-			if strings.Contains(fmt.Sprint(hook["command"]), subcommand) {
+			hookCommand := fmt.Sprint(hook["command"])
+			for _, alias := range aliases {
+				if strings.Contains(hookCommand, alias) {
+					return
+				}
+			}
+			if strings.Contains(hookCommand, subcommand) {
 				return
 			}
 		}
@@ -394,6 +489,21 @@ func ensureHookEvent(settings map[string]any, eventName, subcommand, matcher str
 		group["matcher"] = matcher
 	}
 	hooks[eventName] = append(current, group)
+}
+
+func hookCommandAliases(subcommand string) []string {
+	switch subcommand {
+	case "hook-worktree-create":
+		return []string{"claude-worktree-create.ps1"}
+	case "hook-worktree-remove":
+		return []string{"claude-worktree-remove.ps1"}
+	case "hook-subagent-context":
+		return []string{"claude-subagent-context.ps1"}
+	case "hook-subagent-stop":
+		return []string{"claude-subagent-stop.ps1"}
+	default:
+		return nil
+	}
 }
 
 func hookGroupsFromAny(value any) []map[string]any {
