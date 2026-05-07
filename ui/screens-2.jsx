@@ -444,6 +444,8 @@ const BrowserBridge = () => {
           <div className="v">{bridgeState?.current_title || "—"}</div>
           <div className="k">Last action</div>
           <div className="v mono">{bridgeState?.last_action || "—"}</div>
+          <div className="k">Screenshot</div>
+          <div className="v mono">{bridgeState?.last_screenshot || "—"}</div>
           <div className="k">Last error</div>
           <div className="v mono">{bridgeState?.last_error || "—"}</div>
         </div>

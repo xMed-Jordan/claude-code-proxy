@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -17,6 +18,7 @@ func TestAntigravityMCPToolsExposeVisibleControls(t *testing.T) {
 		"browser_navigate",
 		"browser_snapshot",
 		"browser_screenshot",
+		"browser_console",
 		"browser_move",
 		"browser_click",
 		"browser_type",
@@ -110,4 +112,34 @@ func TestSanitizeFilePart(t *testing.T) {
 	if got != "www-shalabi-clinics-com" {
 		t.Fatalf("sanitizeFilePart = %q", got)
 	}
+}
+
+func TestScreenshotOutputDirUsesCallerCWD(t *testing.T) {
+	t.Setenv("ANTIGRAVITY_SCREENSHOT_DIR", "")
+	t.Setenv("ANTIGRAVITY_BROWSER_CALLER_CWD", `C:\Users\hrash`)
+	got := antigravityScreenshotOutputDir()
+	want := filepath.Join(`C:\Users\hrash`, antigravityScreenshotDir)
+	if got != want {
+		t.Fatalf("antigravityScreenshotOutputDir = %q, want %q", got, want)
+	}
+}
+
+func TestBrowserConsoleToolExists(t *testing.T) {
+	tools := antigravityMCPTools()
+	for _, tool := range tools {
+		if tool.Name != "browser_console" {
+			continue
+		}
+		props, ok := tool.InputSchema["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("browser_console schema missing properties: %#v", tool.InputSchema)
+		}
+		for _, key := range []string{"reload", "wait_ms", "include_network", "max_events"} {
+			if _, ok := props[key]; !ok {
+				t.Fatalf("browser_console schema missing %q", key)
+			}
+		}
+		return
+	}
+	t.Fatal("browser_console tool missing")
 }

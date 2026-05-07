@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,7 +29,7 @@ const (
 	antigravityMCPVersion    = "0.2.0"
 	antigravityStateFile     = ".antigravity-browser-state.json"
 	antigravityOverlayID     = "ccp-visible-cursor"
-	antigravityScreenshotDir = ".antigravity-screenshots"
+	antigravityScreenshotDir = "Claude Code Screenshots"
 	defaultBrowserWaitLimit  = 15 * time.Second
 )
 
@@ -244,6 +245,16 @@ func antigravityMCPTools() []mcpTool {
 			}, nil),
 		},
 		{
+			Name:        "browser_console",
+			Description: "Check the active Chrome page for console errors, runtime exceptions, failed loads, and HTTP 4xx/5xx script/style/API responses.",
+			InputSchema: objectSchema(map[string]any{
+				"reload":          map[string]any{"type": "boolean", "description": "Reload the page before collecting errors. Defaults to true."},
+				"wait_ms":         map[string]any{"type": "number", "description": "Collection window after attaching/reload, capped at 10000 ms."},
+				"include_network": map[string]any{"type": "boolean", "description": "Include failed network loads and HTTP 4xx/5xx responses. Defaults to true."},
+				"max_events":      map[string]any{"type": "number", "description": "Maximum events to return. Defaults to 50."},
+			}, nil),
+		},
+		{
 			Name:        "browser_move",
 			Description: "Move the visible overlay cursor to a selector, text, or coordinate without clicking.",
 			InputSchema: targetSchema(),
@@ -332,6 +343,8 @@ func callAntigravityTool(ctx context.Context, name string, args map[string]any) 
 		result, err = toolBrowserSnapshot(ctx, intArg(args, "max_text_chars", 6000))
 	case "browser_screenshot":
 		result, err = toolBrowserScreenshot(ctx, boolArg(args, "include_image", false))
+	case "browser_console":
+		result, err = toolBrowserConsole(ctx, args)
 	case "browser_move":
 		result, err = toolBrowserMove(ctx, args)
 	case "browser_click":
@@ -477,6 +490,41 @@ func toolBrowserScreenshot(ctx context.Context, includeImage bool) (mcpToolResul
 		content = append(content, map[string]any{"type": "image", "data": data, "mimeType": "image/png"})
 	}
 	return mcpToolResult{Content: content}, nil
+}
+
+func toolBrowserConsole(ctx context.Context, args map[string]any) (mcpToolResult, error) {
+	client, err := newCDPClient(ctx)
+	if err != nil {
+		return mcpToolResult{}, err
+	}
+	defer client.Close()
+
+	wait := time.Duration(intArg(args, "wait_ms", 3000)) * time.Millisecond
+	if wait <= 0 || wait > 10*time.Second {
+		wait = 3 * time.Second
+	}
+	maxEvents := intArg(args, "max_events", 50)
+	if maxEvents <= 0 || maxEvents > 200 {
+		maxEvents = 50
+	}
+	reload := boolArg(args, "reload", true)
+	includeNetwork := boolArg(args, "include_network", true)
+	events, err := client.CollectConsole(ctx, wait, reload, includeNetwork, maxEvents)
+	if err != nil {
+		return mcpToolResult{}, err
+	}
+	page := client.pageInfo(ctx)
+	writeAntigravityBrowserStateFromPage("browser_console", fmt.Sprintf("checked console; %d issue(s)", len(events)), client.baseURL, page, "")
+	return textToolResult(jsonText(map[string]any{
+		"ok":              true,
+		"url":             stringFromMap(page, "url"),
+		"title":           stringFromMap(page, "title"),
+		"reload":          reload,
+		"wait_ms":         wait.Milliseconds(),
+		"include_network": includeNetwork,
+		"issue_count":     len(events),
+		"issues":          events,
+	})), nil
 }
 
 func toolBrowserMove(ctx context.Context, args map[string]any) (mcpToolResult, error) {
@@ -722,6 +770,105 @@ func (c *cdpClient) Call(ctx context.Context, method string, params map[string]a
 		}
 		return map[string]any{}, nil
 	}
+}
+
+func (c *cdpClient) callLocked(ctx context.Context, method string, params map[string]any, collect func(map[string]any)) (map[string]any, error) {
+	id := c.nextID
+	c.nextID++
+	if params == nil {
+		params = map[string]any{}
+	}
+	if err := c.conn.WriteJSON(map[string]any{"id": id, "method": method, "params": params}); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for Chrome DevTools response to %s", method)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		var msg map[string]any
+		if err := c.conn.ReadJSON(&msg); err != nil {
+			if isTimeoutError(err) {
+				continue
+			}
+			return nil, err
+		}
+		if collect != nil {
+			collect(msg)
+		}
+		if gotID, ok := numericID(msg["id"]); !ok || gotID != id {
+			continue
+		}
+		if rawErr, ok := msg["error"]; ok {
+			return nil, fmt.Errorf("Chrome DevTools error for %s: %s", method, jsonText(rawErr))
+		}
+		if result, ok := msg["result"].(map[string]any); ok {
+			return result, nil
+		}
+		return map[string]any{}, nil
+	}
+}
+
+func (c *cdpClient) CollectConsole(ctx context.Context, wait time.Duration, reload bool, includeNetwork bool, maxEvents int) ([]map[string]any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	events := make([]map[string]any, 0)
+	requestURLs := map[string]string{}
+	collect := func(msg map[string]any) {
+		if len(events) >= maxEvents {
+			return
+		}
+		if event, ok := consoleIssueFromCDP(msg, includeNetwork, requestURLs); ok {
+			events = append(events, event)
+		}
+	}
+
+	if _, err := c.callLocked(ctx, "Runtime.enable", nil, collect); err != nil {
+		return nil, err
+	}
+	if _, err := c.callLocked(ctx, "Log.enable", nil, collect); err != nil {
+		return nil, err
+	}
+	if includeNetwork {
+		if _, err := c.callLocked(ctx, "Network.enable", nil, collect); err != nil {
+			return nil, err
+		}
+	}
+	if reload {
+		if _, err := c.callLocked(ctx, "Page.reload", map[string]any{"ignoreCache": true}, collect); err != nil {
+			return nil, err
+		}
+	}
+
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) && len(events) < maxEvents {
+		select {
+		case <-ctx.Done():
+			return events, ctx.Err()
+		default:
+		}
+		remaining := time.Until(deadline)
+		if remaining > 500*time.Millisecond {
+			remaining = 500 * time.Millisecond
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(remaining))
+		var msg map[string]any
+		if err := c.conn.ReadJSON(&msg); err != nil {
+			if isTimeoutError(err) {
+				continue
+			}
+			return events, nil
+		}
+		collect(msg)
+	}
+	return events, nil
 }
 
 func (c *cdpClient) Evaluate(ctx context.Context, expression string, awaitPromise bool) (any, error) {
@@ -1176,6 +1323,153 @@ func keySpec(key string) map[string]any {
 	return map[string]any{"key": key, "code": key, "vk": 0, "text": ""}
 }
 
+func consoleIssueFromCDP(msg map[string]any, includeNetwork bool, requestURLs map[string]string) (map[string]any, bool) {
+	method := stringFromMap(msg, "method")
+	params := mapFromAny(msg["params"])
+	switch method {
+	case "Runtime.exceptionThrown":
+		details := mapFromAny(params["exceptionDetails"])
+		exception := mapFromAny(details["exception"])
+		text := firstNonEmpty(
+			stringFromMap(exception, "description"),
+			stringFromMap(exception, "value"),
+			stringFromMap(details, "text"),
+		)
+		return compactIssue(map[string]any{
+			"type":   "runtime_exception",
+			"level":  "error",
+			"text":   text,
+			"url":    stringFromMap(details, "url"),
+			"line":   intFromAny(details["lineNumber"]) + 1,
+			"column": intFromAny(details["columnNumber"]) + 1,
+			"source": "Runtime.exceptionThrown",
+		}), true
+	case "Runtime.consoleAPICalled":
+		level := strings.ToLower(stringFromMap(params, "type"))
+		if level != "error" && level != "assert" {
+			return nil, false
+		}
+		return compactIssue(map[string]any{
+			"type":   "console",
+			"level":  level,
+			"text":   consoleArgsText(params["args"]),
+			"url":    stringFromMap(params, "url"),
+			"line":   intFromAny(params["lineNumber"]) + 1,
+			"column": intFromAny(params["columnNumber"]) + 1,
+			"source": "Runtime.consoleAPICalled",
+		}), true
+	case "Log.entryAdded":
+		entry := mapFromAny(params["entry"])
+		level := strings.ToLower(stringFromMap(entry, "level"))
+		if level != "error" {
+			return nil, false
+		}
+		return compactIssue(map[string]any{
+			"type":   "log",
+			"level":  level,
+			"text":   stringFromMap(entry, "text"),
+			"url":    stringFromMap(entry, "url"),
+			"line":   intFromAny(entry["lineNumber"]),
+			"source": firstNonEmpty(stringFromMap(entry, "source"), "Log.entryAdded"),
+		}), true
+	case "Network.requestWillBeSent":
+		if !includeNetwork {
+			return nil, false
+		}
+		requestID := stringFromMap(params, "requestId")
+		request := mapFromAny(params["request"])
+		if requestID != "" {
+			requestURLs[requestID] = stringFromMap(request, "url")
+		}
+	case "Network.responseReceived":
+		if !includeNetwork {
+			return nil, false
+		}
+		response := mapFromAny(params["response"])
+		status := intFromAny(response["status"])
+		if status < 400 {
+			return nil, false
+		}
+		requestID := stringFromMap(params, "requestId")
+		url := firstNonEmpty(stringFromMap(response, "url"), requestURLs[requestID])
+		return compactIssue(map[string]any{
+			"type":          "http_error",
+			"level":         "error",
+			"status":        status,
+			"resource_type": stringFromMap(params, "type"),
+			"url":           url,
+			"text":          fmt.Sprintf("HTTP %d for %s", status, url),
+			"source":        "Network.responseReceived",
+		}), true
+	case "Network.loadingFailed":
+		if !includeNetwork {
+			return nil, false
+		}
+		requestID := stringFromMap(params, "requestId")
+		if boolFromAny(params["canceled"]) {
+			return nil, false
+		}
+		url := requestURLs[requestID]
+		return compactIssue(map[string]any{
+			"type":          "network_failed",
+			"level":         "error",
+			"resource_type": stringFromMap(params, "type"),
+			"url":           url,
+			"text":          firstNonEmpty(stringFromMap(params, "errorText"), "network load failed"),
+			"blocked":       stringFromMap(params, "blockedReason"),
+			"source":        "Network.loadingFailed",
+		}), true
+	}
+	return nil, false
+}
+
+func compactIssue(issue map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range issue {
+		switch v := value.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				out[key] = truncateString(v, 500)
+			}
+		case int:
+			if v != 0 {
+				out[key] = v
+			}
+		case bool:
+			if v {
+				out[key] = v
+			}
+		default:
+			if value != nil {
+				out[key] = value
+			}
+		}
+	}
+	return out
+}
+
+func consoleArgsText(value any) string {
+	items, _ := value.([]any)
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		obj := mapFromAny(item)
+		text := firstNonEmpty(
+			stringFromMap(obj, "value"),
+			stringFromMap(obj, "description"),
+			stringFromMap(obj, "type"),
+		)
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func waitScript(selector string, text string) string {
 	payload, _ := json.Marshal(map[string]string{"selector": selector, "text": text})
 	return `(() => {
@@ -1260,6 +1554,20 @@ func intArg(args map[string]any, key string, fallback int) int {
 	return fallback
 }
 
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
 func boolArg(args map[string]any, key string, fallback bool) bool {
 	value, ok := args[key]
 	if !ok {
@@ -1272,6 +1580,17 @@ func boolArg(args map[string]any, key string, fallback bool) bool {
 		return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
 	default:
 		return fallback
+	}
+}
+
+func boolFromAny(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
+	default:
+		return false
 	}
 }
 
@@ -1315,7 +1634,11 @@ func stringFromMap(value map[string]any, key string) string {
 	if value == nil {
 		return ""
 	}
-	return fmt.Sprint(value[key])
+	raw, ok := value[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	return fmt.Sprint(raw)
 }
 
 func saveScreenshotPNG(data string, page map[string]any) (string, int, error) {
@@ -1323,7 +1646,7 @@ func saveScreenshotPNG(data string, page map[string]any) (string, int, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("could not decode Chrome screenshot: %w", err)
 	}
-	dir := filepath.Join(mustGetwd(), antigravityScreenshotDir)
+	dir := antigravityScreenshotOutputDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", 0, fmt.Errorf("could not create screenshot folder: %w", err)
 	}
@@ -1340,6 +1663,25 @@ func saveScreenshotPNG(data string, page map[string]any) (string, int, error) {
 		return "", 0, fmt.Errorf("could not write screenshot: %w", err)
 	}
 	return path, len(raw), nil
+}
+
+func antigravityScreenshotOutputDir() string {
+	if raw := strings.TrimSpace(os.Getenv("ANTIGRAVITY_SCREENSHOT_DIR")); raw != "" {
+		if abs, err := filepath.Abs(raw); err == nil {
+			return abs
+		}
+		return raw
+	}
+	root := strings.TrimSpace(os.Getenv("ANTIGRAVITY_BROWSER_CALLER_CWD"))
+	if root == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			root = home
+		}
+	}
+	if root == "" {
+		root = mustGetwd()
+	}
+	return filepath.Join(root, antigravityScreenshotDir)
 }
 
 func sanitizeFilePart(value string) string {

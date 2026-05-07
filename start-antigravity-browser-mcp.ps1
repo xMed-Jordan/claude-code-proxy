@@ -4,7 +4,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$callerPath = (Get-Location).Path
 $basePath = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_CALLER_CWD', 'Process')) -and -not [string]::IsNullOrWhiteSpace($callerPath)) {
+    [Environment]::SetEnvironmentVariable('ANTIGRAVITY_BROWSER_CALLER_CWD', $callerPath, 'Process')
+}
 Set-Location $basePath
 $extensionId = 'eeijfnjmjelapkebgockoeaadonbchdd'
 

@@ -66,7 +66,7 @@ Before applying settings, the proxy creates snapshots of the current Claude Code
 
 ## Antigravity Browser Bridge
 
-The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses built-in browser tools for navigation, screenshots, page snapshots, visible cursor movement, clicks, typing, key presses, and waits.
+The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses built-in browser tools for navigation, screenshots, page snapshots, console checks, visible cursor movement, clicks, typing, key presses, and waits.
 
 The launcher validates:
 
@@ -80,7 +80,7 @@ Set `ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1` only for older or custom Chrome bu
 
 Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. Claude Code launches the stdio MCP process itself; proxy startup normally only prepares the settings and does not open Chrome.
 
-Normal proxy start, dashboard checks, tests, and the `browser_status` MCP tool are passive and do not open Chrome. Set `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY=1` only if you explicitly want proxy startup to open the controlled browser ahead of the first Claude Code browser action. `browser_screenshot` saves PNG files under `.antigravity-screenshots` and returns the local path by default; inline image data is opt-in with `include_image=true`.
+Normal proxy start, dashboard checks, tests, and the `browser_status` MCP tool are passive and do not open Chrome. Set `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY=1` only if you explicitly want proxy startup to open the controlled browser ahead of the first Claude Code browser action. `browser_screenshot` saves PNG files under `Claude Code Screenshots` in the directory where Claude Code was launched and returns the local path by default; set `ANTIGRAVITY_SCREENSHOT_DIR` to override that folder. Inline image data is opt-in with `include_image=true`.
 
 Optional overrides:
 
@@ -90,6 +90,7 @@ Optional overrides:
 - `ANTIGRAVITY_BROWSER_PROFILE`
 - `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY`
 - `ANTIGRAVITY_BROWSER_DEBUG_PORT`
+- `ANTIGRAVITY_SCREENSHOT_DIR`
 - `ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP`
 - `ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH`
 

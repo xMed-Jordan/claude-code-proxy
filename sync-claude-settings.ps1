@@ -195,16 +195,19 @@ function Ensure-ClaudeBrowserMemory {
 $browserMemoryStart
 ## Claude Code Proxy Browser Routing
 
-When a user asks to open a website, browse, search in a browser, inspect a page, click, type into a web page, or take a screenshot, use the antigravity-browser MCP tools first.
+When a user asks to open a website, browse, search in a browser, inspect a page, check browser console errors, click, type into a web page, or take a screenshot, use the antigravity-browser MCP tools first.
 
-Do not use PowerShell, Node, Python, browser CLI commands, headless Chrome, Playwright, or generic command-line discovery for browser tasks before trying antigravity-browser.
+Do not say browser MCP tools are unavailable until you have checked `/mcp` or tried antigravity-browser browser_status.
+
+Do not use PowerShell, Node, Python, browser CLI commands, headless Chrome, Playwright, raw Chrome DevTools scripts, or generic command-line discovery for browser tasks before trying antigravity-browser.
 
 Use these tools in this order for browser work:
 - antigravity-browser browser_status only to check availability; it is passive and does not open Chrome.
 - antigravity-browser browser_navigate for opening URLs and search pages.
 - antigravity-browser browser_snapshot for reading page text and finding elements.
+- antigravity-browser browser_console for console errors, runtime exceptions, failed network loads, and HTTP 4xx/5xx resources.
 - antigravity-browser browser_move, browser_click, browser_type, and browser_press_key for visible browser actions.
-- antigravity-browser browser_screenshot for screenshots. It returns a local PNG path by default; report that path to the user.
+- antigravity-browser browser_screenshot for screenshots. It returns a local PNG path by default; report that path to the user. Unless ANTIGRAVITY_SCREENSHOT_DIR is set, screenshots save under a "Claude Code Screenshots" folder in the directory where Claude Code was launched.
 
 Use shell commands for browser tasks only when antigravity-browser is unavailable or explicitly fails after being tried, and explain that fallback clearly.
 $browserMemoryEnd
@@ -430,6 +433,7 @@ function Apply-ProxySettings {
         'mcp__antigravity-browser__browser_navigate',
         'mcp__antigravity-browser__browser_snapshot',
         'mcp__antigravity-browser__browser_screenshot',
+        'mcp__antigravity-browser__browser_console',
         'mcp__antigravity-browser__browser_move',
         'mcp__antigravity-browser__browser_click',
         'mcp__antigravity-browser__browser_type',

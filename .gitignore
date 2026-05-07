@@ -18,6 +18,7 @@
 .antigravity-browser-state.json
 .antigravity-browser-profile/
 .antigravity-screenshots/
+Claude Code Screenshots/
 .claude-worktrees/
 *.log
 
