@@ -17,9 +17,25 @@ const (
 	claudeJSONSnapshotMetaPath     = ".claude-json.snapshot.meta.json"
 	claudeMemorySnapshotPath       = ".claude-memory.snapshot.md"
 	claudeMemorySnapshotMetaPath   = ".claude-memory.snapshot.meta.json"
-	browserMemoryStart             = "<!-- claude-code-proxy-browser-routing:start -->"
-	browserMemoryEnd               = "<!-- claude-code-proxy-browser-routing:end -->"
+	browserMemoryStart             = "<!-- connect-ai-proxy-browser-routing:start -->"
+	browserMemoryEnd               = "<!-- connect-ai-proxy-browser-routing:end -->"
+	legacyBrowserMemoryStart       = "<!-- " + "claude-code" + "-proxy-browser-routing:start -->"
+	legacyBrowserMemoryEnd         = "<!-- " + "claude-code" + "-proxy-browser-routing:end -->"
 )
+
+var antigravityPermissionTools = []string{
+	"mcp__antigravity-browser__browser_status",
+	"mcp__antigravity-browser__browser_pages",
+	"mcp__antigravity-browser__browser_navigate",
+	"mcp__antigravity-browser__browser_snapshot",
+	"mcp__antigravity-browser__browser_screenshot",
+	"mcp__antigravity-browser__browser_console",
+	"mcp__antigravity-browser__browser_move",
+	"mcp__antigravity-browser__browser_click",
+	"mcp__antigravity-browser__browser_type",
+	"mcp__antigravity-browser__browser_press_key",
+	"mcp__antigravity-browser__browser_wait",
+}
 
 func runClaudeSettingsSyncGo(action string) error {
 	switch strings.ToLower(strings.TrimSpace(action)) {
@@ -73,23 +89,20 @@ func applyProxySettingsGo() error {
 	env["ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"] = firstNonEmpty(proxyEnv["ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"], "thinking")
 	env["CLAUDE_CODE_EFFORT_LEVEL"] = firstNonEmpty(proxyEnv["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh")
 	settings["model"] = "opus[1m]"
-	ensurePermissionAllow(settings, []string{
-		"mcp__antigravity-browser__browser_status",
-		"mcp__antigravity-browser__browser_pages",
-		"mcp__antigravity-browser__browser_navigate",
-		"mcp__antigravity-browser__browser_snapshot",
-		"mcp__antigravity-browser__browser_screenshot",
-		"mcp__antigravity-browser__browser_console",
-		"mcp__antigravity-browser__browser_move",
-		"mcp__antigravity-browser__browser_click",
-		"mcp__antigravity-browser__browser_type",
-		"mcp__antigravity-browser__browser_press_key",
-		"mcp__antigravity-browser__browser_wait",
-	})
-	objectMap(settings, "mcpServers")["antigravity-browser"] = mcpServerConfig(false)
 	ensureClaudeIsolationHooks(settings)
-	if err := ensureClaudeBrowserMemory(); err != nil {
-		return err
+	browserToolsEnabled := envFlagFromMap(proxyEnv, "ANTIGRAVITY_BROWSER_ENABLED", true)
+	if browserToolsEnabled {
+		ensurePermissionAllow(settings, antigravityPermissionTools)
+		objectMap(settings, "mcpServers")["antigravity-browser"] = mcpServerConfig(false)
+		if err := ensureClaudeBrowserMemory(); err != nil {
+			return err
+		}
+	} else {
+		removePermissionAllow(settings, antigravityPermissionTools)
+		removeMCPServer(settings, "antigravity-browser")
+		if err := removeClaudeBrowserMemory(); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(settingsDir, 0700); err != nil {
 		return err
@@ -97,11 +110,20 @@ func applyProxySettingsGo() error {
 	if err := writeJSONFile(settingsPath, settings); err != nil {
 		return err
 	}
-	if err := ensureAntigravityBrowserUserMCP(); err != nil {
-		return err
-	}
-	if err := ensureAntigravityBrowserDesktopMCP(); err != nil {
-		return err
+	if browserToolsEnabled {
+		if err := ensureAntigravityBrowserUserMCP(); err != nil {
+			return err
+		}
+		if err := ensureAntigravityBrowserDesktopMCP(); err != nil {
+			return err
+		}
+	} else {
+		if err := removeAntigravityBrowserUserMCP(); err != nil {
+			return err
+		}
+		if err := removeAntigravityBrowserDesktopMCP(); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("Applied proxy env to Claude Code settings: %s\n", settingsPath)
 	return nil
@@ -284,6 +306,52 @@ func ensurePermissionAllow(settings map[string]any, tools []string) {
 	permissions["allow"] = current
 }
 
+func removePermissionAllow(settings map[string]any, tools []string) {
+	permissionsRaw, ok := settings["permissions"].(map[string]any)
+	if !ok || permissionsRaw == nil {
+		return
+	}
+	remove := map[string]bool{}
+	for _, tool := range tools {
+		remove[tool] = true
+	}
+	current := stringSliceFromAny(permissionsRaw["allow"])
+	filtered := current[:0]
+	for _, tool := range current {
+		if !remove[tool] {
+			filtered = append(filtered, tool)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(permissionsRaw, "allow")
+		return
+	}
+	permissionsRaw["allow"] = filtered
+}
+
+func removeMCPServer(settings map[string]any, name string) {
+	servers, ok := settings["mcpServers"].(map[string]any)
+	if !ok || servers == nil {
+		return
+	}
+	delete(servers, name)
+}
+
+func envFlagFromMap(values map[string]string, key string, fallback bool) bool {
+	raw := strings.TrimSpace(values[key])
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "y", "on", "enabled":
+		return true
+	case "0", "false", "no", "n", "off", "disabled":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func stringSliceFromAny(value any) []string {
 	var out []string
 	switch raw := value.(type) {
@@ -368,7 +436,7 @@ func ensureClaudeBrowserMemory() error {
 		return err
 	}
 	body := strings.TrimSpace(browserMemoryStart + `
-## Claude Code Proxy Browser Routing
+## Connect AI Proxy Browser Routing
 
 When a user asks to open a website, browse, search in a browser, inspect a page, check browser console errors, click, type into a web page, or take a screenshot, use the antigravity-browser MCP tools first.
 
@@ -389,6 +457,7 @@ Use shell commands for browser tasks only when antigravity-browser is unavailabl
 	if raw, err := os.ReadFile(memoryPath); err == nil {
 		current = string(raw)
 	}
+	current = removeManagedBlock(current, legacyBrowserMemoryStart, legacyBrowserMemoryEnd)
 	updated := replaceManagedBlock(current, browserMemoryStart, browserMemoryEnd, body)
 	if err := os.MkdirAll(filepath.Dir(memoryPath), 0700); err != nil {
 		return err
@@ -397,6 +466,35 @@ Use shell commands for browser tasks only when antigravity-browser is unavailabl
 		return err
 	}
 	fmt.Printf("Applied browser routing memory to Claude Code: %s\n", memoryPath)
+	return nil
+}
+
+func removeClaudeBrowserMemory() error {
+	memoryPath := defaultClaudeMemoryPath()
+	raw, err := os.ReadFile(memoryPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := ensureSnapshot(memoryPath, filepath.Join(mustGetwd(), claudeMemorySnapshotPath), filepath.Join(mustGetwd(), claudeMemorySnapshotMetaPath), "memory_path", ""); err != nil {
+		return err
+	}
+	current := string(raw)
+	updated := removeManagedBlock(current, browserMemoryStart, browserMemoryEnd)
+	updated = removeManagedBlock(updated, legacyBrowserMemoryStart, legacyBrowserMemoryEnd)
+	if updated == current {
+		return nil
+	}
+	if strings.TrimSpace(updated) == "" {
+		if err := os.WriteFile(memoryPath, []byte(""), 0600); err != nil {
+			return err
+		}
+	} else if err := os.WriteFile(memoryPath, []byte(updated), 0600); err != nil {
+		return err
+	}
+	fmt.Printf("Removed browser routing memory from Claude Code: %s\n", memoryPath)
 	return nil
 }
 
@@ -414,6 +512,28 @@ func replaceManagedBlock(current, start, end, body string) string {
 	return current + separator + "\n" + body + "\n"
 }
 
+func removeManagedBlock(current, start, end string) string {
+	startIdx := strings.Index(current, start)
+	endIdx := strings.Index(current, end)
+	if startIdx < 0 || endIdx < startIdx {
+		return current
+	}
+	endIdx += len(end)
+	before := strings.TrimRight(current[:startIdx], "\r\n")
+	after := strings.TrimLeft(current[endIdx:], "\r\n")
+	switch {
+	case before == "":
+		if after == "" {
+			return ""
+		}
+		return after + "\n"
+	case after == "":
+		return before + "\n"
+	default:
+		return before + "\n\n" + after
+	}
+}
+
 func ensureAntigravityBrowserUserMCP() error {
 	path := defaultClaudeRootConfigPath()
 	if err := ensureSnapshot(path, filepath.Join(mustGetwd(), claudeJSONSnapshotPath), filepath.Join(mustGetwd(), claudeJSONSnapshotMetaPath), "config_path", "{}"); err != nil {
@@ -428,6 +548,33 @@ func ensureAntigravityBrowserUserMCP() error {
 		return err
 	}
 	fmt.Printf("Applied Antigravity MCP to Claude Code root config: %s\n", path)
+	return nil
+}
+
+func removeAntigravityBrowserUserMCP() error {
+	path := defaultClaudeRootConfigPath()
+	if !fileExists(path) {
+		return nil
+	}
+	if err := ensureSnapshot(path, filepath.Join(mustGetwd(), claudeJSONSnapshotPath), filepath.Join(mustGetwd(), claudeJSONSnapshotMetaPath), "config_path", "{}"); err != nil {
+		return err
+	}
+	config, err := readJSONMap(path)
+	if err != nil {
+		return err
+	}
+	servers, ok := config["mcpServers"].(map[string]any)
+	if !ok || servers == nil {
+		return nil
+	}
+	if _, exists := servers["antigravity-browser"]; !exists {
+		return nil
+	}
+	delete(servers, "antigravity-browser")
+	if err := writeJSONFile(path, config); err != nil {
+		return err
+	}
+	fmt.Printf("Removed Antigravity MCP from Claude Code root config: %s\n", path)
 	return nil
 }
 
@@ -470,6 +617,41 @@ func ensureAntigravityBrowserDesktopMCP() error {
 			return err
 		}
 		fmt.Printf("Applied Antigravity MCP to %s: %s\n", target.Label, target.Path)
+	}
+	return nil
+}
+
+func removeAntigravityBrowserDesktopMCP() error {
+	var errs []string
+	for _, target := range claudeDesktopConfigTargets() {
+		if !fileExists(target.Path) {
+			continue
+		}
+		if err := ensureSnapshot(target.Path, target.Snapshot, target.SnapshotMeta, "config_path", "{}"); err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		config, err := readJSONMap(target.Path)
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		servers, ok := config["mcpServers"].(map[string]any)
+		if !ok || servers == nil {
+			continue
+		}
+		if _, exists := servers["antigravity-browser"]; !exists {
+			continue
+		}
+		delete(servers, "antigravity-browser")
+		if err := writeJSONFile(target.Path, config); err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		fmt.Printf("Removed Antigravity MCP from %s: %s\n", target.Label, target.Path)
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }

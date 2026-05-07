@@ -66,6 +66,7 @@ type config struct {
 	CodexSessionFile   string
 	DBPath             string
 	ProxyKey           string
+	Host               string
 	Port               string
 	Models             map[string]string
 	ModelContexts      map[string]string
@@ -398,6 +399,10 @@ func newProxyMux(cfg config) *http.ServeMux {
 
 func loadConfig() config {
 	port := getenv("PROXY_PORT", getenv("LITELLM_PORT", "4000"))
+	host := strings.TrimSpace(getenv("PROXY_HOST", "127.0.0.1"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
 	baseURL := strings.TrimRight(getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/")
 	codexAuthFile := os.Getenv("CODEX_AUTH_FILE")
 	if codexAuthFile == "" {
@@ -415,6 +420,7 @@ func loadConfig() config {
 		CodexSessionFile:   getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
 		DBPath:             getenv("PROXY_DB_PATH", ".proxy.db"),
 		ProxyKey:           getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
+		Host:               host,
 		Port:               port,
 		ReasoningEffort:    normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
 		ClaudeDefaults:     claudeDefaults,
@@ -708,7 +714,7 @@ func newClientAPIKey() string {
 }
 
 func secretCipherKey(cfg config) []byte {
-	seed := firstNonEmpty(cfg.ProxyKey, cfg.AdminSessionSecret, "claude-code-proxy-local-secret")
+	seed := firstNonEmpty(cfg.ProxyKey, cfg.AdminSessionSecret, "connect-ai-proxy-local-secret")
 	sum := sha256.Sum256([]byte(seed))
 	return sum[:]
 }
@@ -939,7 +945,7 @@ func adminSessionValid(cfg config, r *http.Request) bool {
 }
 
 func adminSessionSignature(cfg config, payload string) string {
-	secret := firstNonEmpty(cfg.AdminSessionSecret, cfg.ProxyKey, "claude-code-proxy-admin")
+	secret := firstNonEmpty(cfg.AdminSessionSecret, cfg.ProxyKey, "connect-ai-proxy-admin")
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(payload))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -3605,12 +3611,12 @@ func apiDocRoutes() []apiDocRoute {
 		{
 			Group: "Documentation", OperationID: "getOpenAPI", Method: http.MethodGet, Path: "/openapi.json", Summary: "Download OpenAPI document", Auth: apiDocAuthPublic,
 			Description:    "OpenAPI 3.0.3 JSON for Postman, Swagger UI, and other API tools.",
-			ResponseSchema: "OpenAPIDocument", ResponseExample: map[string]any{"openapi": "3.0.3", "info": map[string]any{"title": "Claude Code Codex Proxy API"}},
+			ResponseSchema: "OpenAPIDocument", ResponseExample: map[string]any{"openapi": "3.0.3", "info": map[string]any{"title": "Connect AI Proxy API"}},
 		},
 		{
 			Group: "Documentation", OperationID: "getPostmanCollection", Method: http.MethodGet, Path: "/postman.json", Summary: "Download Postman collection", Auth: apiDocAuthPublic,
 			Description:    "Postman Collection v2.1 export generated from the local API documentation manifest.",
-			ResponseSchema: "PostmanCollection", ResponseExample: map[string]any{"info": map[string]any{"name": "Claude Code Codex Proxy API"}},
+			ResponseSchema: "PostmanCollection", ResponseExample: map[string]any{"info": map[string]any{"name": "Connect AI Proxy API"}},
 		},
 		{
 			Group: "Public", OperationID: "getHealth", Method: http.MethodGet, Path: "/health", Summary: "Check proxy health", Auth: apiDocAuthPublic,
@@ -3842,9 +3848,9 @@ func renderAPIDocsHTML(cfg config) string {
 	routes := apiDocRoutes()
 	groups := apiDocGroups(routes)
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Claude Code Codex Proxy API Docs</title>`)
+	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Connect AI Proxy API Docs</title>`)
 	b.WriteString(`<style>:root{color-scheme:dark;--bg:#0c0f12;--panel:#141920;--panel2:#11161c;--line:#26313c;--fg:#eef3f8;--muted:#9ba8b5;--accent:#78c7ff;--ok:#77d7a2;--warn:#ffd275}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 Inter,Segoe UI,Arial,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}header{position:sticky;top:0;z-index:2;background:rgba(12,15,18,.94);border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}.wrap{max-width:1180px;margin:0 auto;padding:24px}.hero{display:grid;gap:10px}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}h1{margin:0;font-size:32px;line-height:1.1}h2{margin:32px 0 12px;font-size:19px}h3{margin:0;font-size:17px}.links{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:7px;padding:8px 10px}.grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:24px}.nav{position:sticky;top:104px;align-self:start;border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:12px}.nav a{display:block;color:var(--muted);padding:5px 6px;border-radius:5px}.nav a:hover{background:var(--panel);color:var(--fg);text-decoration:none}.card{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin:12px 0;padding:16px}.meta{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.tag{border:1px solid var(--line);border-radius:999px;color:var(--muted);padding:2px 8px;font-size:12px}.method{font-weight:700;color:var(--ok)}.path{font-family:JetBrains Mono,Consolas,monospace;color:#d8ecff}.desc{color:var(--muted)}pre{overflow:auto;background:#090c0f;border:1px solid var(--line);border-radius:7px;padding:12px;color:#dbe7f2}code{font-family:JetBrains Mono,Consolas,monospace}.note{border-left:3px solid var(--warn);padding-left:10px;color:#d7c28b}.small{font-size:12px;color:var(--muted)}@media(max-width:880px){.grid{grid-template-columns:1fr}.nav{position:static}}</style></head><body>`)
-	b.WriteString(`<header><div class="wrap hero"><div class="eyebrow">Local API documentation</div><h1>Claude Code Codex Proxy API</h1><div class="desc">Readable endpoint docs plus importable OpenAPI and Postman exports. No local secrets are embedded; examples use variables such as <code>{{proxyApiKey}}</code>.</div><div class="links">`)
+	b.WriteString(`<header><div class="wrap hero"><div class="eyebrow">Local API documentation</div><h1>Connect AI Proxy API</h1><div class="desc">Readable endpoint docs plus importable OpenAPI and Postman exports. No local secrets are embedded; examples use variables such as <code>{{proxyApiKey}}</code>.</div><div class="links">`)
 	b.WriteString(`<a class="btn" href="/openapi.json">OpenAPI JSON</a><a class="btn" href="/postman.json">Postman collection</a><a class="btn" href="/">Control panel</a>`)
 	b.WriteString(`</div><div class="small">Base URL: <code>` + html.EscapeString(apiDocsBaseURL(cfg)) + `</code></div></div></header>`)
 	b.WriteString(`<div class="wrap grid"><nav class="nav"><strong>Groups</strong>`)
@@ -3994,9 +4000,9 @@ func buildOpenAPISpec(cfg config) map[string]any {
 	return map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
-			"title":       "Claude Code Codex Proxy API",
+			"title":       "Connect AI Proxy API",
 			"version":     "1.0.0",
-			"description": "Local Postman-ready API documentation for claude-code-proxy. Examples use placeholders and never embed local secrets.",
+			"description": "Local Postman-ready API documentation for connect-ai-proxy. Examples use placeholders and never embed local secrets.",
 		},
 		"servers": []map[string]any{{"url": apiDocsBaseURL(cfg), "description": "Local proxy"}},
 		"tags":    openAPITags(apiDocGroups(apiDocRoutes())),
@@ -4247,7 +4253,7 @@ func buildPostmanCollection(cfg config) map[string]any {
 	}
 	return map[string]any{
 		"info": map[string]any{
-			"name":        "Claude Code Codex Proxy API",
+			"name":        "Connect AI Proxy API",
 			"description": "Local Postman collection generated from the proxy API documentation manifest. Set variables before sending authenticated requests.",
 			"schema":      "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
 		},
@@ -4690,7 +4696,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
 	uiDir := filepath.Join(".", "ui")
 	if r.URL.Path == "/" {
 		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeFile(w, r, filepath.Join(uiDir, "Codex Proxy Control Panel.html"))
+		http.ServeFile(w, r, filepath.Join(uiDir, "Connect AI Proxy Control Panel.html"))
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/ui/") {
@@ -5215,6 +5221,7 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"local_url":            localURL,
 			"anthropic_url":        localURL + "/anthropic",
 			"openai_url":           localURL + "/openai/v1",
+			"host":                 cfg.Host,
 			"port":                 cfg.Port,
 			"upstream":             cfg.Upstream,
 			"codex_auth":           auth,

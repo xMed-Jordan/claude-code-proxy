@@ -82,9 +82,9 @@ func defaultClaudeGatewayModelsCachePath() string {
 
 func proxyBinaryNameFor(goos string) string {
 	if goos == "windows" {
-		return "claude-code-proxy.exe"
+		return "connect-ai-proxy.exe"
 	}
-	return "claude-code-proxy"
+	return "connect-ai-proxy"
 }
 
 func currentProxyBinaryName() string {

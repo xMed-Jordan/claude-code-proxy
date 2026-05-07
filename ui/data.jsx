@@ -1,4 +1,4 @@
-// data.jsx — sample data + helpers for the Codex Proxy dashboard
+// data.jsx — sample data + helpers for the Connect AI Proxy dashboard
 
 const SAMPLE_LOGS_RUNNING = [
   { ts: "14:42:08.124", lvl: "info",  meth: "GET",  path: "/anthropic/v1/models",                status: 200, dur: 4,    ip: "127.0.0.1", note: "" },

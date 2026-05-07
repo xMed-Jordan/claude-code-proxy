@@ -1,4 +1,4 @@
-# Claude Code Codex Proxy
+# Connect AI Proxy
 
 Local cross-platform proxy for Windows, Linux, and macOS that exposes Anthropic-compatible endpoints for Claude Code and forwards requests to Codex/ChatGPT subscription auth.
 
@@ -54,7 +54,7 @@ go run . start
 go run . launch-claude
 ```
 
-After the first start, the built binary lives at `bin/claude-code-proxy.exe` on Windows and `bin/claude-code-proxy` on Linux/macOS. Existing PowerShell scripts remain as Windows compatibility wrappers.
+After the first start, the built binary lives at `bin/connect-ai-proxy.exe` on Windows and `bin/connect-ai-proxy` on Linux/macOS. Existing PowerShell scripts remain as Windows compatibility wrappers.
 
 Useful Go commands:
 
@@ -65,6 +65,66 @@ Useful Go commands:
 - `go run . browser-start --dry-run`
 - `go run . build --all`
 - `go run . install-startup` / `go run . uninstall-startup`
+
+## Linux Install Script
+
+On Linux, the installer prepares the machine, builds the proxy, registers `connect-ai-proxy.service`, and starts it through `systemd`:
+
+```sh
+chmod +x install-linux.sh
+./install-linux.sh
+```
+
+To preview the work without changing the system:
+
+```sh
+./install-linux.sh --dry-run
+```
+
+The installer supports `apt`, `dnf`, `yum`, `zypper`, `pacman`, and `apk`. It checks `sudo`, installs missing base packages, verifies Node.js 18+ with npm, installs Claude Code with `npm i -g @anthropic-ai/claude-code` when `claude` is missing, installs or updates Go from the official Go release metadata, installs Codex with `npm i -g @openai/codex`, and pauses for Codex sign-in if `~/.codex/auth.json` is not ready.
+
+During install it asks whether this is a local workstation or a server. Server installs skip Chrome/Antigravity browser tools by default. Browser tools are only installed/configured if you approve them; if skipped, the installer sets `ANTIGRAVITY_BROWSER_ENABLED=0` so Claude Code browser MCP setup is not injected.
+
+For a static HTTPS domain, run the installer normally and answer yes when prompted, or pass the values up front:
+
+```sh
+./install-linux.sh --server --https --domain proxy.example.com --email admin@example.com --confirm-dns
+```
+
+HTTPS mode keeps the Go proxy bound to `127.0.0.1`, installs/configures Caddy, uses HTTP only for ACME validation and redirect, and exposes the public endpoint through HTTPS. Defaults are internal proxy port `4000`, public HTTP port `80`, and public HTTPS port `443`; the installer asks before changing them. DNS must already point to the server before certificate setup.
+
+Service commands:
+
+```sh
+sudo systemctl start connect-ai-proxy
+sudo systemctl stop connect-ai-proxy
+sudo systemctl reload connect-ai-proxy
+sudo systemctl restart connect-ai-proxy
+sudo systemctl status connect-ai-proxy
+sudo systemctl enable --now connect-ai-proxy
+sudo systemctl disable --now connect-ai-proxy
+```
+
+Installer helper actions:
+
+```sh
+./install-linux.sh status
+./install-linux.sh restart
+./install-linux.sh disable
+./install-linux.sh uninstall
+```
+
+Troubleshooting notes:
+
+- If `sudo` fails, run as a sudo-capable user or as root.
+- If the distro package manager provides an older Node.js, install Node.js 18+ from your distro or Node.js docs and rerun the installer.
+- If Claude Code is missing, the installer installs it; if `claude` is still not on `PATH`, fix the global npm bin path and rerun the installer.
+- If Codex login is incomplete, run `codex` as the installing user and finish sign-in, then rerun the installer.
+- If HTTPS fails, confirm DNS A/AAAA records point to the server and inbound ports `80` and `443` are open.
+- If browser tools are enabled later, rerun with `--browser-tools`; install the Antigravity Chrome extension in Chrome/Chromium before using browser MCP actions.
+- Caddy status and reload are managed with `sudo systemctl status caddy` and `sudo systemctl reload caddy`.
+
+Installer sources: [Go install docs](https://go.dev/doc/install), [Go downloads JSON](https://go.dev/dl/?mode=json), [Node.js downloads](https://nodejs.org/en/download), [Claude Code setup docs](https://docs.anthropic.com/en/docs/claude-code/setup), [Codex CLI docs](https://developers.openai.com/codex/cli), [Caddy install docs](https://caddyserver.com/docs/install), and [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https).
 
 ## Claude Code and Desktop Settings
 
@@ -79,6 +139,8 @@ Starting the proxy applies local Claude Code settings:
 - Claude Code isolation hooks for subagent worktrees and child Codex sessions
 - A proxy-managed `~/.claude/CLAUDE.md` memory block that tells Claude Code to use `antigravity-browser` for browser navigation, clicking, typing, page reads, and screenshots
 
+Set `ANTIGRAVITY_BROWSER_ENABLED=0` to keep browser MCP tools out of Claude Code and Desktop settings. This is the Linux installer default for server installs unless browser tools are explicitly enabled.
+
 Claude Desktop's **Customize > Connectors** screen is for remote/web connectors and can be empty even when local MCP servers are configured. Local Desktop MCP servers are managed through `claude_desktop_config.json`; these tools appear inside chats from the `+` / connectors tool picker after Claude Desktop reloads the config. Official Desktop integration targets Windows and macOS; Linux Desktop config support is best-effort.
 
 To manage the browser bridge from Claude Desktop's **Settings > Extensions** screen, build a local Desktop Extension package:
@@ -87,7 +149,7 @@ To manage the browser bridge from Claude Desktop's **Settings > Extensions** scr
 go run . package-extension
 ```
 
-Then use **Install Extension** with `dist/claude-code-proxy-browser.mcpb` or `dist/claude-code-proxy-browser.dxt`, or **Install Unpacked Extension** with `dist/claude-code-proxy-browser`.
+Then use **Install Extension** with `dist/connect-ai-proxy-browser.mcpb` or `dist/connect-ai-proxy-browser.dxt`, or **Install Unpacked Extension** with `dist/connect-ai-proxy-browser`.
 
 ## API Keys
 

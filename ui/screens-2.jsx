@@ -375,7 +375,7 @@ const BrowserBridge = () => {
   const openBridge = () => {
     if (status?.bridge_url) window.open(status.bridge_url, "_blank", "noopener,noreferrer");
   };
-  const launcher = status?.launcher?.command || status?.launcher?.path || "claude-code-proxy browser-mcp";
+  const launcher = status?.launcher?.command || status?.launcher?.path || "connect-ai-proxy browser-mcp";
 
   const rows = [
     { label: "Extension", ok: ext.exists, meta: ext.exists ? `${manifest.name || "Antigravity"} ${manifest.version || ""}` : "not found" },
@@ -384,8 +384,8 @@ const BrowserBridge = () => {
     { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
     { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : (status?.chrome?.default_cdp_forced ? (status?.chrome?.can_relaunch_default ? "forced Default relaunch available" : "forced Default mode waiting") : "Default profile blocked by Chrome; controlled profile will be used") },
     { label: "Chrome windows", ok: true, meta: `${status?.chrome?.process_count || 0} processes · ${status?.chrome?.visible_count || 0} visible` },
-    { label: "Claude Code MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "claude-code-proxy"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
-    { label: "Claude Desktop MCP", ok: desktopMcp.present, meta: desktopMcp.present ? `${desktopMcp.command || "claude-code-proxy"} ${Array.isArray(desktopMcp.args) ? desktopMcp.args.join(" ") : ""}` : (desktopMcp.exists ? `${desktopMcp.server_count || 0} local servers · antigravity-browser not injected` : "desktop config not found") },
+    { label: "Claude Code MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "connect-ai-proxy"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+    { label: "Claude Desktop MCP", ok: desktopMcp.present, meta: desktopMcp.present ? `${desktopMcp.command || "connect-ai-proxy"} ${Array.isArray(desktopMcp.args) ? desktopMcp.args.join(" ") : ""}` : (desktopMcp.exists ? `${desktopMcp.server_count || 0} local servers · antigravity-browser not injected` : "desktop config not found") },
     { label: "Visible control", ok: !!status?.visible_overlay, meta: bridgeState?.connected_now ? `connected · ${bridgeState.last_action || "ready"}` : "cursor overlay tools ready when Claude starts MCP" },
   ];
 
@@ -490,7 +490,7 @@ function prettyProbe(value) {
 
 const Setup = () => {
   const { data: status } = usePolling("/ui/api/status", 3000);
-  const launcher = status?.launcher_commands?.launch_claude || "claude-code-proxy launch-claude";
+  const launcher = status?.launcher_commands?.launch_claude || "connect-ai-proxy launch-claude";
   const rootUrl = status?.local_url || "http://127.0.0.1:4000";
   const baseUrl = status?.anthropic_url || `${rootUrl}/anthropic`;
   const openAIBaseUrl = status?.openai_url || `${rootUrl}/openai/v1`;

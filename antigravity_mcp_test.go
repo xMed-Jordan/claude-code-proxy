@@ -55,7 +55,7 @@ func TestTargetSchemaAllowsSelectorTextOrCoordinates(t *testing.T) {
 }
 
 func TestSafeChromeWindowTitle(t *testing.T) {
-	if !safeChromeWindowTitle("Claude Code Codex Proxy - Control Panel - Google Chrome") {
+	if !safeChromeWindowTitle("Connect AI Proxy - Control Panel - Google Chrome") {
 		t.Fatal("proxy dashboard Chrome window should be safe to relaunch")
 	}
 	if !safeChromeWindowTitle("") {

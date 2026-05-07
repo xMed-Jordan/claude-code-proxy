@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -73,7 +74,7 @@ func runCLI(args []string) (bool, error) {
 }
 
 func printCLIHelp() {
-	fmt.Println(`claude-code-proxy commands:
+	fmt.Println(`connect-ai-proxy commands:
   serve                         Run the HTTP proxy in the foreground
   start | stop | restart         Manage the background proxy process
   launch-claude [args...]        Start Claude Code through the local proxy
@@ -95,8 +96,8 @@ func runServe() error {
 	}
 	proxyEnabled.Store(true)
 	mux := newProxyMux(cfg)
-	server := &http.Server{Addr: "127.0.0.1:" + cfg.Port, Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
-	fmt.Printf("claude-code-proxy listening on http://%s\n", server.Addr)
+	server := &http.Server{Addr: net.JoinHostPort(cfg.Host, cfg.Port), Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
+	fmt.Printf("connect-ai-proxy listening on http://%s\n", server.Addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -490,7 +491,7 @@ func runHookWorktreeCreate() error {
 	}
 	metadata["kind"] = "plain"
 	_ = writeJSONFile(filepath.Join(target, ".claude-proxy-worktree.json"), metadata)
-	_ = os.WriteFile(filepath.Join(target, "README.txt"), []byte("Temporary Claude Code isolated workspace created by claude-code-proxy.\nOriginal working directory: "+cwd+"\nThis folder is safe to remove after the subagent finishes.\n"), 0600)
+	_ = os.WriteFile(filepath.Join(target, "README.txt"), []byte("Temporary Claude Code isolated workspace created by connect-ai-proxy.\nOriginal working directory: "+cwd+"\nThis folder is safe to remove after the subagent finishes.\n"), 0600)
 	fmt.Println(target)
 	return nil
 }

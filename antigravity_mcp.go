@@ -1155,8 +1155,8 @@ func safeChromeWindowTitle(title string) bool {
 		return true
 	}
 	safeParts := []string{
-		"claude code codex proxy",
-		"codex proxy control panel",
+		"connect ai proxy",
+		"connect ai proxy control panel",
 		"127.0.0.1:4000",
 		"localhost:4000",
 	}

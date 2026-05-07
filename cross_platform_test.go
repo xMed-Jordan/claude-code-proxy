@@ -9,11 +9,11 @@ import (
 )
 
 func TestProxyBinaryNameForPlatforms(t *testing.T) {
-	if got := proxyBinaryNameFor("windows"); got != "claude-code-proxy.exe" {
+	if got := proxyBinaryNameFor("windows"); got != "connect-ai-proxy.exe" {
 		t.Fatalf("windows binary = %q", got)
 	}
 	for _, goos := range []string{"linux", "darwin"} {
-		if got := proxyBinaryNameFor(goos); got != "claude-code-proxy" {
+		if got := proxyBinaryNameFor(goos); got != "connect-ai-proxy" {
 			t.Fatalf("%s binary = %q", goos, got)
 		}
 	}
@@ -24,7 +24,7 @@ func TestHookCommandStringIncludesBinaryAndSubcommand(t *testing.T) {
 	if !strings.Contains(cmd, "hook-worktree-create") {
 		t.Fatalf("hook command missing subcommand: %s", cmd)
 	}
-	if !strings.Contains(cmd, "claude-code-proxy") {
+	if !strings.Contains(cmd, "connect-ai-proxy") {
 		t.Fatalf("hook command missing binary name: %s", cmd)
 	}
 	if runtime.GOOS == "windows" && !strings.Contains(cmd, `"`) {
@@ -94,11 +94,31 @@ func TestMCPServerConfigUsesGoBinary(t *testing.T) {
 	if server["type"] != "stdio" {
 		t.Fatalf("server type = %#v", server["type"])
 	}
-	if !strings.Contains(server["command"].(string), "claude-code-proxy") {
+	if !strings.Contains(server["command"].(string), "connect-ai-proxy") {
 		t.Fatalf("server command = %#v", server["command"])
 	}
 	args, ok := server["args"].([]string)
 	if !ok || len(args) != 1 || args[0] != "browser-mcp" {
 		t.Fatalf("server args = %#v", server["args"])
+	}
+}
+
+func TestBrowserToolsFlagDefaultsEnabled(t *testing.T) {
+	if !envFlagFromMap(map[string]string{}, "ANTIGRAVITY_BROWSER_ENABLED", true) {
+		t.Fatal("browser tools should default to enabled")
+	}
+	if envFlagFromMap(map[string]string{"ANTIGRAVITY_BROWSER_ENABLED": "0"}, "ANTIGRAVITY_BROWSER_ENABLED", true) {
+		t.Fatal("browser tools flag should accept 0 as disabled")
+	}
+}
+
+func TestRemoveManagedBlockCleansLegacyBrowserMarker(t *testing.T) {
+	current := "before\n\n" + legacyBrowserMemoryStart + "\nold block\n" + legacyBrowserMemoryEnd + "\n\nafter\n"
+	got := removeManagedBlock(current, legacyBrowserMemoryStart, legacyBrowserMemoryEnd)
+	if strings.Contains(got, "old block") || strings.Contains(got, legacyBrowserMemoryStart) {
+		t.Fatalf("legacy block was not removed: %q", got)
+	}
+	if !strings.Contains(got, "before") || !strings.Contains(got, "after") {
+		t.Fatalf("surrounding memory was not preserved: %q", got)
 	}
 }

@@ -72,7 +72,7 @@ func runPackageExtension() error {
 		return err
 	}
 	distRoot := filepath.Join(mustGetwd(), "dist")
-	extensionRoot := filepath.Join(distRoot, "claude-code-proxy-browser")
+	extensionRoot := filepath.Join(distRoot, "connect-ai-proxy-browser")
 	serverBinRoot := filepath.Join(extensionRoot, "server", "bin")
 	if err := os.RemoveAll(extensionRoot); err != nil {
 		return err
@@ -94,9 +94,9 @@ func runPackageExtension() error {
 	if err := os.WriteFile(filepath.Join(extensionRoot, "manifest.json"), rawManifest, 0600); err != nil {
 		return err
 	}
-	zipPath := filepath.Join(distRoot, "claude-code-proxy-browser.zip")
-	mcpbPath := filepath.Join(distRoot, "claude-code-proxy-browser.mcpb")
-	dxtPath := filepath.Join(distRoot, "claude-code-proxy-browser.dxt")
+	zipPath := filepath.Join(distRoot, "connect-ai-proxy-browser.zip")
+	mcpbPath := filepath.Join(distRoot, "connect-ai-proxy-browser.mcpb")
+	dxtPath := filepath.Join(distRoot, "connect-ai-proxy-browser.dxt")
 	for _, artifact := range []string{zipPath, mcpbPath, dxtPath} {
 		_ = os.Remove(artifact)
 	}
@@ -129,14 +129,14 @@ func desktopExtensionManifest() map[string]any {
 	binary := "server/bin/" + currentProxyBinaryName()
 	return map[string]any{
 		"manifest_version": "0.3",
-		"name":             "claude-code-proxy-browser",
-		"display_name":     "Claude Code Proxy Browser",
+		"name":             "connect-ai-proxy-browser",
+		"display_name":     "Connect AI Proxy Browser",
 		"version":          "0.1.0",
 		"description":      "Local visible browser-control MCP bridge for Claude Desktop and Claude Code.",
-		"long_description": "Claude Code Proxy Browser exposes local browser-control tools through MCP. It can check browser status, list pages, navigate, read visible page text, capture screenshots, inspect console/network errors, move a visible cursor overlay, click, type, press keys, and wait for page content.",
-		"author":           map[string]string{"name": "Local Claude Code Proxy"},
+		"long_description": "Connect AI Proxy Browser exposes local browser-control tools through MCP. It can check browser status, list pages, navigate, read visible page text, capture screenshots, inspect console/network errors, move a visible cursor overlay, click, type, press keys, and wait for page content.",
+		"author":           map[string]string{"name": "Local Connect AI Proxy"},
 		"license":          "MIT",
-		"keywords":         []string{"browser", "mcp", "automation", "local", "claude-code-proxy"},
+		"keywords":         []string{"browser", "mcp", "automation", "local", "connect-ai-proxy"},
 		"tools": []map[string]string{
 			{"name": "browser_status", "description": "Check Chrome, Antigravity extension, and browser-control connection status."},
 			{"name": "browser_pages", "description": "List open Chrome pages available to the browser bridge."},

@@ -1,4 +1,4 @@
-module claude-code-proxy
+module connect-ai-proxy
 
 go 1.25.0
 

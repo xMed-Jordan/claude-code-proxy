@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const startupName = "claude-code-proxy"
+const startupName = "connect-ai-proxy"
 
 func installStartup() error {
 	if err := ensureCurrentBinaryBuilt(); err != nil {
@@ -33,16 +33,16 @@ func installStartup() error {
 func uninstallStartup() error {
 	switch runtime.GOOS {
 	case "windows":
-		return runCommand("schtasks.exe", "/Delete", "/TN", "ClaudeCodeCodexProxy", "/F")
+		return runCommand("schtasks.exe", "/Delete", "/TN", "ConnectAIProxy", "/F")
 	case "darwin":
-		path := filepath.Join(userHomeDir(), "Library", "LaunchAgents", "com.claude-code-proxy.plist")
+		path := filepath.Join(userHomeDir(), "Library", "LaunchAgents", "com.connect-ai-proxy.plist")
 		_ = runCommand("launchctl", "unload", path)
 		_ = os.Remove(path)
 		fmt.Println("Removed macOS LaunchAgent.")
 		return nil
 	case "linux":
-		path := filepath.Join(userHomeDir(), ".config", "systemd", "user", "claude-code-proxy.service")
-		_ = runCommand("systemctl", "--user", "disable", "--now", "claude-code-proxy.service")
+		path := filepath.Join(userHomeDir(), ".config", "systemd", "user", "connect-ai-proxy.service")
+		_ = runCommand("systemctl", "--user", "disable", "--now", "connect-ai-proxy.service")
 		_ = os.Remove(path)
 		fmt.Println("Removed Linux user service.")
 		return nil
@@ -55,10 +55,10 @@ func installWindowsStartup() error {
 	bin := preferredProxyBinaryPath()
 	psCommand := fmt.Sprintf("Set-Location -LiteralPath %s; & %s start", powershellQuote(mustGetwd()), powershellQuote(bin))
 	taskRun := `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "` + strings.ReplaceAll(psCommand, `"`, `\"`) + `"`
-	if err := runCommand("schtasks.exe", "/Create", "/SC", "ONLOGON", "/TN", "ClaudeCodeCodexProxy", "/TR", taskRun, "/F"); err != nil {
+	if err := runCommand("schtasks.exe", "/Create", "/SC", "ONLOGON", "/TN", "ConnectAIProxy", "/TR", taskRun, "/F"); err != nil {
 		return err
 	}
-	fmt.Println("Installed startup task 'ClaudeCodeCodexProxy'.")
+	fmt.Println("Installed startup task 'ConnectAIProxy'.")
 	return nil
 }
 
@@ -71,13 +71,13 @@ func installMacStartup() error {
 	if err := os.MkdirAll(launchAgents, 0700); err != nil {
 		return err
 	}
-	path := filepath.Join(launchAgents, "com.claude-code-proxy.plist")
+	path := filepath.Join(launchAgents, "com.connect-ai-proxy.plist")
 	content := []byte(fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.claude-code-proxy</string>
+  <string>com.connect-ai-proxy</string>
   <key>ProgramArguments</key>
   <array>
     <string>%s</string>
@@ -122,9 +122,9 @@ func installLinuxStartup() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "claude-code-proxy.service")
+	path := filepath.Join(dir, "connect-ai-proxy.service")
 	service := fmt.Sprintf(`[Unit]
-Description=Claude Code Codex Proxy
+Description=Connect AI Proxy
 
 [Service]
 Type=oneshot
@@ -142,8 +142,8 @@ WantedBy=default.target
 	if err := runCommand("systemctl", "--user", "daemon-reload"); err != nil {
 		return err
 	}
-	if err := runCommand("systemctl", "--user", "enable", "--now", "claude-code-proxy.service"); err != nil {
-		fmt.Printf("Wrote systemd user service at %s. Enable manually with: systemctl --user enable --now claude-code-proxy.service\n", path)
+	if err := runCommand("systemctl", "--user", "enable", "--now", "connect-ai-proxy.service"); err != nil {
+		fmt.Printf("Wrote systemd user service at %s. Enable manually with: systemctl --user enable --now connect-ai-proxy.service\n", path)
 		return nil
 	}
 	fmt.Printf("Installed Linux user service: %s\n", path)
