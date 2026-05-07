@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -950,48 +951,25 @@ func ensureChromeDebugEndpoint(ctx context.Context) error {
 func startChromeForCDP() error {
 	chromePath := chromeExecutablePath()
 	if chromePath == "" {
-		return errors.New("Google Chrome was not found. Set ANTIGRAVITY_CHROME_PATH to chrome.exe")
+		return errors.New("Google Chrome was not found. Set ANTIGRAVITY_CHROME_PATH if it is installed in a custom location")
 	}
-	debugPort := antigravityBrowserDebugPort()
-	mode := antigravityBrowserMode()
-	effectiveMode := mode
+	args := chromeLaunchArgs()
+	effectiveMode := plannedChromeMode()
 	lastAction := "started Chrome for browser control"
-	args := []string{
-		"--remote-debugging-address=127.0.0.1",
-		"--remote-debugging-port=" + debugPort,
-		"--no-first-run",
-		"--no-default-browser-check",
-	}
-	if mode != "dedicated" && chromeProcessRunning() {
-		if !defaultChromeCDPForced() {
-			effectiveMode = "dedicated_fallback"
-			lastAction = "started dedicated fallback because Chrome blocks DevTools on the Default profile"
-		} else if canRelaunchDefaultChrome() {
-			if err := stopChromeProcessesForDefaultBridge(); err != nil {
-				return err
-			}
-			effectiveMode = "default_relaunched"
-			lastAction = "relaunched default Chrome for browser control"
-		} else {
-			effectiveMode = "dedicated_fallback"
-			lastAction = "started dedicated fallback because default Chrome has user windows without DevTools"
-		}
-	}
-	if mode != "dedicated" && !chromeProcessRunning() && !defaultChromeCDPForced() {
-		effectiveMode = "dedicated_fallback"
+	if effectiveMode == "dedicated_fallback" {
 		lastAction = "started dedicated fallback because Chrome blocks DevTools on the Default profile"
 	}
-	if effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback" {
-		profilePath := antigravityProfilePath()
-		_ = os.MkdirAll(profilePath, 0700)
-		args = append(args, "--user-data-dir="+profilePath)
-		if extensionPath := antigravityExtensionPath(); extensionPath != "" {
-			args = append(args, "--load-extension="+extensionPath, "--disable-extensions-except="+extensionPath)
-		}
-	} else {
-		args = append(args, "--profile-directory=Default")
+	if effectiveMode == "default_relaunched" {
+		lastAction = "relaunched default Chrome for browser control"
 	}
-	args = append(args, "about:blank")
+	if effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback" {
+		_ = os.MkdirAll(antigravityProfilePath(), 0700)
+	}
+	if effectiveMode == "default_relaunched" {
+		if err := stopChromeProcessesForDefaultBridge(); err != nil {
+			return err
+		}
+	}
 	cmd := exec.Command(chromePath, args...)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("could not start Chrome for browser control: %w", err)
@@ -1010,6 +988,48 @@ func startChromeForCDP() error {
 	return nil
 }
 
+func plannedChromeMode() string {
+	debugPort := antigravityBrowserDebugPort()
+	mode := antigravityBrowserMode()
+	effectiveMode := mode
+	if mode != "dedicated" && chromeProcessRunning() {
+		if !defaultChromeCDPForced() {
+			effectiveMode = "dedicated_fallback"
+		} else if canRelaunchDefaultChrome() {
+			effectiveMode = "default_relaunched"
+		} else {
+			effectiveMode = "dedicated_fallback"
+		}
+	}
+	if mode != "dedicated" && !chromeProcessRunning() && !defaultChromeCDPForced() {
+		effectiveMode = "dedicated_fallback"
+	}
+	_ = debugPort
+	return effectiveMode
+}
+
+func chromeLaunchArgs() []string {
+	debugPort := antigravityBrowserDebugPort()
+	effectiveMode := plannedChromeMode()
+	args := []string{
+		"--remote-debugging-address=127.0.0.1",
+		"--remote-debugging-port=" + debugPort,
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+	if effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback" {
+		profilePath := antigravityProfilePath()
+		args = append(args, "--user-data-dir="+profilePath)
+		if extensionPath := antigravityExtensionPath(); extensionPath != "" {
+			args = append(args, "--load-extension="+extensionPath, "--disable-extensions-except="+extensionPath)
+		}
+	} else {
+		args = append(args, "--profile-directory=Default")
+	}
+	args = append(args, "about:blank")
+	return args
+}
+
 func chromeProcessRunning() bool {
 	return len(chromeProcesses()) > 0
 }
@@ -1017,6 +1037,9 @@ func chromeProcessRunning() bool {
 func chromeProcesses() []chromeProcessInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	if runtime.GOOS != "windows" {
+		return unixChromeProcesses(ctx)
+	}
 	out, err := exec.CommandContext(ctx, "tasklist.exe", "/FI", "IMAGENAME eq chrome.exe", "/V", "/FO", "CSV", "/NH").Output()
 	if err != nil {
 		return nil
@@ -1055,11 +1078,42 @@ func chromeProcesses() []chromeProcessInfo {
 	return processes
 }
 
+func unixChromeProcesses(ctx context.Context) []chromeProcessInfo {
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,comm=").Output()
+	if err != nil {
+		return nil
+	}
+	var processes []chromeProcessInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.ToLower(filepath.Base(fields[1]))
+		if !strings.Contains(name, "chrome") && !strings.Contains(name, "chromium") {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		processes = append(processes, chromeProcessInfo{ID: pid, Title: "", IsVisible: false})
+	}
+	return processes
+}
+
 func canRelaunchDefaultChrome() bool {
 	return canRelaunchDefaultChromeFrom(chromeProcesses())
 }
 
 func canRelaunchDefaultChromeFrom(processes []chromeProcessInfo) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
 	if !defaultChromeCDPForced() {
 		return false
 	}
@@ -1115,6 +1169,9 @@ func safeChromeWindowTitle(title string) bool {
 }
 
 func stopChromeProcessesForDefaultBridge() error {
+	if runtime.GOOS != "windows" {
+		return errors.New("safe Default-profile Chrome relaunch is only supported on Windows")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = exec.CommandContext(ctx, "taskkill.exe", "/IM", "chrome.exe", "/F", "/T").Run()

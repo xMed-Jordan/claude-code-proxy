@@ -234,7 +234,8 @@ button { font-family: inherit; color: inherit; }
   border-radius: var(--radius);
   color: var(--fg-1);
   font-size: 12.5px;
-  cursor: default;
+  cursor: pointer;
+  text-decoration: none;
   border: 1px solid transparent;
   position: relative;
 }

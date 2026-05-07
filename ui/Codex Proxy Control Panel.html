@@ -41,6 +41,7 @@
       { id: "logs",      label: "Logs",            icon: "logs",      kbd: "6", badge: "live" },
       { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "7" },
       { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "8" },
+      { id: "docs",      label: "API Docs",        icon: "book",      kbd: "9", href: "/docs" },
     ];
 
     function LoginScreen({ auth, onAuthenticated }) {
@@ -118,8 +119,15 @@
       useEffect(() => {
         const onKey = (e) => {
           if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-          const idx = "12345678".indexOf(e.key);
-          if (idx >= 0) { setRoute(NAV[idx].id); }
+          const idx = "123456789".indexOf(e.key);
+          if (idx >= 0) {
+            const navItem = NAV[idx];
+            if (navItem.href) {
+              window.open(navItem.href, "_blank", "noopener,noreferrer");
+              return;
+            }
+            setRoute(navItem.id);
+          }
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
@@ -186,6 +194,7 @@
 
             <div className="hdr-right">
               <span className="hdr-bind"><Icon name="lock" size={11}/>local-only</span>
+              <a className="btn btn-sm btn-ghost" href="/docs" target="_blank" rel="noreferrer"><Icon name="book" size={11}/>API Docs</a>
               <button className="btn btn-sm btn-ghost" onClick={onLogout}><Icon name="x" size={11}/>Logout</button>
               <span className="hdr-kbd">⌘K</span>
             </div>
@@ -194,18 +203,38 @@
           {/* SIDEBAR */}
           <aside className="side">
             <div className="side-section">Navigate</div>
-            {NAV.map(n => (
-              <div
-                key={n.id}
-                className="side-item"
-                aria-current={route === n.id ? "page" : undefined}
-                onClick={() => setRoute(n.id)}
-              >
-                <Icon name={n.icon} size={14}/>
-                <span>{n.label}</span>
-                {n.badge ? <span className="badge">{n.badge}</span> : <span className="kbd">{n.kbd}</span>}
-              </div>
-            ))}
+            {NAV.map(n => {
+              const navContent = (
+                <>
+                  <Icon name={n.icon} size={14}/>
+                  <span>{n.label}</span>
+                  {n.badge ? <span className="badge">{n.badge}</span> : <span className="kbd">{n.kbd}</span>}
+                </>
+              );
+              if (n.href) {
+                return (
+                  <a
+                    key={n.id}
+                    className="side-item"
+                    href={n.href}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {navContent}
+                  </a>
+                );
+              }
+              return (
+                <div
+                  key={n.id}
+                  className="side-item"
+                  aria-current={route === n.id ? "page" : undefined}
+                  onClick={() => setRoute(n.id)}
+                >
+                  {navContent}
+                </div>
+              );
+            })}
 
             <div className="side-section" style={{marginTop: 8}}>Process</div>
             <div className="side-item" style={{cursor:"default"}}>

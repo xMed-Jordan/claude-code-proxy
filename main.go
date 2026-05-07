@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -342,20 +344,14 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 
 func main() {
 	loadDotEnvIntoProcess()
-	if len(os.Args) > 1 && os.Args[1] == "--antigravity-mcp" {
-		runAntigravityMCP()
+	if handled, err := runCLI(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
-
-	cfg := loadConfig()
-	if err := initProxyDB(cfg); err != nil {
-		log.Printf("proxy database init failed: %v", err)
-	}
-	proxyEnabled.Store(true)
-	mux := newProxyMux(cfg)
-	server := &http.Server{Addr: "127.0.0.1:" + cfg.Port, Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
-	log.Printf("claude-code-proxy listening on http://%s", server.Addr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := runServe(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -392,6 +388,9 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_running": proxyEnabled.Load()})
 	})
+	mux.HandleFunc("/docs", handleAPIDocs(cfg))
+	mux.HandleFunc("/openapi.json", handleOpenAPI(cfg))
+	mux.HandleFunc("/postman.json", handlePostmanCollection(cfg))
 	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
 	mux.HandleFunc("/", handleUI)
 	return mux
@@ -402,7 +401,7 @@ func loadConfig() config {
 	baseURL := strings.TrimRight(getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/")
 	codexAuthFile := os.Getenv("CODEX_AUTH_FILE")
 	if codexAuthFile == "" {
-		codexAuthFile = filepath.Join(os.Getenv("USERPROFILE"), ".codex", "auth.json")
+		codexAuthFile = defaultCodexAuthFile()
 	}
 	env := processEnvValue
 	claudeDefaults := claudeDefaultsFromValues(env)
@@ -3552,6 +3551,837 @@ func writeOpenAIError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "type": "api_error", "code": code}})
 }
 
+type apiDocAuth string
+
+const (
+	apiDocAuthPublic apiDocAuth = "public"
+	apiDocAuthProxy  apiDocAuth = "proxy_key"
+	apiDocAuthAdmin  apiDocAuth = "admin_session"
+)
+
+type apiDocParam struct {
+	Name        string
+	In          string
+	Type        string
+	Description string
+	Required    bool
+	Example     any
+}
+
+type apiDocRoute struct {
+	Group               string
+	OperationID         string
+	Method              string
+	Path                string
+	DisplayPath         string
+	SourcePath          string
+	Summary             string
+	Description         string
+	Auth                apiDocAuth
+	Headers             []apiDocParam
+	QueryParams         []apiDocParam
+	PathParams          []apiDocParam
+	RequestSchema       string
+	ResponseSchema      string
+	RequestContentType  string
+	ResponseContentType string
+	SuccessStatus       int
+	RequestExample      any
+	ResponseExample     any
+	PostmanBodyMode     string
+	PostmanFormData     []apiDocParam
+}
+
+func apiDocRoutes() []apiDocRoute {
+	anthropicVersionHeader := apiDocParam{Name: "anthropic-version", In: "header", Type: "string", Description: "Anthropic API version. The proxy accepts this for Claude-compatible clients.", Required: true, Example: "{{anthropicVersion}}"}
+	sessionHeader := apiDocParam{Name: "X-Proxy-Session-Id", In: "header", Type: "string", Description: "Optional stable local session id. X-Codex-Session-Id, X-OpenAI-Session-Id, X-Claude-Code-Session-Id, X-Claude-Session-Id, and X-Session-Id are also accepted.", Required: false, Example: "{{sessionId}}"}
+	filePathParam := apiDocParam{Name: "path", In: "path", Type: "string", Description: "Provider file path after /openai/v1/files/, for example file-abc123 or file-abc123/content.", Required: true, Example: "file-abc123"}
+	return []apiDocRoute{
+		{
+			Group: "Documentation", OperationID: "getDocs", Method: http.MethodGet, Path: "/docs", Summary: "Read local API documentation", Auth: apiDocAuthPublic,
+			Description:         "Human-readable documentation generated from the same manifest as the OpenAPI and Postman exports.",
+			ResponseContentType: "text/html", ResponseSchema: "HTMLDocument", ResponseExample: "<!doctype html>...",
+		},
+		{
+			Group: "Documentation", OperationID: "getOpenAPI", Method: http.MethodGet, Path: "/openapi.json", Summary: "Download OpenAPI document", Auth: apiDocAuthPublic,
+			Description:    "OpenAPI 3.0.3 JSON for Postman, Swagger UI, and other API tools.",
+			ResponseSchema: "OpenAPIDocument", ResponseExample: map[string]any{"openapi": "3.0.3", "info": map[string]any{"title": "Claude Code Codex Proxy API"}},
+		},
+		{
+			Group: "Documentation", OperationID: "getPostmanCollection", Method: http.MethodGet, Path: "/postman.json", Summary: "Download Postman collection", Auth: apiDocAuthPublic,
+			Description:    "Postman Collection v2.1 export generated from the local API documentation manifest.",
+			ResponseSchema: "PostmanCollection", ResponseExample: map[string]any{"info": map[string]any{"name": "Claude Code Codex Proxy API"}},
+		},
+		{
+			Group: "Public", OperationID: "getHealth", Method: http.MethodGet, Path: "/health", Summary: "Check proxy health", Auth: apiDocAuthPublic,
+			Description:    "Returns whether the local process is reachable and whether proxy endpoints are currently enabled.",
+			ResponseSchema: "HealthResponse", ResponseExample: map[string]any{"ok": true, "proxy_running": true},
+		},
+		{
+			Group: "Public", OperationID: "getAntigravityBridge", Method: http.MethodGet, Path: "/antigravity/bridge", Summary: "Open Antigravity browser bridge probe", Auth: apiDocAuthPublic,
+			Description:         "Serves the local HTML page used by the browser extension bridge for a safe wake and connection probe.",
+			ResponseContentType: "text/html", ResponseSchema: "HTMLDocument", ResponseExample: "<!doctype html>...",
+		},
+		{
+			Group: "Anthropic-compatible", OperationID: "listAnthropicModels", Method: http.MethodGet, Path: "/anthropic/v1/models", Summary: "List Claude-compatible model aliases", Auth: apiDocAuthProxy,
+			Description:    "Lists model aliases exposed through the Anthropic-compatible namespace.",
+			Headers:        []apiDocParam{anthropicVersionHeader},
+			ResponseSchema: "ModelListResponse", ResponseExample: map[string]any{"object": "list", "data": []map[string]any{{"id": "sonnet[1m]", "type": "model", "display_name": "sonnet[1m]"}}},
+		},
+		{
+			Group: "Anthropic-compatible", OperationID: "createAnthropicMessage", Method: http.MethodPost, Path: "/anthropic/v1/messages", Summary: "Create a Claude-compatible message", Auth: apiDocAuthProxy,
+			Description: "Accepts Claude Messages API style requests, then routes them to Codex or an OpenAI-compatible provider. Streaming is supported with server-sent events.",
+			Headers:     []apiDocParam{anthropicVersionHeader, sessionHeader}, RequestSchema: "AnthropicMessageRequest", ResponseSchema: "AnthropicMessageResponse",
+			RequestExample:  map[string]any{"model": "{{model}}", "max_tokens": 256, "stream": false, "messages": []map[string]any{{"role": "user", "content": "Say hello in one sentence."}}},
+			ResponseExample: map[string]any{"id": "msg_local", "type": "message", "role": "assistant", "content": []map[string]any{{"type": "text", "text": "Hello from the proxy."}}, "model": "{{model}}", "stop_reason": "end_turn", "stop_sequence": nil, "usage": map[string]any{"input_tokens": 12, "output_tokens": 6}},
+		},
+		{
+			Group: "Anthropic-compatible", OperationID: "countAnthropicTokens", Method: http.MethodPost, Path: "/anthropic/v1/messages/count_tokens", Summary: "Estimate Claude-compatible input tokens", Auth: apiDocAuthProxy,
+			Description: "Returns a local approximate input token count for a Claude Messages API style request.",
+			Headers:     []apiDocParam{anthropicVersionHeader}, RequestSchema: "AnthropicMessageRequest", ResponseSchema: "CountTokensResponse",
+			RequestExample:  map[string]any{"model": "{{model}}", "messages": []map[string]any{{"role": "user", "content": "Quick count test"}}},
+			ResponseExample: map[string]any{"input_tokens": 14},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "listOpenAIModels", Method: http.MethodGet, Path: "/openai/v1/models", Summary: "List OpenAI-compatible model aliases", Auth: apiDocAuthProxy,
+			Description:    "Lists model aliases exposed through the OpenAI-compatible namespace.",
+			ResponseSchema: "ModelListResponse", ResponseExample: map[string]any{"object": "list", "data": []map[string]any{{"id": "gpt-5.5", "type": "model", "display_name": "gpt-5.5"}}},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "createChatCompletion", Method: http.MethodPost, Path: "/openai/v1/chat/completions", Summary: "Create an OpenAI-compatible chat completion", Auth: apiDocAuthProxy,
+			Description: "Accepts OpenAI Chat Completions style requests. The proxy either forwards to a provider route or converts to Codex Responses internally.",
+			Headers:     []apiDocParam{sessionHeader}, RequestSchema: "OpenAIChatCompletionRequest", ResponseSchema: "OpenAIChatCompletionResponse",
+			RequestExample:  map[string]any{"model": "{{model}}", "messages": []map[string]any{{"role": "user", "content": "Say hello."}}, "max_completion_tokens": 256, "stream": false},
+			ResponseExample: map[string]any{"id": "chatcmpl_local", "object": "chat.completion", "created": 1767225600, "model": "{{model}}", "choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "Hello from the proxy."}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": 12, "completion_tokens": 6}},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "createResponse", Method: http.MethodPost, Path: "/openai/v1/responses", Summary: "Create an OpenAI-compatible response", Auth: apiDocAuthProxy,
+			Description: "Accepts OpenAI Responses API style requests. The local Codex route disables storage and can map stable session ids to local prompt cache keys.",
+			Headers:     []apiDocParam{sessionHeader}, RequestSchema: "ResponsesRequest", ResponseSchema: "ResponsesResponse",
+			RequestExample:  map[string]any{"model": "{{model}}", "input": []map[string]any{{"role": "user", "content": "Say hello."}}, "stream": false},
+			ResponseExample: map[string]any{"id": "resp_local", "object": "response", "model": "{{model}}", "output": []map[string]any{{"type": "message", "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "Hello from the proxy."}}}}, "usage": map[string]any{"input_tokens": 12, "output_tokens": 6}},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "listOpenAIFiles", Method: http.MethodGet, Path: "/openai/v1/files", Summary: "List provider files", Auth: apiDocAuthProxy,
+			Description:    "OpenAI-compatible provider pass-through. Requires the default upstream to be OpenAI-compatible or the client key to route to a provider key.",
+			QueryParams:    []apiDocParam{{Name: "limit", In: "query", Type: "integer", Description: "Provider-specific page size.", Example: 20}, {Name: "after", In: "query", Type: "string", Description: "Provider-specific cursor.", Example: "file-abc123"}, {Name: "purpose", In: "query", Type: "string", Description: "Provider-specific file purpose filter.", Example: "assistants"}},
+			ResponseSchema: "ProviderPassThroughResponse", ResponseExample: map[string]any{"object": "list", "data": []map[string]any{{"id": "file-abc123", "object": "file", "purpose": "assistants"}}},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "uploadOpenAIFile", Method: http.MethodPost, Path: "/openai/v1/files", Summary: "Upload a provider file", Auth: apiDocAuthProxy,
+			Description:        "OpenAI-compatible multipart file upload pass-through.",
+			RequestContentType: "multipart/form-data", ResponseSchema: "ProviderPassThroughResponse", PostmanBodyMode: "formdata",
+			PostmanFormData: []apiDocParam{{Name: "purpose", Type: "string", Description: "Provider file purpose.", Required: true, Example: "assistants"}, {Name: "file", Type: "file", Description: "File selected in Postman.", Required: true}},
+			ResponseExample: map[string]any{"id": "file-abc123", "object": "file", "purpose": "assistants"},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "getOpenAIFilePath", Method: http.MethodGet, Path: "/openai/v1/files/{path}", DisplayPath: "/openai/v1/files/{path...}", SourcePath: "/openai/v1/files/", Summary: "Retrieve a provider file path", Auth: apiDocAuthProxy,
+			Description: "OpenAI-compatible provider pass-through for nested file paths such as file metadata or file content.",
+			PathParams:  []apiDocParam{filePathParam}, ResponseSchema: "ProviderPassThroughResponse", ResponseExample: map[string]any{"id": "file-abc123", "object": "file"},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "deleteOpenAIFilePath", Method: http.MethodDelete, Path: "/openai/v1/files/{path}", DisplayPath: "/openai/v1/files/{path...}", SourcePath: "/openai/v1/files/", Summary: "Delete a provider file path", Auth: apiDocAuthProxy,
+			Description: "OpenAI-compatible provider pass-through for file deletion where the upstream provider supports it.",
+			PathParams:  []apiDocParam{filePathParam}, ResponseSchema: "ProviderPassThroughResponse", ResponseExample: map[string]any{"id": "file-abc123", "object": "file", "deleted": true},
+		},
+		{
+			Group: "Admin auth", OperationID: "getAdminAuthStatus", Method: http.MethodGet, Path: "/ui/api/auth/status", Summary: "Check admin login status", Auth: apiDocAuthPublic,
+			Description:    "Returns whether local admin auth is configured and whether the current browser session is authenticated.",
+			ResponseSchema: "UIAuthStatusResponse", ResponseExample: map[string]any{"configured": true, "authenticated": true, "username": "admin"},
+		},
+		{
+			Group: "Admin auth", OperationID: "setupAdminAuth", Method: http.MethodPost, Path: "/ui/api/auth/setup", Summary: "Create local admin login", Auth: apiDocAuthPublic,
+			Description:   "Creates the first local admin login. Fails once admin auth is already configured.",
+			RequestSchema: "UIAuthCredentialsRequest", ResponseSchema: "OKResponse",
+			RequestExample:  map[string]any{"username": "{{adminUsername}}", "password": "{{adminPassword}}"},
+			ResponseExample: map[string]any{"ok": true, "message": "Admin login configured."},
+		},
+		{
+			Group: "Admin auth", OperationID: "loginAdmin", Method: http.MethodPost, Path: "/ui/api/auth/login", Summary: "Log in to the admin UI", Auth: apiDocAuthPublic,
+			Description:   "Sets the local admin session cookie when the credentials are valid.",
+			RequestSchema: "UIAuthCredentialsRequest", ResponseSchema: "OKResponse",
+			RequestExample:  map[string]any{"username": "{{adminUsername}}", "password": "{{adminPassword}}"},
+			ResponseExample: map[string]any{"ok": true},
+		},
+		{
+			Group: "Admin auth", OperationID: "logoutAdmin", Method: http.MethodPost, Path: "/ui/api/auth/logout", Summary: "Clear admin session", Auth: apiDocAuthPublic,
+			Description:    "Expires the local admin session cookie.",
+			ResponseSchema: "OKResponse", ResponseExample: map[string]any{"ok": true},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIStatus", Method: http.MethodGet, Path: "/ui/api/status", Summary: "Get dashboard status", Auth: apiDocAuthAdmin,
+			Description:    "Returns runtime status, local URLs, model rows, auth metadata, dashboard metrics, and the latest request summary.",
+			ResponseSchema: "UIStatusResponse", ResponseExample: map[string]any{"running": true, "proxy_running": true, "local_url": "http://127.0.0.1:4000", "anthropic_url": "http://127.0.0.1:4000/anthropic", "openai_url": "http://127.0.0.1:4000/openai/v1", "upstream": "codex"},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIConfig", Method: http.MethodGet, Path: "/ui/api/config", Summary: "Read editable proxy config", Auth: apiDocAuthAdmin,
+			Description:    "Returns .env-backed configuration values for the control panel. Secret-looking values are masked in config fields.",
+			ResponseSchema: "UIConfigResponse", ResponseExample: map[string]any{"config": map[string]any{"OPENAI_BASE_URL": "https://api.openai.com/v1", "PROXY_API_KEY": "sk-...abcd"}, "secrets": map[string]any{"PROXY_API_KEY": "{{proxyApiKey}}"}, "aliases": []map[string]any{}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "saveUIConfig", Method: http.MethodPost, Path: "/ui/api/config", Summary: "Save editable proxy config", Auth: apiDocAuthAdmin,
+			Description:   "Persists selected .env values and model aliases. Restart the proxy to apply process-level settings.",
+			RequestSchema: "UIConfigRequest", ResponseSchema: "OKResponse",
+			RequestExample:  map[string]any{"config": map[string]any{"OPENAI_BASE_URL": "https://api.openai.com/v1"}, "aliases": []map[string]any{{"From": "sonnet[1m]", "To": "gpt-5.5", "Context": "1m"}}},
+			ResponseExample: map[string]any{"ok": true, "message": "Configuration saved. Restart proxy to apply changes."},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIModels", Method: http.MethodGet, Path: "/ui/api/models", Summary: "List model aliases", Auth: apiDocAuthAdmin,
+			ResponseSchema: "UIModelsResponse", ResponseExample: map[string]any{"models": []map[string]any{{"alias": "sonnet[1m]", "real": "gpt-5.5", "context": "1m"}}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "saveUIModels", Method: http.MethodPost, Path: "/ui/api/models", Summary: "Save model aliases", Auth: apiDocAuthAdmin,
+			RequestSchema: "UIModelsRequest", ResponseSchema: "UIModelsResponse",
+			RequestExample:  map[string]any{"models": []map[string]any{{"alias": "sonnet[1m]", "real": "gpt-5.5", "context": "1m"}}},
+			ResponseExample: map[string]any{"ok": true, "message": "Model aliases saved and active for new requests.", "models": []map[string]any{{"alias": "sonnet[1m]", "real": "gpt-5.5", "context": "1m"}}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIKeys", Method: http.MethodGet, Path: "/ui/api/keys", Summary: "List provider and client keys", Auth: apiDocAuthAdmin,
+			ResponseSchema: "UIKeysResponse", ResponseExample: map[string]any{"providers": []map[string]any{}, "clients": []map[string]any{}, "defaults": map[string]any{"anthropic_base": "http://127.0.0.1:4000/anthropic", "openai_local_url": "http://127.0.0.1:4000/openai/v1"}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "saveUIProviderKey", Method: http.MethodPost, Path: "/ui/api/keys/provider", Summary: "Create or renew a provider key", Auth: apiDocAuthAdmin,
+			RequestSchema: "UIProviderKeyRequest", ResponseSchema: "UIKeysResponse",
+			RequestExample:  map[string]any{"provider": "openai", "label": "OpenAI key", "base_url": "https://api.openai.com/v1", "api_key": "{{providerApiKey}}"},
+			ResponseExample: map[string]any{"ok": true, "message": "Provider key saved.", "providers": []map[string]any{}, "clients": []map[string]any{}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "createUIClientKey", Method: http.MethodPost, Path: "/ui/api/keys/client", Summary: "Create a local client API key", Auth: apiDocAuthAdmin,
+			RequestSchema: "UIClientKeyRequest", ResponseSchema: "UIClientKeyCreateResponse",
+			RequestExample:  map[string]any{"label": "Postman", "schema": "both", "provider": "default", "provider_key_id": ""},
+			ResponseExample: map[string]any{"ok": true, "message": "Client key created. Copy it now; it will not be shown again.", "api_key": "{{proxyApiKey}}", "providers": []map[string]any{}, "clients": []map[string]any{}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "toggleUIKey", Method: http.MethodPost, Path: "/ui/api/keys/toggle", Summary: "Enable or disable a key", Auth: apiDocAuthAdmin,
+			RequestSchema: "UIKeyToggleRequest", ResponseSchema: "UIKeysResponse",
+			RequestExample:  map[string]any{"kind": "client", "id": "{{clientKeyId}}", "enabled": true},
+			ResponseExample: map[string]any{"ok": true, "providers": []map[string]any{}, "clients": []map[string]any{}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "validateProxy", Method: http.MethodGet, Path: "/ui/api/validate", Summary: "Run local validation checks", Auth: apiDocAuthAdmin,
+			ResponseSchema: "UIValidateResponse", ResponseExample: map[string]any{"ok": true, "ran_at": "12:00:00", "model": "sonnet[1m]", "upstream_model": "gpt-5.5", "steps": []map[string]any{{"name": "GET /anthropic/v1/models", "ok": true, "status": 200}}, "duration_total": 123},
+		},
+		{
+			Group: "Admin control panel", OperationID: "testProxyRequest", Method: http.MethodPost, Path: "/ui/api/test", Summary: "Send a quick test prompt", Auth: apiDocAuthAdmin,
+			RequestSchema: "UITestRequest", ResponseSchema: "UITestResponse",
+			RequestExample:  map[string]any{"model": "{{model}}", "prompt": "Reply with only OK.", "stream": false},
+			ResponseExample: map[string]any{"status": 200, "duration_ms": 450, "raw": "{\"type\":\"message\"}", "text": "OK"},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUILogs", Method: http.MethodGet, Path: "/ui/api/logs", Summary: "Read local logs", Auth: apiDocAuthAdmin,
+			ResponseSchema: "UILogsResponse", ResponseExample: map[string]any{"rows": []map[string]any{}, "stdout": "", "stderr": "", "trace": ""},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIAntigravity", Method: http.MethodGet, Path: "/ui/api/antigravity", Summary: "Read browser bridge status", Auth: apiDocAuthAdmin,
+			ResponseSchema: "AntigravityStatusResponse", ResponseExample: map[string]any{"available": true, "mode": "dedicated", "last_action": "browser_status"},
+		},
+		{
+			Group: "Admin control panel", OperationID: "probeUIAntigravity", Method: http.MethodPost, Path: "/ui/api/antigravity/probe", Summary: "Record browser bridge probe data", Auth: apiDocAuthAdmin,
+			RequestSchema: "AntigravityProbeRequest", ResponseSchema: "AntigravityProbeResponse",
+			RequestExample:  map[string]any{"source": "postman", "url": "http://127.0.0.1:4000/antigravity/bridge"},
+			ResponseExample: map[string]any{"ok": true, "probe": map[string]any{"source": "postman"}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "stopProxy", Method: http.MethodPost, Path: "/ui/api/proxy/stop", Summary: "Stop proxy endpoints", Auth: apiDocAuthAdmin,
+			ResponseSchema: "OKResponse", ResponseExample: map[string]any{"ok": true, "running": false, "message": "Proxy endpoints stopped. Claude settings restored. Control panel remains online."},
+		},
+		{
+			Group: "Admin control panel", OperationID: "startProxy", Method: http.MethodPost, Path: "/ui/api/proxy/start", Summary: "Start proxy endpoints", Auth: apiDocAuthAdmin,
+			ResponseSchema: "OKResponse", ResponseExample: map[string]any{"ok": true, "running": true, "message": "Proxy endpoints started. Claude settings applied."},
+		},
+		{
+			Group: "Admin control panel", OperationID: "restartProxy", Method: http.MethodPost, Path: "/ui/api/proxy/restart", Summary: "Restart proxy process", Auth: apiDocAuthAdmin,
+			ResponseSchema: "OKResponse", ResponseExample: map[string]any{"ok": true, "message": "Proxy restarting."},
+		},
+	}
+}
+
+func handleAPIDocs(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = io.WriteString(w, renderAPIDocsHTML(cfg))
+	}
+}
+
+func handleOpenAPI(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		writeJSON(w, http.StatusOK, buildOpenAPISpec(cfg))
+	}
+}
+
+func handlePostmanCollection(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		writeJSON(w, http.StatusOK, buildPostmanCollection(cfg))
+	}
+}
+
+func apiDocsBaseURL(cfg config) string {
+	port := strings.TrimSpace(cfg.Port)
+	if port == "" {
+		port = "4000"
+	}
+	return "http://127.0.0.1:" + port
+}
+
+func renderAPIDocsHTML(cfg config) string {
+	routes := apiDocRoutes()
+	groups := apiDocGroups(routes)
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Claude Code Codex Proxy API Docs</title>`)
+	b.WriteString(`<style>:root{color-scheme:dark;--bg:#0c0f12;--panel:#141920;--panel2:#11161c;--line:#26313c;--fg:#eef3f8;--muted:#9ba8b5;--accent:#78c7ff;--ok:#77d7a2;--warn:#ffd275}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 Inter,Segoe UI,Arial,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}header{position:sticky;top:0;z-index:2;background:rgba(12,15,18,.94);border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}.wrap{max-width:1180px;margin:0 auto;padding:24px}.hero{display:grid;gap:10px}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}h1{margin:0;font-size:32px;line-height:1.1}h2{margin:32px 0 12px;font-size:19px}h3{margin:0;font-size:17px}.links{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:7px;padding:8px 10px}.grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:24px}.nav{position:sticky;top:104px;align-self:start;border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:12px}.nav a{display:block;color:var(--muted);padding:5px 6px;border-radius:5px}.nav a:hover{background:var(--panel);color:var(--fg);text-decoration:none}.card{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin:12px 0;padding:16px}.meta{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.tag{border:1px solid var(--line);border-radius:999px;color:var(--muted);padding:2px 8px;font-size:12px}.method{font-weight:700;color:var(--ok)}.path{font-family:JetBrains Mono,Consolas,monospace;color:#d8ecff}.desc{color:var(--muted)}pre{overflow:auto;background:#090c0f;border:1px solid var(--line);border-radius:7px;padding:12px;color:#dbe7f2}code{font-family:JetBrains Mono,Consolas,monospace}.note{border-left:3px solid var(--warn);padding-left:10px;color:#d7c28b}.small{font-size:12px;color:var(--muted)}@media(max-width:880px){.grid{grid-template-columns:1fr}.nav{position:static}}</style></head><body>`)
+	b.WriteString(`<header><div class="wrap hero"><div class="eyebrow">Local API documentation</div><h1>Claude Code Codex Proxy API</h1><div class="desc">Readable endpoint docs plus importable OpenAPI and Postman exports. No local secrets are embedded; examples use variables such as <code>{{proxyApiKey}}</code>.</div><div class="links">`)
+	b.WriteString(`<a class="btn" href="/openapi.json">OpenAPI JSON</a><a class="btn" href="/postman.json">Postman collection</a><a class="btn" href="/">Control panel</a>`)
+	b.WriteString(`</div><div class="small">Base URL: <code>` + html.EscapeString(apiDocsBaseURL(cfg)) + `</code></div></div></header>`)
+	b.WriteString(`<div class="wrap grid"><nav class="nav"><strong>Groups</strong>`)
+	for _, group := range groups {
+		b.WriteString(`<a href="#group-` + html.EscapeString(docAnchor(group)) + `">` + html.EscapeString(group) + `</a>`)
+	}
+	b.WriteString(`</nav><main>`)
+	b.WriteString(`<section class="card"><h3>Authentication</h3><p class="desc">Proxy endpoints accept <code>x-api-key</code>, <code>anthropic-api-key</code>, <code>api-key</code>, or <code>Authorization: Bearer {{proxyApiKey}}</code>. Admin endpoints use the <code>ccp_admin_session</code> cookie created by <code>/ui/api/auth/setup</code> or <code>/ui/api/auth/login</code>.</p></section>`)
+	for _, group := range groups {
+		b.WriteString(`<h2 id="group-` + html.EscapeString(docAnchor(group)) + `">` + html.EscapeString(group) + `</h2>`)
+		for _, route := range routes {
+			if route.Group != group {
+				continue
+			}
+			b.WriteString(`<article class="card" id="` + html.EscapeString(route.OperationID) + `">`)
+			b.WriteString(`<h3><span class="method">` + html.EscapeString(route.Method) + `</span> <span class="path">` + html.EscapeString(routeDisplayPath(route)) + `</span></h3>`)
+			b.WriteString(`<div class="meta"><span class="tag">` + html.EscapeString(route.Summary) + `</span><span class="tag">` + html.EscapeString(apiDocAuthLabel(route.Auth)) + `</span></div>`)
+			if route.Description != "" {
+				b.WriteString(`<p class="desc">` + html.EscapeString(route.Description) + `</p>`)
+			}
+			if len(route.Headers) > 0 || len(route.QueryParams) > 0 || len(route.PathParams) > 0 {
+				b.WriteString(`<p class="small">`)
+				writeDocParamsHTML(&b, "Headers", route.Headers)
+				writeDocParamsHTML(&b, "Query", route.QueryParams)
+				writeDocParamsHTML(&b, "Path", route.PathParams)
+				b.WriteString(`</p>`)
+			}
+			if route.RequestExample != nil {
+				b.WriteString(`<h4>Request example</h4><pre><code>` + html.EscapeString(docExample(route.RequestExample)) + `</code></pre>`)
+			} else if len(route.PostmanFormData) > 0 {
+				b.WriteString(`<h4>Request form data</h4><pre><code>`)
+				for _, p := range route.PostmanFormData {
+					b.WriteString(html.EscapeString(p.Name + " = " + fmt.Sprint(p.Example) + "\n"))
+				}
+				b.WriteString(`</code></pre>`)
+			}
+			if route.ResponseExample != nil {
+				b.WriteString(`<h4>Response example</h4><pre><code>` + html.EscapeString(docExample(route.ResponseExample)) + `</code></pre>`)
+			}
+			if route.Auth == apiDocAuthAdmin {
+				b.WriteString(`<p class="note">Admin routes require a valid local browser session cookie. In Postman, call the login endpoint first and let Postman store the cookie, or set <code>{{adminSessionCookie}}</code>.</p>`)
+			}
+			b.WriteString(`</article>`)
+		}
+	}
+	b.WriteString(`</main></div></body></html>`)
+	return b.String()
+}
+
+func writeDocParamsHTML(b *strings.Builder, label string, params []apiDocParam) {
+	if len(params) == 0 {
+		return
+	}
+	b.WriteString(`<strong>` + html.EscapeString(label) + `:</strong> `)
+	for i, p := range params {
+		if i > 0 {
+			b.WriteString(`, `)
+		}
+		b.WriteString(`<code>` + html.EscapeString(p.Name) + `</code>`)
+	}
+	b.WriteString(`. `)
+}
+
+func apiDocGroups(routes []apiDocRoute) []string {
+	seen := map[string]bool{}
+	var groups []string
+	for _, route := range routes {
+		if route.Group == "" || seen[route.Group] {
+			continue
+		}
+		seen[route.Group] = true
+		groups = append(groups, route.Group)
+	}
+	return groups
+}
+
+func routeDisplayPath(route apiDocRoute) string {
+	if route.DisplayPath != "" {
+		return route.DisplayPath
+	}
+	return route.Path
+}
+
+func routeCoveragePath(route apiDocRoute) string {
+	if route.SourcePath != "" {
+		return route.SourcePath
+	}
+	return route.Path
+}
+
+func docAnchor(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	replacer := strings.NewReplacer(" ", "-", "/", "-", "{", "", "}", "", ".", "", ":", "", "_", "-")
+	return strings.Trim(replacer.Replace(s), "-")
+}
+
+func docExample(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	default:
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return fmt.Sprint(v)
+		}
+		return string(b)
+	}
+}
+
+func apiDocAuthLabel(auth apiDocAuth) string {
+	switch auth {
+	case apiDocAuthProxy:
+		return "Proxy API key"
+	case apiDocAuthAdmin:
+		return "Admin session cookie"
+	default:
+		return "Public local"
+	}
+}
+
+func buildOpenAPISpec(cfg config) map[string]any {
+	paths := map[string]any{}
+	for _, route := range apiDocRoutes() {
+		pathItem, _ := paths[route.Path].(map[string]any)
+		if pathItem == nil {
+			pathItem = map[string]any{}
+		}
+		op := map[string]any{
+			"operationId": route.OperationID,
+			"summary":     route.Summary,
+			"description": strings.TrimSpace(route.Description + "\n\nAuth: " + apiDocAuthLabel(route.Auth)),
+			"tags":        []string{route.Group},
+			"responses":   openAPIResponses(route),
+		}
+		if params := openAPIParameters(route); len(params) > 0 {
+			op["parameters"] = params
+		}
+		if req := openAPIRequestBody(route); req != nil {
+			op["requestBody"] = req
+		}
+		if sec := openAPISecurity(route.Auth); len(sec) > 0 {
+			op["security"] = sec
+		}
+		pathItem[strings.ToLower(route.Method)] = op
+		paths[route.Path] = pathItem
+	}
+	return map[string]any{
+		"openapi": "3.0.3",
+		"info": map[string]any{
+			"title":       "Claude Code Codex Proxy API",
+			"version":     "1.0.0",
+			"description": "Local Postman-ready API documentation for claude-code-proxy. Examples use placeholders and never embed local secrets.",
+		},
+		"servers": []map[string]any{{"url": apiDocsBaseURL(cfg), "description": "Local proxy"}},
+		"tags":    openAPITags(apiDocGroups(apiDocRoutes())),
+		"paths":   paths,
+		"components": map[string]any{
+			"securitySchemes": openAPISecuritySchemes(),
+			"schemas":         openAPISchemas(),
+		},
+	}
+}
+
+func openAPITags(groups []string) []map[string]string {
+	tags := make([]map[string]string, 0, len(groups))
+	for _, group := range groups {
+		tags = append(tags, map[string]string{"name": group})
+	}
+	return tags
+}
+
+func openAPIParameters(route apiDocRoute) []map[string]any {
+	all := append([]apiDocParam{}, route.PathParams...)
+	all = append(all, route.QueryParams...)
+	all = append(all, route.Headers...)
+	params := make([]map[string]any, 0, len(all))
+	for _, p := range all {
+		in := p.In
+		if in == "" {
+			in = "query"
+		}
+		param := map[string]any{
+			"name":        p.Name,
+			"in":          in,
+			"description": p.Description,
+			"required":    p.Required || in == "path",
+			"schema":      openAPIParamSchema(p),
+		}
+		if p.Example != nil {
+			param["example"] = p.Example
+		}
+		params = append(params, param)
+	}
+	return params
+}
+
+func openAPIParamSchema(p apiDocParam) map[string]any {
+	switch p.Type {
+	case "integer":
+		return map[string]any{"type": "integer"}
+	case "boolean":
+		return map[string]any{"type": "boolean"}
+	case "file":
+		return map[string]any{"type": "string", "format": "binary"}
+	default:
+		return map[string]any{"type": "string"}
+	}
+}
+
+func openAPIRequestBody(route apiDocRoute) map[string]any {
+	if route.RequestSchema == "" && route.RequestExample == nil && len(route.PostmanFormData) == 0 {
+		return nil
+	}
+	contentType := firstNonEmpty(route.RequestContentType, "application/json")
+	media := map[string]any{}
+	if len(route.PostmanFormData) > 0 {
+		props := map[string]any{}
+		required := []string{}
+		for _, p := range route.PostmanFormData {
+			props[p.Name] = openAPIParamSchema(p)
+			if p.Required {
+				required = append(required, p.Name)
+			}
+		}
+		schema := map[string]any{"type": "object", "properties": props}
+		if len(required) > 0 {
+			schema["required"] = required
+		}
+		media["schema"] = schema
+	} else {
+		media["schema"] = openAPISchemaRef(route.RequestSchema)
+		if route.RequestExample != nil {
+			media["example"] = route.RequestExample
+		}
+	}
+	return map[string]any{"required": true, "content": map[string]any{contentType: media}}
+}
+
+func openAPIResponses(route apiDocRoute) map[string]any {
+	status := route.SuccessStatus
+	if status == 0 {
+		status = http.StatusOK
+	}
+	contentType := firstNonEmpty(route.ResponseContentType, "application/json")
+	success := map[string]any{"description": http.StatusText(status)}
+	if route.ResponseSchema != "" || route.ResponseExample != nil {
+		media := map[string]any{"schema": openAPISchemaRef(route.ResponseSchema)}
+		if route.ResponseExample != nil {
+			media["example"] = route.ResponseExample
+		}
+		success["content"] = map[string]any{contentType: media}
+	}
+	return map[string]any{
+		strconv.Itoa(status): success,
+		"default": map[string]any{
+			"description": "Error response",
+			"content": map[string]any{"application/json": map[string]any{
+				"schema":  openAPISchemaRef("ErrorResponse"),
+				"example": map[string]any{"error": "method not allowed"},
+			}},
+		},
+	}
+}
+
+func openAPISecurity(auth apiDocAuth) []map[string][]string {
+	switch auth {
+	case apiDocAuthProxy:
+		return []map[string][]string{{"ProxyApiKey": {}}, {"ProxyAnthropicApiKey": {}}, {"ProxyGenericApiKey": {}}, {"ProxyBearer": {}}}
+	case apiDocAuthAdmin:
+		return []map[string][]string{{"AdminSessionCookie": {}}}
+	default:
+		return nil
+	}
+}
+
+func openAPISecuritySchemes() map[string]any {
+	return map[string]any{
+		"ProxyApiKey": map[string]any{
+			"type":        "apiKey",
+			"in":          "header",
+			"name":        "x-api-key",
+			"description": "Local proxy key. Use {{proxyApiKey}} in Postman.",
+		},
+		"ProxyAnthropicApiKey": map[string]any{"type": "apiKey", "in": "header", "name": "anthropic-api-key"},
+		"ProxyGenericApiKey":   map[string]any{"type": "apiKey", "in": "header", "name": "api-key"},
+		"ProxyBearer":          map[string]any{"type": "http", "scheme": "bearer"},
+		"AdminSessionCookie":   map[string]any{"type": "apiKey", "in": "cookie", "name": adminSessionCookieName},
+	}
+}
+
+func openAPISchemaRef(name string) map[string]any {
+	if name == "" {
+		return map[string]any{"type": "object", "additionalProperties": true}
+	}
+	return map[string]any{"$ref": "#/components/schemas/" + name}
+}
+
+func schemaObject(properties map[string]any, required ...string) map[string]any {
+	out := map[string]any{"type": "object", "properties": properties}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
+func schemaOpenObject(properties map[string]any, required ...string) map[string]any {
+	out := schemaObject(properties, required...)
+	out["additionalProperties"] = true
+	return out
+}
+
+func schemaArray(item any) map[string]any {
+	return map[string]any{"type": "array", "items": item}
+}
+
+func schemaString(description string) map[string]any {
+	out := map[string]any{"type": "string"}
+	if description != "" {
+		out["description"] = description
+	}
+	return out
+}
+
+func schemaInteger(description string) map[string]any {
+	out := map[string]any{"type": "integer"}
+	if description != "" {
+		out["description"] = description
+	}
+	return out
+}
+
+func schemaBoolean(description string) map[string]any {
+	out := map[string]any{"type": "boolean"}
+	if description != "" {
+		out["description"] = description
+	}
+	return out
+}
+
+func openAPISchemas() map[string]any {
+	anyValue := map[string]any{"nullable": true}
+	stringMap := map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}}
+	anyMap := map[string]any{"type": "object", "additionalProperties": true}
+	message := schemaObject(map[string]any{"role": schemaString("Message role."), "content": anyValue}, "role")
+	modelRow := schemaObject(map[string]any{"id": schemaString("Model id."), "type": schemaString("Object type."), "display_name": schemaString("Display name.")})
+	providerKey := schemaOpenObject(map[string]any{"id": schemaString("Provider key id."), "provider": schemaString("Provider name."), "schema": schemaString("Provider schema."), "label": schemaString("Label."), "base_url": schemaString("Provider base URL."), "key_preview": schemaString("Masked key preview."), "enabled": schemaBoolean("Whether the key is enabled."), "created_at": schemaString("Created timestamp."), "updated_at": schemaString("Updated timestamp.")})
+	clientKey := schemaOpenObject(map[string]any{"id": schemaString("Client key id."), "label": schemaString("Label."), "key_preview": schemaString("Masked key preview."), "schema": schemaString("anthropic, openai, or both."), "provider": schemaString("Provider route."), "provider_key_id": schemaString("Provider key id."), "provider_label": schemaString("Provider label."), "enabled": schemaBoolean("Whether the key is enabled."), "created_at": schemaString("Created timestamp."), "updated_at": schemaString("Updated timestamp."), "last_used_at": schemaString("Last-used timestamp.")})
+	modelAlias := schemaObject(map[string]any{"alias": schemaString("Local model alias."), "real": schemaString("Upstream model id."), "context": schemaString("Optional context label.")})
+	return map[string]any{
+		"HTMLDocument":                 map[string]any{"type": "string", "description": "HTML document."},
+		"OpenAPIDocument":              map[string]any{"type": "object", "additionalProperties": true},
+		"PostmanCollection":            map[string]any{"type": "object", "additionalProperties": true},
+		"ErrorResponse":                schemaOpenObject(map[string]any{"error": anyValue, "type": schemaString("Anthropic-style error wrapper type.")}),
+		"OKResponse":                   schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether the operation succeeded."), "message": schemaString("Human-readable status message."), "running": schemaBoolean("Proxy running state.")}),
+		"HealthResponse":               schemaObject(map[string]any{"ok": schemaBoolean("Process is reachable."), "proxy_running": schemaBoolean("Proxy endpoints are enabled.")}, "ok", "proxy_running"),
+		"ModelListResponse":            schemaObject(map[string]any{"object": schemaString("list"), "data": schemaArray(modelRow)}, "object", "data"),
+		"AnthropicMessageRequest":      schemaOpenObject(map[string]any{"model": schemaString("Claude-compatible model alias."), "max_tokens": schemaInteger("Maximum output tokens."), "system": anyValue, "messages": schemaArray(message), "tools": schemaArray(anyMap), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "speed": schemaString("Optional speed hint."), "output_config": anyMap}, "model", "messages"),
+		"AnthropicMessageResponse":     schemaOpenObject(map[string]any{"id": schemaString("Message id."), "type": schemaString("message"), "role": schemaString("assistant"), "content": schemaArray(anyMap), "model": schemaString("Requested model alias."), "stop_reason": schemaString("Stop reason."), "stop_sequence": anyValue, "usage": anyMap}),
+		"CountTokensResponse":          schemaObject(map[string]any{"input_tokens": schemaInteger("Approximate input token count.")}, "input_tokens"),
+		"OpenAIChatCompletionRequest":  schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "messages": schemaArray(message), "tools": schemaArray(anyMap), "max_tokens": schemaInteger("Maximum output tokens."), "max_completion_tokens": schemaInteger("Maximum output tokens."), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "reasoning_effort": schemaString("Optional reasoning effort."), "user": schemaString("Optional user/session id."), "metadata": anyMap, "extra_body": anyValue}, "model", "messages"),
+		"OpenAIChatCompletionResponse": schemaOpenObject(map[string]any{"id": schemaString("Completion id."), "object": schemaString("chat.completion"), "created": schemaInteger("Unix timestamp."), "model": schemaString("Model id."), "choices": schemaArray(anyMap), "usage": anyMap}),
+		"ResponsesRequest":             schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "instructions": schemaString("Optional system instructions."), "input": schemaArray(anyValue), "tools": schemaArray(anyMap), "reasoning": anyMap, "temperature": map[string]any{"type": "number"}, "service_tier": schemaString("Optional service tier."), "prompt_cache_key": schemaString("Optional prompt cache key."), "stream": schemaBoolean("Enable SSE streaming."), "store": schemaBoolean("Ignored locally and forced false.")}, "model", "input"),
+		"ResponsesResponse":            schemaOpenObject(map[string]any{"id": schemaString("Response id."), "object": schemaString("response"), "model": schemaString("Model id."), "output": schemaArray(anyMap), "usage": anyMap}),
+		"ProviderPassThroughResponse":  map[string]any{"type": "object", "additionalProperties": true, "description": "Provider-shaped OpenAI-compatible response."},
+		"UIAuthStatusResponse":         schemaObject(map[string]any{"configured": schemaBoolean("Admin auth is configured."), "authenticated": schemaBoolean("Current request has a valid admin cookie."), "username": schemaString("Configured admin username.")}, "configured", "authenticated", "username"),
+		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password.")}, "username", "password"),
+		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "local_url": schemaString("Local control panel URL."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "port": schemaString("Local port."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
+		"UIConfigResponse":             schemaObject(map[string]any{"config": stringMap, "secrets": stringMap, "aliases": schemaArray(modelAlias)}, "config", "secrets", "aliases"),
+		"UIConfigRequest":              schemaObject(map[string]any{"config": stringMap, "aliases": schemaArray(schemaObject(map[string]any{"From": schemaString("Alias."), "To": schemaString("Model id."), "Context": schemaString("Context label.")}))}),
+		"UIModelsResponse":             schemaOpenObject(map[string]any{"models": schemaArray(modelAlias), "ok": schemaBoolean("Whether save succeeded."), "message": schemaString("Status message.")}),
+		"UIModelsRequest":              schemaObject(map[string]any{"models": schemaArray(modelAlias)}, "models"),
+		"UIKeysResponse":               schemaOpenObject(map[string]any{"providers": schemaArray(providerKey), "clients": schemaArray(clientKey), "defaults": stringMap}),
+		"UIProviderKeyRequest":         schemaObject(map[string]any{"id": schemaString("Existing provider key id when renewing."), "provider": schemaString("openai or gemini."), "label": schemaString("Label."), "base_url": schemaString("Provider base URL."), "api_key": schemaString("Provider API key.")}, "provider", "api_key"),
+		"UIClientKeyRequest":           schemaObject(map[string]any{"label": schemaString("Client key label."), "schema": schemaString("both, anthropic, or openai."), "provider": schemaString("default, openai, or gemini."), "provider_key_id": schemaString("Provider key id.")}),
+		"UIClientKeyCreateResponse":    schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether creation succeeded."), "message": schemaString("Status message."), "api_key": schemaString("Raw local client API key, shown once."), "providers": schemaArray(providerKey), "clients": schemaArray(clientKey)}),
+		"UIKeyToggleRequest":           schemaObject(map[string]any{"kind": schemaString("provider or client."), "id": schemaString("Key id."), "enabled": schemaBoolean("Desired enabled state.")}, "kind", "id", "enabled"),
+		"UIValidateResponse":           schemaOpenObject(map[string]any{"ok": schemaBoolean("All validation steps passed."), "ran_at": schemaString("Local time."), "model": schemaString("Requested model alias."), "upstream_model": schemaString("Resolved upstream model."), "steps": schemaArray(anyMap), "duration_total": schemaInteger("Total duration in ms.")}),
+		"UITestRequest":                schemaObject(map[string]any{"model": schemaString("Model alias."), "prompt": schemaString("Prompt text."), "stream": schemaBoolean("Use streaming.")}),
+		"UITestResponse":               schemaObject(map[string]any{"status": schemaInteger("HTTP status from test request."), "duration_ms": schemaInteger("Duration in ms."), "raw": schemaString("Raw response body."), "text": schemaString("Extracted assistant text.")}),
+		"UILogsResponse":               schemaObject(map[string]any{"rows": schemaArray(anyMap), "stdout": schemaString("Proxy stdout log."), "stderr": schemaString("Proxy stderr log."), "trace": schemaString("Trace log.")}),
+		"AntigravityStatusResponse":    map[string]any{"type": "object", "additionalProperties": true},
+		"AntigravityProbeRequest":      map[string]any{"type": "object", "additionalProperties": true},
+		"AntigravityProbeResponse":     schemaObject(map[string]any{"ok": schemaBoolean("Probe accepted."), "probe": anyMap}, "ok", "probe"),
+	}
+}
+
+func buildPostmanCollection(cfg config) map[string]any {
+	routes := apiDocRoutes()
+	grouped := map[string][]apiDocRoute{}
+	for _, route := range routes {
+		grouped[route.Group] = append(grouped[route.Group], route)
+	}
+	items := []map[string]any{}
+	for _, group := range apiDocGroups(routes) {
+		groupItems := []map[string]any{}
+		for _, route := range grouped[group] {
+			groupItems = append(groupItems, postmanItem(route))
+		}
+		items = append(items, map[string]any{"name": group, "item": groupItems})
+	}
+	return map[string]any{
+		"info": map[string]any{
+			"name":        "Claude Code Codex Proxy API",
+			"description": "Local Postman collection generated from the proxy API documentation manifest. Set variables before sending authenticated requests.",
+			"schema":      "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		},
+		"variable": []map[string]any{
+			{"key": "baseUrl", "value": apiDocsBaseURL(cfg)},
+			{"key": "proxyApiKey", "value": ""},
+			{"key": "anthropicVersion", "value": "2023-06-01"},
+			{"key": "model", "value": "sonnet[1m]"},
+			{"key": "sessionId", "value": "postman-local-session"},
+			{"key": "adminUsername", "value": "admin"},
+			{"key": "adminPassword", "value": ""},
+			{"key": "adminSessionCookie", "value": ""},
+			{"key": "providerApiKey", "value": ""},
+			{"key": "clientKeyId", "value": ""},
+			{"key": "path", "value": "file-abc123"},
+		},
+		"item": items,
+	}
+}
+
+func postmanItem(route apiDocRoute) map[string]any {
+	request := map[string]any{
+		"method":      route.Method,
+		"header":      postmanHeaders(route),
+		"url":         postmanURL(route),
+		"description": strings.TrimSpace(route.Description + "\n\nAuth: " + apiDocAuthLabel(route.Auth)),
+	}
+	if body := postmanBody(route); body != nil {
+		request["body"] = body
+	}
+	return map[string]any{
+		"name":    route.Method + " " + routeDisplayPath(route),
+		"request": request,
+	}
+}
+
+func postmanHeaders(route apiDocRoute) []map[string]any {
+	seen := map[string]bool{}
+	var headers []map[string]any
+	add := func(key, value, description string, disabled bool) {
+		lower := strings.ToLower(key)
+		if seen[lower] {
+			return
+		}
+		seen[lower] = true
+		h := map[string]any{"key": key, "value": value}
+		if description != "" {
+			h["description"] = description
+		}
+		if disabled {
+			h["disabled"] = true
+		}
+		headers = append(headers, h)
+	}
+	if route.Auth == apiDocAuthProxy {
+		add("x-api-key", "{{proxyApiKey}}", "Accepted alternatives: anthropic-api-key, api-key, or Authorization: Bearer {{proxyApiKey}}.", false)
+	}
+	if route.Auth == apiDocAuthAdmin {
+		add("Cookie", adminSessionCookieName+"={{adminSessionCookie}}", "Optional. Postman can also store this cookie after login.", true)
+	}
+	for _, p := range route.Headers {
+		add(p.Name, fmt.Sprint(p.Example), p.Description, false)
+	}
+	if route.RequestExample != nil && route.RequestContentType == "" && route.Method != http.MethodGet {
+		add("Content-Type", "application/json", "", false)
+	}
+	return headers
+}
+
+func postmanURL(route apiDocRoute) map[string]any {
+	path := route.Path
+	for _, p := range route.PathParams {
+		path = strings.ReplaceAll(path, "{"+p.Name+"}", "{{"+p.Name+"}}")
+	}
+	raw := "{{baseUrl}}" + path
+	query := []map[string]any{}
+	if len(route.QueryParams) > 0 {
+		parts := []string{}
+		for _, p := range route.QueryParams {
+			value := "{{" + p.Name + "}}"
+			if p.Example != nil {
+				value = fmt.Sprint(p.Example)
+			}
+			parts = append(parts, p.Name+"="+value)
+			query = append(query, map[string]any{"key": p.Name, "value": value, "description": p.Description, "disabled": !p.Required})
+		}
+		raw += "?" + strings.Join(parts, "&")
+	}
+	out := map[string]any{
+		"raw":  raw,
+		"host": []string{"{{baseUrl}}"},
+		"path": postmanPathSegments(path),
+	}
+	if len(query) > 0 {
+		out["query"] = query
+	}
+	return out
+}
+
+func postmanPathSegments(path string) []string {
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return nil
+	}
+	return strings.Split(path, "/")
+}
+
+func postmanBody(route apiDocRoute) map[string]any {
+	if route.PostmanBodyMode == "formdata" {
+		form := []map[string]any{}
+		for _, p := range route.PostmanFormData {
+			item := map[string]any{"key": p.Name, "type": "text", "description": p.Description}
+			if p.Type == "file" {
+				item["type"] = "file"
+				item["src"] = []string{}
+			} else if p.Example != nil {
+				item["value"] = fmt.Sprint(p.Example)
+			}
+			form = append(form, item)
+		}
+		return map[string]any{"mode": "formdata", "formdata": form}
+	}
+	if route.RequestExample == nil || route.Method == http.MethodGet {
+		return nil
+	}
+	return map[string]any{
+		"mode": "raw",
+		"raw":  docExample(route.RequestExample),
+		"options": map[string]any{"raw": map[string]any{
+			"language": "json",
+		}},
+	}
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -3911,7 +4741,7 @@ func antigravityStatus() map[string]any {
 	manifest := antigravityManifestInfo(extensionPath)
 	profilePath := antigravityProfilePath()
 	chromePath := chromeExecutablePath()
-	launcherPath := filepath.Join(mustGetwd(), "start-antigravity-browser-mcp.ps1")
+	launcherPath := preferredProxyBinaryPath()
 	bridgeURL := "http://127.0.0.1:" + getenv("PROXY_PORT", getenv("LITELLM_PORT", "4000")) + "/antigravity/bridge"
 	browserMode := antigravityBrowserMode()
 	debugPort := antigravityBrowserDebugPort()
@@ -3953,6 +4783,7 @@ func antigravityStatus() map[string]any {
 			"path":                 chromePath,
 			"exists":               chromePath != "",
 			"mode":                 browserMode,
+			"visibility_supported": runtime.GOOS == "windows",
 			"startup_enabled":      envFlag("ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", false),
 			"browser_url":          browserURL,
 			"debug_port":           debugPort,
@@ -3965,8 +4796,9 @@ func antigravityStatus() map[string]any {
 			"default_cdp_note":     defaultChromeCDPNote(),
 		},
 		"launcher": map[string]any{
-			"path":   launcherPath,
-			"exists": fileExists(launcherPath),
+			"path":    launcherPath,
+			"command": commandDisplay(launcherPath, "browser-mcp"),
+			"exists":  fileExists(launcherPath),
 		},
 		"mcp":             antigravityMCPSettings(),
 		"bridge_url":      bridgeURL,
@@ -4014,37 +4846,7 @@ func antigravityBrowserEndpointRunning(browserURL string) bool {
 }
 
 func antigravityExtensionPath() string {
-	if path := strings.TrimSpace(os.Getenv("ANTIGRAVITY_EXTENSION_PATH")); path != "" && fileExists(filepath.Join(path, "manifest.json")) {
-		if abs, err := filepath.Abs(path); err == nil {
-			return abs
-		}
-		return path
-	}
-	root := filepath.Join(os.Getenv("LOCALAPPDATA"), "Google", "Chrome", "User Data", "Default", "Extensions", antigravityExtensionID)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return ""
-	}
-	bestPath := ""
-	var bestTime time.Time
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(root, entry.Name())
-		if !fileExists(filepath.Join(path, "manifest.json")) {
-			continue
-		}
-		info, err := entry.Info()
-		if err == nil && (bestPath == "" || info.ModTime().After(bestTime)) {
-			bestPath = path
-			bestTime = info.ModTime()
-		}
-		if bestPath == "" {
-			bestPath = path
-		}
-	}
-	return bestPath
+	return findChromeExtensionPath(antigravityExtensionID)
 }
 
 func antigravityProfilePath() string {
@@ -4097,7 +4899,7 @@ func antigravityManifestInfo(extensionPath string) map[string]any {
 }
 
 func antigravityMCPSettings() map[string]any {
-	settingsPath := filepath.Join(os.Getenv("USERPROFILE"), ".claude.json")
+	settingsPath := defaultClaudeRootConfigPath()
 	out := map[string]any{
 		"name":     "antigravity-browser",
 		"path":     settingsPath,
@@ -4136,6 +4938,9 @@ func antigravityMCPSettings() map[string]any {
 			out["launcher"] = server.Args[i+1]
 			break
 		}
+	}
+	if out["launcher"] == "" && len(server.Args) > 0 && server.Args[0] == "browser-mcp" {
+		out["launcher"] = server.Command
 	}
 	return out
 }
@@ -4203,26 +5008,17 @@ func antigravityDesktopMCPSettings() map[string]any {
 			break
 		}
 	}
+	if out["launcher"] == "" && len(server.Args) > 0 && server.Args[0] == "browser-mcp" {
+		out["launcher"] = server.Command
+	}
 	return out
 }
 
 func claudeDesktopConfigPaths() []string {
-	paths := []string{}
-	if localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); localAppData != "" {
-		paths = append(paths, filepath.Join(localAppData, "Claude-3p", "claude_desktop_config.json"))
-	}
-	if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
-		paths = append(paths, filepath.Join(appData, "Claude", "claude_desktop_config.json"))
-	}
-	seen := map[string]bool{}
-	out := make([]string, 0, len(paths))
-	for _, path := range paths {
-		key := strings.ToLower(path)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, path)
+	targets := claudeDesktopConfigTargets()
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, target.Path)
 	}
 	return out
 }
@@ -4237,20 +5033,7 @@ func sortedMapKeys(values map[string]string) []string {
 }
 
 func chromeExecutablePath() string {
-	if path := strings.TrimSpace(os.Getenv("ANTIGRAVITY_CHROME_PATH")); path != "" && fileExists(path) {
-		return path
-	}
-	candidates := []string{
-		filepath.Join(os.Getenv("ProgramFiles"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Google", "Chrome", "Application", "chrome.exe"),
-	}
-	for _, candidate := range candidates {
-		if candidate != "" && fileExists(candidate) {
-			return candidate
-		}
-	}
-	return ""
+	return findChromeExecutablePath()
 }
 
 func executablePath(names ...string) string {
@@ -4411,26 +5194,39 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 		auth := codexAuthMetadata(cfg)
 		claudeVersion := commandOutput(2*time.Second, "claude", "--version")
 		localURL := "http://127.0.0.1:" + cfg.Port
+		desktopTargets := claudeDesktopConfigTargets()
+		desktopPaths := make([]string, 0, len(desktopTargets))
+		for _, target := range desktopTargets {
+			desktopPaths = append(desktopPaths, target.Path)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"running":          proxyEnabled.Load(),
-			"proxy_running":    proxyEnabled.Load(),
-			"pid":              os.Getpid(),
-			"uptime_seconds":   int(time.Since(startedAt).Seconds()),
-			"local_url":        localURL,
-			"anthropic_url":    localURL + "/anthropic",
-			"openai_url":       localURL + "/openai/v1",
-			"port":             cfg.Port,
-			"upstream":         cfg.Upstream,
-			"codex_auth":       auth,
-			"codex_sessions":   codexSessionMetadata(cfg),
-			"claude_settings":  claudeSettingsMetadata(cfg),
-			"antigravity":      antigravityStatus(),
-			"dashboard":        dashboardMetrics(),
-			"models":           modelRows(cfg),
-			"last_request":     lastRequest(),
-			"claude_version":   strings.TrimSpace(claudeVersion),
-			"proxy_key":        cfg.ProxyKey,
-			"proxy_key_masked": maskSecret(cfg.ProxyKey),
+			"running":              proxyEnabled.Load(),
+			"proxy_running":        proxyEnabled.Load(),
+			"pid":                  os.Getpid(),
+			"platform":             platformName(),
+			"goos":                 runtime.GOOS,
+			"goarch":               runtime.GOARCH,
+			"binary_path":          preferredProxyBinaryPath(),
+			"launcher_commands":    launcherCommands(cfg),
+			"desktop_supported":    desktopSupportedOnCurrentPlatform(),
+			"desktop_config_paths": desktopPaths,
+			"browser":              map[string]any{"visibility_supported": runtime.GOOS == "windows"},
+			"uptime_seconds":       int(time.Since(startedAt).Seconds()),
+			"local_url":            localURL,
+			"anthropic_url":        localURL + "/anthropic",
+			"openai_url":           localURL + "/openai/v1",
+			"port":                 cfg.Port,
+			"upstream":             cfg.Upstream,
+			"codex_auth":           auth,
+			"codex_sessions":       codexSessionMetadata(cfg),
+			"claude_settings":      claudeSettingsMetadata(cfg),
+			"antigravity":          antigravityStatus(),
+			"dashboard":            dashboardMetrics(),
+			"models":               modelRows(cfg),
+			"last_request":         lastRequest(),
+			"claude_version":       strings.TrimSpace(claudeVersion),
+			"proxy_key":            cfg.ProxyKey,
+			"proxy_key_masked":     maskSecret(cfg.ProxyKey),
 		})
 	}
 }
@@ -4463,8 +5259,8 @@ func codexSessionMetadata(cfg config) map[string]any {
 }
 
 func claudeSettingsMetadata(cfg config) map[string]any {
-	settingsPath := filepath.Join(os.Getenv("USERPROFILE"), ".claude", "settings.json")
-	cachePath := filepath.Join(os.Getenv("USERPROFILE"), ".claude", "cache", "gateway-models.json")
+	settingsPath := defaultClaudeSettingsPath()
+	cachePath := defaultClaudeGatewayModelsCachePath()
 	info := map[string]any{
 		"path":                  settingsPath,
 		"exists":                false,
@@ -4950,8 +5746,8 @@ func handleUIStart(w http.ResponseWriter, r *http.Request) {
 
 func handleUIRestart(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		script := filepath.Join(mustGetwd(), "start-proxy.ps1")
-		cmd := exec.Command("pwsh", "-NoProfile", "-Command", "Start-Sleep -Seconds 1; & '"+strings.ReplaceAll(script, "'", "''")+"'")
+		bin := preferredProxyBinaryPath()
+		cmd := exec.Command(bin, "start")
 		_ = cmd.Start()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Proxy restarting."})
 		go func() { time.Sleep(250 * time.Millisecond); os.Exit(0) }()
@@ -4975,22 +5771,7 @@ func validateHTTP(method, url string, headers map[string]string, body []byte, na
 }
 
 func runClaudeSettingsSync(action string) error {
-	script := filepath.Join(mustGetwd(), "sync-claude-settings.ps1")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "pwsh", "-NoProfile", "-File", script, "-Action", action)
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return fmt.Errorf("Claude settings %s timed out", strings.ToLower(action))
-	}
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("Claude settings %s failed: %s", strings.ToLower(action), msg)
-	}
-	return nil
+	return runClaudeSettingsSyncGo(action)
 }
 
 func codexAuthMetadata(cfg config) map[string]any {

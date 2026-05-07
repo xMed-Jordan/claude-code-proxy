@@ -20,7 +20,7 @@ const SAMPLE_LOGS_RUNNING = [
 
 const SAMPLE_LOGS_WARN = [
   { ts: "14:38:02.001", lvl: "info",  meth: "",     path: "proxy started",   status: 0, dur: 0, ip: "", note: "listen 127.0.0.1:4000 pid=14324" },
-  { ts: "14:38:02.142", lvl: "info",  meth: "",     path: "auth loaded",     status: 0, dur: 0, ip: "", note: "C:\\Users\\hrash\\.codex\\auth.json mode=chatgpt" },
+  { ts: "14:38:02.142", lvl: "info",  meth: "",     path: "auth loaded",     status: 0, dur: 0, ip: "", note: "~/.codex/auth.json mode=chatgpt" },
   { ts: "14:38:02.180", lvl: "warn",  meth: "",     path: "auth advisory",   status: 0, dur: 0, ip: "", note: "codex chatgpt token expires in 7d 14h" },
   { ts: "14:38:14.221", lvl: "info",  meth: "GET",  path: "/anthropic/v1/models",      status: 200, dur: 4,  ip: "127.0.0.1", note: "" },
   { ts: "14:38:18.501", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",    status: 200, dur: 1422, ip: "127.0.0.1", note: "model=gpt-5.5" },
@@ -48,7 +48,7 @@ const SAMPLE_MODELS = [
 const DEFAULT_CONFIG = {
   UPSTREAM: "codex",
   CODEX_BASE_URL: "https://chatgpt.com/backend-api/codex",
-  CODEX_AUTH_FILE: "C:\\Users\\hrash\\.codex\\auth.json",
+  CODEX_AUTH_FILE: "~/.codex/auth.json",
   PROXY_PORT: "4000",
   PROXY_API_KEY: "ccp_local_4f8e29a6c1b7d3e5_71a9",
   PROXY_BIND: "127.0.0.1",

@@ -170,6 +170,144 @@ func TestNamespacedModelRoutesAndLegacyV1Removed(t *testing.T) {
 	}
 }
 
+func TestDocumentationRoutesPublicAndValid(t *testing.T) {
+	cfg := config{Port: "4000", ProxyKey: "sk-local", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	for _, path := range []string{"/docs", "/openapi.json", "/postman.json"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	openAPIReq := httptest.NewRequest(http.MethodGet, "/openapi.json", nil)
+	openAPIRec := httptest.NewRecorder()
+	handler.ServeHTTP(openAPIRec, openAPIReq)
+	var openAPI map[string]any
+	if err := json.Unmarshal(openAPIRec.Body.Bytes(), &openAPI); err != nil {
+		t.Fatalf("openapi.json is invalid JSON: %v", err)
+	}
+	if openAPI["openapi"] != "3.0.3" {
+		t.Fatalf("openapi version = %v, want 3.0.3", openAPI["openapi"])
+	}
+	paths, ok := openAPI["paths"].(map[string]any)
+	if !ok {
+		t.Fatalf("openapi paths missing: %#v", openAPI["paths"])
+	}
+	for _, path := range []string{"/anthropic/v1/messages", "/openai/v1/chat/completions", "/ui/api/status"} {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("openapi path %s missing", path)
+		}
+	}
+	for path := range paths {
+		if strings.HasPrefix(path, "/v1/") {
+			t.Fatalf("legacy root path documented unexpectedly: %s", path)
+		}
+	}
+
+	postmanReq := httptest.NewRequest(http.MethodGet, "/postman.json", nil)
+	postmanRec := httptest.NewRecorder()
+	handler.ServeHTTP(postmanRec, postmanReq)
+	var collection map[string]any
+	if err := json.Unmarshal(postmanRec.Body.Bytes(), &collection); err != nil {
+		t.Fatalf("postman.json is invalid JSON: %v", err)
+	}
+	info, ok := collection["info"].(map[string]any)
+	if !ok {
+		t.Fatalf("postman info missing: %#v", collection["info"])
+	}
+	if info["schema"] != "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" {
+		t.Fatalf("postman schema = %v", info["schema"])
+	}
+	if items, ok := collection["item"].([]any); !ok || len(items) == 0 {
+		t.Fatalf("postman collection has no items: %#v", collection["item"])
+	}
+}
+
+func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
+	routes := apiDocRoutes()
+	coverage := map[string]bool{}
+	operations := map[string]bool{}
+	for _, route := range routes {
+		if route.OperationID == "" {
+			t.Fatalf("route missing operation id: %#v", route)
+		}
+		if operations[route.OperationID] {
+			t.Fatalf("duplicate operation id: %s", route.OperationID)
+		}
+		operations[route.OperationID] = true
+		if strings.HasPrefix(route.Path, "/v1/") || strings.HasPrefix(routeCoveragePath(route), "/v1/") {
+			t.Fatalf("legacy root path documented unexpectedly: %#v", route)
+		}
+		coverage[route.Method+" "+routeCoveragePath(route)] = true
+	}
+
+	expected := []string{
+		"GET /docs",
+		"GET /openapi.json",
+		"GET /postman.json",
+		"GET /health",
+		"GET /antigravity/bridge",
+		"GET /anthropic/v1/models",
+		"POST /anthropic/v1/messages",
+		"POST /anthropic/v1/messages/count_tokens",
+		"GET /openai/v1/models",
+		"POST /openai/v1/chat/completions",
+		"POST /openai/v1/responses",
+		"GET /openai/v1/files",
+		"POST /openai/v1/files",
+		"GET /openai/v1/files/",
+		"DELETE /openai/v1/files/",
+		"GET /ui/api/auth/status",
+		"POST /ui/api/auth/setup",
+		"POST /ui/api/auth/login",
+		"POST /ui/api/auth/logout",
+		"GET /ui/api/status",
+		"GET /ui/api/config",
+		"POST /ui/api/config",
+		"GET /ui/api/models",
+		"POST /ui/api/models",
+		"GET /ui/api/keys",
+		"POST /ui/api/keys/provider",
+		"POST /ui/api/keys/client",
+		"POST /ui/api/keys/toggle",
+		"GET /ui/api/validate",
+		"POST /ui/api/test",
+		"GET /ui/api/logs",
+		"GET /ui/api/antigravity",
+		"POST /ui/api/antigravity/probe",
+		"POST /ui/api/proxy/stop",
+		"POST /ui/api/proxy/start",
+		"POST /ui/api/proxy/restart",
+	}
+	for _, want := range expected {
+		if !coverage[want] {
+			t.Fatalf("documented route coverage missing %s", want)
+		}
+	}
+
+	assertAuth := func(method, path string, want apiDocAuth) {
+		t.Helper()
+		for _, route := range routes {
+			if route.Method == method && routeCoveragePath(route) == path {
+				if route.Auth != want {
+					t.Fatalf("%s %s auth = %s, want %s", method, path, route.Auth, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s %s not found in docs manifest", method, path)
+	}
+	assertAuth(http.MethodGet, "/health", apiDocAuthPublic)
+	assertAuth(http.MethodPost, "/anthropic/v1/messages", apiDocAuthProxy)
+	assertAuth(http.MethodPost, "/openai/v1/chat/completions", apiDocAuthProxy)
+	assertAuth(http.MethodGet, "/ui/api/auth/status", apiDocAuthPublic)
+	assertAuth(http.MethodGet, "/ui/api/status", apiDocAuthAdmin)
+}
+
 func TestAnthropicNamespaceRoutes(t *testing.T) {
 	restoreProxyEnabled := proxyEnabled.Load()
 	proxyEnabled.Store(true)

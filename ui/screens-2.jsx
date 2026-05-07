@@ -375,7 +375,7 @@ const BrowserBridge = () => {
   const openBridge = () => {
     if (status?.bridge_url) window.open(status.bridge_url, "_blank", "noopener,noreferrer");
   };
-  const launcher = status?.launcher?.path || "start-antigravity-browser-mcp.ps1";
+  const launcher = status?.launcher?.command || status?.launcher?.path || "claude-code-proxy browser-mcp";
 
   const rows = [
     { label: "Extension", ok: ext.exists, meta: ext.exists ? `${manifest.name || "Antigravity"} ${manifest.version || ""}` : "not found" },
@@ -384,8 +384,8 @@ const BrowserBridge = () => {
     { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
     { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : (status?.chrome?.default_cdp_forced ? (status?.chrome?.can_relaunch_default ? "forced Default relaunch available" : "forced Default mode waiting") : "Default profile blocked by Chrome; controlled profile will be used") },
     { label: "Chrome windows", ok: true, meta: `${status?.chrome?.process_count || 0} processes · ${status?.chrome?.visible_count || 0} visible` },
-    { label: "Claude Code MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
-    { label: "Claude Desktop MCP", ok: desktopMcp.present, meta: desktopMcp.present ? `${desktopMcp.command || "pwsh"} ${Array.isArray(desktopMcp.args) ? desktopMcp.args.join(" ") : ""}` : (desktopMcp.exists ? `${desktopMcp.server_count || 0} local servers · antigravity-browser not injected` : "desktop config not found") },
+    { label: "Claude Code MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "claude-code-proxy"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+    { label: "Claude Desktop MCP", ok: desktopMcp.present, meta: desktopMcp.present ? `${desktopMcp.command || "claude-code-proxy"} ${Array.isArray(desktopMcp.args) ? desktopMcp.args.join(" ") : ""}` : (desktopMcp.exists ? `${desktopMcp.server_count || 0} local servers · antigravity-browser not injected` : "desktop config not found") },
     { label: "Visible control", ok: !!status?.visible_overlay, meta: bridgeState?.connected_now ? `connected · ${bridgeState.last_action || "ready"}` : "cursor overlay tools ready when Claude starts MCP" },
   ];
 
@@ -457,7 +457,7 @@ const BrowserBridge = () => {
         <div className="grid-2">
           <div>
             <div className="txt-3" style={{fontSize:10.5, textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:6}}>Launcher</div>
-            <CodeBox lang="PowerShell" code={launcher}/>
+            <CodeBox lang="Shell" code={launcher}/>
           </div>
           <div className="kv" style={{ gridTemplateColumns: "130px 1fr", rowGap: 8 }}>
             <div className="k">Mode</div>
@@ -490,7 +490,7 @@ function prettyProbe(value) {
 
 const Setup = () => {
   const { data: status } = usePolling("/ui/api/status", 3000);
-  const launcher = `C:\\Users\\hrash\\Documents\\claude-code-proxy\\start-claude-code.ps1`;
+  const launcher = status?.launcher_commands?.launch_claude || "claude-code-proxy launch-claude";
   const rootUrl = status?.local_url || "http://127.0.0.1:4000";
   const baseUrl = status?.anthropic_url || `${rootUrl}/anthropic`;
   const openAIBaseUrl = status?.openai_url || `${rootUrl}/openai/v1`;
@@ -520,7 +520,10 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export API_TIMEOUT_MS=3000000
 claude --model gpt-5.3-codex`;
 
-  const [shell, setShell] = useState2("powershell");
+  const [shell, setShell] = useState2("auto");
+  const activeShell = shell === "auto" ? (status?.goos === "windows" ? "powershell" : "bash") : shell;
+  const desktopSupported = status?.desktop_supported !== false;
+  const desktopOk = desktopSupported ? !!status?.antigravity?.mcp?.desktop?.present : true;
 
   const checks = [
     { ok: "ok",   label: `Proxy is running and bound to ${baseUrl.replace("http://", "")}`,     meta: `PID ${status?.pid || "—"}` },
@@ -528,7 +531,7 @@ claude --model gpt-5.3-codex`;
     { ok: "ok",   label: "GET /anthropic/v1/models returns 4 entries",                         meta: "200 · 4 ms" },
     { ok: "ok",   label: "POST /anthropic/v1/messages succeeds against gpt-5.3-codex",         meta: "200 · 1.28 s" },
     { ok: status?.claude_settings?.mode === "anthropic_auth_token" && !status?.claude_settings?.api_key_present ? "ok" : "warn", label: "Claude settings use ANTHROPIC_AUTH_TOKEN", meta: `api key ${status?.claude_settings?.api_key_present ? "present" : "absent"} · cache ${status?.claude_settings?.gateway_cache_present ? "present" : "absent"}` },
-    { ok: status?.antigravity?.mcp?.present && status?.antigravity?.mcp?.desktop?.present ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: `Code ${status?.antigravity?.mcp?.present ? "ready" : "missing"} · Desktop ${status?.antigravity?.mcp?.desktop?.present ? "ready" : "missing"}` },
+    { ok: status?.antigravity?.mcp?.present && desktopOk ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: `Code ${status?.antigravity?.mcp?.present ? "ready" : "missing"} · Desktop ${desktopSupported ? (status?.antigravity?.mcp?.desktop?.present ? "ready" : "missing") : "not supported on this platform"}` },
     { ok: status?.antigravity?.ready ? "ok" : "warn", label: "Antigravity browser bridge ready", meta: status?.antigravity?.extension?.exists ? `extension ${status?.antigravity?.extension?.manifest?.version || "installed"}` : "extension not found" },
     { ok: status?.claude_version ? "ok" : "warn", label: "Claude Code CLI detected on PATH",   meta: status?.claude_version || "not detected" },
   ];
@@ -548,9 +551,9 @@ claude --model gpt-5.3-codex`;
               <h3>Run the launcher</h3>
               <p>The launcher exports the right environment variables and starts Claude Code with the recommended model.</p>
               <CodeBox
-                lang="PowerShell"
+                lang="Shell"
                 code={launcher}
-                hint="Right-click → Run with PowerShell. Or invoke from a terminal."
+                hint="Run from a terminal in this project folder."
               />
             </div>
           </div>
@@ -570,14 +573,14 @@ claude --model gpt-5.3-codex`;
 
         <Card title="Manual setup · environment variables" actions={
           <div className="seg">
-            <button aria-pressed={shell === "powershell"} onClick={() => setShell("powershell")}>PowerShell</button>
-            <button aria-pressed={shell === "bash"} onClick={() => setShell("bash")}>bash · zsh</button>
-            <button aria-pressed={shell === "env"} onClick={() => setShell("env")}>.env</button>
+            <button aria-pressed={activeShell === "powershell"} onClick={() => setShell("powershell")}>PowerShell</button>
+            <button aria-pressed={activeShell === "bash"} onClick={() => setShell("bash")}>bash · zsh</button>
+            <button aria-pressed={activeShell === "env"} onClick={() => setShell("env")}>.env</button>
           </div>
         }>
-          {shell === "env" && <CodeBox lang=".env" code={env}/>}
-          {shell === "powershell" && <CodeBox lang="PowerShell" code={psh}/>}
-          {shell === "bash" && <CodeBox lang="bash" code={bash}/>}
+          {activeShell === "env" && <CodeBox lang=".env" code={env}/>}
+          {activeShell === "powershell" && <CodeBox lang="PowerShell" code={psh}/>}
+          {activeShell === "bash" && <CodeBox lang="bash" code={bash}/>}
           <p className="txt-2" style={{ fontSize: 11.5, marginTop: 10 }}>
             <Icon name="info" size={11} style={{ color: "var(--accent)", verticalAlign: "-1px", marginRight: 4 }}/>
             <span className="mono" style={{color:"var(--fg-1)"}}>ANTHROPIC_AUTH_TOKEN</span> is the local proxy token, not your Anthropic billing key. It never leaves your machine.
