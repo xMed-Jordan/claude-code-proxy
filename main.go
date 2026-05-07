@@ -2808,7 +2808,44 @@ func functionArgumentsToInput(arguments string) any {
 	if _, ok := input.(map[string]any); !ok {
 		return map[string]any{"value": input}
 	}
-	return input
+	return cleanClaudeToolInput(input)
+}
+
+func cleanClaudeToolInput(input any) any {
+	switch v := input.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, value := range v {
+			if strings.EqualFold(key, "pages") && emptyClaudeToolArgument(value) {
+				continue
+			}
+			out[key] = cleanClaudeToolInput(value)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, cleanClaudeToolInput(item))
+		}
+		return out
+	default:
+		return input
+	}
+}
+
+func emptyClaudeToolArgument(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	case map[string]any:
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 func anthropicStopReason(content []any) string {
@@ -3422,8 +3459,7 @@ func toAnthropicResponse(resp openAIResponse, requestedModel string) map[string]
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 		for _, tc := range choice.Message.ToolCalls {
-			var input any = map[string]any{}
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			input := functionArgumentsToInput(tc.Function.Arguments)
 			content = append(content, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input})
 		}
 	}

@@ -13,6 +13,22 @@ import (
 	"testing"
 )
 
+func anthropicToolUseBlock(t *testing.T, out map[string]any) map[string]any {
+	t.Helper()
+	content, ok := out["content"].([]any)
+	if !ok {
+		t.Fatalf("content = %#v, want []any", out["content"])
+	}
+	for _, item := range content {
+		block, ok := item.(map[string]any)
+		if ok && block["type"] == "tool_use" {
+			return block
+		}
+	}
+	t.Fatalf("tool_use block missing: %#v", content)
+	return nil
+}
+
 func TestAnthropicResponsesTextPreservesRequestedModel(t *testing.T) {
 	resp := responsesResponse{
 		ID:     "resp_test",
@@ -43,24 +59,44 @@ func TestResponsesFunctionCallConvertsToAnthropicToolUse(t *testing.T) {
 	if out["stop_reason"] != "tool_use" {
 		t.Fatalf("stop_reason = %v, want tool_use", out["stop_reason"])
 	}
-	content := out["content"].([]any)
-	var block map[string]any
-	for _, item := range content {
-		candidate := item.(map[string]any)
-		if candidate["type"] == "tool_use" {
-			block = candidate
-			break
-		}
-	}
-	if block == nil {
-		t.Fatalf("tool_use block missing: %#v", content)
-	}
+	block := anthropicToolUseBlock(t, out)
 	if block["type"] != "tool_use" || block["id"] != "call_1" || block["name"] != "read_file" {
 		t.Fatalf("tool block = %#v", block)
 	}
 	input := block["input"].(map[string]any)
 	if input["path"] != `C:\tmp\x.txt` {
 		t.Fatalf("input path = %v", input["path"])
+	}
+}
+
+func TestResponsesFunctionCallDropsEmptyPagesArgument(t *testing.T) {
+	resp := responsesResponse{
+		ID:     "resp_test",
+		Model:  "gpt-5.5",
+		Output: []responsesOutputItem{{Type: "function_call", ID: "fc_1", CallID: "call_1", Name: "Read", Arguments: `{"file_path":"C:\\tmp\\x.php","pages":"","limit":200}`}},
+	}
+	out := toAnthropicResponsesResponse(resp, "opus[1m]")
+	block := anthropicToolUseBlock(t, out)
+	input := block["input"].(map[string]any)
+	if _, ok := input["pages"]; ok {
+		t.Fatalf("pages argument was not removed: %#v", input)
+	}
+	if input["file_path"] != `C:\tmp\x.php` {
+		t.Fatalf("file_path = %v", input["file_path"])
+	}
+}
+
+func TestResponsesFunctionCallPreservesNonEmptyPagesArgument(t *testing.T) {
+	resp := responsesResponse{
+		ID:     "resp_test",
+		Model:  "gpt-5.5",
+		Output: []responsesOutputItem{{Type: "function_call", ID: "fc_1", CallID: "call_1", Name: "Read", Arguments: `{"file_path":"C:\\tmp\\x.pdf","pages":"1-2"}`}},
+	}
+	out := toAnthropicResponsesResponse(resp, "opus[1m]")
+	block := anthropicToolUseBlock(t, out)
+	input := block["input"].(map[string]any)
+	if input["pages"] != "1-2" {
+		t.Fatalf("pages = %v, want 1-2", input["pages"])
 	}
 }
 
