@@ -17,6 +17,7 @@
 .antigravity-browser.pid
 .antigravity-browser-state.json
 .antigravity-browser-profile/
+.antigravity-screenshots/
 .claude-worktrees/
 *.log
 

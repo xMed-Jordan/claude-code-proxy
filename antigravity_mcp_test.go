@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAntigravityMCPToolsExposeVisibleControls(t *testing.T) {
 	tools := antigravityMCPTools()
@@ -78,5 +81,33 @@ func TestDefaultRelaunchRequiresExplicitForce(t *testing.T) {
 	t.Setenv("ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "1")
 	if !canRelaunchDefaultChromeFrom(processes) {
 		t.Fatal("forced Default Chrome relaunch should allow safe Chrome windows")
+	}
+}
+
+func TestBrowserScreenshotDefaultsToFileResult(t *testing.T) {
+	tools := antigravityMCPTools()
+	for _, tool := range tools {
+		if tool.Name != "browser_screenshot" {
+			continue
+		}
+		props, ok := tool.InputSchema["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("browser_screenshot schema missing properties: %#v", tool.InputSchema)
+		}
+		if _, ok := props["include_image"]; !ok {
+			t.Fatal("browser_screenshot should expose include_image opt-in")
+		}
+		if !strings.Contains(tool.Description, "save") {
+			t.Fatalf("browser_screenshot description should mention saving to a file: %q", tool.Description)
+		}
+		return
+	}
+	t.Fatal("browser_screenshot tool missing")
+}
+
+func TestSanitizeFilePart(t *testing.T) {
+	got := sanitizeFilePart("www.shalabi-clinics.com")
+	if got != "www-shalabi-clinics-com" {
+		t.Fatalf("sanitizeFilePart = %q", got)
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -23,11 +24,12 @@ import (
 )
 
 const (
-	antigravityMCPName      = "antigravity-browser"
-	antigravityMCPVersion   = "0.2.0"
-	antigravityStateFile    = ".antigravity-browser-state.json"
-	antigravityOverlayID    = "ccp-visible-cursor"
-	defaultBrowserWaitLimit = 15 * time.Second
+	antigravityMCPName       = "antigravity-browser"
+	antigravityMCPVersion    = "0.2.0"
+	antigravityStateFile     = ".antigravity-browser-state.json"
+	antigravityOverlayID     = "ccp-visible-cursor"
+	antigravityScreenshotDir = ".antigravity-screenshots"
+	defaultBrowserWaitLimit  = 15 * time.Second
 )
 
 type mcpEnvelope struct {
@@ -70,16 +72,17 @@ type cdpClient struct {
 }
 
 type antigravityBrowserState struct {
-	UpdatedAt    string `json:"updated_at"`
-	PID          int    `json:"pid"`
-	Mode         string `json:"mode"`
-	BrowserURL   string `json:"browser_url"`
-	Connected    bool   `json:"connected"`
-	CurrentURL   string `json:"current_url"`
-	CurrentTitle string `json:"current_title"`
-	LastTool     string `json:"last_tool"`
-	LastAction   string `json:"last_action"`
-	LastError    string `json:"last_error"`
+	UpdatedAt      string `json:"updated_at"`
+	PID            int    `json:"pid"`
+	Mode           string `json:"mode"`
+	BrowserURL     string `json:"browser_url"`
+	Connected      bool   `json:"connected"`
+	CurrentURL     string `json:"current_url"`
+	CurrentTitle   string `json:"current_title"`
+	LastTool       string `json:"last_tool"`
+	LastAction     string `json:"last_action"`
+	LastError      string `json:"last_error"`
+	LastScreenshot string `json:"last_screenshot,omitempty"`
 }
 
 type chromeProcessInfo struct {
@@ -235,8 +238,10 @@ func antigravityMCPTools() []mcpTool {
 		},
 		{
 			Name:        "browser_screenshot",
-			Description: "Take a screenshot of the active Chrome page.",
-			InputSchema: objectSchema(nil, nil),
+			Description: "Take a screenshot of the active Chrome page and save it to a local PNG file. Inline image data is omitted by default to keep Claude Code responsive.",
+			InputSchema: objectSchema(map[string]any{
+				"include_image": map[string]any{"type": "boolean", "description": "Also return inline PNG image data. Defaults to false."},
+			}, nil),
 		},
 		{
 			Name:        "browser_move",
@@ -326,7 +331,7 @@ func callAntigravityTool(ctx context.Context, name string, args map[string]any) 
 	case "browser_snapshot":
 		result, err = toolBrowserSnapshot(ctx, intArg(args, "max_text_chars", 6000))
 	case "browser_screenshot":
-		result, err = toolBrowserScreenshot(ctx)
+		result, err = toolBrowserScreenshot(ctx, boolArg(args, "include_image", false))
 	case "browser_move":
 		result, err = toolBrowserMove(ctx, args)
 	case "browser_click":
@@ -431,7 +436,7 @@ func toolBrowserSnapshot(ctx context.Context, maxTextChars int) (mcpToolResult, 
 	return textToolResult(jsonText(value)), nil
 }
 
-func toolBrowserScreenshot(ctx context.Context) (mcpToolResult, error) {
+func toolBrowserScreenshot(ctx context.Context, includeImage bool) (mcpToolResult, error) {
 	client, err := newCDPClient(ctx)
 	if err != nil {
 		return mcpToolResult{}, err
@@ -453,11 +458,25 @@ func toolBrowserScreenshot(ctx context.Context) (mcpToolResult, error) {
 		return mcpToolResult{}, errors.New("Chrome returned an empty screenshot")
 	}
 	page := client.pageInfo(ctx)
-	writeAntigravityBrowserStateFromPage("browser_screenshot", "captured screenshot", client.baseURL, page, "")
-	return mcpToolResult{Content: []map[string]any{
-		{"type": "text", "text": "Screenshot captured from " + stringFromMap(page, "url")},
-		{"type": "image", "data": data, "mimeType": "image/png"},
-	}}, nil
+	screenshotPath, byteCount, err := saveScreenshotPNG(data, page)
+	if err != nil {
+		return mcpToolResult{}, err
+	}
+	writeAntigravityBrowserScreenshotState(client.baseURL, page, screenshotPath, "")
+	content := []map[string]any{
+		{"type": "text", "text": jsonText(map[string]any{
+			"ok":              true,
+			"url":             stringFromMap(page, "url"),
+			"title":           stringFromMap(page, "title"),
+			"screenshot_path": screenshotPath,
+			"bytes":           byteCount,
+			"inline_image":    includeImage,
+		})},
+	}
+	if includeImage {
+		content = append(content, map[string]any{"type": "image", "data": data, "mimeType": "image/png"})
+	}
+	return mcpToolResult{Content: content}, nil
 }
 
 func toolBrowserMove(ctx context.Context, args map[string]any) (mcpToolResult, error) {
@@ -1299,6 +1318,49 @@ func stringFromMap(value map[string]any, key string) string {
 	return fmt.Sprint(value[key])
 }
 
+func saveScreenshotPNG(data string, page map[string]any) (string, int, error) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return "", 0, fmt.Errorf("could not decode Chrome screenshot: %w", err)
+	}
+	dir := filepath.Join(mustGetwd(), antigravityScreenshotDir)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", 0, fmt.Errorf("could not create screenshot folder: %w", err)
+	}
+	host := "page"
+	if parsed, err := url.Parse(stringFromMap(page, "url")); err == nil && strings.TrimSpace(parsed.Hostname()) != "" {
+		host = parsed.Hostname()
+	}
+	name := sanitizeFilePart(host)
+	if name == "" {
+		name = "page"
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s-%d.png", name, time.Now().Format("20060102-150405"), time.Now().UnixNano()%1000000))
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		return "", 0, fmt.Errorf("could not write screenshot: %w", err)
+	}
+	return path, len(raw), nil
+}
+
+func sanitizeFilePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 func chunkString(value string, size int) []string {
 	if size <= 0 || len(value) <= size {
 		return []string{value}
@@ -1327,6 +1389,23 @@ func writeAntigravityBrowserStateFromPage(tool string, action string, browserURL
 		LastAction:   action,
 		LastError:    lastError,
 	})
+}
+
+func writeAntigravityBrowserScreenshotState(browserURL string, page map[string]any, screenshotPath string, lastError string) {
+	state := antigravityBrowserState{
+		UpdatedAt:      time.Now().Format(time.RFC3339),
+		PID:            os.Getpid(),
+		Mode:           antigravityBrowserMode(),
+		BrowserURL:     browserURL,
+		Connected:      true,
+		CurrentURL:     stringFromMap(page, "url"),
+		CurrentTitle:   stringFromMap(page, "title"),
+		LastTool:       "browser_screenshot",
+		LastAction:     "saved screenshot",
+		LastError:      lastError,
+		LastScreenshot: screenshotPath,
+	}
+	writeAntigravityBrowserState(state)
 }
 
 func writeAntigravityBrowserState(state antigravityBrowserState) {

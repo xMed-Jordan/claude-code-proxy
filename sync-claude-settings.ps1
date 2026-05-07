@@ -197,13 +197,16 @@ $browserMemoryStart
 
 When a user asks to open a website, browse, search in a browser, inspect a page, click, type into a web page, or take a screenshot, use the antigravity-browser MCP tools first.
 
-Prefer these tools over PowerShell, Node, Python, browser CLI commands, or generic command-line discovery for browser tasks:
+Do not use PowerShell, Node, Python, browser CLI commands, headless Chrome, Playwright, or generic command-line discovery for browser tasks before trying antigravity-browser.
+
+Use these tools in this order for browser work:
+- antigravity-browser browser_status only to check availability; it is passive and does not open Chrome.
 - antigravity-browser browser_navigate for opening URLs and search pages.
 - antigravity-browser browser_snapshot for reading page text and finding elements.
 - antigravity-browser browser_move, browser_click, browser_type, and browser_press_key for visible browser actions.
-- antigravity-browser browser_screenshot for screenshots.
+- antigravity-browser browser_screenshot for screenshots. It returns a local PNG path by default; report that path to the user.
 
-Use shell commands for browser tasks only when antigravity-browser is unavailable or explicitly fails, and explain that fallback clearly.
+Use shell commands for browser tasks only when antigravity-browser is unavailable or explicitly fails after being tried, and explain that fallback clearly.
 $browserMemoryEnd
 "@
 

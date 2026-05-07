@@ -80,7 +80,7 @@ Set `ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1` only for older or custom Chrome bu
 
 Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. Claude Code launches the stdio MCP process itself; proxy startup normally only prepares the settings and does not open Chrome.
 
-Normal proxy start, dashboard checks, tests, and the `browser_status` MCP tool are passive and do not open Chrome. Set `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY=1` only if you explicitly want proxy startup to open the controlled browser ahead of the first Claude Code browser action.
+Normal proxy start, dashboard checks, tests, and the `browser_status` MCP tool are passive and do not open Chrome. Set `ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY=1` only if you explicitly want proxy startup to open the controlled browser ahead of the first Claude Code browser action. `browser_screenshot` saves PNG files under `.antigravity-screenshots` and returns the local path by default; inline image data is opt-in with `include_image=true`.
 
 Optional overrides:
 
