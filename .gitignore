@@ -9,6 +9,7 @@
 .proxy.err.log
 .proxy.trace.log
 .proxy.trace.log.old
+.proxy.sessions.json
 *.log
 
 # Build outputs

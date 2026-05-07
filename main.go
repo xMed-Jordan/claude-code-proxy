@@ -43,16 +43,17 @@ const (
 )
 
 type config struct {
-	OpenAIAPIKey    string
-	OpenAIBaseURL   string
-	Upstream        string
-	CodexBaseURL    string
-	CodexAuthFile   string
-	ProxyKey        string
-	Port            string
-	Models          map[string]string
-	ClaudeDefaults  map[string]string
-	ReasoningEffort string
+	OpenAIAPIKey     string
+	OpenAIBaseURL    string
+	Upstream         string
+	CodexBaseURL     string
+	CodexAuthFile    string
+	CodexSessionFile string
+	ProxyKey         string
+	Port             string
+	Models           map[string]string
+	ClaudeDefaults   map[string]string
+	ReasoningEffort  string
 }
 
 type codexAuthFile struct {
@@ -182,15 +183,16 @@ type openAIChatCompletion struct {
 }
 
 type responsesRequest struct {
-	Model        string              `json:"model"`
-	Instructions string              `json:"instructions,omitempty"`
-	Input        []any               `json:"input"`
-	Tools        []responsesTool     `json:"tools,omitempty"`
-	Reasoning    *responsesReasoning `json:"reasoning,omitempty"`
-	Temperature  *float64            `json:"temperature,omitempty"`
-	ServiceTier  string              `json:"service_tier,omitempty"`
-	Stream       bool                `json:"stream,omitempty"`
-	Store        bool                `json:"store"`
+	Model          string              `json:"model"`
+	Instructions   string              `json:"instructions,omitempty"`
+	Input          []any               `json:"input"`
+	Tools          []responsesTool     `json:"tools,omitempty"`
+	Reasoning      *responsesReasoning `json:"reasoning,omitempty"`
+	Temperature    *float64            `json:"temperature,omitempty"`
+	ServiceTier    string              `json:"service_tier,omitempty"`
+	PromptCacheKey string              `json:"prompt_cache_key,omitempty"`
+	Stream         bool                `json:"stream,omitempty"`
+	Store          bool                `json:"store"`
 }
 
 type responsesReasoning struct {
@@ -346,14 +348,15 @@ func loadConfig() config {
 		codexAuthFile = filepath.Join(os.Getenv("USERPROFILE"), ".codex", "auth.json")
 	}
 	return config{
-		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:   baseURL,
-		Upstream:        strings.ToLower(getenv("UPSTREAM", "codex")),
-		CodexBaseURL:    strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
-		CodexAuthFile:   codexAuthFile,
-		ProxyKey:        getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
-		Port:            port,
-		ReasoningEffort: normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
+		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:    baseURL,
+		Upstream:         strings.ToLower(getenv("UPSTREAM", "codex")),
+		CodexBaseURL:     strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
+		CodexAuthFile:    codexAuthFile,
+		CodexSessionFile: getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
+		ProxyKey:         getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
+		Port:             port,
+		ReasoningEffort:  normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
 		ClaudeDefaults: map[string]string{
 			"opus":   getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7[1m]"),
 			"sonnet": getenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6[1m]"),
@@ -566,11 +569,21 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		if cfg.Upstream == "codex" {
 			responsesReq := toResponses(cfg, in)
+			session := configureCodexSession(cfg, r, rawBody, in, &responsesReq)
+			if session.Enabled {
+				traceLogID(traceID, "codex.session", summarizeCodexSession(session))
+			}
 			traceLogID(traceID, "codex.prepared", summarizeResponsesRequest(responsesReq))
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: responsesReq.Model, Stream: in.Stream})
 			note := requestNote(in.Model, responsesReq.Model, in.Stream, requestReasoningEffort(cfg, in))
 			if responsesReq.ServiceTier != "" {
 				note += " service_tier=" + responsesReq.ServiceTier
+			}
+			if session.Enabled {
+				note += " flow=" + session.FlowHash + " codex_session=" + session.CodexSessionID
+				if session.SideThread {
+					note += " side_thread=" + session.SideThreadKind
+				}
 			}
 			setRequestNote(r, note+" trace="+traceID)
 			if in.Stream {
@@ -719,6 +732,214 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		out.Input = append(out.Input, convertAnthropicMessageToResponses(role, msg.Content)...)
 	}
 	return out
+}
+
+type codexSessionInfo struct {
+	Enabled        bool
+	FlowID         string
+	FlowHash       string
+	FlowSource     string
+	RegistryKey    string
+	CodexSessionID string
+	PromptCacheKey string
+	SideThread     bool
+	SideThreadKind string
+}
+
+type codexSessionRegistry struct {
+	Version   int                           `json:"version"`
+	UpdatedAt string                        `json:"updated_at"`
+	Sessions  map[string]codexSessionRecord `json:"sessions"`
+}
+
+type codexSessionRecord struct {
+	CodexSessionID string `json:"codex_session_id"`
+	FlowHash       string `json:"flow_hash"`
+	FlowSource     string `json:"flow_source"`
+	SideThread     bool   `json:"side_thread"`
+	SideThreadKind string `json:"side_thread_kind,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+	RequestCount   int    `json:"request_count"`
+}
+
+var codexSessionMu sync.Mutex
+
+func configureCodexSession(cfg config, r *http.Request, rawBody []byte, in anthropicRequest, out *responsesRequest) codexSessionInfo {
+	if !codexSessionIsolationEnabled() {
+		return codexSessionInfo{}
+	}
+	flowID, source := extractClaudeFlowID(r, rawBody, in)
+	flowHash := hashString(flowID)[:16]
+	sideThread, sideKind := detectOneShotClaudeRequest(in)
+	registryKey := flowHash
+	if sideThread {
+		bodyHash := hashString(string(rawBody))[:16]
+		registryKey = flowHash + ":one-shot:" + firstNonEmpty(sideKind, "request") + ":" + bodyHash
+	}
+	sessionID := stableCodexSessionID(registryKey)
+	info := codexSessionInfo{
+		Enabled:        true,
+		FlowID:         flowID,
+		FlowHash:       flowHash,
+		FlowSource:     source,
+		RegistryKey:    registryKey,
+		CodexSessionID: sessionID,
+		SideThread:     sideThread,
+		SideThreadKind: sideKind,
+	}
+	if codexPromptCacheKeyEnabled() {
+		out.PromptCacheKey = sessionID
+		info.PromptCacheKey = sessionID
+	}
+	recordCodexSession(cfg, info)
+	return info
+}
+
+func codexSessionIsolationEnabled() bool {
+	return envFlag("CODEX_SESSION_ISOLATION", true)
+}
+
+func codexPromptCacheKeyEnabled() bool {
+	return envFlag("CODEX_PROMPT_CACHE_KEY", true)
+}
+
+func envFlag(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func extractClaudeFlowID(r *http.Request, rawBody []byte, in anthropicRequest) (string, string) {
+	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Claude-Session-Id", "X-Session-Id"} {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value, strings.ToLower(name)
+		}
+	}
+	seed := strings.Join([]string{
+		r.Header.Get("User-Agent"),
+		r.Header.Get("X-App"),
+		truncateString(latestUserText(in), 4096),
+		truncateString(string(rawBody), 4096),
+	}, "|")
+	return "fallback:" + hashString(seed), "fallback_request_hash"
+}
+
+func detectOneShotClaudeRequest(in anthropicRequest) (bool, string) {
+	text := strings.ToLower(latestUserText(in))
+	switch {
+	case strings.Contains(text, "<command-name>/btw</command-name>") || strings.HasPrefix(strings.TrimSpace(text), "/btw") || strings.Contains(text, "\n/btw"):
+		return true, "btw"
+	case strings.Contains(text, "this session is being continued from a previous conversation that ran out of context"):
+		return true, "compact"
+	case strings.Contains(text, "compact summary") || strings.Contains(text, "conversation compacted"):
+		return true, "compact"
+	case strings.Contains(text, "critical: respond with text only") && strings.Contains(text, "do not call any tools"):
+		return true, "one-shot"
+	default:
+		return false, ""
+	}
+}
+
+func latestUserText(in anthropicRequest) string {
+	for i := len(in.Messages) - 1; i >= 0; i-- {
+		if in.Messages[i].Role != "user" {
+			continue
+		}
+		if blocks, ok := in.Messages[i].Content.([]any); ok {
+			for j := len(blocks) - 1; j >= 0; j-- {
+				m, ok := blocks[j].(map[string]any)
+				if !ok || fmt.Sprint(m["type"]) != "text" {
+					continue
+				}
+				if text := strings.TrimSpace(fmt.Sprint(m["text"])); text != "" {
+					return text
+				}
+			}
+		}
+		return contentToText(in.Messages[i].Content)
+	}
+	return ""
+}
+
+func stableCodexSessionID(registryKey string) string {
+	return "ccp_" + hashString(registryKey)[:32]
+}
+
+func hashString(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func recordCodexSession(cfg config, info codexSessionInfo) {
+	path := codexSessionFilePath(cfg)
+	now := time.Now().Format(time.RFC3339)
+	codexSessionMu.Lock()
+	defer codexSessionMu.Unlock()
+	registry := readCodexSessionRegistry(path)
+	if registry.Version == 0 {
+		registry.Version = 1
+	}
+	if registry.Sessions == nil {
+		registry.Sessions = map[string]codexSessionRecord{}
+	}
+	record := registry.Sessions[info.RegistryKey]
+	if record.CreatedAt == "" {
+		record.CreatedAt = now
+	}
+	record.CodexSessionID = info.CodexSessionID
+	record.FlowHash = info.FlowHash
+	record.FlowSource = info.FlowSource
+	record.SideThread = info.SideThread
+	record.SideThreadKind = info.SideThreadKind
+	record.UpdatedAt = now
+	record.RequestCount++
+	registry.Sessions[info.RegistryKey] = record
+	registry.UpdatedAt = now
+	if err := writeCodexSessionRegistry(path, registry); err != nil {
+		traceLogID("", "codex.session_write_error", map[string]any{"path": path, "error": err.Error()})
+	}
+}
+
+func readCodexSessionRegistry(path string) codexSessionRegistry {
+	var registry codexSessionRegistry
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return registry
+	}
+	if err := json.Unmarshal(raw, &registry); err != nil {
+		return codexSessionRegistry{}
+	}
+	return registry
+}
+
+func writeCodexSessionRegistry(path string, registry codexSessionRegistry) error {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+	}
+	raw, err := json.MarshalIndent(registry, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0600)
+}
+
+func codexSessionFilePath(cfg config) string {
+	if filepath.IsAbs(cfg.CodexSessionFile) {
+		return cfg.CodexSessionFile
+	}
+	return filepath.Clean(cfg.CodexSessionFile)
 }
 
 func requestUsesClaudeFastMode(r *http.Request, in anthropicRequest) bool {
@@ -993,6 +1214,10 @@ func retryCodexRequestAfter400(out responsesRequest, status int, msg string) (co
 	if out.ServiceTier != "" && strings.Contains(lower, "service_tier") {
 		out.ServiceTier = ""
 		return codexRetryRequest{reason: "service_tier_not_accepted", request: out}, true
+	}
+	if out.PromptCacheKey != "" && strings.Contains(lower, "prompt_cache_key") {
+		out.PromptCacheKey = ""
+		return codexRetryRequest{reason: "prompt_cache_key_not_accepted", request: out}, true
 	}
 	return codexRetryRequest{}, false
 }
@@ -2016,7 +2241,21 @@ func summarizeResponsesRequest(out responsesRequest) map[string]any {
 		"reasoning_effort":   effort,
 		"reasoning_summary":  summary,
 		"service_tier":       out.ServiceTier,
+		"prompt_cache_key":   out.PromptCacheKey,
 		"temperature":        out.Temperature,
+	}
+}
+
+func summarizeCodexSession(info codexSessionInfo) map[string]any {
+	return map[string]any{
+		"enabled":          info.Enabled,
+		"flow_hash":        info.FlowHash,
+		"flow_source":      info.FlowSource,
+		"registry_key":     info.RegistryKey,
+		"codex_session_id": info.CodexSessionID,
+		"prompt_cache_key": info.PromptCacheKey,
+		"side_thread":      info.SideThread,
+		"side_thread_kind": info.SideThreadKind,
 	}
 }
 
@@ -2149,6 +2388,7 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"port":             cfg.Port,
 			"upstream":         cfg.Upstream,
 			"codex_auth":       auth,
+			"codex_sessions":   codexSessionMetadata(cfg),
 			"claude_settings":  claudeSettingsMetadata(cfg),
 			"dashboard":        dashboardMetrics(),
 			"models":           modelRows(cfg),
@@ -2158,6 +2398,33 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"proxy_key_masked": maskSecret(cfg.ProxyKey),
 		})
 	}
+}
+
+func codexSessionMetadata(cfg config) map[string]any {
+	path := codexSessionFilePath(cfg)
+	info := map[string]any{
+		"enabled":                  codexSessionIsolationEnabled(),
+		"prompt_cache_key_enabled": codexPromptCacheKeyEnabled(),
+		"path":                     path,
+		"exists":                   false,
+		"count":                    0,
+		"updated_at":               "",
+	}
+	registry := readCodexSessionRegistry(path)
+	if registry.Version == 0 {
+		return info
+	}
+	info["exists"] = true
+	info["count"] = len(registry.Sessions)
+	info["updated_at"] = registry.UpdatedAt
+	sideThreads := 0
+	for _, record := range registry.Sessions {
+		if record.SideThread {
+			sideThreads++
+		}
+	}
+	info["side_thread_count"] = sideThreads
+	return info
 }
 
 func claudeSettingsMetadata(cfg config) map[string]any {

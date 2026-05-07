@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -289,5 +291,102 @@ func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
 	}
 	if got := reasoningSummaryText(resp.Output[0]); got != "Checked the fix." {
 		t.Fatalf("reasoning summary = %q, want Checked the fix.", got)
+	}
+}
+
+func TestCodexSessionKeyStablePerClaudeFlow(t *testing.T) {
+	t.Setenv("CODEX_SESSION_ISOLATION", "1")
+	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")
+	cfg := config{CodexSessionFile: filepath.Join(t.TempDir(), "sessions.json")}
+	in := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+
+	first := responsesRequest{}
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	firstInfo := configureCodexSession(cfg, firstReq, body, in, &first)
+
+	second := responsesRequest{}
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	secondInfo := configureCodexSession(cfg, secondReq, body, in, &second)
+
+	if first.PromptCacheKey == "" {
+		t.Fatal("prompt_cache_key was not assigned")
+	}
+	if first.PromptCacheKey != second.PromptCacheKey {
+		t.Fatalf("prompt cache keys differ: %q vs %q", first.PromptCacheKey, second.PromptCacheKey)
+	}
+	if firstInfo.FlowHash != secondInfo.FlowHash || firstInfo.CodexSessionID != secondInfo.CodexSessionID {
+		t.Fatalf("session info did not stay stable: %#v %#v", firstInfo, secondInfo)
+	}
+}
+
+func TestCodexSessionKeyDifferentPerClaudeFlow(t *testing.T) {
+	t.Setenv("CODEX_SESSION_ISOLATION", "1")
+	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")
+	cfg := config{CodexSessionFile: filepath.Join(t.TempDir(), "sessions.json")}
+	in := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+
+	first := responsesRequest{}
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	configureCodexSession(cfg, firstReq, body, in, &first)
+
+	second := responsesRequest{}
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-b")
+	configureCodexSession(cfg, secondReq, body, in, &second)
+
+	if first.PromptCacheKey == second.PromptCacheKey {
+		t.Fatalf("different flows shared prompt_cache_key %q", first.PromptCacheKey)
+	}
+}
+
+func TestCodexSideThreadGetsChildSession(t *testing.T) {
+	t.Setenv("CODEX_SESSION_ISOLATION", "1")
+	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")
+	cfg := config{CodexSessionFile: filepath.Join(t.TempDir(), "sessions.json")}
+	normal := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}}}}
+	side := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "older context"},
+		map[string]any{"type": "text", "text": "/btw how are you"},
+	}}}}
+	normalBody := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	sideBody := []byte(`{"messages":[{"role":"user","content":"/btw how are you"}]}`)
+
+	normalOut := responsesRequest{}
+	normalReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(normalBody))
+	normalReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	normalInfo := configureCodexSession(cfg, normalReq, normalBody, normal, &normalOut)
+
+	sideOut := responsesRequest{}
+	sideReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(sideBody))
+	sideReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	sideInfo := configureCodexSession(cfg, sideReq, sideBody, side, &sideOut)
+
+	if !sideInfo.SideThread || sideInfo.SideThreadKind != "btw" {
+		t.Fatalf("side thread not detected: %#v", sideInfo)
+	}
+	if normalInfo.FlowHash != sideInfo.FlowHash {
+		t.Fatalf("child session should keep parent flow hash: normal=%#v side=%#v", normalInfo, sideInfo)
+	}
+	if normalOut.PromptCacheKey == sideOut.PromptCacheKey {
+		t.Fatalf("side thread shared parent prompt_cache_key %q", sideOut.PromptCacheKey)
+	}
+}
+
+func TestRetryRemovesPromptCacheKeyWhenRejected(t *testing.T) {
+	out := responsesRequest{PromptCacheKey: "ccp_test"}
+	retry, ok := retryCodexRequestAfter400(out, http.StatusBadRequest, `{"error":{"message":"Unknown parameter: 'prompt_cache_key'."}}`)
+	if !ok {
+		t.Fatal("retry was not requested")
+	}
+	if retry.reason != "prompt_cache_key_not_accepted" {
+		t.Fatalf("retry reason = %q", retry.reason)
+	}
+	if retry.request.PromptCacheKey != "" {
+		t.Fatalf("prompt_cache_key still set: %#v", retry.request)
 	}
 }
