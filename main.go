@@ -69,7 +69,9 @@ type anthropicRequest struct {
 	Tools        []anthropicTool        `json:"tools,omitempty"`
 	Temperature  *float64               `json:"temperature,omitempty"`
 	Stream       bool                   `json:"stream,omitempty"`
+	Speed        string                 `json:"speed,omitempty"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+	FastMode     bool                   `json:"-"`
 }
 
 type anthropicOutputConfig struct {
@@ -82,9 +84,14 @@ type anthropicMessage struct {
 }
 
 type anthropicTool struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	InputSchema any    `json:"input_schema,omitempty"`
+	Type           string   `json:"type,omitempty"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description,omitempty"`
+	InputSchema    any      `json:"input_schema,omitempty"`
+	MaxUses        int      `json:"max_uses,omitempty"`
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
+	UserLocation   any      `json:"user_location,omitempty"`
 }
 
 type openAIRequest struct {
@@ -179,6 +186,7 @@ type responsesRequest struct {
 	Tools        []responsesTool     `json:"tools,omitempty"`
 	Reasoning    *responsesReasoning `json:"reasoning,omitempty"`
 	Temperature  *float64            `json:"temperature,omitempty"`
+	ServiceTier  string              `json:"service_tier,omitempty"`
 	Stream       bool                `json:"stream,omitempty"`
 	Store        bool                `json:"store"`
 }
@@ -198,10 +206,13 @@ type responseInput struct {
 }
 
 type responsesTool struct {
-	Type        string `json:"type"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Parameters  any    `json:"parameters,omitempty"`
+	Type              string `json:"type"`
+	Name              string `json:"name,omitempty"`
+	Description       string `json:"description,omitempty"`
+	Parameters        any    `json:"parameters,omitempty"`
+	Filters           any    `json:"filters,omitempty"`
+	UserLocation      any    `json:"user_location,omitempty"`
+	SearchContextSize string `json:"search_context_size,omitempty"`
 }
 
 type responsesResponse struct {
@@ -341,6 +352,8 @@ func loadConfig() config {
 		Models: map[string]string{
 			"opus":                      cleanModel(getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
 			"opus[1m]":                  cleanModel(getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
+			"claude-opus-4-6":           cleanModel(getenv("OPENAI_CLAUDE_FAST_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
+			"claude-opus-4-6[1m]":       cleanModel(getenv("OPENAI_CLAUDE_FAST_MODEL", getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")))),
 			"claude-opus-4-7":           cleanModel(getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
 			"claude-opus-4-7[1m]":       cleanModel(getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
 			"sonnet":                    cleanModel(getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
@@ -533,6 +546,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 			writeAnthropicError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+		in.FastMode = requestUsesClaudeFastMode(r, in)
 		traceLogID(traceID, "anthropic.decoded", summarizeAnthropicRequest(in))
 		out, err := toOpenAI(cfg, in)
 		if err != nil {
@@ -544,7 +558,11 @@ func handleMessages(cfg config) http.HandlerFunc {
 			responsesReq := toResponses(cfg, in)
 			traceLogID(traceID, "codex.prepared", summarizeResponsesRequest(responsesReq))
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: responsesReq.Model, Stream: in.Stream})
-			setRequestNote(r, requestNote(in.Model, responsesReq.Model, in.Stream, requestReasoningEffort(cfg, in))+" trace="+traceID)
+			note := requestNote(in.Model, responsesReq.Model, in.Stream, requestReasoningEffort(cfg, in))
+			if responsesReq.ServiceTier != "" {
+				note += " service_tier=" + responsesReq.ServiceTier
+			}
+			setRequestNote(r, note+" trace="+traceID)
 			if in.Stream {
 				streamCodex(ctx, cfg, responsesReq, in.Model, w, r)
 				return
@@ -663,11 +681,25 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		instructions = "You are a helpful coding assistant."
 	}
 	out := responsesRequest{Model: model, Instructions: instructions, Temperature: in.Temperature, Stream: in.Stream, Store: false}
+	if in.FastMode {
+		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
+	}
 	if effort := requestReasoningEffort(cfg, in); effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: effort}
 	}
+	hasWebSearch := false
 	for _, tool := range in.Tools {
+		if isClaudeWebSearchTool(tool) {
+			if !hasWebSearch {
+				out.Tools = append(out.Tools, codexWebSearchTool(tool))
+				hasWebSearch = true
+			}
+			continue
+		}
 		out.Tools = append(out.Tools, responsesTool{Type: "function", Name: tool.Name, Description: tool.Description, Parameters: tool.InputSchema})
+	}
+	if hasWebSearch {
+		out.Instructions = strings.TrimSpace(out.Instructions + "\n\nUse the built-in web search tool when current web information is needed. Return cited source links in the final answer.")
 	}
 	for _, msg := range in.Messages {
 		role := msg.Role
@@ -677,6 +709,69 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		out.Input = append(out.Input, convertAnthropicMessageToResponses(role, msg.Content)...)
 	}
 	return out
+}
+
+func requestUsesClaudeFastMode(r *http.Request, in anthropicRequest) bool {
+	if strings.EqualFold(strings.TrimSpace(in.Speed), "fast") {
+		return true
+	}
+	if isClaudeFastModel(in.Model) {
+		return true
+	}
+	for _, beta := range r.Header.Values("Anthropic-Beta") {
+		if strings.Contains(strings.ToLower(beta), "fast-mode") && isClaudeFastModel(in.Model) {
+			return true
+		}
+	}
+	return false
+}
+
+func isClaudeFastModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(model, "[1m]", "")))
+	return model == "claude-opus-4-6"
+}
+
+func isClaudeWebSearchTool(tool anthropicTool) bool {
+	return isClaudeWebSearchToolName(tool.Name) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(tool.Type)), "web_search")
+}
+
+func isClaudeWebSearchToolName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name == "websearch" || name == "web_search" || name == "mcp__web-search__web_search"
+}
+
+func codexWebSearchTool(tool anthropicTool) responsesTool {
+	out := responsesTool{Type: codexWebSearchToolType(), UserLocation: tool.UserLocation}
+	if filters := codexWebSearchFilters(tool); filters != nil && out.Type == "web_search" {
+		out.Filters = filters
+	}
+	if size := strings.TrimSpace(os.Getenv("CODEX_WEB_SEARCH_CONTEXT_SIZE")); size != "" {
+		out.SearchContextSize = size
+	}
+	return out
+}
+
+func codexWebSearchFilters(tool anthropicTool) any {
+	filters := map[string]any{}
+	if len(tool.AllowedDomains) > 0 {
+		filters["allowed_domains"] = tool.AllowedDomains
+	}
+	if len(tool.BlockedDomains) > 0 {
+		filters["blocked_domains"] = tool.BlockedDomains
+	}
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
+}
+
+func codexWebSearchToolType() string {
+	switch strings.TrimSpace(os.Getenv("CODEX_WEB_SEARCH_TOOL_TYPE")) {
+	case "web_search_preview", "web_search_preview_2025_03_11":
+		return strings.TrimSpace(os.Getenv("CODEX_WEB_SEARCH_TOOL_TYPE"))
+	default:
+		return "web_search"
+	}
 }
 
 func convertAnthropicMessageToResponses(role string, content any) []any {
@@ -712,12 +807,22 @@ func convertAnthropicMessageToResponses(role string, content any) []any {
 				messageParts = append(messageParts, image)
 			}
 		case "tool_use":
+			if isClaudeWebSearchToolName(fmt.Sprint(m["name"])) {
+				rawInput, _ := json.Marshal(m["input"])
+				messageParts = append(messageParts, map[string]any{"type": inputTextType(role), "text": "Web search requested: " + string(rawInput)})
+				continue
+			}
 			flushMessage()
 			args, _ := json.Marshal(m["input"])
 			items = append(items, responseInput{Type: "function_call", CallID: fmt.Sprint(m["id"]), Name: fmt.Sprint(m["name"]), Arguments: string(args)})
 		case "tool_result":
+			text := contentToText(m["content"])
+			if strings.HasPrefix(strings.TrimSpace(text), "Web search results for query:") {
+				messageParts = append(messageParts, map[string]any{"type": inputTextType(role), "text": text})
+				continue
+			}
 			flushMessage()
-			items = append(items, responseInput{Type: "function_call_output", CallID: fmt.Sprint(m["tool_use_id"]), Output: contentToText(m["content"])})
+			items = append(items, responseInput{Type: "function_call_output", CallID: fmt.Sprint(m["tool_use_id"]), Output: text})
 		}
 	}
 	flushMessage()
@@ -799,6 +904,10 @@ func callCodex(ctx context.Context, cfg config, out responsesRequest, requestedM
 }
 
 func callCodexResponses(ctx context.Context, cfg config, out responsesRequest) (responsesResponse, int, string, error) {
+	return callCodexResponsesOnce(ctx, cfg, out, true)
+}
+
+func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesRequest, allowRetry bool) (responsesResponse, int, string, error) {
 	out.Stream = true
 	start := time.Now()
 	traceLog(ctx, "codex.request", map[string]any{
@@ -828,11 +937,70 @@ func callCodexResponses(ctx context.Context, cfg config, out responsesRequest) (
 			msg = resp.Status
 		}
 		traceLog(ctx, "codex.error_body", map[string]any{"status": resp.StatusCode, "body": truncateString(msg, traceBodyLimit)})
+		if allowRetry {
+			if retry, ok := retryCodexRequestAfter400(out, resp.StatusCode, msg); ok {
+				traceLog(ctx, "codex.retry", map[string]any{"reason": retry.reason, "payload": summarizeResponsesRequest(retry.request)})
+				return callCodexResponsesOnce(ctx, cfg, retry.request, false)
+			}
+		}
 		return responsesResponse{}, resp.StatusCode, msg, fmt.Errorf("codex upstream returned %s", resp.Status)
 	}
 	collected := collectCodexStream(ctx, resp.Body, out.Model)
 	traceLog(ctx, "codex.collected", summarizeResponsesResponse(collected))
 	return collected, http.StatusOK, "", nil
+}
+
+type codexRetryRequest struct {
+	reason  string
+	request responsesRequest
+}
+
+func retryCodexRequestAfter400(out responsesRequest, status int, msg string) (codexRetryRequest, bool) {
+	if status != http.StatusBadRequest {
+		return codexRetryRequest{}, false
+	}
+	lower := strings.ToLower(msg)
+	if hasCodexWebSearchTool(out) && strings.Contains(lower, "web_search") {
+		return codexRetryRequest{reason: "alternate_web_search_tool_type", request: swapCodexWebSearchToolType(out, alternateCodexWebSearchToolType(out))}, true
+	}
+	if out.ServiceTier != "" && strings.Contains(lower, "service_tier") {
+		out.ServiceTier = ""
+		return codexRetryRequest{reason: "service_tier_not_accepted", request: out}, true
+	}
+	return codexRetryRequest{}, false
+}
+
+func hasCodexWebSearchTool(out responsesRequest) bool {
+	for _, tool := range out.Tools {
+		if strings.HasPrefix(tool.Type, "web_search") {
+			return true
+		}
+	}
+	return false
+}
+
+func alternateCodexWebSearchToolType(out responsesRequest) string {
+	for _, tool := range out.Tools {
+		switch tool.Type {
+		case "web_search":
+			return "web_search_preview"
+		case "web_search_preview", "web_search_preview_2025_03_11":
+			return "web_search"
+		}
+	}
+	return "web_search_preview"
+}
+
+func swapCodexWebSearchToolType(out responsesRequest, toolType string) responsesRequest {
+	for i := range out.Tools {
+		if strings.HasPrefix(out.Tools[i].Type, "web_search") {
+			out.Tools[i].Type = toolType
+			if toolType != "web_search" {
+				out.Tools[i].Filters = nil
+			}
+		}
+	}
+	return out
 }
 
 func streamCodex(ctx context.Context, cfg config, out responsesRequest, requestedModel string, w http.ResponseWriter, r *http.Request) {
@@ -1715,7 +1883,7 @@ func summarizeAnthropicRequest(in anthropicRequest) map[string]any {
 	}
 	tools := []string{}
 	for _, tool := range in.Tools {
-		tools = append(tools, tool.Name)
+		tools = append(tools, firstNonEmpty(tool.Name, tool.Type))
 	}
 	effort := ""
 	if in.OutputConfig != nil {
@@ -1731,13 +1899,15 @@ func summarizeAnthropicRequest(in anthropicRequest) map[string]any {
 		"tools":        tools,
 		"tool_count":   len(in.Tools),
 		"effort":       effort,
+		"speed":        in.Speed,
+		"fast_mode":    in.FastMode,
 	}
 }
 
 func summarizeResponsesRequest(out responsesRequest) map[string]any {
 	tools := []string{}
 	for _, tool := range out.Tools {
-		tools = append(tools, tool.Name)
+		tools = append(tools, firstNonEmpty(tool.Name, tool.Type))
 	}
 	effort := ""
 	if out.Reasoning != nil {
@@ -1752,6 +1922,7 @@ func summarizeResponsesRequest(out responsesRequest) map[string]any {
 		"tools":              tools,
 		"tool_count":         len(out.Tools),
 		"reasoning_effort":   effort,
+		"service_tier":       out.ServiceTier,
 		"temperature":        out.Temperature,
 	}
 }
@@ -2188,7 +2359,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
 	var b strings.Builder
 	for _, k := range keys {
 		if v, ok := vals[k]; ok {
@@ -2247,7 +2418,10 @@ func modelRows(cfg config) []map[string]any {
 
 func isAdvertisedModel(alias string) bool {
 	lower := strings.ToLower(alias)
-	return !(strings.HasPrefix(lower, "claude-3-") || strings.HasPrefix(lower, "claude-instant"))
+	if strings.HasPrefix(lower, "claude-3-") || strings.HasPrefix(lower, "claude-instant") {
+		return false
+	}
+	return lower != "claude-opus-4-6" && lower != "claude-opus-4-6[1m]"
 }
 
 func firstNonEmpty(values ...string) string {

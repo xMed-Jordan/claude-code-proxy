@@ -4,6 +4,8 @@ Local Windows proxy that exposes Anthropic-compatible endpoints for Claude Code 
 
 It also includes a local control panel at `http://127.0.0.1:4000/`.
 
+Claude Code's `WebSearch` tool is translated to Codex Responses web search, and Claude Code `/fast` requests are translated to a supported Codex model with `service_tier=priority`.
+
 ## Endpoints
 
 - `GET /health`
@@ -37,6 +39,12 @@ Starting the proxy applies local Claude Code settings:
 - `ANTHROPIC_AUTH_TOKEN=<PROXY_API_KEY>`
 - `API_TIMEOUT_MS=3000000`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+
+Fast mode and web search are controlled by:
+
+- `OPENAI_CLAUDE_FAST_MODEL=gpt-5.5`
+- `CODEX_FAST_SERVICE_TIER=priority`
+- `CODEX_WEB_SEARCH_TOOL_TYPE=web_search`
 
 Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
 
