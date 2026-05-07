@@ -11,10 +11,18 @@ $settingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
 $settingsDir = Split-Path -Parent $settingsPath
 $claudeMemoryPath = Join-Path $env:USERPROFILE '.claude\CLAUDE.md'
 $claudeJsonPath = Join-Path $env:USERPROFILE '.claude.json'
+$claudeDesktopConfigPath = Join-Path $env:APPDATA 'Claude\claude_desktop_config.json'
+$claudeDesktopConfigDir = Split-Path -Parent $claudeDesktopConfigPath
+$claudeDesktopActiveConfigPath = Join-Path $env:LOCALAPPDATA 'Claude-3p\claude_desktop_config.json'
+$claudeDesktopActiveConfigDir = Split-Path -Parent $claudeDesktopActiveConfigPath
 $snapshotPath = Join-Path $basePath '.claude-settings.snapshot.json'
 $snapshotMetaPath = Join-Path $basePath '.claude-settings.snapshot.meta.json'
 $claudeJsonSnapshotPath = Join-Path $basePath '.claude-json.snapshot.json'
 $claudeJsonSnapshotMetaPath = Join-Path $basePath '.claude-json.snapshot.meta.json'
+$claudeDesktopConfigSnapshotPath = Join-Path $basePath '.claude-desktop-config.snapshot.json'
+$claudeDesktopConfigSnapshotMetaPath = Join-Path $basePath '.claude-desktop-config.snapshot.meta.json'
+$claudeDesktopActiveConfigSnapshotPath = Join-Path $basePath '.claude-desktop-active-config.snapshot.json'
+$claudeDesktopActiveConfigSnapshotMetaPath = Join-Path $basePath '.claude-desktop-active-config.snapshot.meta.json'
 $claudeMemorySnapshotPath = Join-Path $basePath '.claude-memory.snapshot.md'
 $claudeMemorySnapshotMetaPath = Join-Path $basePath '.claude-memory.snapshot.meta.json'
 $envFile = Join-Path $basePath '.env'
@@ -104,6 +112,75 @@ function Ensure-ClaudeJsonSnapshot {
         reused      = $false
     } | ConvertTo-Json -Depth 4 | Set-Content -Path $claudeJsonSnapshotMetaPath -Encoding UTF8
     Write-Host "Created Claude Code root config snapshot: $claudeJsonSnapshotPath"
+}
+
+function Get-ClaudeDesktopConfigTargets {
+    $targets = @(
+        [pscustomobject]@{
+            Label        = 'Claude Desktop config'
+            Path         = $claudeDesktopConfigPath
+            Directory    = $claudeDesktopConfigDir
+            Snapshot     = $claudeDesktopConfigSnapshotPath
+            SnapshotMeta = $claudeDesktopConfigSnapshotMetaPath
+        },
+        [pscustomobject]@{
+            Label        = 'Claude Desktop active config'
+            Path         = $claudeDesktopActiveConfigPath
+            Directory    = $claudeDesktopActiveConfigDir
+            Snapshot     = $claudeDesktopActiveConfigSnapshotPath
+            SnapshotMeta = $claudeDesktopActiveConfigSnapshotMetaPath
+        }
+    )
+
+    $seen = @{}
+    $result = @()
+    foreach ($target in $targets) {
+        if ([string]::IsNullOrWhiteSpace($target.Path)) { continue }
+        $key = $target.Path.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $result += $target
+    }
+    return $result
+}
+
+function Ensure-ClaudeDesktopConfigSnapshot {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Target
+    )
+
+    if (Test-Path $Target.Snapshot) {
+        if (-not (Test-Path $Target.SnapshotMeta)) {
+            [pscustomobject]@{
+                config_path = $Target.Path
+                existed     = $true
+                saved_at    = $null
+                reused      = $true
+                note        = "Existing $($Target.Label) snapshot preserved; not overwritten during proxy start."
+            } | ConvertTo-Json -Depth 4 | Set-Content -Path $Target.SnapshotMeta -Encoding UTF8
+        }
+        Write-Host "Existing $($Target.Label) snapshot preserved: $($Target.Snapshot)"
+        return
+    }
+
+    if (-not (Test-Path $Target.Directory)) {
+        New-Item -ItemType Directory -Path $Target.Directory -Force | Out-Null
+    }
+
+    $existed = Test-Path $Target.Path
+    if ($existed) {
+        Copy-Item -Path $Target.Path -Destination $Target.Snapshot -Force
+    } else {
+        Set-Content -Path $Target.Snapshot -Value "{}" -Encoding UTF8
+    }
+
+    [pscustomobject]@{
+        config_path = $Target.Path
+        existed     = $existed
+        saved_at    = (Get-Date).ToString('o')
+        reused      = $false
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $Target.SnapshotMeta -Encoding UTF8
+    Write-Host "Created $($Target.Label) snapshot: $($Target.Snapshot)"
 }
 
 function Ensure-ClaudeMemorySnapshot {
@@ -288,6 +365,52 @@ function Ensure-AntigravityBrowserUserMcp {
     Write-Host "Applied Antigravity MCP to Claude Code root config: $claudeJsonPath"
 }
 
+function Ensure-AntigravityBrowserDesktopMcp {
+    $targets = @(Get-ClaudeDesktopConfigTargets)
+    $mergedMcpServers = [pscustomobject]@{}
+
+    foreach ($target in $targets) {
+        if (-not (Test-Path $target.Path)) { continue }
+        try {
+            $existing = Get-Content $target.Path -Raw | ConvertFrom-Json
+        } catch {
+            continue
+        }
+        if (-not ($existing.PSObject.Properties.Name -contains 'mcpServers') -or $null -eq $existing.mcpServers) {
+            continue
+        }
+        foreach ($serverProp in $existing.mcpServers.PSObject.Properties) {
+            if ($mergedMcpServers.PSObject.Properties.Name -notcontains $serverProp.Name) {
+                Set-JsonProperty -Object $mergedMcpServers -Name $serverProp.Name -Value $serverProp.Value
+            }
+        }
+    }
+
+    $launcherPath = Join-Path $basePath 'start-antigravity-browser-mcp.ps1'
+    $server = [pscustomobject]@{
+        command = 'pwsh'
+        args    = @('-NoProfile', '-File', $launcherPath)
+        env     = [pscustomobject]@{
+            CCP_BROWSER_MCP = 'antigravity-browser'
+        }
+    }
+    Set-JsonProperty -Object $mergedMcpServers -Name 'antigravity-browser' -Value $server
+
+    foreach ($target in $targets) {
+        Ensure-ClaudeDesktopConfigSnapshot -Target $target
+
+        if (Test-Path $target.Path) {
+            $config = Get-Content $target.Path -Raw | ConvertFrom-Json
+        } else {
+            $config = [pscustomobject]@{}
+        }
+
+        Set-JsonProperty -Object $config -Name 'mcpServers' -Value $mergedMcpServers
+        $config | ConvertTo-Json -Depth 100 | Set-Content -Path $target.Path -Encoding UTF8
+        Write-Host "Applied Antigravity MCP to $($target.Label): $($target.Path)"
+    }
+}
+
 function New-ProxyCommandHook {
     param(
         [Parameter(Mandatory = $true)] [string]$ScriptPath
@@ -394,7 +517,7 @@ function Apply-ProxySettings {
         Set-JsonProperty -Object $settings -Name 'env' -Value ([pscustomobject]@{})
     }
 
-    Set-JsonProperty -Object $settings.env -Name 'ANTHROPIC_BASE_URL' -Value "http://127.0.0.1:$port"
+    Set-JsonProperty -Object $settings.env -Name 'ANTHROPIC_BASE_URL' -Value "http://127.0.0.1:$port/anthropic"
     Remove-JsonProperty -Object $settings.env -Name 'ANTHROPIC_API_KEY'
     Set-JsonProperty -Object $settings.env -Name 'ANTHROPIC_AUTH_TOKEN' -Value $proxyKey
     Set-JsonProperty -Object $settings.env -Name 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY' -Value '1'
@@ -446,6 +569,7 @@ function Apply-ProxySettings {
 
     $settings | ConvertTo-Json -Depth 100 | Set-Content -Path $settingsPath -Encoding UTF8
     Ensure-AntigravityBrowserUserMcp
+    Ensure-AntigravityBrowserDesktopMcp
     Write-Host "Applied proxy env to Claude Code settings: $settingsPath"
     Write-Host "Snapshot path: $snapshotPath"
 }
@@ -528,10 +652,47 @@ function Restore-ClaudeMemory {
     Remove-Item -Path $claudeMemorySnapshotMetaPath -Force -ErrorAction SilentlyContinue
 }
 
+function Restore-ClaudeDesktopConfigTarget {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Target
+    )
+
+    if (-not (Test-Path $Target.Snapshot)) {
+        Write-Host "No $($Target.Label) snapshot found to restore."
+        return
+    }
+    $existed = $true
+    if (Test-Path $Target.SnapshotMeta) {
+        $meta = Get-Content $Target.SnapshotMeta -Raw | ConvertFrom-Json
+        $existed = [bool]$meta.existed
+    }
+
+    if ($existed) {
+        if (-not (Test-Path $Target.Directory)) {
+            New-Item -ItemType Directory -Path $Target.Directory -Force | Out-Null
+        }
+        Copy-Item -Path $Target.Snapshot -Destination $Target.Path -Force
+        Write-Host "Restored $($Target.Label) from snapshot: $($Target.Path)"
+    } else {
+        Remove-Item -Path $Target.Path -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed $($Target.Label) created for proxy: $($Target.Path)"
+    }
+
+    Remove-Item -Path $Target.Snapshot -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $Target.SnapshotMeta -Force -ErrorAction SilentlyContinue
+}
+
+function Restore-ClaudeDesktopConfig {
+    foreach ($target in @(Get-ClaudeDesktopConfigTargets)) {
+        Restore-ClaudeDesktopConfigTarget -Target $target
+    }
+}
+
 if ($Action -eq 'Apply') {
     Apply-ProxySettings
 } else {
     Restore-OriginalSettings
     Restore-ClaudeJsonConfig
+    Restore-ClaudeDesktopConfig
     Restore-ClaudeMemory
 }

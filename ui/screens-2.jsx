@@ -132,7 +132,7 @@ const TestRequest = () => {
                 <button className="btn" onClick={cancel}><Icon name="x" size={11}/>Cancel</button>
               )}
               <div className="spacer"></div>
-              <span className="txt-3 mono" style={{fontSize: 11}}>POST /v1/messages</span>
+              <span className="txt-3 mono" style={{fontSize: 11}}>POST /anthropic/v1/messages</span>
             </div>
 
             <details>
@@ -368,6 +368,7 @@ const BrowserBridge = () => {
   const manifest = ext.manifest || {};
   const profile = status?.profile || {};
   const mcp = status?.mcp || {};
+  const desktopMcp = mcp.desktop || {};
   const probe = status?.last_probe || null;
   const bridgeState = status?.bridge_state || {};
   const ready = !!status?.ready;
@@ -383,7 +384,8 @@ const BrowserBridge = () => {
     { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
     { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : (status?.chrome?.default_cdp_forced ? (status?.chrome?.can_relaunch_default ? "forced Default relaunch available" : "forced Default mode waiting") : "Default profile blocked by Chrome; controlled profile will be used") },
     { label: "Chrome windows", ok: true, meta: `${status?.chrome?.process_count || 0} processes · ${status?.chrome?.visible_count || 0} visible` },
-    { label: "Claude MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+    { label: "Claude Code MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+    { label: "Claude Desktop MCP", ok: desktopMcp.present, meta: desktopMcp.present ? `${desktopMcp.command || "pwsh"} ${Array.isArray(desktopMcp.args) ? desktopMcp.args.join(" ") : ""}` : (desktopMcp.exists ? `${desktopMcp.server_count || 0} local servers · antigravity-browser not injected` : "desktop config not found") },
     { label: "Visible control", ok: !!status?.visible_overlay, meta: bridgeState?.connected_now ? `connected · ${bridgeState.last_action || "ready"}` : "cursor overlay tools ready when Claude starts MCP" },
   ];
 
@@ -489,7 +491,9 @@ function prettyProbe(value) {
 const Setup = () => {
   const { data: status } = usePolling("/ui/api/status", 3000);
   const launcher = `C:\\Users\\hrash\\Documents\\claude-code-proxy\\start-claude-code.ps1`;
-  const baseUrl = status?.local_url || "http://127.0.0.1:4000";
+  const rootUrl = status?.local_url || "http://127.0.0.1:4000";
+  const baseUrl = status?.anthropic_url || `${rootUrl}/anthropic`;
+  const openAIBaseUrl = status?.openai_url || `${rootUrl}/openai/v1`;
   const apiKey = status?.proxy_key || "YOUR_LOCAL_PROXY_TOKEN";
   const env = `ANTHROPIC_BASE_URL=${baseUrl}
 ANTHROPIC_AUTH_TOKEN=${apiKey}
@@ -521,10 +525,10 @@ claude --model gpt-5.3-codex`;
   const checks = [
     { ok: "ok",   label: `Proxy is running and bound to ${baseUrl.replace("http://", "")}`,     meta: `PID ${status?.pid || "—"}` },
     { ok: status?.codex_auth?.exists ? "ok" : "err", label: "Codex auth file found",           meta: `${status?.codex_auth?.path || "~/.codex/auth.json"} · mode ${status?.codex_auth?.mode || "unknown"}` },
-    { ok: "ok",   label: "GET /v1/models returns 4 entries",                                   meta: "200 · 4 ms" },
-    { ok: "ok",   label: "POST /v1/messages succeeds against gpt-5.3-codex",                   meta: "200 · 1.28 s" },
+    { ok: "ok",   label: "GET /anthropic/v1/models returns 4 entries",                         meta: "200 · 4 ms" },
+    { ok: "ok",   label: "POST /anthropic/v1/messages succeeds against gpt-5.3-codex",         meta: "200 · 1.28 s" },
     { ok: status?.claude_settings?.mode === "anthropic_auth_token" && !status?.claude_settings?.api_key_present ? "ok" : "warn", label: "Claude settings use ANTHROPIC_AUTH_TOKEN", meta: `api key ${status?.claude_settings?.api_key_present ? "present" : "absent"} · cache ${status?.claude_settings?.gateway_cache_present ? "present" : "absent"}` },
-    { ok: status?.antigravity?.mcp?.present ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: status?.antigravity?.mcp?.present ? "server antigravity-browser" : "start endpoints to inject MCP settings" },
+    { ok: status?.antigravity?.mcp?.present && status?.antigravity?.mcp?.desktop?.present ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: `Code ${status?.antigravity?.mcp?.present ? "ready" : "missing"} · Desktop ${status?.antigravity?.mcp?.desktop?.present ? "ready" : "missing"}` },
     { ok: status?.antigravity?.ready ? "ok" : "warn", label: "Antigravity browser bridge ready", meta: status?.antigravity?.extension?.exists ? `extension ${status?.antigravity?.extension?.manifest?.version || "installed"}` : "extension not found" },
     { ok: status?.claude_version ? "ok" : "warn", label: "Claude Code CLI detected on PATH",   meta: status?.claude_version || "not detected" },
   ];
@@ -577,6 +581,7 @@ claude --model gpt-5.3-codex`;
           <p className="txt-2" style={{ fontSize: 11.5, marginTop: 10 }}>
             <Icon name="info" size={11} style={{ color: "var(--accent)", verticalAlign: "-1px", marginRight: 4 }}/>
             <span className="mono" style={{color:"var(--fg-1)"}}>ANTHROPIC_AUTH_TOKEN</span> is the local proxy token, not your Anthropic billing key. It never leaves your machine.
+            OpenAI-compatible clients use <span className="mono" style={{color:"var(--fg-1)"}}>{openAIBaseUrl}</span>.
           </p>
         </Card>
       </div>

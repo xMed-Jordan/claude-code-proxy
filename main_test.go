@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -100,6 +101,169 @@ func TestAnthropicErrorTypes(t *testing.T) {
 		if got := anthropicErrorType(code); got != want {
 			t.Fatalf("anthropicErrorType(%d) = %s, want %s", code, got, want)
 		}
+	}
+}
+
+func TestNamespacedModelRoutesAndLegacyV1Removed(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+
+	cfg := config{Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	for _, path := range []string{"/anthropic/v1/models", "/openai/v1/models"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, path := range []string{"/v1/models", "/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions", "/v1/responses"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		if path == "/v1/models" {
+			req = httptest.NewRequest(http.MethodGet, path, nil)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		}
+	}
+}
+
+func TestAnthropicNamespaceRoutes(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("upstream path = %s, want /chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    "chatcmpl_test",
+			"model": "gpt-5.5",
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"role": "assistant", "content": "hello from upstream"},
+			}},
+			"usage": map[string]int{"prompt_tokens": 3, "completion_tokens": 4},
+		})
+	}))
+	defer upstream.Close()
+
+	cfg := config{
+		OpenAIAPIKey:  "sk-test",
+		OpenAIBaseURL: upstream.URL,
+		Upstream:      "openai",
+		Models:        map[string]string{"sonnet[1m]": "gpt-5.5"},
+	}
+	handler := newProxyMux(cfg)
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages/count_tokens", strings.NewReader(`{"model":"sonnet[1m]","messages":[{"role":"user","content":"hi"}]}`))
+	tokenRec := httptest.NewRecorder()
+	handler.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("count_tokens status = %d, want 200; body=%s", tokenRec.Code, tokenRec.Body.String())
+	}
+
+	msgReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	msgRec := httptest.NewRecorder()
+	handler.ServeHTTP(msgRec, msgReq)
+	if msgRec.Code != http.StatusOK {
+		t.Fatalf("messages status = %d, want 200; body=%s", msgRec.Code, msgRec.Body.String())
+	}
+	if !strings.Contains(msgRec.Body.String(), "hello from upstream") {
+		t.Fatalf("messages body missing upstream text: %s", msgRec.Body.String())
+	}
+}
+
+func TestAnthropicNamespaceStreamingRoute(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"hello"},"finish_reason":""}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":" stream"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	cfg := config{
+		OpenAIAPIKey:  "sk-test",
+		OpenAIBaseURL: upstream.URL,
+		Upstream:      "openai",
+		Models:        map[string]string{"sonnet[1m]": "gpt-5.5"},
+	}
+	handler := newProxyMux(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	raw := rec.Body.String()
+	for _, want := range []string{"event: message_start", "event: content_block_delta", "hello", "stream", "event: message_stop", "data: [DONE]"} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("stream missing %q:\n%s", want, raw)
+		}
+	}
+}
+
+func TestOpenAINamespaceRoutesUseOpenAICompatibleUpstream(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+
+	var paths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
+			t.Fatalf("Authorization = %q, want Bearer sk-test", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat/completions":
+			_, _ = io.WriteString(w, `{"id":"chatcmpl_test","model":"gemini-3-flash-preview","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+		case "/responses":
+			_, _ = io.WriteString(w, `{"id":"resp_test","object":"response","status":"completed","model":"gemini-3-flash-preview","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+		default:
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config{
+		OpenAIAPIKey:  "sk-test",
+		OpenAIBaseURL: upstream.URL,
+		Upstream:      "openai",
+		Models:        map[string]string{"gemini-coder": "gemini-3-flash-preview"},
+	}
+	handler := newProxyMux(cfg)
+
+	chatReq := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(`{"model":"gemini-coder","messages":[{"role":"user","content":"hi"}]}`))
+	chatRec := httptest.NewRecorder()
+	handler.ServeHTTP(chatRec, chatReq)
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200; body=%s", chatRec.Code, chatRec.Body.String())
+	}
+
+	respReq := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"gemini-coder","input":[{"role":"user","content":"hi"}]}`))
+	respRec := httptest.NewRecorder()
+	handler.ServeHTTP(respRec, respReq)
+	if respRec.Code != http.StatusOK {
+		t.Fatalf("responses status = %d, want 200; body=%s", respRec.Code, respRec.Body.String())
+	}
+
+	if strings.Join(paths, ",") != "/chat/completions,/responses" {
+		t.Fatalf("upstream paths = %#v", paths)
 	}
 }
 
@@ -212,6 +376,65 @@ func TestFastModeMapsClaudeOpus46ToCodexPriority(t *testing.T) {
 	if out.ServiceTier != "priority" {
 		t.Fatalf("service_tier = %q, want priority", out.ServiceTier)
 	}
+}
+
+func TestSaveModelAliasesPersistsOverridesAndDisabledRows(t *testing.T) {
+	t.Setenv("PROXY_MODEL_ALIASES", "")
+	t.Setenv("PROXY_MODEL_ALIASES_DISABLED", "")
+	vals := map[string]string{}
+	next, err := saveModelAliasesToEnvMap(vals, []modelAliasConfig{
+		{Alias: "sonnet", Real: "gpt-5.4", Context: "1m"},
+		{Alias: "custom-claude", Real: "gpt-5.4-mini", Context: "200k"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Models["sonnet"] != "gpt-5.4" {
+		t.Fatalf("sonnet = %q, want gpt-5.4", next.Models["sonnet"])
+	}
+	if next.Models["custom-claude"] != "gpt-5.4-mini" || !next.ModelCustom["custom-claude"] {
+		t.Fatalf("custom alias not active/custom: %#v %#v", next.Models, next.ModelCustom)
+	}
+	if _, ok := next.Models["opus"]; ok {
+		t.Fatalf("deleted built-in alias remained active: %#v", next.Models)
+	}
+
+	var overrides []modelAliasConfig
+	if err := json.Unmarshal([]byte(vals["PROXY_MODEL_ALIASES"]), &overrides); err != nil {
+		t.Fatalf("override JSON invalid: %v", err)
+	}
+	if len(overrides) != 2 {
+		t.Fatalf("overrides = %#v, want 2 rows", overrides)
+	}
+	var disabled []string
+	if err := json.Unmarshal([]byte(vals["PROXY_MODEL_ALIASES_DISABLED"]), &disabled); err != nil {
+		t.Fatalf("disabled JSON invalid: %v", err)
+	}
+	if !stringSliceContains(disabled, "opus") {
+		t.Fatalf("disabled aliases = %#v, want opus disabled", disabled)
+	}
+	if stringSliceContains(disabled, "claude-3-7-sonnet-latest") {
+		t.Fatalf("hidden legacy aliases should not be written as disabled: %#v", disabled)
+	}
+}
+
+func TestNormalizeSubmittedModelAliasesRejectsDuplicates(t *testing.T) {
+	_, err := normalizeSubmittedModelAliases([]modelAliasConfig{
+		{Alias: "sonnet", Real: "gpt-5.5", Context: "200k"},
+		{Alias: "SONNET", Real: "gpt-5.4", Context: "1m"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("err = %v, want duplicate error", err)
+	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestHistoricalWebSearchBlocksBecomePlainMessages(t *testing.T) {
@@ -350,6 +573,137 @@ func TestWebSearchPreflightThinkingUsesLatestUserRequest(t *testing.T) {
 	}
 }
 
+func TestAnthropicMediaBlocksConvertToOpenAICompatibleParts(t *testing.T) {
+	in := anthropicRequest{
+		Model:        "gemini-3-flash-preview",
+		MaxTokens:    64,
+		OutputConfig: &anthropicOutputConfig{Effort: "xhigh"},
+		Messages: []anthropicMessage{{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "Read these."},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+			map[string]any{"type": "document", "title": "brief.pdf", "source": map[string]any{"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+		}}},
+	}
+
+	out, err := toOpenAI(config{}, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ReasoningEffort != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want xhigh before provider normalization", out.ReasoningEffort)
+	}
+	prepared := prepareOpenAIRequestForUpstream(config{}, providerCredential{Provider: "gemini"}, out)
+	if prepared.ReasoningEffort != "high" {
+		t.Fatalf("gemini reasoning_effort = %q, want high", prepared.ReasoningEffort)
+	}
+	if len(out.Messages) != 1 {
+		t.Fatalf("messages = %#v", out.Messages)
+	}
+	parts, ok := out.Messages[0].Content.([]any)
+	if !ok {
+		t.Fatalf("content = %#v, want content parts", out.Messages[0].Content)
+	}
+	if len(parts) != 3 {
+		t.Fatalf("parts = %#v", parts)
+	}
+	image := parts[1].(map[string]any)
+	if image["type"] != "image_url" {
+		t.Fatalf("image part = %#v", image)
+	}
+	imageURL := image["image_url"].(map[string]any)
+	if imageURL["url"] != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("image URL = %#v", imageURL)
+	}
+	file := parts[2].(map[string]any)
+	if file["type"] != "file" {
+		t.Fatalf("file part = %#v", file)
+	}
+	fileBody := file["file"].(map[string]any)
+	if fileBody["filename"] != "brief.pdf" || fileBody["file_data"] != "JVBERi0=" {
+		t.Fatalf("file body = %#v", fileBody)
+	}
+}
+
+func TestOpenAIFileContentConvertsToResponsesInputFile(t *testing.T) {
+	content := []any{
+		map[string]any{"type": "text", "text": "Summarize this file."},
+		map[string]any{"type": "file", "file": map[string]any{"filename": "notes.txt", "file_data": "SGVsbG8="}},
+	}
+	converted := openAIContentToResponses("user", content)
+	parts, ok := converted.([]map[string]any)
+	if !ok {
+		t.Fatalf("converted = %#v, want response content parts", converted)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if parts[1]["type"] != "input_file" || parts[1]["filename"] != "notes.txt" || parts[1]["file_data"] != "SGVsbG8=" {
+		t.Fatalf("file part = %#v", parts[1])
+	}
+}
+
+func TestOpenAIFilesProxyPassesThroughToProvider(t *testing.T) {
+	var gotPath, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		gotAuth = r.Header.Get("Authorization")
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
+	}))
+	defer upstream.Close()
+
+	cfg := config{Upstream: "openai", OpenAIAPIKey: "sk-test", OpenAIBaseURL: upstream.URL}
+	req := httptest.NewRequest(http.MethodGet, "/openai/v1/files?limit=1", nil)
+	rr := httptest.NewRecorder()
+	handleOpenAIFiles(cfg)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if gotPath != "/files?limit=1" {
+		t.Fatalf("upstream path = %q", gotPath)
+	}
+	if gotAuth != "Bearer sk-test" {
+		t.Fatalf("auth header = %q", gotAuth)
+	}
+}
+
+func TestOpenAICompatibleCustomSessionID(t *testing.T) {
+	t.Setenv("CODEX_SESSION_ISOLATION", "1")
+	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")
+	cfg := config{CodexSessionFile: filepath.Join(t.TempDir(), "sessions.json")}
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader("{}"))
+	req.Header.Set("X-Proxy-Session-Id", "workspace-session-7")
+	in := openAIRequest{Model: "gpt-5.5", Messages: []openAIMessage{{Role: "user", Content: "hi"}}}
+	applyCustomSessionToOpenAIRequest(req, &in)
+	if in.User != "workspace-session-7" {
+		t.Fatalf("user = %q", in.User)
+	}
+
+	out := responsesRequest{}
+	info := configureOpenAICompatibleSession(cfg, req, in, &out)
+	if !info.Enabled || out.PromptCacheKey == "" {
+		t.Fatalf("session was not configured: info=%#v out=%#v", info, out)
+	}
+
+	again := responsesRequest{}
+	againInfo := configureOpenAICompatibleSession(cfg, req, in, &again)
+	if out.PromptCacheKey != again.PromptCacheKey || info.CodexSessionID != againInfo.CodexSessionID {
+		t.Fatalf("session was not stable: %#v %#v", info, againInfo)
+	}
+}
+
+func TestClientKeySchemaAllowsOnlySelectedNamespace(t *testing.T) {
+	if !clientKeySchemaAllowsPath("anthropic", "/anthropic/v1/messages") || clientKeySchemaAllowsPath("anthropic", "/openai/v1/chat/completions") {
+		t.Fatal("anthropic schema gating failed")
+	}
+	if !clientKeySchemaAllowsPath("openai", "/openai/v1/chat/completions") || clientKeySchemaAllowsPath("openai", "/anthropic/v1/messages") {
+		t.Fatal("openai schema gating failed")
+	}
+	if !clientKeySchemaAllowsPath("both", "/anthropic/v1/messages") || !clientKeySchemaAllowsPath("both", "/openai/v1/responses") {
+		t.Fatal("both schema gating failed")
+	}
+}
+
 func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
 	events := []responsesStreamEvent{
 		{Type: "response.reasoning_summary_text.delta", ItemID: "rs_1", OutputIndex: 0, SummaryIndex: 0, Delta: "Checked "},
@@ -382,12 +736,12 @@ func TestCodexSessionKeyStablePerClaudeFlow(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 
 	first := responsesRequest{}
-	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	firstReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
 	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	firstInfo := configureCodexSession(cfg, firstReq, body, in, &first)
 
 	second := responsesRequest{}
-	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	secondReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
 	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	secondInfo := configureCodexSession(cfg, secondReq, body, in, &second)
 
@@ -410,12 +764,12 @@ func TestCodexSessionKeyDifferentPerClaudeFlow(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 
 	first := responsesRequest{}
-	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	firstReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
 	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	configureCodexSession(cfg, firstReq, body, in, &first)
 
 	second := responsesRequest{}
-	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	secondReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
 	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-b")
 	configureCodexSession(cfg, secondReq, body, in, &second)
 
@@ -437,12 +791,12 @@ func TestCodexSideThreadGetsChildSession(t *testing.T) {
 	sideBody := []byte(`{"messages":[{"role":"user","content":"/btw how are you"}]}`)
 
 	normalOut := responsesRequest{}
-	normalReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(normalBody))
+	normalReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(normalBody))
 	normalReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	normalInfo := configureCodexSession(cfg, normalReq, normalBody, normal, &normalOut)
 
 	sideOut := responsesRequest{}
-	sideReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(sideBody))
+	sideReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(sideBody))
 	sideReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	sideInfo := configureCodexSession(cfg, sideReq, sideBody, side, &sideOut)
 
@@ -472,19 +826,19 @@ func TestCodexSubagentMarkerGetsStableChildSession(t *testing.T) {
 	}}}}
 
 	normalOut := responsesRequest{}
-	normalReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)))
+	normalReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)))
 	normalReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	configureCodexSession(cfg, normalReq, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), normal, &normalOut)
 
 	firstOut := responsesRequest{}
 	firstBody := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},{"type":"text","text":"Inspect downloads."}]}]}`)
-	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	firstReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(firstBody))
 	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	firstInfo := configureCodexSession(cfg, firstReq, firstBody, firstAgent, &firstOut)
 
 	secondOut := responsesRequest{}
 	secondBody := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},{"type":"text","text":"Continue inspecting downloads."}]}]}`)
-	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	secondReq := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(secondBody))
 	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
 	secondInfo := configureCodexSession(cfg, secondReq, secondBody, secondAgent, &secondOut)
 

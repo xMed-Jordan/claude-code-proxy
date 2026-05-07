@@ -1,31 +1,31 @@
 // data.jsx — sample data + helpers for the Codex Proxy dashboard
 
 const SAMPLE_LOGS_RUNNING = [
-  { ts: "14:42:08.124", lvl: "info",  meth: "GET",  path: "/v1/models",                status: 200, dur: 4,    ip: "127.0.0.1", note: "" },
-  { ts: "14:42:08.301", lvl: "info",  meth: "POST", path: "/v1/messages/count_tokens", status: 200, dur: 12,   ip: "127.0.0.1", note: "tokens=842" },
-  { ts: "14:42:08.418", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 1284, ip: "127.0.0.1", note: "model=gpt-5.5 stream=false" },
+  { ts: "14:42:08.124", lvl: "info",  meth: "GET",  path: "/anthropic/v1/models",                status: 200, dur: 4,    ip: "127.0.0.1", note: "" },
+  { ts: "14:42:08.301", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages/count_tokens", status: 200, dur: 12,   ip: "127.0.0.1", note: "tokens=842" },
+  { ts: "14:42:08.418", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 1284, ip: "127.0.0.1", note: "model=gpt-5.5 stream=false" },
   { ts: "14:42:09.766", lvl: "debug", meth: "",     path: "alias resolved",            status: 0,   dur: 0,    ip: "",          note: "claude-3-7-sonnet-latest → gpt-5.5" },
-  { ts: "14:42:11.009", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 6420, ip: "127.0.0.1", note: "model=gpt-5.3-codex stream=true frames=42" },
-  { ts: "14:42:17.502", lvl: "info",  meth: "POST", path: "/v1/messages/count_tokens", status: 200, dur: 8,    ip: "127.0.0.1", note: "tokens=212" },
-  { ts: "14:42:18.044", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 944,  ip: "127.0.0.1", note: "model=gpt-5.4-mini stream=false" },
-  { ts: "14:42:21.118", lvl: "warn",  meth: "POST", path: "/v1/messages",              status: 200, dur: 4188, ip: "127.0.0.1", note: "upstream slow > 4s, codex region us-east-1" },
-  { ts: "14:42:25.301", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 1822, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
+  { ts: "14:42:11.009", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 6420, ip: "127.0.0.1", note: "model=gpt-5.3-codex stream=true frames=42" },
+  { ts: "14:42:17.502", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages/count_tokens", status: 200, dur: 8,    ip: "127.0.0.1", note: "tokens=212" },
+  { ts: "14:42:18.044", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 944,  ip: "127.0.0.1", note: "model=gpt-5.4-mini stream=false" },
+  { ts: "14:42:21.118", lvl: "warn",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 4188, ip: "127.0.0.1", note: "upstream slow > 4s, codex region us-east-1" },
+  { ts: "14:42:25.301", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 1822, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
   { ts: "14:42:28.510", lvl: "debug", meth: "",     path: "auth refresh",              status: 0,   dur: 0,    ip: "",          note: "codex chatgpt token refreshed (exp 90d)" },
-  { ts: "14:42:31.402", lvl: "info",  meth: "GET",  path: "/v1/models",                status: 200, dur: 3,    ip: "127.0.0.1", note: "" },
-  { ts: "14:42:34.221", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 2104, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
-  { ts: "14:42:36.802", lvl: "warn",  meth: "POST", path: "/v1/messages",              status: 429, dur: 18,   ip: "127.0.0.1", note: "upstream rate limit, retry-after 1s" },
-  { ts: "14:42:37.901", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 1605, ip: "127.0.0.1", note: "model=gpt-5.5 retry ok" },
-  { ts: "14:42:40.118", lvl: "info",  meth: "POST", path: "/v1/messages",              status: 200, dur: 982,  ip: "127.0.0.1", note: "model=gpt-5.4-mini stream=false" },
+  { ts: "14:42:31.402", lvl: "info",  meth: "GET",  path: "/anthropic/v1/models",                status: 200, dur: 3,    ip: "127.0.0.1", note: "" },
+  { ts: "14:42:34.221", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 2104, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
+  { ts: "14:42:36.802", lvl: "warn",  meth: "POST", path: "/anthropic/v1/messages",              status: 429, dur: 18,   ip: "127.0.0.1", note: "upstream rate limit, retry-after 1s" },
+  { ts: "14:42:37.901", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 1605, ip: "127.0.0.1", note: "model=gpt-5.5 retry ok" },
+  { ts: "14:42:40.118", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",              status: 200, dur: 982,  ip: "127.0.0.1", note: "model=gpt-5.4-mini stream=false" },
 ];
 
 const SAMPLE_LOGS_WARN = [
   { ts: "14:38:02.001", lvl: "info",  meth: "",     path: "proxy started",   status: 0, dur: 0, ip: "", note: "listen 127.0.0.1:4000 pid=14324" },
   { ts: "14:38:02.142", lvl: "info",  meth: "",     path: "auth loaded",     status: 0, dur: 0, ip: "", note: "C:\\Users\\hrash\\.codex\\auth.json mode=chatgpt" },
   { ts: "14:38:02.180", lvl: "warn",  meth: "",     path: "auth advisory",   status: 0, dur: 0, ip: "", note: "codex chatgpt token expires in 7d 14h" },
-  { ts: "14:38:14.221", lvl: "info",  meth: "GET",  path: "/v1/models",      status: 200, dur: 4,  ip: "127.0.0.1", note: "" },
-  { ts: "14:38:18.501", lvl: "info",  meth: "POST", path: "/v1/messages",    status: 200, dur: 1422, ip: "127.0.0.1", note: "model=gpt-5.5" },
-  { ts: "14:38:24.118", lvl: "warn",  meth: "POST", path: "/v1/messages",    status: 200, dur: 4188, ip: "127.0.0.1", note: "upstream slow > 4s" },
-  { ts: "14:38:30.401", lvl: "info",  meth: "POST", path: "/v1/messages",    status: 200, dur: 1604, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
+  { ts: "14:38:14.221", lvl: "info",  meth: "GET",  path: "/anthropic/v1/models",      status: 200, dur: 4,  ip: "127.0.0.1", note: "" },
+  { ts: "14:38:18.501", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",    status: 200, dur: 1422, ip: "127.0.0.1", note: "model=gpt-5.5" },
+  { ts: "14:38:24.118", lvl: "warn",  meth: "POST", path: "/anthropic/v1/messages",    status: 200, dur: 4188, ip: "127.0.0.1", note: "upstream slow > 4s" },
+  { ts: "14:38:30.401", lvl: "info",  meth: "POST", path: "/anthropic/v1/messages",    status: 200, dur: 1604, ip: "127.0.0.1", note: "model=gpt-5.5 stream=true" },
 ];
 
 const SAMPLE_LOGS_STOPPED = [
@@ -67,10 +67,10 @@ const ALIAS_DEFAULTS = [
 ];
 
 const VALIDATION_STEPS = [
-  { name: "GET /v1/models",                expect: "200 OK · 4 models",      tone: "ok",   ms: 4 },
-  { name: "POST /v1/messages/count_tokens", expect: "200 OK · 842 tokens",    tone: "ok",   ms: 12 },
-  { name: "POST /v1/messages",              expect: "200 OK · non-streaming", tone: "ok",   ms: 1284 },
-  { name: "POST /v1/messages (stream)",     expect: "200 OK · 42 SSE frames", tone: "ok",   ms: 6420 },
+  { name: "GET /anthropic/v1/models",                expect: "200 OK · 4 models",      tone: "ok",   ms: 4 },
+  { name: "POST /anthropic/v1/messages/count_tokens", expect: "200 OK · 842 tokens",    tone: "ok",   ms: 12 },
+  { name: "POST /anthropic/v1/messages",              expect: "200 OK · non-streaming", tone: "ok",   ms: 1284 },
+  { name: "POST /anthropic/v1/messages (stream)",     expect: "200 OK · 42 SSE frames", tone: "ok",   ms: 6420 },
 ];
 
 // Sparkline generator: deterministic pseudo-random

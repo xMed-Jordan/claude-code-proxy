@@ -122,6 +122,9 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
     return `${n > 0 ? "▲" : "▼"} ${Math.abs(n).toFixed(0)}%`;
   };
   const validationOk = validation.length > 0 && validation.every(s => s.tone === "ok");
+  const rootUrl = liveStatus?.local_url || "http://127.0.0.1:4000";
+  const anthropicUrl = liveStatus?.anthropic_url || `${rootUrl}/anthropic`;
+  const openaiUrl = liveStatus?.openai_url || `${rootUrl}/openai/v1`;
 
   return (
     <section data-screen-label="01 Dashboard" className="col" style={{ gap: 16 }}>
@@ -146,14 +149,24 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
               {proxyState === "stopped" && <Pill tone="muted">Endpoints paused</Pill>}
               <span className="txt-3 mono">uptime {isUp ? fmtUptime(liveStatus?.uptime_seconds || 0) : "—"}</span>
             </div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 4 }}>
-              <span className="mono" style={{ fontSize: 26, fontWeight: 500, letterSpacing: "-0.02em", color: "var(--fg)" }}>
-                {liveStatus?.local_url || "http://127.0.0.1:4000"}
-              </span>
-              <CopyBtn text={liveStatus?.local_url || "http://127.0.0.1:4000"} label="Copy URL"/>
+            <div className="col" style={{ gap: 6, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 14 }}>
+                <span className="txt-3 mono" style={{ width: 70 }}>Anthropic</span>
+                <span className="mono" style={{ fontSize: 22, fontWeight: 500, color: "var(--fg)" }}>
+                  {anthropicUrl}
+                </span>
+                <CopyBtn text={anthropicUrl} label="Copy"/>
+              </div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 14 }}>
+                <span className="txt-3 mono" style={{ width: 70 }}>OpenAI</span>
+                <span className="mono" style={{ fontSize: 16, fontWeight: 500, color: "var(--fg-1)" }}>
+                  {openaiUrl}
+                </span>
+                <CopyBtn text={openaiUrl} label="Copy"/>
+              </div>
             </div>
             <p className="txt-2" style={{ margin: "2px 0 16px" }}>
-              Anthropic-compatible API surface · forwarding to <span className="mono" style={{color:"var(--fg-1)"}}>codex chatgpt</span> backend
+              Split Anthropic/OpenAI API surfaces · forwarding to <span className="mono" style={{color:"var(--fg-1)"}}>codex chatgpt</span> backend
             </p>
             <div className="row" style={{ gap: 6 }}>
               {isUp ? (
@@ -208,7 +221,7 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
                   ? <Pill tone="ok">Ready</Pill>
                   : <Pill tone="warn">Needs check</Pill>}
                 <span className="txt-3 mono">
-                  {liveStatus?.antigravity?.mcp?.present ? " antigravity-browser MCP" : " MCP not injected"}
+                  Code {liveStatus?.antigravity?.mcp?.present ? "MCP ready" : "MCP missing"} · Desktop {liveStatus?.antigravity?.mcp?.desktop?.present ? "MCP ready" : "MCP missing"}
                   {liveStatus?.antigravity?.extension?.manifest?.version ? ` · ext ${liveStatus.antigravity.extension.manifest.version}` : ""}
                 </span>
               </div>
@@ -494,15 +507,307 @@ const Configuration = ({ pushToast }) => {
   );
 };
 
+// ─────────────────────────── API KEYS ───────────────────────────
+
+const ApiKeys = ({ pushToast = () => {}, liveStatus }) => {
+  const [data, setData] = useState({ providers: [], clients: [], defaults: {} });
+  const [providerForm, setProviderForm] = useState({ id: "", provider: "gemini", label: "Google AI Studio", base_url: "", api_key: "" });
+  const [clientForm, setClientForm] = useState({ label: "Claude Code", schema: "both", provider: "default", provider_key_id: "" });
+  const [createdKey, setCreatedKey] = useState("");
+  const load = () => api.get("/ui/api/keys").then(setData).catch(e => pushToast(`Load failed · ${e.message || e}`));
+  useEffect(() => { load(); }, []);
+  const defaults = data.defaults || {};
+  const providerOptions = data.providers || [];
+  const selectedProviderKeys = providerOptions.filter(p => p.provider === clientForm.provider && p.enabled);
+  const rootUrl = liveStatus?.local_url || "http://127.0.0.1:4000";
+  const anthropicUrl = liveStatus?.anthropic_url || defaults.anthropic_base || `${rootUrl}/anthropic`;
+  const openaiUrl = liveStatus?.openai_url || defaults.openai_local_url || `${rootUrl}/openai/v1`;
+  const providerBaseDefault = providerForm.provider === "gemini" ? defaults.gemini_base_url : defaults.openai_base_url;
+
+  const saveProvider = () => {
+    api.post("/ui/api/keys/provider", { ...providerForm, base_url: providerForm.base_url || providerBaseDefault })
+      .then(res => {
+        setData(d => ({ ...d, providers: res.providers || d.providers, clients: res.clients || d.clients }));
+        setProviderForm(f => ({ ...f, id: "", api_key: "" }));
+        pushToast(res.message || "Provider key saved");
+      })
+      .catch(e => pushToast(`Save failed · ${e.message || e}`));
+  };
+  const renewProvider = (p) => {
+    setProviderForm({
+      id: p.id,
+      provider: p.provider,
+      label: p.label,
+      base_url: p.base_url,
+      api_key: "",
+    });
+    pushToast(`Renewing ${p.label} · paste the new provider key`);
+  };
+  const createClient = () => {
+    api.post("/ui/api/keys/client", clientForm)
+      .then(res => {
+        setCreatedKey(res.api_key || "");
+        setData(d => ({ ...d, providers: res.providers || d.providers, clients: res.clients || d.clients }));
+        pushToast(res.message || "Client key created");
+      })
+      .catch(e => pushToast(`Create failed · ${e.message || e}`));
+  };
+  const toggle = (kind, row) => {
+    api.post("/ui/api/keys/toggle", { kind, id: row.id, enabled: !row.enabled })
+      .then(res => setData(d => ({ ...d, providers: res.providers || d.providers, clients: res.clients || d.clients })))
+      .catch(e => pushToast(`Update failed · ${e.message || e}`));
+  };
+
+  return (
+    <section data-screen-label="04 API Keys" className="col" style={{ gap: 16 }}>
+      <SectionHd
+        title="API keys"
+        sub="Manage provider keys for OpenAI and Google AI Studio, plus local client keys for Claude Code or OpenAI-compatible clients."
+        actions={<button className="btn btn-sm btn-ghost" onClick={load}><Icon name="refresh" size={11}/>Refresh</button>}
+      />
+
+      <div className="stats">
+        <div className="stat">
+          <div className="lbl">Anthropic base URL</div>
+          <div className="row sb">
+            <span className="mono" style={{ color: "var(--fg)", fontSize: 13 }}>{anthropicUrl}</span>
+            <CopyBtn text={anthropicUrl} label="Copy"/>
+          </div>
+          <div className="sub">Use this with Claude Code.</div>
+        </div>
+        <div className="stat">
+          <div className="lbl">OpenAI-compatible base URL</div>
+          <div className="row sb">
+            <span className="mono" style={{ color: "var(--fg)", fontSize: 13 }}>{openaiUrl}</span>
+            <CopyBtn text={openaiUrl} label="Copy"/>
+          </div>
+          <div className="sub">Use this for OpenAI SDK-compatible clients.</div>
+        </div>
+        <div className="stat">
+          <div className="lbl">Provider keys</div>
+          <div className="val">{providerOptions.length}</div>
+          <div className="sub">OpenAI · Google AI Studio</div>
+        </div>
+        <div className="stat">
+          <div className="lbl">Client keys</div>
+          <div className="val">{(data.clients || []).length}</div>
+          <div className="sub">Local proxy authentication</div>
+        </div>
+      </div>
+
+      <div className="col-2">
+        <Card title={providerForm.id ? "Renew provider key" : "Add provider key"}>
+          <div className="col" style={{ gap: 10 }}>
+            <div className="seg">
+              {[
+                { value: "gemini", label: "Google AI Studio" },
+                { value: "openai", label: "OpenAI" },
+              ].map(opt => (
+                <button key={opt.value} aria-pressed={providerForm.provider === opt.value} onClick={() => setProviderForm(f => ({ ...f, id: "", provider: opt.value, label: opt.label, base_url: "" }))}>{opt.label}</button>
+              ))}
+            </div>
+            <input className="inp inp-sans" placeholder="Label" value={providerForm.label} onChange={e => setProviderForm(f => ({ ...f, label: e.target.value }))}/>
+            <input className="inp inp-sans mono" placeholder={providerBaseDefault || "Provider base URL"} value={providerForm.base_url} onChange={e => setProviderForm(f => ({ ...f, base_url: e.target.value }))}/>
+            <input className="inp inp-sans mono" placeholder="Provider API key" value={providerForm.api_key} onChange={e => setProviderForm(f => ({ ...f, api_key: e.target.value }))} type="password"/>
+            <button className="btn btn-primary" disabled={!providerForm.api_key} onClick={saveProvider}><Icon name="check" size={12}/>{providerForm.id ? "Renew provider key" : "Save provider key"}</button>
+            {providerForm.id && <button className="btn btn-sm btn-ghost" onClick={() => setProviderForm({ id: "", provider: "gemini", label: "Google AI Studio", base_url: "", api_key: "" })}>Cancel renewal</button>}
+            <div className="hint"><Icon name="lock" size={11}/>Schema: OpenAI-compatible. Gemini uses the Google AI Studio OpenAI-compatible base URL; keys are encrypted in SQLite.</div>
+          </div>
+        </Card>
+
+        <Card title="Create client key">
+          <div className="col" style={{ gap: 10 }}>
+            <input className="inp inp-sans" placeholder="Label" value={clientForm.label} onChange={e => setClientForm(f => ({ ...f, label: e.target.value }))}/>
+            <select className="inp inp-sans" value={clientForm.schema} onChange={e => setClientForm(f => ({ ...f, schema: e.target.value }))}>
+              <option value="both">Both schemas</option>
+              <option value="anthropic">Anthropic only</option>
+              <option value="openai">OpenAI-compatible only</option>
+            </select>
+            <select className="inp inp-sans" value={clientForm.provider} onChange={e => setClientForm(f => ({ ...f, provider: e.target.value, provider_key_id: "" }))}>
+              <option value="default">Default proxy route</option>
+              <option value="gemini">Google AI Studio provider key</option>
+              <option value="openai">OpenAI provider key</option>
+            </select>
+            {clientForm.provider !== "default" && (
+              <select className="inp inp-sans" value={clientForm.provider_key_id} onChange={e => setClientForm(f => ({ ...f, provider_key_id: e.target.value }))}>
+                <option value="">Use first enabled {clientForm.provider} key</option>
+                {selectedProviderKeys.map(p => <option key={p.id} value={p.id}>{p.label} · {p.key_preview}</option>)}
+              </select>
+            )}
+            <button className="btn btn-primary" onClick={createClient}><Icon name="plus" size={12}/>Create client key</button>
+            {createdKey && (
+              <div className="created-key">
+                <div className="txt-3">Copy this key now. It will not be shown again.</div>
+                <TokenField value={createdKey} copyValue={createdKey}/>
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+
+      <div className="col-2">
+        <Card title="Provider keys" flush>
+          <table className="tbl">
+            <thead><tr><th>Provider</th><th>Schema</th><th>Label</th><th>Base URL</th><th>Key</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {(data.providers || []).map(p => (
+                <tr key={p.id}>
+                  <td className="mono">{p.provider}</td>
+                  <td className="mono">{p.schema || "openai-compatible"}</td>
+                  <td>{p.label}</td>
+                  <td className="mono">{p.base_url}</td>
+                  <td className="mono">{p.key_preview}</td>
+                  <td>{p.enabled ? <Pill tone="ok">Enabled</Pill> : <Pill tone="muted">Disabled</Pill>}</td>
+                  <td className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
+                    <button className="btn btn-sm btn-ghost" onClick={() => renewProvider(p)}>Renew</button>
+                    <button className="btn btn-sm btn-ghost" onClick={() => toggle("provider", p)}>{p.enabled ? "Disable" : "Enable"}</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!(data.providers || []).length && <div className="empty-table">No provider keys yet.</div>}
+        </Card>
+
+        <Card title="Client keys" flush>
+          <table className="tbl">
+            <thead><tr><th>Label</th><th>Key</th><th>Schema</th><th>Route</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {(data.clients || []).map(k => (
+                <tr key={k.id}>
+                  <td>{k.label}</td>
+                  <td className="mono">{k.key_preview}</td>
+                  <td className="mono">{k.schema || "both"}</td>
+                  <td className="mono">{k.provider ? `${k.provider}${k.provider_label ? " · " + k.provider_label : ""}` : "default"}</td>
+                  <td>{k.enabled ? <Pill tone="ok">Enabled</Pill> : <Pill tone="muted">Disabled</Pill>}</td>
+                  <td><button className="btn btn-sm btn-ghost" onClick={() => toggle("client", k)}>{k.enabled ? "Disable" : "Enable"}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!(data.clients || []).length && <div className="empty-table">No client keys yet.</div>}
+        </Card>
+      </div>
+    </section>
+  );
+};
+
 // ─────────────────────────── MODELS ───────────────────────────
 
-const Models = () => {
+const CODEX_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
+
+function modelStatusFor(real) {
+  if (!real) return "unsupported";
+  return CODEX_MODEL_OPTIONS.includes(real) ? "ok" : "untested";
+}
+
+function normalizeModelDraft(m, idx = 0) {
+  const alias = m.alias || "";
+  const real = m.real || "";
+  const status = m.status || modelStatusFor(real);
+  return {
+    id: m.id || alias || `model-${idx}`,
+    alias,
+    real,
+    status,
+    context: (m.context || "200k").toLowerCase() === "1m" ? "1m" : "200k",
+    desc: m.desc || `${alias || "New alias"} maps to ${real || "no upstream model"}`,
+    default: !!m.default,
+    recommended: !!m.recommended,
+  };
+}
+
+const Models = ({ pushToast = () => {} }) => {
   const [filter, setFilter] = useState("all");
-  const [models, setModels] = useState(SAMPLE_MODELS);
-  const refresh = () => api.get("/ui/api/models").then(res => setModels((res.models || []).map(m => ({ alias: m.alias, real: m.real, status: m.status, context: m.context || "200k", desc: `${m.alias} maps to ${m.real}`, default: m.default, recommended: m.recommended })))).catch(() => {});
+  const [query, setQuery] = useState("");
+  const [models, setModels] = useState(SAMPLE_MODELS.map(normalizeModelDraft));
+  const [editing, setEditing] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const refresh = () => api.get("/ui/api/models").then(res => {
+    setModels((res.models || []).map((m, i) => normalizeModelDraft({
+      alias: m.alias,
+      real: m.real,
+      status: m.status,
+      context: m.context || "200k",
+      desc: `${m.alias} maps to ${m.real}`,
+      default: m.default,
+      recommended: m.recommended,
+    }, i)));
+    setDirty(false);
+    setEditing(null);
+  }).catch(() => {});
   useEffect(() => { refresh(); }, []);
-  const filtered = models.filter(m => filter === "all" || m.status === filter);
+  const aliasCounts = useMemo(() => models.reduce((acc, m) => {
+    const key = m.alias.trim().toLowerCase();
+    if (key) acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {}), [models]);
+  const invalidIds = useMemo(() => new Set(models.filter(m => {
+    const alias = m.alias.trim();
+    const real = m.real.trim();
+    return !alias || !real || aliasCounts[alias.toLowerCase()] > 1 || /\s/.test(alias);
+  }).map(m => m.id)), [models, aliasCounts]);
+  const filtered = models.filter(m => {
+    const statusMatch = filter === "all"
+      || m.status === filter
+      || (filter === "warn" && (m.status === "warn" || m.status === "untested"));
+    const q = query.trim().toLowerCase();
+    const queryMatch = !q || m.alias.toLowerCase().includes(q) || m.real.toLowerCase().includes(q);
+    return statusMatch && queryMatch;
+  });
   const counts = models.reduce((acc, m) => { acc[m.status] = (acc[m.status] || 0) + 1; return acc; }, {});
+  const canSave = dirty && !saving && invalidIds.size === 0;
+
+  const updateModel = (id, key, value) => {
+    setModels(rows => rows.map(row => {
+      if (row.id !== id) return row;
+      const next = normalizeModelDraft({ ...row, [key]: value, status: key === "real" ? modelStatusFor(value) : row.status });
+      if (key === "real") next.status = modelStatusFor(value.trim());
+      next.desc = `${next.alias || "New alias"} maps to ${next.real || "no upstream model"}`;
+      return next;
+    }));
+    setDirty(true);
+  };
+
+  const addAlias = () => {
+    const id = `new-${Date.now()}`;
+    setModels(rows => [...rows, normalizeModelDraft({ id, alias: "", real: "gpt-5.5", context: "200k", status: "ok", desc: "New alias maps to gpt-5.5" })]);
+    setEditing(id);
+    setFilter("all");
+    setDirty(true);
+  };
+
+  const removeModel = (id) => {
+    setModels(rows => rows.filter(row => row.id !== id));
+    if (editing === id) setEditing(null);
+    setDirty(true);
+  };
+
+  const save = () => {
+    if (!canSave) {
+      if (invalidIds.size > 0) pushToast("Fix blank or duplicate model aliases first");
+      return;
+    }
+    setSaving(true);
+    api.post("/ui/api/models", {
+      models: models.map(m => ({ alias: m.alias.trim(), real: m.real.trim(), context: m.context })),
+    }).then(res => {
+      setModels((res.models || []).map((m, i) => normalizeModelDraft({
+        alias: m.alias,
+        real: m.real,
+        status: m.status,
+        context: m.context || "200k",
+        desc: `${m.alias} maps to ${m.real}`,
+        default: m.default,
+        recommended: m.recommended,
+      }, i)));
+      setDirty(false);
+      setEditing(null);
+      pushToast(res.message || "Model aliases saved");
+    }).catch(e => pushToast(`Save failed · ${e.message || e}`))
+      .finally(() => setSaving(false));
+  };
 
   return (
     <section data-screen-label="03 Models" className="col" style={{ gap: 16 }}>
@@ -511,8 +816,12 @@ const Models = () => {
         sub="The model identifiers this proxy advertises to Claude Code, and what they map to upstream."
         actions={
           <>
+            {dirty && <Pill tone={invalidIds.size ? "err" : "warn"}>{invalidIds.size ? "Fix rows" : "Unsaved changes"}</Pill>}
             <button className="btn btn-sm btn-ghost" onClick={refresh}><Icon name="refresh" size={11}/>Refresh from upstream</button>
-            <button className="btn btn-sm"><Icon name="plus" size={11}/>Add alias</button>
+            <button className="btn btn-sm" onClick={addAlias}><Icon name="plus" size={11}/>Add alias</button>
+            <button className={`btn btn-sm ${canSave ? "btn-primary" : ""}`} disabled={!canSave} onClick={save}>
+              <Icon name="check" size={11}/>{saving ? "Saving" : "Save"}
+            </button>
           </>
         }
       />
@@ -527,52 +836,82 @@ const Models = () => {
         <div className="spacer"></div>
         <div className="row" style={{ gap: 6 }}>
           <Icon name="search" size={12}/>
-          <input className="inp inp-sans" placeholder="Filter by alias…" style={{ width: 220, height: 26 }}/>
+          <input className="inp inp-sans" placeholder="Filter by alias…" value={query} onChange={e => setQuery(e.target.value)} style={{ width: 220, height: 26 }}/>
         </div>
       </div>
 
       <Card flush>
-        <table className="tbl">
+        <datalist id="codex-model-options">
+          {CODEX_MODEL_OPTIONS.map(model => <option key={model} value={model}/>)}
+        </datalist>
+        <table className="tbl model-table">
           <thead>
             <tr>
-              <th style={{width: "32%"}}>Public alias</th>
+              <th style={{width: "28%"}}>Public alias</th>
               <th style={{width: 16}}></th>
-              <th style={{width: "20%"}}>Codex model</th>
-              <th>Context</th>
-              <th>Status</th>
+              <th style={{width: "22%"}}>Codex model</th>
+              <th style={{width: 118}}>Context</th>
+              <th style={{width: 118}}>Status</th>
               <th>Notes</th>
-              <th style={{width: 40}}></th>
+              <th style={{width: 78}}></th>
             </tr>
           </thead>
           <tbody>
             {filtered.map(m => (
-              <tr key={m.alias}>
+              <tr key={m.id} data-editing={editing === m.id ? "true" : undefined}>
                 <td className="mono">
-                  <div className="row" style={{gap: 8}}>
-                    <span style={{color:"var(--fg)"}}>{m.alias}</span>
-                    {m.default && <Pill tone="info">default</Pill>}
-                    {m.recommended && <Pill tone="ok">recommended</Pill>}
-                  </div>
+                  {editing === m.id ? (
+                    <input className={`inp ${invalidIds.has(m.id) ? "invalid" : ""}`} value={m.alias} onChange={e => updateModel(m.id, "alias", e.target.value)} placeholder="claude-sonnet-4-6"/>
+                  ) : (
+                    <div className="row" style={{gap: 8}}>
+                      <span style={{color:"var(--fg)"}}>{m.alias}</span>
+                      {m.default && <Pill tone="info">default</Pill>}
+                      {m.recommended && <Pill tone="ok">recommended</Pill>}
+                    </div>
+                  )}
                 </td>
                 <td style={{color:"var(--fg-3)", textAlign:"center"}}><Icon name="arrowR" size={11}/></td>
-                <td className="mono" style={{color: m.real ? "var(--fg)" : "var(--fg-3)"}}>{m.real || "—"}</td>
-                <td>{m.context === "1m" ? <Pill tone="info">1M tokens</Pill> : <Pill tone="muted">200k</Pill>}</td>
+                <td className="mono" style={{color: m.real ? "var(--fg)" : "var(--fg-3)"}}>
+                  {editing === m.id ? (
+                    <input className={`inp ${invalidIds.has(m.id) ? "invalid" : ""}`} list="codex-model-options" value={m.real} onChange={e => updateModel(m.id, "real", e.target.value)} placeholder="gpt-5.5"/>
+                  ) : (m.real || "—")}
+                </td>
+                <td>
+                  {editing === m.id ? (
+                    <select className="inp model-context-select" value={m.context} onChange={e => updateModel(m.id, "context", e.target.value)}>
+                      <option value="200k">200k</option>
+                      <option value="1m">1M tokens</option>
+                    </select>
+                  ) : (m.context === "1m" ? <Pill tone="info">1M tokens</Pill> : <Pill tone="muted">200k</Pill>)}
+                </td>
                 <td>
                   {m.status === "ok" && <Pill tone="ok">Available</Pill>}
                   {m.status === "warn" && <Pill tone="warn">Untested</Pill>}
                   {m.status === "untested" && <Pill tone="muted">Untested</Pill>}
                   {m.status === "unsupported" && <Pill tone="err">Unsupported</Pill>}
                 </td>
-                <td className="txt-2" style={{fontSize: 12}}>{m.desc}</td>
+                <td className="txt-2" style={{fontSize: 12}}>
+                  {invalidIds.has(m.id)
+                    ? "Alias and Codex model are required; aliases must be unique."
+                    : `${m.alias || "New alias"} maps to ${m.real || "no upstream model"}`}
+                </td>
                 <td>
-                  <button className="btn btn-sm btn-ghost" title="More">
-                    <Icon name="chevronR" size={11}/>
-                  </button>
+                  <div className="model-actions">
+                    <button className="btn btn-sm btn-ghost" title={editing === m.id ? "Done editing" : "Edit alias"} onClick={() => setEditing(editing === m.id ? null : m.id)}>
+                      <Icon name={editing === m.id ? "check" : "edit"} size={11}/>
+                    </button>
+                    <button className="btn btn-sm btn-ghost btn-err" title="Delete alias" onClick={() => removeModel(m.id)}>
+                      <Icon name="trash" size={11}/>
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+        {filtered.length === 0 && (
+          <div className="empty-table">No model aliases match this filter.</div>
+        )}
       </Card>
 
       <div style={{ display:"flex", gap: 10, alignItems: "flex-start", padding: "10px 14px", border: "1px solid var(--line)", borderRadius: "var(--radius)", background: "var(--bg-1)", color: "var(--fg-2)", fontSize: 12 }}>
@@ -596,4 +935,5 @@ window.TokenField = TokenField;
 window.CopyBtn = CopyBtn;
 window.Dashboard = Dashboard;
 window.Configuration = Configuration;
+window.ApiKeys = ApiKeys;
 window.Models = Models;

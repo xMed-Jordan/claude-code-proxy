@@ -4,7 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -22,6 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -29,9 +36,11 @@ var (
 	proxyEnabled         atomic.Bool
 	requestNotes         sync.Map
 	requestStats         sync.Map
+	requestProviderKeys  sync.Map
 	logMu                sync.Mutex
 	logRows              []uiLogRow
 	traceMu              sync.Mutex
+	modelConfigMu        sync.RWMutex
 	validationMu         sync.Mutex
 	lastValidation       map[string]any
 	antigravityMu        sync.Mutex
@@ -47,17 +56,29 @@ const (
 )
 
 type config struct {
-	OpenAIAPIKey     string
-	OpenAIBaseURL    string
-	Upstream         string
-	CodexBaseURL     string
-	CodexAuthFile    string
-	CodexSessionFile string
-	ProxyKey         string
-	Port             string
-	Models           map[string]string
-	ClaudeDefaults   map[string]string
-	ReasoningEffort  string
+	OpenAIAPIKey       string
+	OpenAIBaseURL      string
+	Upstream           string
+	CodexBaseURL       string
+	CodexAuthFile      string
+	CodexSessionFile   string
+	DBPath             string
+	ProxyKey           string
+	Port               string
+	Models             map[string]string
+	ModelContexts      map[string]string
+	ModelCustom        map[string]bool
+	ClaudeDefaults     map[string]string
+	ReasoningEffort    string
+	AdminUsername      string
+	AdminPasswordHash  string
+	AdminSessionSecret string
+}
+
+type modelAliasConfig struct {
+	Alias   string `json:"alias"`
+	Real    string `json:"real"`
+	Context string `json:"context,omitempty"`
 }
 
 type codexAuthFile struct {
@@ -110,6 +131,9 @@ type openAIRequest struct {
 	Temperature         *float64        `json:"temperature,omitempty"`
 	Stream              bool            `json:"stream,omitempty"`
 	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	User                string          `json:"user,omitempty"`
+	Metadata            map[string]any  `json:"metadata,omitempty"`
+	ExtraBody           any             `json:"extra_body,omitempty"`
 }
 
 type openAIMessage struct {
@@ -324,35 +348,53 @@ func main() {
 	}
 
 	cfg := loadConfig()
+	if err := initProxyDB(cfg); err != nil {
+		log.Printf("proxy database init failed: %v", err)
+	}
 	proxyEnabled.Store(true)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", requireAuth(cfg, requireProxyEnabled(handleModels(cfg))))
-	mux.HandleFunc("/v1/messages", requireAuth(cfg, requireProxyEnabled(handleMessages(cfg))))
-	mux.HandleFunc("/v1/messages/count_tokens", requireAuth(cfg, requireProxyEnabled(handleCountTokens)))
-	mux.HandleFunc("/v1/chat/completions", requireAuth(cfg, requireProxyEnabled(handleChatCompletions(cfg))))
-	mux.HandleFunc("/v1/responses", requireAuth(cfg, requireProxyEnabled(handleResponses(cfg))))
-	mux.HandleFunc("/ui/api/status", handleUIStatus(cfg))
-	mux.HandleFunc("/ui/api/config", handleUIConfig(cfg))
-	mux.HandleFunc("/ui/api/models", handleUIModels(cfg))
-	mux.HandleFunc("/ui/api/validate", handleUIValidate(cfg))
-	mux.HandleFunc("/ui/api/test", handleUITest(cfg))
-	mux.HandleFunc("/ui/api/logs", handleUILogs)
-	mux.HandleFunc("/ui/api/antigravity", handleUIAntigravityStatus)
-	mux.HandleFunc("/ui/api/antigravity/probe", handleUIAntigravityProbe)
-	mux.HandleFunc("/ui/api/proxy/stop", handleUIStop)
-	mux.HandleFunc("/ui/api/proxy/start", handleUIStart)
-	mux.HandleFunc("/ui/api/proxy/restart", handleUIRestart(cfg))
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_running": proxyEnabled.Load()})
-	})
-	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
-	mux.HandleFunc("/", handleUI)
-
+	mux := newProxyMux(cfg)
 	server := &http.Server{Addr: "127.0.0.1:" + cfg.Port, Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
 	log.Printf("claude-code-proxy listening on http://%s", server.Addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func newProxyMux(cfg config) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/anthropic/v1/models", requireAuth(cfg, requireProxyEnabled(handleModels(cfg))))
+	mux.HandleFunc("/anthropic/v1/messages", requireAuth(cfg, requireProxyEnabled(handleMessages(cfg))))
+	mux.HandleFunc("/anthropic/v1/messages/count_tokens", requireAuth(cfg, requireProxyEnabled(handleCountTokens)))
+	mux.HandleFunc("/openai/v1/models", requireAuth(cfg, requireProxyEnabled(handleModels(cfg))))
+	mux.HandleFunc("/openai/v1/chat/completions", requireAuth(cfg, requireProxyEnabled(handleChatCompletions(cfg))))
+	mux.HandleFunc("/openai/v1/responses", requireAuth(cfg, requireProxyEnabled(handleResponses(cfg))))
+	mux.HandleFunc("/openai/v1/files", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
+	mux.HandleFunc("/openai/v1/files/", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
+	mux.HandleFunc("/ui/api/auth/status", handleUIAuthStatus(cfg))
+	mux.HandleFunc("/ui/api/auth/setup", handleUIAuthSetup(cfg))
+	mux.HandleFunc("/ui/api/auth/login", handleUIAuthLogin(cfg))
+	mux.HandleFunc("/ui/api/auth/logout", handleUIAuthLogout(cfg))
+	mux.HandleFunc("/ui/api/status", requireAdmin(cfg, handleUIStatus(cfg)))
+	mux.HandleFunc("/ui/api/config", requireAdmin(cfg, handleUIConfig(cfg)))
+	mux.HandleFunc("/ui/api/models", requireAdmin(cfg, handleUIModels(cfg)))
+	mux.HandleFunc("/ui/api/keys", requireAdmin(cfg, handleUIKeys(cfg)))
+	mux.HandleFunc("/ui/api/keys/provider", requireAdmin(cfg, handleUIProviderKeys(cfg)))
+	mux.HandleFunc("/ui/api/keys/client", requireAdmin(cfg, handleUIClientKeys(cfg)))
+	mux.HandleFunc("/ui/api/keys/toggle", requireAdmin(cfg, handleUIKeyToggle(cfg)))
+	mux.HandleFunc("/ui/api/validate", requireAdmin(cfg, handleUIValidate(cfg)))
+	mux.HandleFunc("/ui/api/test", requireAdmin(cfg, handleUITest(cfg)))
+	mux.HandleFunc("/ui/api/logs", requireAdmin(cfg, handleUILogs))
+	mux.HandleFunc("/ui/api/antigravity", requireAdmin(cfg, handleUIAntigravityStatus))
+	mux.HandleFunc("/ui/api/antigravity/probe", requireAdmin(cfg, handleUIAntigravityProbe))
+	mux.HandleFunc("/ui/api/proxy/stop", requireAdmin(cfg, handleUIStop))
+	mux.HandleFunc("/ui/api/proxy/start", requireAdmin(cfg, handleUIStart))
+	mux.HandleFunc("/ui/api/proxy/restart", requireAdmin(cfg, handleUIRestart(cfg)))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_running": proxyEnabled.Load()})
+	})
+	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
+	mux.HandleFunc("/", handleUI)
+	return mux
 }
 
 func loadConfig() config {
@@ -362,47 +404,619 @@ func loadConfig() config {
 	if codexAuthFile == "" {
 		codexAuthFile = filepath.Join(os.Getenv("USERPROFILE"), ".codex", "auth.json")
 	}
+	env := processEnvValue
+	claudeDefaults := claudeDefaultsFromValues(env)
+	models, modelContexts, modelCustom := modelAliasesFromValues(env)
 	return config{
-		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:    baseURL,
-		Upstream:         strings.ToLower(getenv("UPSTREAM", "codex")),
-		CodexBaseURL:     strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
-		CodexAuthFile:    codexAuthFile,
-		CodexSessionFile: getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
-		ProxyKey:         getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
-		Port:             port,
-		ReasoningEffort:  normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
-		ClaudeDefaults: map[string]string{
-			"opus":   getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7[1m]"),
-			"sonnet": getenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6[1m]"),
-			"haiku":  getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5"),
-		},
-		Models: map[string]string{
-			"opus":                      cleanModel(getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
-			"opus[1m]":                  cleanModel(getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
-			"claude-opus-4-6":           cleanModel(getenv("OPENAI_CLAUDE_FAST_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
-			"claude-opus-4-6[1m]":       cleanModel(getenv("OPENAI_CLAUDE_FAST_MODEL", getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")))),
-			"claude-opus-4-7":           cleanModel(getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
-			"claude-opus-4-7[1m]":       cleanModel(getenv("OPENAI_CLAUDE_OPUS_1M_MODEL", getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
-			"sonnet":                    cleanModel(getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
-			"sonnet[1m]":                cleanModel(getenv("OPENAI_CLAUDE_SONNET_1M_MODEL", getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5")))),
-			"claude-sonnet-4-6":         cleanModel(getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
-			"claude-sonnet-4-6[1m]":     cleanModel(getenv("OPENAI_CLAUDE_SONNET_1M_MODEL", getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5")))),
-			"haiku":                     cleanModel(getenv("OPENAI_CLAUDE_HAIKU_MODEL", getenv("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
-			"claude-haiku-4-5":          cleanModel(getenv("OPENAI_CLAUDE_HAIKU_MODEL", getenv("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
-			"claude-haiku-4-5-20251001": cleanModel(getenv("OPENAI_CLAUDE_HAIKU_MODEL", getenv("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
-			"gpt-5.3-codex":             cleanModel(getenv("OPENAI_CLAUDE_CODEX_MODEL", "gpt-5.3-codex")),
-			"claude-3-7-sonnet-latest":  cleanModel(getenv("OPENAI_CLAUDE_SONNET_MODEL", getenv("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
-			"claude-3-5-haiku-latest":   cleanModel(getenv("OPENAI_CLAUDE_HAIKU_MODEL", getenv("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
-			"claude-3-opus-20240229":    cleanModel(getenv("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
-		},
+		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:      baseURL,
+		Upstream:           strings.ToLower(getenv("UPSTREAM", "codex")),
+		CodexBaseURL:       strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
+		CodexAuthFile:      codexAuthFile,
+		CodexSessionFile:   getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
+		DBPath:             getenv("PROXY_DB_PATH", ".proxy.db"),
+		ProxyKey:           getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
+		Port:               port,
+		ReasoningEffort:    normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
+		ClaudeDefaults:     claudeDefaults,
+		Models:             models,
+		ModelContexts:      modelContexts,
+		ModelCustom:        modelCustom,
+		AdminUsername:      strings.TrimSpace(getenv("ADMIN_USERNAME", "")),
+		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
+		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
 	}
+}
+
+type envValueFunc func(key, fallback string) string
+
+func processEnvValue(key, fallback string) string {
+	return getenv(key, fallback)
+}
+
+func mapEnvValue(vals map[string]string) envValueFunc {
+	return func(key, fallback string) string {
+		if v := strings.TrimSpace(vals[key]); v != "" {
+			return v
+		}
+		return getenv(key, fallback)
+	}
+}
+
+func claudeDefaultsFromValues(env envValueFunc) map[string]string {
+	return map[string]string{
+		"opus":   env("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7[1m]"),
+		"sonnet": env("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6[1m]"),
+		"haiku":  env("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5"),
+	}
+}
+
+func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
+	return map[string]string{
+		"opus":                      cleanModel(env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
+		"opus[1m]":                  cleanModel(env("OPENAI_CLAUDE_OPUS_1M_MODEL", env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
+		"claude-opus-4-6":           cleanModel(env("OPENAI_CLAUDE_FAST_MODEL", env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
+		"claude-opus-4-6[1m]":       cleanModel(env("OPENAI_CLAUDE_FAST_MODEL", env("OPENAI_CLAUDE_OPUS_1M_MODEL", env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")))),
+		"claude-opus-4-7":           cleanModel(env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
+		"claude-opus-4-7[1m]":       cleanModel(env("OPENAI_CLAUDE_OPUS_1M_MODEL", env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5"))),
+		"sonnet":                    cleanModel(env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
+		"sonnet[1m]":                cleanModel(env("OPENAI_CLAUDE_SONNET_1M_MODEL", env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5")))),
+		"claude-sonnet-4-6":         cleanModel(env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
+		"claude-sonnet-4-6[1m]":     cleanModel(env("OPENAI_CLAUDE_SONNET_1M_MODEL", env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5")))),
+		"haiku":                     cleanModel(env("OPENAI_CLAUDE_HAIKU_MODEL", env("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
+		"claude-haiku-4-5":          cleanModel(env("OPENAI_CLAUDE_HAIKU_MODEL", env("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
+		"claude-haiku-4-5-20251001": cleanModel(env("OPENAI_CLAUDE_HAIKU_MODEL", env("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
+		"gpt-5.3-codex":             cleanModel(env("OPENAI_CLAUDE_CODEX_MODEL", "gpt-5.3-codex")),
+		"claude-3-7-sonnet-latest":  cleanModel(env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
+		"claude-3-5-haiku-latest":   cleanModel(env("OPENAI_CLAUDE_HAIKU_MODEL", env("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
+		"claude-3-opus-20240229":    cleanModel(env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
+	}
+}
+
+func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]string, map[string]bool) {
+	models := defaultModelAliasesFromValues(env)
+	contexts := map[string]string{}
+	custom := map[string]bool{}
+	for _, row := range parseModelAliasConfigs(env("PROXY_MODEL_ALIASES", "")) {
+		alias := strings.TrimSpace(row.Alias)
+		real := cleanModel(strings.TrimSpace(row.Real))
+		if alias == "" || real == "" {
+			continue
+		}
+		models[alias] = real
+		contexts[alias] = normalizeModelContext(row.Context)
+		custom[alias] = true
+	}
+	for alias := range parseDisabledModelAliases(env("PROXY_MODEL_ALIASES_DISABLED", "")) {
+		delete(models, alias)
+		delete(contexts, alias)
+		delete(custom, alias)
+	}
+	return models, contexts, custom
+}
+
+func parseModelAliasConfigs(raw string) []modelAliasConfig {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var rows []modelAliasConfig
+	if err := json.Unmarshal([]byte(raw), &rows); err == nil {
+		return rows
+	}
+	return nil
+}
+
+func parseDisabledModelAliases(raw string) map[string]bool {
+	out := map[string]bool{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return out
+	}
+	var aliases []string
+	if strings.HasPrefix(raw, "[") && json.Unmarshal([]byte(raw), &aliases) == nil {
+		for _, alias := range aliases {
+			if alias = strings.TrimSpace(alias); alias != "" {
+				out[alias] = true
+			}
+		}
+		return out
+	}
+	for _, alias := range strings.Split(raw, ",") {
+		if alias = strings.TrimSpace(alias); alias != "" {
+			out[alias] = true
+		}
+	}
+	return out
+}
+
+func normalizeModelContext(context string) string {
+	context = strings.ToLower(strings.TrimSpace(context))
+	if context == "1m" || context == "1m tokens" || context == "1000k" {
+		return "1m"
+	}
+	return "200k"
+}
+
+const adminSessionCookieName = "ccp_admin_session"
+
+type providerKeyRow struct {
+	ID         string `json:"id"`
+	Provider   string `json:"provider"`
+	Schema     string `json:"schema"`
+	Label      string `json:"label"`
+	BaseURL    string `json:"base_url"`
+	KeyPreview string `json:"key_preview"`
+	Enabled    bool   `json:"enabled"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+type clientKeyRow struct {
+	ID            string `json:"id"`
+	Label         string `json:"label"`
+	KeyPreview    string `json:"key_preview"`
+	Schema        string `json:"schema"`
+	Provider      string `json:"provider"`
+	ProviderKeyID string `json:"provider_key_id"`
+	ProviderLabel string `json:"provider_label,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	LastUsedAt    string `json:"last_used_at,omitempty"`
+}
+
+type providerCredential struct {
+	Provider      string
+	Label         string
+	APIKey        string
+	BaseURL       string
+	ProviderKeyID string
+	Schema        string
+}
+
+func initProxyDB(cfg config) error {
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := migrateProxyDB(db); err != nil {
+		return err
+	}
+	if err := seedProxyDBFromEnv(db, cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func openProxyDB(cfg config) (*sql.DB, error) {
+	path := strings.TrimSpace(cfg.DBPath)
+	if path == "" {
+		path = ".proxy.db"
+	}
+	return sql.Open("sqlite", path)
+}
+
+func migrateProxyDB(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS provider_keys (
+			id TEXT PRIMARY KEY,
+			provider TEXT NOT NULL,
+			label TEXT NOT NULL,
+			base_url TEXT NOT NULL,
+			api_key_enc TEXT NOT NULL,
+			key_preview TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS client_keys (
+			id TEXT PRIMARY KEY,
+			label TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			key_preview TEXT NOT NULL,
+			schema TEXT NOT NULL DEFAULT 'both',
+			provider TEXT NOT NULL DEFAULT '',
+			provider_key_id TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_provider_keys_provider ON provider_keys(provider, enabled)`,
+		`CREATE INDEX IF NOT EXISTS idx_client_keys_hash ON client_keys(key_hash, enabled)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	if err := ensureSQLiteColumn(db, "client_keys", "schema", "TEXT NOT NULL DEFAULT 'both'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureSQLiteColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
+}
+
+func seedProxyDBFromEnv(db *sql.DB, cfg config) error {
+	now := time.Now().Format(time.RFC3339)
+	if key := strings.TrimSpace(cfg.ProxyKey); key != "" && key != "YOUR_PROXY_TOKEN" {
+		var count int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM client_keys WHERE key_hash = ?`, hashString(key)).Scan(&count)
+		if count == 0 {
+			_, err := db.Exec(`INSERT INTO client_keys (id, label, key_hash, key_preview, provider, provider_key_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, '', '', 1, ?, ?)`,
+				randomID("ck"), "Claude Code default", hashString(key), maskSecret(key), now, now)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	openAIKey := strings.TrimSpace(cfg.OpenAIAPIKey)
+	if openAIKey != "" && openAIKey != "YOUR_OPENAI_API_KEY" && !strings.HasPrefix(openAIKey, "sk-or-") {
+		var count int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM provider_keys WHERE provider = 'openai'`).Scan(&count)
+		if count == 0 {
+			enc, err := encryptSecret(cfg, openAIKey)
+			if err != nil {
+				return err
+			}
+			_, err = db.Exec(`INSERT INTO provider_keys (id, provider, label, base_url, api_key_enc, key_preview, enabled, created_at, updated_at) VALUES (?, 'openai', ?, ?, ?, ?, 1, ?, ?)`,
+				randomID("pk"), "OpenAI from .env", firstNonEmpty(cfg.OpenAIBaseURL, "https://api.openai.com/v1"), enc, maskSecret(openAIKey), now, now)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func randomID(prefix string) string {
+	raw := make([]byte, 12)
+	_, _ = rand.Read(raw)
+	return prefix + "_" + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func newClientAPIKey() string {
+	raw := make([]byte, 24)
+	_, _ = rand.Read(raw)
+	return "ccp_" + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func secretCipherKey(cfg config) []byte {
+	seed := firstNonEmpty(cfg.ProxyKey, cfg.AdminSessionSecret, "claude-code-proxy-local-secret")
+	sum := sha256.Sum256([]byte(seed))
+	return sum[:]
+}
+
+func encryptSecret(cfg config, value string) (string, error) {
+	block, err := aes.NewCipher(secretCipherKey(cfg))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(value), nil)
+	return "aesgcm:" + base64.RawURLEncoding.EncodeToString(append(nonce, sealed...)), nil
+}
+
+func decryptSecret(cfg config, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "aesgcm:") {
+		return value, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, "aesgcm:"))
+	if err != nil {
+		return "", err
+	}
+	keys := [][]byte{secretCipherKey(cfg)}
+	if cfg.AdminSessionSecret != "" {
+		adminKey := sha256.Sum256([]byte(cfg.AdminSessionSecret))
+		keys = append(keys, adminKey[:])
+	}
+	var lastErr error
+	for _, key := range keys {
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(raw) < gcm.NonceSize() {
+			return "", errors.New("encrypted secret is too short")
+		}
+		nonce, ciphertext := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+		plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+		if err == nil {
+			return string(plain), nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+func adminConfigured(cfg config) bool {
+	cfg = adminRuntimeConfig(cfg)
+	return strings.TrimSpace(cfg.AdminUsername) != "" && strings.TrimSpace(cfg.AdminPasswordHash) != ""
+}
+
+func adminRuntimeConfig(cfg config) config {
+	if v := strings.TrimSpace(os.Getenv("ADMIN_USERNAME")); v != "" {
+		cfg.AdminUsername = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ADMIN_PASSWORD_HASH")); v != "" {
+		cfg.AdminPasswordHash = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET")); v != "" {
+		cfg.AdminSessionSecret = v
+	}
+	return cfg
+}
+
+func requireAdmin(cfg config, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg = adminRuntimeConfig(cfg)
+		if !adminConfigured(cfg) {
+			writeJSON(w, http.StatusLocked, map[string]any{"error": "admin setup required"})
+			return
+		}
+		if adminSessionValid(cfg, r) {
+			next(w, r)
+			return
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "admin login required"})
+	}
+}
+
+func handleUIAuthStatus(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg = adminRuntimeConfig(cfg)
+		configured := adminConfigured(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configured":    configured,
+			"authenticated": configured && adminSessionValid(cfg, r),
+			"username":      cfg.AdminUsername,
+		})
+	}
+}
+
+func handleUIAuthSetup(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg = adminRuntimeConfig(cfg)
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if adminConfigured(cfg) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "admin login is already configured"})
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		username := strings.TrimSpace(body.Username)
+		if username == "" || len(body.Password) < 8 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "username and an 8+ character password are required"})
+			return
+		}
+		hash, err := hashAdminPassword(body.Password)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		secret := randomID("sess")
+		vals := readEnvMap()
+		vals["ADMIN_USERNAME"] = username
+		vals["ADMIN_PASSWORD_HASH"] = hash
+		vals["ADMIN_SESSION_SECRET"] = secret
+		if vals["PROXY_DB_PATH"] == "" {
+			vals["PROXY_DB_PATH"] = ".proxy.db"
+		}
+		if err := writeEnvMap(vals); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		syncProcessEnvKeys(vals, "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET", "PROXY_DB_PATH")
+		cfg.AdminUsername = username
+		cfg.AdminPasswordHash = hash
+		cfg.AdminSessionSecret = secret
+		setAdminSessionCookie(w, cfg, username)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Admin login configured."})
+	}
+}
+
+func handleUIAuthLogin(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg = adminRuntimeConfig(cfg)
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !adminConfigured(cfg) {
+			writeJSON(w, http.StatusPreconditionRequired, map[string]any{"error": "admin login is not configured"})
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		if !hmac.Equal([]byte(strings.TrimSpace(body.Username)), []byte(cfg.AdminUsername)) || !verifyAdminPassword(cfg.AdminPasswordHash, body.Password) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid username or password"})
+			return
+		}
+		setAdminSessionCookie(w, cfg, cfg.AdminUsername)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}
+}
+
+func handleUIAuthLogout(_ config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: adminSessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}
+}
+
+func setAdminSessionCookie(w http.ResponseWriter, cfg config, username string) {
+	exp := time.Now().Add(24 * time.Hour).Unix()
+	payload := fmt.Sprintf("%s|%d", username, exp)
+	sig := adminSessionSignature(cfg, payload)
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminSessionCookieName,
+		Value:    base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + sig,
+		Path:     "/",
+		MaxAge:   24 * 60 * 60,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func adminSessionValid(cfg config, r *http.Request) bool {
+	c, err := r.Cookie(adminSessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	parts := strings.SplitN(c.Value, ".", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	payloadRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	payload := string(payloadRaw)
+	if !hmac.Equal([]byte(parts[1]), []byte(adminSessionSignature(cfg, payload))) {
+		return false
+	}
+	fields := strings.Split(payload, "|")
+	if len(fields) != 2 || fields[0] != cfg.AdminUsername {
+		return false
+	}
+	exp, err := strconv.ParseInt(fields[1], 10, 64)
+	return err == nil && time.Now().Unix() < exp
+}
+
+func adminSessionSignature(cfg config, payload string) string {
+	secret := firstNonEmpty(cfg.AdminSessionSecret, cfg.ProxyKey, "claude-code-proxy-admin")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func hashAdminPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	iterations := 120000
+	dk := pbkdf2SHA256([]byte(password), salt, iterations, 32)
+	return fmt.Sprintf("pbkdf2_sha256$%d$%s$%s", iterations, base64.RawURLEncoding.EncodeToString(salt), base64.RawURLEncoding.EncodeToString(dk)), nil
+}
+
+func verifyAdminPassword(encoded, password string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2_sha256" {
+		return false
+	}
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations <= 0 {
+		return false
+	}
+	salt, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	want, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	got := pbkdf2SHA256([]byte(password), salt, iterations, len(want))
+	return hmac.Equal(got, want)
+}
+
+func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
+	var out []byte
+	block := 1
+	for len(out) < keyLen {
+		mac := hmac.New(sha256.New, password)
+		_, _ = mac.Write(salt)
+		_, _ = mac.Write([]byte{byte(block >> 24), byte(block >> 16), byte(block >> 8), byte(block)})
+		u := mac.Sum(nil)
+		t := append([]byte(nil), u...)
+		for i := 1; i < iterations; i++ {
+			mac = hmac.New(sha256.New, password)
+			_, _ = mac.Write(u)
+			u = mac.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		out = append(out, t...)
+		block++
+	}
+	return out[:keyLen]
 }
 
 func requireAuth(cfg config, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.ProxyKey != "" && cfg.ProxyKey != "YOUR_PROXY_TOKEN" {
-			if !proxyRequestHasKey(r, cfg.ProxyKey) {
+			if proxyRequestHasKey(r, cfg.ProxyKey) {
+				next(w, r)
+				return
+			}
+			if route, ok := lookupClientKeyRoute(cfg, r); ok {
+				if !clientKeySchemaAllowsPath(route.Schema, r.URL.Path) {
+					writeSchemaAuthError(w, r, route.Schema)
+					return
+				}
+				requestProviderKeys.Store(r, route)
+				next(w, r)
+				return
+			}
+			{
 				traceID := newTraceID()
 				traceLogID(traceID, "auth.failure", map[string]any{"method": r.Method, "path": r.URL.Path, "remote": clientIP(r), "headers": safeHeaderSummary(r.Header), "summary": proxyAuthSummary(r)})
 				setRequestNote(r, "auth mismatch; "+proxyAuthSummary(r)+" trace="+traceID)
@@ -411,6 +1025,37 @@ func requireAuth(cfg config, next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 		next(w, r)
+	}
+}
+
+func writeSchemaAuthError(w http.ResponseWriter, r *http.Request, schema string) {
+	msg := "client key is not allowed to use the " + strings.TrimSpace(schema) + " schema"
+	if strings.HasPrefix(r.URL.Path, "/openai/") {
+		writeOpenAIError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	writeAnthropicError(w, http.StatusUnauthorized, msg)
+}
+
+func clientKeySchemaAllowsPath(schema, path string) bool {
+	switch normalizeClientSchema(schema) {
+	case "anthropic":
+		return strings.HasPrefix(path, "/anthropic/")
+	case "openai":
+		return strings.HasPrefix(path, "/openai/")
+	default:
+		return strings.HasPrefix(path, "/anthropic/") || strings.HasPrefix(path, "/openai/")
+	}
+}
+
+func normalizeClientSchema(schema string) string {
+	switch strings.ToLower(strings.TrimSpace(schema)) {
+	case "anthropic", "claude":
+		return "anthropic"
+	case "openai", "openai-compatible", "openai_compatible":
+		return "openai"
+	default:
+		return "both"
 	}
 }
 
@@ -451,18 +1096,169 @@ func takeRequestStat(r *http.Request) requestStat {
 }
 
 func proxyRequestHasKey(r *http.Request, want string) bool {
+	for _, value := range proxyRequestKeys(r) {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func proxyRequestKeys(r *http.Request) []string {
+	out := []string{}
 	for _, name := range []string{"x-api-key", "anthropic-api-key", "api-key"} {
 		for _, value := range r.Header.Values(name) {
-			if strings.TrimSpace(value) == want {
-				return true
+			if value = strings.TrimSpace(value); value != "" {
+				out = append(out, value)
 			}
 		}
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
-		return strings.TrimSpace(auth[7:]) == want
+		auth = strings.TrimSpace(auth[7:])
 	}
-	return auth == want
+	if auth != "" {
+		out = append(out, auth)
+	}
+	return out
+}
+
+func lookupClientKeyRoute(cfg config, r *http.Request) (providerCredential, bool) {
+	for _, key := range proxyRequestKeys(r) {
+		route, ok := lookupClientKeyRouteByKey(cfg, key)
+		if ok {
+			return route, true
+		}
+	}
+	return providerCredential{}, false
+}
+
+func lookupClientKeyRouteByKey(cfg config, key string) (providerCredential, bool) {
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		return providerCredential{}, false
+	}
+	defer db.Close()
+	if err := migrateProxyDB(db); err != nil {
+		return providerCredential{}, false
+	}
+	var clientID, provider, providerKeyID, schema string
+	err = db.QueryRow(`SELECT id, provider, provider_key_id, schema FROM client_keys WHERE key_hash = ? AND enabled = 1`, hashString(key)).Scan(&clientID, &provider, &providerKeyID, &schema)
+	if err != nil {
+		return providerCredential{}, false
+	}
+	_, _ = db.Exec(`UPDATE client_keys SET last_used_at = ? WHERE id = ?`, time.Now().Format(time.RFC3339), clientID)
+	route := providerCredential{Provider: strings.ToLower(strings.TrimSpace(provider)), ProviderKeyID: strings.TrimSpace(providerKeyID), Schema: normalizeClientSchema(schema)}
+	if route.ProviderKeyID != "" {
+		cred, ok := providerCredentialByID(cfg, db, route.ProviderKeyID)
+		if ok {
+			cred.Schema = route.Schema
+			return cred, true
+		}
+	}
+	if route.Provider != "" {
+		if cred, ok := firstProviderCredential(cfg, db, route.Provider); ok {
+			cred.Schema = route.Schema
+			return cred, true
+		}
+	}
+	return route, true
+}
+
+func requestProviderRoute(r *http.Request) (providerCredential, bool) {
+	value, ok := requestProviderKeys.Load(r)
+	if !ok {
+		return providerCredential{}, false
+	}
+	route, ok := value.(providerCredential)
+	return route, ok
+}
+
+func takeRequestProviderRoute(r *http.Request) (providerCredential, bool) {
+	value, ok := requestProviderKeys.LoadAndDelete(r)
+	if !ok {
+		return providerCredential{}, false
+	}
+	route, ok := value.(providerCredential)
+	return route, ok
+}
+
+func providerCredentialByID(cfg config, db *sql.DB, id string) (providerCredential, bool) {
+	var cred providerCredential
+	var enc string
+	var enabled int
+	err := db.QueryRow(`SELECT id, provider, label, base_url, api_key_enc, enabled FROM provider_keys WHERE id = ?`, id).Scan(&cred.ProviderKeyID, &cred.Provider, &cred.Label, &cred.BaseURL, &enc, &enabled)
+	if err != nil || enabled == 0 {
+		return providerCredential{}, false
+	}
+	apiKey, err := decryptSecret(cfg, enc)
+	if err != nil || strings.TrimSpace(apiKey) == "" {
+		return providerCredential{}, false
+	}
+	cred.APIKey = apiKey
+	cred.Provider = strings.ToLower(strings.TrimSpace(cred.Provider))
+	if strings.TrimSpace(cred.BaseURL) == "" {
+		cred.BaseURL = defaultProviderBaseURL(cred.Provider)
+	}
+	cred.BaseURL = strings.TrimRight(cred.BaseURL, "/")
+	return cred, true
+}
+
+func firstProviderCredential(cfg config, db *sql.DB, provider string) (providerCredential, bool) {
+	var id string
+	err := db.QueryRow(`SELECT id FROM provider_keys WHERE provider = ? AND enabled = 1 ORDER BY created_at DESC LIMIT 1`, strings.ToLower(strings.TrimSpace(provider))).Scan(&id)
+	if err != nil {
+		return providerCredential{}, false
+	}
+	return providerCredentialByID(cfg, db, id)
+}
+
+func effectiveOpenAIUpstream(cfg config, r *http.Request) providerCredential {
+	if r != nil {
+		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
+			if route.APIKey != "" {
+				route.BaseURL = strings.TrimRight(firstNonEmpty(route.BaseURL, defaultProviderBaseURL(route.Provider)), "/")
+				return route
+			}
+			if route.ProviderKeyID != "" {
+				if db, err := openProxyDB(cfg); err == nil {
+					defer db.Close()
+					if cred, ok := providerCredentialByID(cfg, db, route.ProviderKeyID); ok {
+						return cred
+					}
+				}
+			}
+			if db, err := openProxyDB(cfg); err == nil {
+				defer db.Close()
+				if cred, ok := firstProviderCredential(cfg, db, route.Provider); ok {
+					return cred
+				}
+			}
+		}
+	}
+	return providerCredential{Provider: "openai", Label: "OpenAI from .env", APIKey: cfg.OpenAIAPIKey, BaseURL: strings.TrimRight(firstNonEmpty(cfg.OpenAIBaseURL, "https://api.openai.com/v1"), "/")}
+}
+
+func defaultProviderBaseURL(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "gemini", "google", "google-ai-studio":
+		return "https://generativelanguage.googleapis.com/v1beta/openai"
+	case "openai":
+		return "https://api.openai.com/v1"
+	default:
+		return ""
+	}
+}
+
+func providerSchema(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "gemini", "google", "google-ai-studio":
+		return "openai-compatible"
+	case "openai":
+		return "openai-compatible"
+	default:
+		return ""
+	}
 }
 
 func proxyAuthSummary(r *http.Request) string {
@@ -512,11 +1308,18 @@ func handleModels(cfg config) http.HandlerFunc {
 			writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		data := make([]map[string]any, 0, len(cfg.Models))
+		modelConfigMu.RLock()
+		names := make([]string, 0, len(cfg.Models))
 		for name := range cfg.Models {
-			if !isAdvertisedModel(name) {
+			if !isAdvertisedModel(name) && !cfg.ModelCustom[name] {
 				continue
 			}
+			names = append(names, name)
+		}
+		modelConfigMu.RUnlock()
+		sort.Strings(names)
+		data := make([]map[string]any, 0, len(names))
+		for _, name := range names {
 			data = append(data, map[string]any{"id": name, "type": "model", "display_name": name})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -562,7 +1365,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 			"body_truncated":    len(rawBody) > traceBodyLimit,
 			"body_preview_json": truncateString(string(rawBody), traceBodyLimit),
 		})
-		if cfg.Upstream == "openai" && (cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(cfg.OpenAIAPIKey, "sk-or-")) {
+		route, hasProviderRoute := requestProviderRoute(r)
+		if cfg.Upstream == "openai" && !hasProviderRoute && (cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(cfg.OpenAIAPIKey, "sk-or-")) {
 			traceLogID(traceID, "anthropic.config_error", map[string]any{"message": "OPENAI_API_KEY is not configured"})
 			writeAnthropicError(w, http.StatusBadRequest, "OPENAI_API_KEY is not configured")
 			return
@@ -580,6 +1384,18 @@ func handleMessages(cfg config) http.HandlerFunc {
 		if err != nil {
 			traceLogID(traceID, "anthropic.convert_error", map[string]any{"error": err.Error()})
 			writeAnthropicError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		applyCustomSessionToOpenAIRequest(r, &out)
+		if hasProviderRoute && route.Provider != "" {
+			traceLogID(traceID, "openai_compatible.prepared", summarizeOpenAIRequest(out))
+			setRequestStat(r, requestStat{Model: in.Model, Upstream: firstNonEmpty(route.Provider, out.Model), Stream: in.Stream})
+			setRequestNote(r, requestNote(in.Model, out.Model, in.Stream, out.ReasoningEffort)+" provider="+route.Provider+" trace="+traceID)
+			if in.Stream {
+				streamOpenAI(ctx, cfg, out, in.Model, w, r)
+				return
+			}
+			callOpenAI(ctx, cfg, out, in.Model, w, r)
 			return
 		}
 		if cfg.Upstream == "codex" {
@@ -633,13 +1449,23 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		if in.MaxTokens == 0 {
 			in.MaxTokens = in.MaxCompletionTokens
 		}
+		applyCustomSessionToOpenAIRequest(r, &in)
+		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
+			setRequestStat(r, requestStat{Model: in.Model, Upstream: route.Provider, Stream: in.Stream})
+			proxyOpenAIChat(r.Context(), cfg, in, w, r)
+			return
+		}
 		if cfg.Upstream == "openai" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
-			proxyOpenAIChat(r.Context(), cfg, in, w)
+			proxyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
+		session := configureOpenAICompatibleSession(cfg, r, in, &out)
 		setRequestStat(r, requestStat{Model: in.Model, Upstream: out.Model, Stream: in.Stream})
+		if session.Enabled {
+			setRequestNote(r, "openai session="+session.FlowHash+" codex_session="+session.CodexSessionID)
+		}
 		if in.Stream {
 			streamCodexAsOpenAIChat(r.Context(), cfg, out, w)
 			return
@@ -669,11 +1495,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		if mapped, ok := cfg.Models[in.Model]; ok {
-			in.Model = mapped
-		} else {
-			in.Model = cleanModel(in.Model)
-		}
+		in.Model = resolveModel(cfg, in.Model)
 		if strings.TrimSpace(in.Instructions) == "" {
 			in.Instructions = "You are a helpful coding assistant."
 		}
@@ -685,13 +1507,22 @@ func handleResponses(cfg config) http.HandlerFunc {
 			in.Reasoning.Effort = normalizeReasoningEffort(in.Reasoning.Effort)
 		}
 		in.Store = false
-		if cfg.Upstream == "openai" {
-			setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
-			proxyOpenAIResponses(r.Context(), cfg, in, w)
+		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
+			setRequestStat(r, requestStat{Model: in.Model, Upstream: route.Provider, Stream: in.Stream})
+			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
 			return
 		}
+		if cfg.Upstream == "openai" {
+			setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
+			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
+			return
+		}
+		session := configureResponsesCustomSession(cfg, r, &in)
 		in.Temperature = nil
 		setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
+		if session.Enabled {
+			setRequestNote(r, "responses session="+session.FlowHash+" codex_session="+session.CodexSessionID)
+		}
 		if in.Stream {
 			streamCodexResponsesRaw(r.Context(), cfg, in, w)
 			return
@@ -710,11 +1541,22 @@ func handleResponses(cfg config) http.HandlerFunc {
 	}
 }
 
-func toResponses(cfg config, in anthropicRequest) responsesRequest {
-	model, ok := cfg.Models[in.Model]
-	if !ok {
-		model = cleanModel(in.Model)
+func handleOpenAIFiles(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := requestProviderRoute(r); ok {
+			proxyOpenAIPassthrough(r.Context(), cfg, w, r, "/openai/v1")
+			return
+		}
+		if cfg.Upstream == "openai" {
+			proxyOpenAIPassthrough(r.Context(), cfg, w, r, "/openai/v1")
+			return
+		}
+		writeOpenAIError(w, http.StatusBadRequest, "Files endpoint requires an OpenAI-compatible provider route")
 	}
+}
+
+func toResponses(cfg config, in anthropicRequest) responsesRequest {
+	model := resolveModel(cfg, in.Model)
 	instructions := contentToText(in.System)
 	if instructions == "" {
 		instructions = "You are a helpful coding assistant."
@@ -838,7 +1680,7 @@ func envFlag(key string, fallback bool) bool {
 }
 
 func extractClaudeFlowID(r *http.Request, rawBody []byte, in anthropicRequest) (string, string) {
-	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Claude-Session-Id", "X-Session-Id"} {
+	for _, name := range customSessionHeaderNames() {
 		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
 			return value, strings.ToLower(name)
 		}
@@ -850,6 +1692,100 @@ func extractClaudeFlowID(r *http.Request, rawBody []byte, in anthropicRequest) (
 		truncateString(string(rawBody), 4096),
 	}, "|")
 	return "fallback:" + hashString(seed), "fallback_request_hash"
+}
+
+func customSessionHeaderNames() []string {
+	return []string{
+		"X-Proxy-Session-Id",
+		"X-Codex-Session-Id",
+		"X-OpenAI-Session-Id",
+		"X-Claude-Code-Session-Id",
+		"X-Claude-Session-Id",
+		"X-Session-Id",
+	}
+}
+
+func applyCustomSessionToOpenAIRequest(r *http.Request, out *openAIRequest) {
+	if out == nil || strings.TrimSpace(out.User) != "" {
+		return
+	}
+	if id, _ := extractCustomSessionIDFromHeaders(r); id != "" {
+		out.User = id
+	}
+}
+
+func configureOpenAICompatibleSession(cfg config, r *http.Request, in openAIRequest, out *responsesRequest) codexSessionInfo {
+	flowID, source := extractOpenAICompatibleSessionID(r, in)
+	return configureNamedCodexSession(cfg, flowID, source, "openai", out)
+}
+
+func configureResponsesCustomSession(cfg config, r *http.Request, out *responsesRequest) codexSessionInfo {
+	flowID, source := extractCustomSessionIDFromHeaders(r)
+	return configureNamedCodexSession(cfg, flowID, source, "openai", out)
+}
+
+func configureNamedCodexSession(cfg config, flowID, source, namespace string, out *responsesRequest) codexSessionInfo {
+	if !codexSessionIsolationEnabled() || strings.TrimSpace(flowID) == "" || out == nil {
+		return codexSessionInfo{}
+	}
+	flowID = strings.TrimSpace(flowID)
+	flowHash := hashString(flowID)[:16]
+	registryKey := firstNonEmpty(namespace, "custom") + ":" + flowHash
+	sessionID := stableCodexSessionID(registryKey)
+	info := codexSessionInfo{
+		Enabled:        true,
+		FlowID:         flowID,
+		FlowHash:       flowHash,
+		FlowSource:     firstNonEmpty(source, "custom_session"),
+		RegistryKey:    registryKey,
+		CodexSessionID: sessionID,
+	}
+	if codexPromptCacheKeyEnabled() && strings.TrimSpace(out.PromptCacheKey) == "" {
+		out.PromptCacheKey = sessionID
+		info.PromptCacheKey = sessionID
+	} else {
+		info.PromptCacheKey = out.PromptCacheKey
+	}
+	recordCodexSession(cfg, info)
+	return info
+}
+
+func extractOpenAICompatibleSessionID(r *http.Request, in openAIRequest) (string, string) {
+	if id, source := extractCustomSessionIDFromHeaders(r); id != "" {
+		return id, source
+	}
+	if id := strings.TrimSpace(in.User); id != "" {
+		return id, "user"
+	}
+	for _, key := range []string{"proxy_session_id", "session_id", "conversation_id", "thread_id"} {
+		if value := metadataString(in.Metadata, key); value != "" {
+			return value, "metadata." + key
+		}
+	}
+	return "", ""
+}
+
+func extractCustomSessionIDFromHeaders(r *http.Request) (string, string) {
+	if r == nil {
+		return "", ""
+	}
+	for _, name := range customSessionHeaderNames() {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value, strings.ToLower(name)
+		}
+	}
+	return "", ""
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func detectIsolatedClaudeRequest(r *http.Request, rawBody []byte, in anthropicRequest) (bool, string, string) {
@@ -1129,19 +2065,82 @@ func inputTextType(role string) string {
 }
 
 func anthropicImageToResponses(block map[string]any) map[string]any {
-	source, ok := block["source"].(map[string]any)
-	if !ok {
-		return nil
+	source := anthropicBlockSource(block)
+	if url := anthropicSourceImageURL(source); url != "" {
+		return map[string]any{"type": "input_image", "image_url": url}
 	}
-	if fmt.Sprint(source["type"]) != "base64" {
-		return nil
+	return nil
+}
+
+func anthropicBlockSource(block map[string]any) map[string]any {
+	if source, ok := block["source"].(map[string]any); ok {
+		return source
 	}
-	mediaType := fmt.Sprint(source["media_type"])
-	data := fmt.Sprint(source["data"])
-	if mediaType == "" || data == "" {
-		return nil
+	if source, ok := block["file"].(map[string]any); ok {
+		return source
 	}
-	return map[string]any{"type": "input_image", "image_url": "data:" + mediaType + ";base64," + data}
+	return block
+}
+
+func anthropicSourceImageURL(source map[string]any) string {
+	if url := stringField(source, "url"); url != "" {
+		return url
+	}
+	mediaType := firstNonEmpty(stringField(source, "media_type"), stringField(source, "mime_type"))
+	data := stringField(source, "data")
+	if data == "" || mediaType == "" {
+		return ""
+	}
+	if !strings.EqualFold(stringField(source, "type"), "base64") && !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		return ""
+	}
+	return "data:" + mediaType + ";base64," + data
+}
+
+func anthropicSourceMediaType(block, source map[string]any) string {
+	return firstNonEmpty(
+		stringField(source, "media_type"),
+		stringField(source, "mime_type"),
+		stringField(block, "media_type"),
+		stringField(block, "mime_type"),
+	)
+}
+
+func anthropicFileName(block, source map[string]any) string {
+	return firstNonEmpty(
+		stringField(block, "filename"),
+		stringField(block, "title"),
+		stringField(block, "name"),
+		stringField(source, "filename"),
+		stringField(source, "display_name"),
+		stringField(source, "name"),
+	)
+}
+
+func anthropicSourceText(source map[string]any) string {
+	if strings.EqualFold(stringField(source, "type"), "text") {
+		return firstNonEmpty(stringField(source, "text"), stringField(source, "content"), stringField(source, "data"))
+	}
+	mediaType := strings.ToLower(firstNonEmpty(stringField(source, "media_type"), stringField(source, "mime_type")))
+	if strings.HasPrefix(mediaType, "text/") {
+		return firstNonEmpty(stringField(source, "text"), stringField(source, "content"), stringField(source, "data"))
+	}
+	return firstNonEmpty(stringField(source, "text"), stringField(source, "content"))
+}
+
+func stringField(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := m[key]
+		if !ok || value == nil {
+			continue
+		}
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text == "" || text == "<nil>" {
+			continue
+		}
+		return text
+	}
+	return ""
 }
 
 func loadCodexAuth(cfg config) (codexAuthFile, error) {
@@ -1895,10 +2894,7 @@ func sendAnthropicMessageDeltaStop(w io.Writer, stopReason string, outputTokens 
 }
 
 func openAIChatToResponses(cfg config, in openAIRequest) responsesRequest {
-	model, ok := cfg.Models[in.Model]
-	if !ok {
-		model = cleanModel(in.Model)
-	}
+	model := resolveModel(cfg, in.Model)
 	out := responsesRequest{Model: model, Stream: in.Stream, Store: false}
 	if effort := normalizeReasoningEffort(firstNonEmpty(in.ReasoningEffort, cfg.ReasoningEffort)); effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: effort}
@@ -1958,12 +2954,63 @@ func openAIContentToResponses(role string, content any) any {
 			if url := openAIImageURL(m["image_url"]); url != "" {
 				parts = append(parts, map[string]any{"type": "input_image", "image_url": url})
 			}
+		case "input_image":
+			if url := stringField(m, "image_url"); url != "" {
+				parts = append(parts, map[string]any{"type": "input_image", "image_url": url})
+			}
+		case "file", "input_file":
+			if file := openAIFileToResponses(m); file != nil {
+				parts = append(parts, file)
+			}
 		}
 	}
 	if len(parts) == 0 {
 		return nil
 	}
 	return parts
+}
+
+func openAIFileToResponses(block map[string]any) map[string]any {
+	file := map[string]any{}
+	if nested, ok := block["file"].(map[string]any); ok {
+		for _, key := range []string{"file_id", "file_data", "filename"} {
+			if value := stringField(nested, key); value != "" {
+				file[key] = value
+			}
+		}
+		if url := firstNonEmpty(stringField(nested, "url"), stringField(nested, "file_url")); url != "" {
+			if strings.HasPrefix(strings.ToLower(url), "data:image/") || looksLikeImageURL(url) {
+				return map[string]any{"type": "input_image", "image_url": url}
+			}
+			return map[string]any{"type": "input_text", "text": "Attached file: " + url}
+		}
+	}
+	for _, key := range []string{"file_id", "file_data", "filename"} {
+		if value := stringField(block, key); value != "" {
+			file[key] = value
+		}
+	}
+	if len(file) > 0 {
+		file["type"] = "input_file"
+		return file
+	}
+	if url := firstNonEmpty(stringField(block, "url"), stringField(block, "file_url")); url != "" {
+		if strings.HasPrefix(strings.ToLower(url), "data:image/") || looksLikeImageURL(url) {
+			return map[string]any{"type": "input_image", "image_url": url}
+		}
+		return map[string]any{"type": "input_text", "text": "Attached file: " + url}
+	}
+	return nil
+}
+
+func looksLikeImageURL(url string) bool {
+	lower := strings.ToLower(strings.TrimSpace(url))
+	for _, suffix := range []string{".png", ".jpg", ".jpeg", ".gif", ".webp"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func openAIImageURL(v any) string {
@@ -2032,11 +3079,8 @@ func responsesToOpenAIResponse(resp responsesResponse) map[string]any {
 }
 
 func toOpenAI(cfg config, in anthropicRequest) (openAIRequest, error) {
-	model, ok := cfg.Models[in.Model]
-	if !ok {
-		model = cleanModel(in.Model)
-	}
-	out := openAIRequest{Model: model, MaxTokens: in.MaxTokens, Temperature: in.Temperature, Stream: in.Stream}
+	model := resolveModel(cfg, in.Model)
+	out := openAIRequest{Model: model, MaxTokens: in.MaxTokens, Temperature: in.Temperature, Stream: in.Stream, ReasoningEffort: requestReasoningEffort(cfg, in)}
 	if sys := contentToText(in.System); sys != "" {
 		out.Messages = append(out.Messages, openAIMessage{Role: "system", Content: sys})
 	}
@@ -2055,49 +3099,146 @@ func convertMessage(msg anthropicMessage) []openAIMessage {
 	if !ok {
 		return []openAIMessage{{Role: msg.Role, Content: contentToText(msg.Content)}}
 	}
-	var text []string
+	var parts []map[string]any
 	var toolCalls []openAIToolCall
 	var out []openAIMessage
+	flushMessage := func() {
+		if len(parts) == 0 && len(toolCalls) == 0 {
+			return
+		}
+		out = append(out, openAIMessage{Role: msg.Role, Content: openAIContentFromParts(parts), ToolCalls: toolCalls})
+		parts = nil
+		toolCalls = nil
+	}
 	for _, block := range blocks {
 		m, ok := block.(map[string]any)
 		if !ok {
 			continue
 		}
-		switch m["type"] {
+		switch fmt.Sprint(m["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
 		case "text":
-			text = append(text, fmt.Sprint(m["text"]))
+			if text := stringField(m, "text"); text != "" {
+				parts = append(parts, openAITextPart(text))
+			}
+		case "image":
+			if part := anthropicImageToOpenAIContentPart(m); part != nil {
+				parts = append(parts, part)
+			}
+		case "document", "file":
+			parts = append(parts, anthropicFileToOpenAIContentParts(m)...)
 		case "tool_use":
 			args, _ := json.Marshal(m["input"])
 			toolCalls = append(toolCalls, openAIToolCall{ID: fmt.Sprint(m["id"]), Type: "function", Function: openAIToolFunction{Name: fmt.Sprint(m["name"]), Arguments: string(args)}})
 		case "tool_result":
+			flushMessage()
 			out = append(out, openAIMessage{Role: "tool", ToolCallID: fmt.Sprint(m["tool_use_id"]), Content: contentToText(m["content"])})
+		default:
+			if text := contentToText(m); text != "" {
+				parts = append(parts, openAITextPart(text))
+			}
 		}
 	}
-	if len(text) > 0 || len(toolCalls) > 0 {
-		out = append([]openAIMessage{{Role: msg.Role, Content: strings.Join(text, "\n"), ToolCalls: toolCalls}}, out...)
-	}
+	flushMessage()
 	return out
 }
 
-func proxyOpenAIChat(ctx context.Context, cfg config, out openAIRequest, w http.ResponseWriter) {
-	if cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" {
-		writeOpenAIError(w, http.StatusBadRequest, "OPENAI_API_KEY is not configured")
-		return
-	}
-	if mapped, ok := cfg.Models[out.Model]; ok {
-		out.Model = mapped
-	} else {
-		out.Model = cleanModel(out.Model)
-	}
-	proxyOpenAIRequest(ctx, cfg.OpenAIAPIKey, cfg.OpenAIBaseURL+"/chat/completions", out, w)
+func openAITextPart(text string) map[string]any {
+	return map[string]any{"type": "text", "text": text}
 }
 
-func proxyOpenAIResponses(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
-	if cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" {
-		writeOpenAIError(w, http.StatusBadRequest, "OPENAI_API_KEY is not configured")
+func openAIContentFromParts(parts []map[string]any) any {
+	if len(parts) == 0 {
+		return ""
+	}
+	texts := []string{}
+	for _, part := range parts {
+		if fmt.Sprint(part["type"]) != "text" {
+			out := make([]any, 0, len(parts))
+			for _, p := range parts {
+				out = append(out, p)
+			}
+			return out
+		}
+		if text := stringField(part, "text"); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+func anthropicImageToOpenAIContentPart(block map[string]any) map[string]any {
+	source := anthropicBlockSource(block)
+	if url := anthropicSourceImageURL(source); url != "" {
+		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
+	}
+	return nil
+}
+
+func anthropicFileToOpenAIContentParts(block map[string]any) []map[string]any {
+	source := anthropicBlockSource(block)
+	mediaType := anthropicSourceMediaType(block, source)
+	if strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		if part := anthropicImageToOpenAIContentPart(block); part != nil {
+			return []map[string]any{part}
+		}
+	}
+	if text := anthropicSourceText(source); text != "" {
+		return []map[string]any{openAITextPart(text)}
+	}
+	file := map[string]any{}
+	if fileID := stringField(source, "file_id", "id"); fileID != "" {
+		file["file_id"] = fileID
+	}
+	if data := stringField(source, "file_data"); data != "" {
+		file["file_data"] = data
+	} else if strings.EqualFold(stringField(source, "type"), "base64") {
+		if data := stringField(source, "data"); data != "" {
+			file["file_data"] = data
+		}
+	}
+	if filename := anthropicFileName(block, source); filename != "" {
+		file["filename"] = filename
+	}
+	if len(file) > 0 {
+		return []map[string]any{{"type": "file", "file": file}}
+	}
+	if uri := firstNonEmpty(stringField(source, "file_uri", "uri"), stringField(source, "url")); uri != "" {
+		label := anthropicFileName(block, source)
+		if label == "" {
+			label = "attached file"
+		}
+		return []map[string]any{openAITextPart(label + ": " + uri)}
+	}
+	return nil
+}
+
+func proxyOpenAIChat(ctx context.Context, cfg config, out openAIRequest, w http.ResponseWriter, r *http.Request) {
+	upstream := effectiveOpenAIUpstream(cfg, r)
+	if upstream.APIKey == "" || upstream.APIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(upstream.APIKey, "sk-or-") {
+		writeOpenAIError(w, http.StatusBadRequest, "OpenAI-compatible provider API key is not configured")
 		return
 	}
-	proxyOpenAIRequest(ctx, cfg.OpenAIAPIKey, cfg.OpenAIBaseURL+"/responses", out, w)
+	out = prepareOpenAIRequestForUpstream(cfg, upstream, out)
+	proxyOpenAIRequest(ctx, upstream.APIKey, strings.TrimRight(upstream.BaseURL, "/")+"/chat/completions", out, w)
+}
+
+func proxyOpenAIResponses(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter, r *http.Request) {
+	upstream := effectiveOpenAIUpstream(cfg, r)
+	if upstream.APIKey == "" || upstream.APIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(upstream.APIKey, "sk-or-") {
+		writeOpenAIError(w, http.StatusBadRequest, "OpenAI-compatible provider API key is not configured")
+		return
+	}
+	proxyOpenAIRequest(ctx, upstream.APIKey, strings.TrimRight(upstream.BaseURL, "/")+"/responses", out, w)
+}
+
+func prepareOpenAIRequestForUpstream(cfg config, upstream providerCredential, out openAIRequest) openAIRequest {
+	out.Model = resolveModel(cfg, out.Model)
+	if normalizeReasoningEffort(out.ReasoningEffort) == "xhigh" {
+		out.ReasoningEffort = "high"
+	}
+	return out
 }
 
 func proxyOpenAIRequest(ctx context.Context, apiKey, url string, body any, w http.ResponseWriter) {
@@ -2120,10 +3261,68 @@ func proxyOpenAIRequest(ctx context.Context, apiKey, url string, body any, w htt
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func proxyOpenAIPassthrough(ctx context.Context, cfg config, w http.ResponseWriter, r *http.Request, localPrefix string) {
+	upstream := effectiveOpenAIUpstream(cfg, r)
+	if upstream.APIKey == "" || upstream.APIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(upstream.APIKey, "sk-or-") {
+		writeOpenAIError(w, http.StatusBadRequest, "OpenAI-compatible provider API key is not configured")
+		return
+	}
+	suffix := strings.TrimPrefix(r.URL.Path, localPrefix)
+	if suffix == r.URL.Path {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid OpenAI-compatible proxy path")
+		return
+	}
+	upstreamURL := strings.TrimRight(upstream.BaseURL, "/") + suffix
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	copyPassthroughHeaders(req.Header, r.Header)
+	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func copyPassthroughHeaders(dst, src http.Header) {
+	for _, name := range []string{"Content-Type", "Accept", "OpenAI-Beta", "OpenAI-Organization", "OpenAI-Project"} {
+		for _, value := range src.Values(name) {
+			dst.Add(name, value)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for _, name := range []string{"Content-Type", "OpenAI-Request-ID", "X-Request-ID"} {
+		for _, value := range src.Values(name) {
+			dst.Add(name, value)
+		}
+	}
+	if dst.Get("Content-Type") == "" {
+		dst.Set("Content-Type", "application/json")
+	}
+}
+
 func callOpenAI(ctx context.Context, cfg config, out openAIRequest, requestedModel string, w http.ResponseWriter, r *http.Request) {
+	upstream := effectiveOpenAIUpstream(cfg, r)
+	if upstream.APIKey == "" || upstream.APIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(upstream.APIKey, "sk-or-") {
+		writeAnthropicError(w, http.StatusBadRequest, "OpenAI-compatible provider API key is not configured")
+		return
+	}
+	out = prepareOpenAIRequestForUpstream(cfg, upstream, out)
 	body, _ := json.Marshal(out)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, cfg.OpenAIBaseURL+"/chat/completions", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(upstream.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2151,9 +3350,15 @@ func callOpenAI(ctx context.Context, cfg config, out openAIRequest, requestedMod
 }
 
 func streamOpenAI(ctx context.Context, cfg config, out openAIRequest, requestedModel string, w http.ResponseWriter, r *http.Request) {
+	upstream := effectiveOpenAIUpstream(cfg, r)
+	if upstream.APIKey == "" || upstream.APIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(upstream.APIKey, "sk-or-") {
+		writeAnthropicError(w, http.StatusBadRequest, "OpenAI-compatible provider API key is not configured")
+		return
+	}
+	out = prepareOpenAIRequestForUpstream(cfg, upstream, out)
 	body, _ := json.Marshal(out)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, cfg.OpenAIBaseURL+"/chat/completions", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(upstream.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2348,6 +3553,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			OutputTokens: stat.OutputTokens,
 			StopReason:   stat.StopReason,
 		})
+		requestProviderKeys.Delete(r)
 	})
 }
 
@@ -2519,6 +3725,8 @@ func summarizeOpenAIRequest(out openAIRequest) map[string]any {
 		"tool_count":       len(out.Tools),
 		"max_tokens":       out.MaxTokens,
 		"reasoning_effort": out.ReasoningEffort,
+		"user_set":         strings.TrimSpace(out.User) != "",
+		"extra_body_set":   out.ExtraBody != nil,
 	}
 }
 
@@ -2861,6 +4069,7 @@ func antigravityMCPSettings() map[string]any {
 		"command":  "",
 		"args":     []string{},
 		"launcher": "",
+		"desktop":  antigravityDesktopMCPSettings(),
 	}
 	raw, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -2891,6 +4100,93 @@ func antigravityMCPSettings() map[string]any {
 			out["launcher"] = server.Args[i+1]
 			break
 		}
+	}
+	return out
+}
+
+func antigravityDesktopMCPSettings() map[string]any {
+	out := map[string]any{
+		"name":         "antigravity-browser",
+		"path":         "",
+		"paths":        []string{},
+		"exists":       false,
+		"present":      false,
+		"command":      "",
+		"args":         []string{},
+		"launcher":     "",
+		"server_count": 0,
+		"servers":      []string{},
+	}
+	type desktopServer struct {
+		Command string            `json:"command"`
+		Args    []string          `json:"args"`
+		Env     map[string]string `json:"env"`
+	}
+	mergedServers := map[string]desktopServer{}
+	configPaths := claudeDesktopConfigPaths()
+	out["paths"] = configPaths
+	for _, configPath := range configPaths {
+		raw, err := os.ReadFile(configPath)
+		if err != nil {
+			continue
+		}
+		if out["path"] == "" {
+			out["path"] = configPath
+		}
+		out["exists"] = true
+		var settings struct {
+			MCPServers map[string]desktopServer `json:"mcpServers"`
+		}
+		if json.Unmarshal(raw, &settings) != nil {
+			continue
+		}
+		for name, server := range settings.MCPServers {
+			if _, ok := mergedServers[name]; !ok {
+				mergedServers[name] = server
+			}
+		}
+	}
+	servers := make([]string, 0, len(mergedServers))
+	for name := range mergedServers {
+		servers = append(servers, name)
+	}
+	sort.Strings(servers)
+	out["server_count"] = len(servers)
+	out["servers"] = servers
+	server, ok := mergedServers["antigravity-browser"]
+	if !ok {
+		return out
+	}
+	out["present"] = true
+	out["command"] = server.Command
+	out["args"] = server.Args
+	out["env_keys"] = sortedMapKeys(server.Env)
+	for i, arg := range server.Args {
+		if strings.EqualFold(arg, "-File") && i+1 < len(server.Args) {
+			out["launcher"] = server.Args[i+1]
+			break
+		}
+	}
+	return out
+}
+
+func claudeDesktopConfigPaths() []string {
+	paths := []string{}
+	if localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); localAppData != "" {
+		paths = append(paths, filepath.Join(localAppData, "Claude-3p", "claude_desktop_config.json"))
+	}
+	if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+		paths = append(paths, filepath.Join(appData, "Claude", "claude_desktop_config.json"))
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		key := strings.ToLower(path)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, path)
 	}
 	return out
 }
@@ -3078,12 +4374,15 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 		}
 		auth := codexAuthMetadata(cfg)
 		claudeVersion := commandOutput(2*time.Second, "claude", "--version")
+		localURL := "http://127.0.0.1:" + cfg.Port
 		writeJSON(w, http.StatusOK, map[string]any{
 			"running":          proxyEnabled.Load(),
 			"proxy_running":    proxyEnabled.Load(),
 			"pid":              os.Getpid(),
 			"uptime_seconds":   int(time.Since(startedAt).Seconds()),
-			"local_url":        "http://127.0.0.1:" + cfg.Port,
+			"local_url":        localURL,
+			"anthropic_url":    localURL + "/anthropic",
+			"openai_url":       localURL + "/openai/v1",
 			"port":             cfg.Port,
 			"upstream":         cfg.Upstream,
 			"codex_auth":       auth,
@@ -3210,8 +4509,286 @@ func handleUIConfig(cfg config) http.HandlerFunc {
 
 func handleUIModels(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"models": modelRows(cfg)})
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, map[string]any{"models": modelRows(cfg)})
+		case http.MethodPost:
+			var body struct {
+				Models []modelAliasConfig `json:"models"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+				return
+			}
+			current := readEnvMap()
+			next, err := saveModelAliasesToEnvMap(current, body.Models)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			if err := writeEnvMap(current); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			syncProcessEnvKeys(current, "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED")
+			replaceRuntimeModelConfig(cfg, next)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Model aliases saved and active for new requests.", "models": modelRows(cfg)})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		}
 	}
+}
+
+func handleUIKeys(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		providers, clients, err := readKeyRows(cfg)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"providers": providers,
+			"clients":   clients,
+			"defaults": map[string]string{
+				"openai_base_url":  defaultProviderBaseURL("openai"),
+				"gemini_base_url":  defaultProviderBaseURL("gemini"),
+				"anthropic_base":   "http://127.0.0.1:" + cfg.Port + "/anthropic",
+				"openai_local_url": "http://127.0.0.1:" + cfg.Port + "/openai/v1",
+			},
+		})
+	}
+}
+
+func handleUIProviderKeys(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+			Label    string `json:"label"`
+			BaseURL  string `json:"base_url"`
+			APIKey   string `json:"api_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		provider := strings.ToLower(strings.TrimSpace(body.Provider))
+		if provider != "openai" && provider != "gemini" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider must be openai or gemini"})
+			return
+		}
+		apiKey := strings.TrimSpace(body.APIKey)
+		if apiKey == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider API key is required"})
+			return
+		}
+		label := strings.TrimSpace(body.Label)
+		if label == "" {
+			label = strings.Title(provider) + " key"
+		}
+		baseURL := strings.TrimRight(strings.TrimSpace(body.BaseURL), "/")
+		if baseURL == "" {
+			baseURL = defaultProviderBaseURL(provider)
+		}
+		enc, err := encryptSecret(cfg, apiKey)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		db, err := openProxyDB(cfg)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		defer db.Close()
+		if err := migrateProxyDB(db); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		now := time.Now().Format(time.RFC3339)
+		message := "Provider key saved."
+		if id := strings.TrimSpace(body.ID); id != "" {
+			res, err := db.Exec(`UPDATE provider_keys SET provider = ?, label = ?, base_url = ?, api_key_enc = ?, key_preview = ?, updated_at = ? WHERE id = ?`,
+				provider, label, baseURL, enc, maskSecret(apiKey), now, id)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			affected, _ := res.RowsAffected()
+			if affected == 0 {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider key not found"})
+				return
+			}
+			message = "Provider key renewed."
+		} else {
+			_, err = db.Exec(`INSERT INTO provider_keys (id, provider, label, base_url, api_key_enc, key_preview, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+				randomID("pk"), provider, label, baseURL, enc, maskSecret(apiKey), now, now)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		providers, clients, _ := readKeyRows(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": message, "providers": providers, "clients": clients})
+	}
+}
+
+func handleUIClientKeys(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			Label         string `json:"label"`
+			Schema        string `json:"schema"`
+			Provider      string `json:"provider"`
+			ProviderKeyID string `json:"provider_key_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		label := strings.TrimSpace(body.Label)
+		if label == "" {
+			label = "Client key"
+		}
+		schema := normalizeClientSchema(body.Schema)
+		provider := strings.ToLower(strings.TrimSpace(body.Provider))
+		if provider != "" && provider != "default" && provider != "openai" && provider != "gemini" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider must be default, openai, or gemini"})
+			return
+		}
+		if provider == "default" {
+			provider = ""
+		}
+		rawKey := newClientAPIKey()
+		db, err := openProxyDB(cfg)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		defer db.Close()
+		if err := migrateProxyDB(db); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		now := time.Now().Format(time.RFC3339)
+		_, err = db.Exec(`INSERT INTO client_keys (id, label, key_hash, key_preview, schema, provider, provider_key_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+			randomID("ck"), label, hashString(rawKey), maskSecret(rawKey), schema, provider, strings.TrimSpace(body.ProviderKeyID), now, now)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		providers, clients, _ := readKeyRows(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Client key created. Copy it now; it will not be shown again.", "api_key": rawKey, "providers": providers, "clients": clients})
+	}
+}
+
+func handleUIKeyToggle(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			Kind    string `json:"kind"`
+			ID      string `json:"id"`
+			Enabled bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		table := ""
+		switch body.Kind {
+		case "provider":
+			table = "provider_keys"
+		case "client":
+			table = "client_keys"
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "kind must be provider or client"})
+			return
+		}
+		db, err := openProxyDB(cfg)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		defer db.Close()
+		enabled := 0
+		if body.Enabled {
+			enabled = 1
+		}
+		_, err = db.Exec(`UPDATE `+table+` SET enabled = ?, updated_at = ? WHERE id = ?`, enabled, time.Now().Format(time.RFC3339), strings.TrimSpace(body.ID))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		providers, clients, _ := readKeyRows(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "providers": providers, "clients": clients})
+	}
+}
+
+func readKeyRows(cfg config) ([]providerKeyRow, []clientKeyRow, error) {
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer db.Close()
+	if err := migrateProxyDB(db); err != nil {
+		return nil, nil, err
+	}
+	providers := []providerKeyRow{}
+	rows, err := db.Query(`SELECT id, provider, label, base_url, key_preview, enabled, created_at, updated_at FROM provider_keys ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row providerKeyRow
+		var enabled int
+		if err := rows.Scan(&row.ID, &row.Provider, &row.Label, &row.BaseURL, &row.KeyPreview, &enabled, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, nil, err
+		}
+		row.Schema = providerSchema(row.Provider)
+		row.Enabled = enabled != 0
+		providers = append(providers, row)
+	}
+	providerLabels := map[string]string{}
+	for _, row := range providers {
+		providerLabels[row.ID] = row.Label
+	}
+	clients := []clientKeyRow{}
+	clientRows, err := db.Query(`SELECT id, label, key_preview, schema, provider, provider_key_id, enabled, created_at, updated_at, last_used_at FROM client_keys ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer clientRows.Close()
+	for clientRows.Next() {
+		var row clientKeyRow
+		var enabled int
+		if err := clientRows.Scan(&row.ID, &row.Label, &row.KeyPreview, &row.Schema, &row.Provider, &row.ProviderKeyID, &enabled, &row.CreatedAt, &row.UpdatedAt, &row.LastUsedAt); err != nil {
+			return nil, nil, err
+		}
+		row.Schema = normalizeClientSchema(row.Schema)
+		row.Enabled = enabled != 0
+		row.ProviderLabel = providerLabels[row.ProviderKeyID]
+		clients = append(clients, row)
+	}
+	return providers, clients, nil
 }
 
 func handleUILogs(w http.ResponseWriter, r *http.Request) {
@@ -3230,13 +4807,13 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 		base := "http://127.0.0.1:" + cfg.Port
 		headers := map[string]string{"x-api-key": cfg.ProxyKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
 		modelAlias := "sonnet[1m]"
-		steps = append(steps, validateHTTP(http.MethodGet, base+"/v1/models", headers, nil, "GET /v1/models"))
+		steps = append(steps, validateHTTP(http.MethodGet, base+"/anthropic/v1/models", headers, nil, "GET /anthropic/v1/models"))
 		body := []byte(`{"model":"sonnet[1m]","messages":[{"role":"user","content":"Quick count test"}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/v1/messages/count_tokens", headers, body, "POST /v1/messages/count_tokens"))
+		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages/count_tokens", headers, body, "POST /anthropic/v1/messages/count_tokens"))
 		body = []byte(`{"model":"sonnet[1m]","max_tokens":32,"messages":[{"role":"user","content":"Say hello in one sentence."}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/v1/messages", headers, body, "POST /v1/messages"))
+		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers, body, "POST /anthropic/v1/messages"))
 		body = []byte(`{"model":"sonnet[1m]","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Say streaming hello."}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/v1/messages", headers, body, "POST /v1/messages (stream)"))
+		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers, body, "POST /anthropic/v1/messages (stream)"))
 		ok := true
 		for _, step := range steps {
 			if step["ok"] != true {
@@ -3248,7 +4825,7 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 			"ok":             ok,
 			"ran_at":         time.Now().Format("15:04:05"),
 			"model":          modelAlias,
-			"upstream_model": firstNonEmpty(cfg.Models[modelAlias], modelAlias),
+			"upstream_model": resolveModel(cfg, modelAlias),
 			"steps":          steps,
 			"duration_total": validationDurationTotal(steps),
 		}
@@ -3293,7 +4870,7 @@ func handleUITest(cfg config) http.HandlerFunc {
 		}
 		payload, _ := json.Marshal(map[string]any{"model": body.Model, "max_tokens": 1024, "stream": body.Stream, "messages": []map[string]string{{"role": "user", "content": body.Prompt}}})
 		start := time.Now()
-		req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+cfg.Port+"/v1/messages", bytes.NewReader(payload))
+		req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+cfg.Port+"/anthropic/v1/messages", bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", cfg.ProxyKey)
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -3424,12 +5001,24 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT", "PROXY_DB_PATH", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {
+		seen[k] = true
 		if v, ok := vals[k]; ok {
 			b.WriteString(k + "=" + v + "\n")
 		}
+	}
+	var extra []string
+	for k := range vals {
+		if !seen[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Strings(extra)
+	for _, k := range extra {
+		b.WriteString(k + "=" + vals[k] + "\n")
 	}
 	return os.WriteFile(".env", []byte(b.String()), 0600)
 }
@@ -3463,11 +5052,146 @@ func applyAliases(vals map[string]string, aliases []struct{ From, To, Context st
 	}
 }
 
+func saveModelAliasesToEnvMap(vals map[string]string, submitted []modelAliasConfig) (config, error) {
+	rows, err := normalizeSubmittedModelAliases(submitted)
+	if err != nil {
+		return config{}, err
+	}
+	env := mapEnvValue(vals)
+	claudeDefaults := claudeDefaultsFromValues(env)
+	baseModels := defaultModelAliasesFromValues(env)
+	baseCfg := config{Models: baseModels, ClaudeDefaults: claudeDefaults}
+
+	submittedAliases := map[string]bool{}
+	for _, row := range rows {
+		submittedAliases[row.Alias] = true
+	}
+
+	var disabled []string
+	for alias := range baseModels {
+		if !isAdvertisedModel(alias) {
+			continue
+		}
+		if !submittedAliases[alias] {
+			disabled = append(disabled, alias)
+		}
+	}
+	sort.Strings(disabled)
+
+	var overrides []modelAliasConfig
+	for _, row := range rows {
+		baseReal, isBase := baseModels[row.Alias]
+		baseContext := contextForAlias(baseCfg, row.Alias)
+		if !isBase || baseReal != row.Real || row.Context != baseContext {
+			overrides = append(overrides, row)
+		}
+	}
+	sort.Slice(overrides, func(i, j int) bool { return overrides[i].Alias < overrides[j].Alias })
+
+	if len(overrides) == 0 {
+		delete(vals, "PROXY_MODEL_ALIASES")
+	} else {
+		raw, _ := json.Marshal(overrides)
+		vals["PROXY_MODEL_ALIASES"] = string(raw)
+	}
+	if len(disabled) == 0 {
+		delete(vals, "PROXY_MODEL_ALIASES_DISABLED")
+	} else {
+		raw, _ := json.Marshal(disabled)
+		vals["PROXY_MODEL_ALIASES_DISABLED"] = string(raw)
+	}
+
+	next := config{
+		Models:         map[string]string{},
+		ModelContexts:  map[string]string{},
+		ModelCustom:    map[string]bool{},
+		ClaudeDefaults: claudeDefaults,
+	}
+	for _, row := range rows {
+		next.Models[row.Alias] = row.Real
+		next.ModelContexts[row.Alias] = row.Context
+		if _, isBase := baseModels[row.Alias]; !isBase || !isAdvertisedModel(row.Alias) {
+			next.ModelCustom[row.Alias] = true
+		}
+	}
+	for _, row := range overrides {
+		next.ModelCustom[row.Alias] = true
+	}
+	return next, nil
+}
+
+func normalizeSubmittedModelAliases(submitted []modelAliasConfig) ([]modelAliasConfig, error) {
+	rows := make([]modelAliasConfig, 0, len(submitted))
+	seen := map[string]bool{}
+	for _, row := range submitted {
+		alias := strings.TrimSpace(row.Alias)
+		real := cleanModel(strings.TrimSpace(row.Real))
+		if alias == "" || real == "" {
+			return nil, fmt.Errorf("alias and Codex model are required")
+		}
+		if strings.ContainsAny(alias, " \t\r\n") {
+			return nil, fmt.Errorf("alias %q cannot contain whitespace", alias)
+		}
+		key := strings.ToLower(alias)
+		if seen[key] {
+			return nil, fmt.Errorf("alias %q is duplicated", alias)
+		}
+		seen[key] = true
+		rows = append(rows, modelAliasConfig{Alias: alias, Real: real, Context: normalizeModelContext(row.Context)})
+	}
+	return rows, nil
+}
+
+func syncProcessEnvKeys(vals map[string]string, keys ...string) {
+	for _, key := range keys {
+		if v, ok := vals[key]; ok {
+			_ = os.Setenv(key, v)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	}
+}
+
+func replaceRuntimeModelConfig(cfg config, next config) {
+	modelConfigMu.Lock()
+	defer modelConfigMu.Unlock()
+	replaceStringMap(cfg.Models, next.Models)
+	replaceStringMap(cfg.ModelContexts, next.ModelContexts)
+	replaceBoolMap(cfg.ModelCustom, next.ModelCustom)
+	replaceStringMap(cfg.ClaudeDefaults, next.ClaudeDefaults)
+}
+
+func replaceStringMap(dst map[string]string, src map[string]string) {
+	if dst == nil {
+		return
+	}
+	for k := range dst {
+		delete(dst, k)
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
+func replaceBoolMap(dst map[string]bool, src map[string]bool) {
+	if dst == nil {
+		return
+	}
+	for k := range dst {
+		delete(dst, k)
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
 func modelRows(cfg config) []map[string]any {
 	supported := map[string]bool{"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true, "gpt-5.3-codex": true}
 	rows := []map[string]any{}
+	modelConfigMu.RLock()
+	defer modelConfigMu.RUnlock()
 	for alias, real := range cfg.Models {
-		if !isAdvertisedModel(alias) {
+		if !isAdvertisedModel(alias) && !cfg.ModelCustom[alias] {
 			continue
 		}
 		status := "unsupported"
@@ -3478,6 +5202,11 @@ func modelRows(cfg config) []map[string]any {
 		}
 		rows = append(rows, map[string]any{"alias": alias, "real": real, "status": status, "context": contextForAlias(cfg, alias), "default": alias == "sonnet" || alias == "sonnet[1m]", "recommended": alias == "gpt-5.3-codex"})
 	}
+	sort.Slice(rows, func(i, j int) bool {
+		left := fmt.Sprint(rows[i]["alias"])
+		right := fmt.Sprint(rows[j]["alias"])
+		return left < right
+	})
 	return rows
 }
 
@@ -3534,6 +5263,9 @@ func normalizeReasoningEffort(effort string) string {
 
 func contextForAlias(cfg config, alias string) string {
 	lower := strings.ToLower(alias)
+	if context := normalizeModelContext(cfg.ModelContexts[alias]); context != "200k" || cfg.ModelContexts[alias] != "" {
+		return context
+	}
 	if lower == "opus" || lower == "claude-opus-4-7" {
 		return contextFromModel(cfg.ClaudeDefaults["opus"])
 	}
@@ -3616,7 +5348,7 @@ func dashboardMetrics() map[string]any {
 }
 
 func isDashboardTraffic(row uiLogRow) bool {
-	return strings.HasPrefix(row.Path, "/v1/")
+	return strings.HasPrefix(row.Path, "/anthropic/v1/") || strings.HasPrefix(row.Path, "/openai/v1/")
 }
 
 func summarizeTrafficRows(rows []uiLogRow) map[string]any {
@@ -3764,6 +5496,16 @@ func getenv(key, fallback string) string {
 }
 
 func cleanModel(model string) string { return strings.TrimPrefix(model, "openai/") }
+
+func resolveModel(cfg config, model string) string {
+	modelConfigMu.RLock()
+	mapped, ok := cfg.Models[model]
+	modelConfigMu.RUnlock()
+	if ok {
+		return mapped
+	}
+	return cleanModel(model)
+}
 
 func requestNote(alias, upstream string, stream bool, effort string) string {
 	parts := []string{"alias=" + firstNonEmpty(alias, upstream), "upstream=" + upstream, "stream=" + strconv.FormatBool(stream)}

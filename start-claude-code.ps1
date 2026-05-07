@@ -25,7 +25,7 @@ if ([string]::IsNullOrWhiteSpace($proxyKey)) {
 
 & (Join-Path $basePath 'start-proxy.ps1')
 
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$port"
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$port/anthropic"
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:ANTHROPIC_AUTH_TOKEN = $proxyKey
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'

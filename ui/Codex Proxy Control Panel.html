@@ -36,13 +36,68 @@
       { id: "dashboard", label: "Dashboard",       icon: "dashboard", kbd: "1" },
       { id: "config",    label: "Configuration",   icon: "config",    kbd: "2" },
       { id: "models",    label: "Models",          icon: "models",    kbd: "3", badge: "8" },
-      { id: "test",      label: "Test request",    icon: "test",      kbd: "4" },
-      { id: "logs",      label: "Logs",            icon: "logs",      kbd: "5", badge: "live" },
-      { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "6" },
-      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "7" },
+      { id: "keys",      label: "API keys",        icon: "key",       kbd: "4" },
+      { id: "test",      label: "Test request",    icon: "test",      kbd: "5" },
+      { id: "logs",      label: "Logs",            icon: "logs",      kbd: "6", badge: "live" },
+      { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "7" },
+      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "8" },
     ];
 
+    function LoginScreen({ auth, onAuthenticated }) {
+      const isSetup = auth && auth.configured === false;
+      const [username, setUsername] = useState(auth?.username || "admin");
+      const [password, setPassword] = useState("");
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState("");
+      const submit = async (e) => {
+        e.preventDefault();
+        setBusy(true);
+        setError("");
+        try {
+          await api.post(isSetup ? "/ui/api/auth/setup" : "/ui/api/auth/login", { username, password });
+          onAuthenticated();
+        } catch (err) {
+          setError(err.message || String(err));
+        } finally {
+          setBusy(false);
+        }
+      };
+      return (
+        <div className="auth-shell">
+          <form className="auth-card" onSubmit={submit}>
+            <div className="auth-mark"><Icon name="lock" size={18}/></div>
+            <h1>{isSetup ? "Set up admin access" : "Admin login"}</h1>
+            <p>{isSetup ? "Create the local admin login before opening the control panel." : "Enter the local admin credentials from this proxy."}</p>
+            <label>
+              <span>Username</span>
+              <input className="inp inp-sans" value={username} onChange={e => setUsername(e.target.value)} autoFocus/>
+            </label>
+            <label>
+              <span>Password</span>
+              <input className="inp inp-sans" value={password} onChange={e => setPassword(e.target.value)} type="password"/>
+            </label>
+            {error && <div className="auth-error">{error}</div>}
+            <button className="btn btn-primary" type="submit" disabled={busy || !username || password.length < (isSetup ? 8 : 1)}>
+              <Icon name={isSetup ? "check" : "lock"} size={12}/>{busy ? "Working" : isSetup ? "Create admin" : "Sign in"}
+            </button>
+            {isSetup && <div className="auth-hint">The password is saved as a hash in .env. The raw password is not stored.</div>}
+          </form>
+        </div>
+      );
+    }
+
     function App() {
+      const [auth, setAuth] = useState({ loading: true, configured: true, authenticated: false });
+      const refreshAuth = () => api.get("/ui/api/auth/status")
+        .then(res => setAuth({ loading: false, ...res }))
+        .catch(() => setAuth({ loading: false, configured: true, authenticated: false }));
+      useEffect(() => { refreshAuth(); }, []);
+      if (auth.loading) return <div className="auth-shell"><div className="auth-card"><h1>Loading</h1></div></div>;
+      if (!auth.authenticated) return <LoginScreen auth={auth} onAuthenticated={refreshAuth}/>;
+      return <ProxyApp onLogout={async () => { await api.post("/ui/api/auth/logout"); refreshAuth(); }}/>;
+    }
+
+    function ProxyApp({ onLogout }) {
       const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
       const [route, setRoute] = useState("dashboard");
       const [toasts, setToasts] = useState([]);
@@ -63,7 +118,7 @@
       useEffect(() => {
         const onKey = (e) => {
           if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-          const idx = "1234567".indexOf(e.key);
+          const idx = "12345678".indexOf(e.key);
           if (idx >= 0) { setRoute(NAV[idx].id); }
         };
         window.addEventListener("keydown", onKey);
@@ -131,6 +186,7 @@
 
             <div className="hdr-right">
               <span className="hdr-bind"><Icon name="lock" size={11}/>local-only</span>
+              <button className="btn btn-sm btn-ghost" onClick={onLogout}><Icon name="x" size={11}/>Logout</button>
               <span className="hdr-kbd">⌘K</span>
             </div>
           </header>
@@ -174,7 +230,8 @@
           <main className="main">
             {route === "dashboard" && <Dashboard proxyState={t.proxyState} onAction={handleAction} liveStatus={liveStatus}/>}
             {route === "config"    && <Configuration pushToast={pushToast}/>}
-            {route === "models"    && <Models/>}
+            {route === "models"    && <Models pushToast={pushToast}/>}
+            {route === "keys"      && <ApiKeys pushToast={pushToast} liveStatus={liveStatus}/>}
             {route === "test"      && <TestRequest/>}
             {route === "logs"      && <Logs proxyState={t.proxyState}/>}
             {route === "browser"   && <BrowserBridge/>}

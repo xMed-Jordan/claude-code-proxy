@@ -3,6 +3,7 @@
 Local Windows proxy that exposes Anthropic-compatible endpoints for Claude Code and forwards requests to Codex/ChatGPT subscription auth.
 
 It also includes a local control panel at `http://127.0.0.1:4000/`.
+On first use, the control panel requires creating a local admin login. The password is stored in `.env` as `ADMIN_PASSWORD_HASH`, not as plaintext.
 
 Claude Code's `WebSearch` tool is translated to Codex Responses web search, and Claude Code `/fast` requests are translated to a supported Codex model with `service_tier=priority`.
 Codex reasoning summaries are returned as Anthropic `thinking` blocks so Claude Code can place them in its thinking UI separately from the final answer.
@@ -12,13 +13,17 @@ Claude Code browser automation is exposed as a separate MCP sidecar named `antig
 ## Endpoints
 
 - `GET /health`
-- `GET /v1/models`
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
+- `GET /anthropic/v1/models`
+- `POST /anthropic/v1/messages`
+- `POST /anthropic/v1/messages/count_tokens`
+- `GET /openai/v1/models`
+- `POST /openai/v1/chat/completions`
+- `POST /openai/v1/responses`
+- `/openai/v1/files...` provider pass-through for OpenAI-compatible file upload/list/retrieve/delete calls
 - `GET /ui/api/antigravity`
 - `GET /antigravity/bridge`
+
+The old root `/v1/...` API paths are intentionally not registered. Claude Code should use `ANTHROPIC_BASE_URL=http://127.0.0.1:4000/anthropic`; OpenAI-compatible clients should use `http://127.0.0.1:4000/openai/v1`.
 
 ## Quick Start
 
@@ -36,17 +41,47 @@ Claude Code browser automation is exposed as a separate MCP sidecar named `antig
 .\start-claude-code.ps1
 ```
 
-## Claude Code Settings
+## Claude Code and Desktop Settings
 
 Starting the proxy applies local Claude Code settings:
 
-- `ANTHROPIC_BASE_URL=http://127.0.0.1:4000`
+- `ANTHROPIC_BASE_URL=http://127.0.0.1:4000/anthropic`
 - `ANTHROPIC_AUTH_TOKEN=<PROXY_API_KEY>`
 - `API_TIMEOUT_MS=3000000`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 - MCP server `antigravity-browser` in `~/.claude.json`, launched by `start-antigravity-browser-mcp.ps1`
+- MCP server `antigravity-browser` in Claude Desktop config, including the active Windows packaged-app path `%LOCALAPPDATA%\Claude-3p\claude_desktop_config.json` when present, preserving any existing local Desktop MCP servers
 - Claude Code isolation hooks for subagent worktrees and child Codex sessions
 - A proxy-managed `~/.claude/CLAUDE.md` memory block that tells Claude Code to use `antigravity-browser` for browser navigation, clicking, typing, page reads, and screenshots
+
+Claude Desktop's **Customize > Connectors** screen is for remote/web connectors and can be empty even when local MCP servers are configured. Local Desktop MCP servers are managed through `claude_desktop_config.json`; on Windows packaged installs the active file may be under `%LOCALAPPDATA%\Claude-3p`. These tools appear inside chats from the `+` / connectors tool picker after Claude Desktop reloads the config.
+
+To manage the browser bridge from Claude Desktop's **Settings > Extensions** screen, build a local Desktop Extension package:
+
+```powershell
+.\build-claude-desktop-extension.ps1
+```
+
+Then use **Install Extension** with `dist\claude-code-proxy-browser.dxt` or **Install Unpacked Extension** with `dist\claude-code-proxy-browser`.
+
+## API Keys
+
+The control panel includes an API Keys page for:
+
+- Provider keys: OpenAI or Google AI Studio/Gemini keys, saved encrypted in the local SQLite database at `PROXY_DB_PATH`. Saved provider keys can be renewed from the Provider keys table without changing the local client keys that route to them.
+- Provider schema: provider keys use the OpenAI-compatible schema. Google AI Studio defaults to `https://generativelanguage.googleapis.com/v1beta/openai`.
+- Client keys: local proxy keys for Claude Code or OpenAI-compatible clients. A client key can use the default proxy route or route directly through a saved OpenAI/Gemini provider key.
+- Client key schema scope: choose `both`, `anthropic`, or `openai` to restrict which public namespace a local client key can call.
+
+Client keys are shown only once when created. Provider keys are only shown as masked previews after saving.
+
+## OpenAI/Gemini Compatibility
+
+The local OpenAI-compatible path is `/openai/v1`. For Gemini through Google AI Studio, create a Gemini provider key in the dashboard and route a client key to that provider. The proxy forwards OpenAI-compatible Chat Completions requests, including `reasoning_effort` and `extra_body` for Gemini-specific thinking configuration.
+
+Image content parts are preserved as `image_url` parts. Anthropic image blocks are converted to OpenAI-compatible `image_url` parts for provider routing. File/document blocks are preserved as OpenAI-compatible `file` parts when they contain `file_id` or base64 `file_data`; text files become text parts, and URL-only non-image files are included as text pointers because the OpenAI-compatible Chat Completions file URL shape is not universal.
+
+Custom session IDs can be supplied with `X-Proxy-Session-Id`, `X-Codex-Session-Id`, `X-OpenAI-Session-Id`, `X-Claude-Code-Session-Id`, `X-Claude-Session-Id`, or `X-Session-Id`. OpenAI-compatible Chat Completions can also use `user` or `metadata.session_id` / `metadata.conversation_id` / `metadata.thread_id`. On Codex routes these become stable local `prompt_cache_key` sessions; on provider routes a session header fills the OpenAI `user` field when the request did not already set it.
 
 Fast mode and web search are controlled by:
 
@@ -62,11 +97,11 @@ Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code
 
 When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting.
 
-Before applying settings, the proxy creates snapshots of the current Claude Code settings, root MCP config, and user memory file. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
+Before applying settings, the proxy creates snapshots of the current Claude Code settings, Claude Code root MCP config, Claude Desktop MCP config, and user memory file. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
 
 ## Antigravity Browser Bridge
 
-The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses built-in browser tools for navigation, screenshots, page snapshots, console checks, visible cursor movement, clicks, typing, key presses, and waits.
+The Antigravity browser bridge is intentionally separate from `/anthropic/v1/messages`. Claude Code and Claude Desktop discover it through MCP, then use browser tools for navigation, screenshots, page snapshots, console checks, visible cursor movement, clicks, typing, key presses, and waits.
 
 The launcher validates:
 
