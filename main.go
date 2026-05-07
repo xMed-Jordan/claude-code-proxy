@@ -24,22 +24,25 @@ import (
 )
 
 var (
-	startedAt      = time.Now()
-	proxyEnabled   atomic.Bool
-	requestNotes   sync.Map
-	requestStats   sync.Map
-	logMu          sync.Mutex
-	logRows        []uiLogRow
-	traceMu        sync.Mutex
-	validationMu   sync.Mutex
-	lastValidation map[string]any
+	startedAt            = time.Now()
+	proxyEnabled         atomic.Bool
+	requestNotes         sync.Map
+	requestStats         sync.Map
+	logMu                sync.Mutex
+	logRows              []uiLogRow
+	traceMu              sync.Mutex
+	validationMu         sync.Mutex
+	lastValidation       map[string]any
+	antigravityMu        sync.Mutex
+	antigravityLastProbe map[string]any
 )
 
 const (
-	traceLogPath   = ".proxy.trace.log"
-	traceBodyLimit = 32768
-	traceMaxBytes  = 10 * 1024 * 1024
-	sseMaxLineSize = 64 * 1024 * 1024
+	traceLogPath           = ".proxy.trace.log"
+	traceBodyLimit         = 32768
+	traceMaxBytes          = 10 * 1024 * 1024
+	sseMaxLineSize         = 64 * 1024 * 1024
+	antigravityExtensionID = "eeijfnjmjelapkebgockoeaadonbchdd"
 )
 
 type config struct {
@@ -327,12 +330,15 @@ func main() {
 	mux.HandleFunc("/ui/api/validate", handleUIValidate(cfg))
 	mux.HandleFunc("/ui/api/test", handleUITest(cfg))
 	mux.HandleFunc("/ui/api/logs", handleUILogs)
+	mux.HandleFunc("/ui/api/antigravity", handleUIAntigravityStatus)
+	mux.HandleFunc("/ui/api/antigravity/probe", handleUIAntigravityProbe)
 	mux.HandleFunc("/ui/api/proxy/stop", handleUIStop)
 	mux.HandleFunc("/ui/api/proxy/start", handleUIStart)
 	mux.HandleFunc("/ui/api/proxy/restart", handleUIRestart(cfg))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_running": proxyEnabled.Load()})
 	})
+	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
 	mux.HandleFunc("/", handleUI)
 
 	server := &http.Server{Addr: "127.0.0.1:" + cfg.Port, Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
@@ -2577,6 +2583,375 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func handleAntigravityBridge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = io.WriteString(w, antigravityBridgeHTML())
+}
+
+func handleUIAntigravityStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, antigravityStatus())
+}
+
+func handleUIAntigravityProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	probe := sanitizeAntigravityProbe(body)
+	antigravityMu.Lock()
+	antigravityLastProbe = probe
+	antigravityMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "probe": probe})
+}
+
+func antigravityStatus() map[string]any {
+	extensionPath := antigravityExtensionPath()
+	manifest := antigravityManifestInfo(extensionPath)
+	profilePath := antigravityProfilePath()
+	chromePath := chromeExecutablePath()
+	npxPath := executablePath("npx.cmd", "npx.exe", "npx")
+	launcherPath := filepath.Join(mustGetwd(), "start-antigravity-browser-mcp.ps1")
+	bridgeURL := "http://127.0.0.1:" + getenv("PROXY_PORT", getenv("LITELLM_PORT", "4000")) + "/antigravity/bridge"
+
+	antigravityMu.Lock()
+	lastProbe := cloneMap(antigravityLastProbe)
+	antigravityMu.Unlock()
+
+	return map[string]any{
+		"extension": map[string]any{
+			"id":              antigravityExtensionID,
+			"path":            extensionPath,
+			"exists":          extensionPath != "",
+			"manifest":        manifest,
+			"manifest_exists": extensionPath != "" && fileExists(filepath.Join(extensionPath, "manifest.json")),
+		},
+		"profile": map[string]any{
+			"path":   profilePath,
+			"exists": fileExists(profilePath),
+		},
+		"chrome": map[string]any{
+			"path":   chromePath,
+			"exists": chromePath != "",
+		},
+		"npx": map[string]any{
+			"path":   npxPath,
+			"exists": npxPath != "",
+		},
+		"launcher": map[string]any{
+			"path":   launcherPath,
+			"exists": fileExists(launcherPath),
+		},
+		"mcp":          antigravityMCPSettings(),
+		"bridge_url":   bridgeURL,
+		"last_probe":   lastProbe,
+		"ready":        extensionPath != "" && chromePath != "" && npxPath != "" && fileExists(launcherPath),
+		"mode":         "hybrid_cdp_first",
+		"extension_id": antigravityExtensionID,
+	}
+}
+
+func antigravityExtensionPath() string {
+	if path := strings.TrimSpace(os.Getenv("ANTIGRAVITY_EXTENSION_PATH")); path != "" && fileExists(filepath.Join(path, "manifest.json")) {
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs
+		}
+		return path
+	}
+	root := filepath.Join(os.Getenv("LOCALAPPDATA"), "Google", "Chrome", "User Data", "Default", "Extensions", antigravityExtensionID)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	bestPath := ""
+	var bestTime time.Time
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if !fileExists(filepath.Join(path, "manifest.json")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && (bestPath == "" || info.ModTime().After(bestTime)) {
+			bestPath = path
+			bestTime = info.ModTime()
+		}
+		if bestPath == "" {
+			bestPath = path
+		}
+	}
+	return bestPath
+}
+
+func antigravityProfilePath() string {
+	if path := strings.TrimSpace(os.Getenv("ANTIGRAVITY_BROWSER_PROFILE")); path != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs
+		}
+		return path
+	}
+	return filepath.Join(mustGetwd(), ".antigravity-browser-profile")
+}
+
+func antigravityManifestInfo(extensionPath string) map[string]any {
+	info := map[string]any{
+		"name":                   "",
+		"version":                "",
+		"service_worker":         "",
+		"externally_connectable": false,
+		"content_script_count":   0,
+	}
+	if extensionPath == "" {
+		return info
+	}
+	raw, err := os.ReadFile(filepath.Join(extensionPath, "manifest.json"))
+	if err != nil {
+		return info
+	}
+	var manifest struct {
+		Name       string `json:"name"`
+		Version    string `json:"version"`
+		Background struct {
+			ServiceWorker string `json:"service_worker"`
+		} `json:"background"`
+		ExternallyConnectable struct {
+			Matches []string `json:"matches"`
+		} `json:"externally_connectable"`
+		ContentScripts []struct {
+			JS []string `json:"js"`
+		} `json:"content_scripts"`
+	}
+	if json.Unmarshal(raw, &manifest) != nil {
+		return info
+	}
+	info["name"] = manifest.Name
+	info["version"] = manifest.Version
+	info["service_worker"] = manifest.Background.ServiceWorker
+	info["externally_connectable"] = len(manifest.ExternallyConnectable.Matches) > 0
+	info["content_script_count"] = len(manifest.ContentScripts)
+	return info
+}
+
+func antigravityMCPSettings() map[string]any {
+	settingsPath := filepath.Join(os.Getenv("USERPROFILE"), ".claude", "settings.json")
+	out := map[string]any{
+		"name":     "antigravity-browser",
+		"path":     settingsPath,
+		"present":  false,
+		"command":  "",
+		"args":     []string{},
+		"launcher": "",
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return out
+	}
+	var settings struct {
+		MCPServers map[string]struct {
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+		} `json:"mcpServers"`
+	}
+	if json.Unmarshal(raw, &settings) != nil {
+		return out
+	}
+	server, ok := settings.MCPServers["antigravity-browser"]
+	if !ok {
+		return out
+	}
+	out["present"] = true
+	out["command"] = server.Command
+	out["args"] = server.Args
+	for i, arg := range server.Args {
+		if strings.EqualFold(arg, "-File") && i+1 < len(server.Args) {
+			out["launcher"] = server.Args[i+1]
+			break
+		}
+	}
+	return out
+}
+
+func chromeExecutablePath() string {
+	if path := strings.TrimSpace(os.Getenv("ANTIGRAVITY_CHROME_PATH")); path != "" && fileExists(path) {
+		return path
+	}
+	candidates := []string{
+		filepath.Join(os.Getenv("ProgramFiles"), "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Google", "Chrome", "Application", "chrome.exe"),
+	}
+	for _, candidate := range candidates {
+		if candidate != "" && fileExists(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func executablePath(names ...string) string {
+	for _, name := range names {
+		path, err := exec.LookPath(name)
+		if err == nil && path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+func sanitizeAntigravityProbe(body map[string]any) map[string]any {
+	out := map[string]any{
+		"received_at": time.Now().Format(time.RFC3339),
+	}
+	for _, key := range []string{"ok", "runtime_available", "sent_at"} {
+		if value, ok := body[key]; ok {
+			out[key] = sanitizeProbeScalar(value)
+		}
+	}
+	for _, key := range []string{"wake", "connection"} {
+		if value, ok := body[key]; ok {
+			out[key] = sanitizeProbeObject(value)
+		}
+	}
+	if value, ok := body["user_agent"]; ok {
+		out["user_agent"] = truncateString(fmt.Sprint(value), 180)
+	}
+	if value, ok := body["error"]; ok {
+		out["error"] = truncateString(fmt.Sprint(value), 500)
+	}
+	return out
+}
+
+func sanitizeProbeObject(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for key, item := range v {
+			if strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "secret") {
+				continue
+			}
+			out[key] = sanitizeProbeScalar(item)
+		}
+		return out
+	default:
+		return sanitizeProbeScalar(value)
+	}
+}
+
+func sanitizeProbeScalar(value any) any {
+	switch v := value.(type) {
+	case string:
+		return truncateString(v, 500)
+	case bool, float64, int, int64, nil:
+		return v
+	default:
+		raw, _ := json.Marshal(v)
+		return truncateString(string(raw), 500)
+	}
+}
+
+func cloneMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func antigravityBridgeHTML() string {
+	return strings.ReplaceAll(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Antigravity Bridge Probe</title>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif; background: #101418; color: #eef3f8; }
+    main { max-width: 860px; margin: 0 auto; padding: 32px 20px; }
+    h1 { font-size: 22px; margin: 0 0 8px; font-weight: 600; }
+    p { color: #9aa8b5; line-height: 1.5; }
+    .panel { border: 1px solid #27313a; background: #161c22; border-radius: 8px; padding: 16px; margin-top: 16px; }
+    .row { display: grid; grid-template-columns: 180px 1fr; gap: 10px; border-top: 1px solid #27313a; padding: 10px 0; }
+    .row:first-child { border-top: 0; }
+    .k { color: #9aa8b5; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .v { font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .ok { color: #6be49c; }
+    .bad { color: #ff8585; }
+    button { border: 1px solid #3a4652; background: #202832; color: #eef3f8; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Antigravity Browser Bridge Probe</h1>
+    <p>This local page checks whether Chrome exposes the Antigravity extension messaging bridge to Claude Code's dedicated browser profile.</p>
+    <button id="run">Run probe</button>
+    <div class="panel" id="out"></div>
+  </main>
+  <script>
+    const extensionId = "__EXTENSION_ID__";
+    const out = document.getElementById("out");
+    const rows = (data) => Object.keys(data).map((key) => '<div class="row"><div class="k">' + key + '</div><div class="v">' + escapeHtml(JSON.stringify(data[key], null, 2)) + '</div></div>').join("");
+    const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    const send = (payload) => new Promise((resolve) => {
+      if (!window.chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
+        resolve({ ok: false, error: "chrome.runtime.sendMessage is not available on this page" });
+        return;
+      }
+      try {
+        chrome.runtime.sendMessage(extensionId, payload, (response) => {
+          const last = chrome.runtime.lastError ? chrome.runtime.lastError.message : "";
+          resolve({ ok: !last, error: last, response: response || null });
+        });
+      } catch (err) {
+        resolve({ ok: false, error: err && err.message ? err.message : String(err) });
+      }
+    });
+    async function runProbe() {
+      const result = {
+        sent_at: new Date().toISOString(),
+        ok: false,
+        runtime_available: !!(window.chrome && chrome.runtime && chrome.runtime.sendMessage),
+        user_agent: navigator.userAgent
+      };
+      result.wake = await send({ action: "serviceWorkerWakeUp", timestamp: Date.now() });
+      result.connection = await send({ type: "CHECK_JETSKI_CONNECTION" });
+      result.ok = !!(result.wake && result.wake.ok);
+      out.innerHTML = rows(result);
+      try {
+        await fetch("/ui/api/antigravity/probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(result)
+        });
+      } catch (err) {
+        result.report_error = err && err.message ? err.message : String(err);
+        out.innerHTML = rows(result);
+      }
+    }
+    document.getElementById("run").addEventListener("click", runProbe);
+    runProbe();
+  </script>
+</body>
+</html>`, "__EXTENSION_ID__", antigravityExtensionID)
+}
+
 func handleUIStatus(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -2596,6 +2971,7 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"codex_auth":       auth,
 			"codex_sessions":   codexSessionMetadata(cfg),
 			"claude_settings":  claudeSettingsMetadata(cfg),
+			"antigravity":      antigravityStatus(),
 			"dashboard":        dashboardMetrics(),
 			"models":           modelRows(cfg),
 			"last_request":     lastRequest(),

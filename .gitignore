@@ -10,6 +10,7 @@
 .proxy.trace.log
 .proxy.trace.log.old
 .proxy.sessions.json
+.antigravity-browser-profile/
 *.log
 
 # Build outputs

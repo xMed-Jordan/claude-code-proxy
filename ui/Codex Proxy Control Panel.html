@@ -38,7 +38,8 @@
       { id: "models",    label: "Models",          icon: "models",    kbd: "3", badge: "8" },
       { id: "test",      label: "Test request",    icon: "test",      kbd: "4" },
       { id: "logs",      label: "Logs",            icon: "logs",      kbd: "5", badge: "live" },
-      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "6" },
+      { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "6" },
+      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "7" },
     ];
 
     function App() {
@@ -62,7 +63,7 @@
       useEffect(() => {
         const onKey = (e) => {
           if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-          const idx = "123456".indexOf(e.key);
+          const idx = "1234567".indexOf(e.key);
           if (idx >= 0) { setRoute(NAV[idx].id); }
         };
         window.addEventListener("keydown", onKey);
@@ -176,6 +177,7 @@
             {route === "models"    && <Models/>}
             {route === "test"      && <TestRequest/>}
             {route === "logs"      && <Logs proxyState={t.proxyState}/>}
+            {route === "browser"   && <BrowserBridge/>}
             {route === "setup"     && <Setup/>}
           </main>
 

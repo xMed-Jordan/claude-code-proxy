@@ -360,6 +360,108 @@ const Logs = ({ proxyState }) => {
 
 const pad = (n) => String(n).padStart(2, "0");
 
+// ─────────────────────────── ANTIGRAVITY BROWSER ───────────────────────────
+
+const BrowserBridge = () => {
+  const { data: status, refresh } = usePolling("/ui/api/antigravity", 3000);
+  const ext = status?.extension || {};
+  const manifest = ext.manifest || {};
+  const profile = status?.profile || {};
+  const mcp = status?.mcp || {};
+  const probe = status?.last_probe || null;
+  const ready = !!status?.ready;
+  const openBridge = () => {
+    if (status?.bridge_url) window.open(status.bridge_url, "_blank", "noopener,noreferrer");
+  };
+  const launcher = status?.launcher?.path || "start-antigravity-browser-mcp.ps1";
+
+  const rows = [
+    { label: "Extension", ok: ext.exists, meta: ext.exists ? `${manifest.name || "Antigravity"} ${manifest.version || ""}` : "not found" },
+    { label: "Manifest bridge", ok: !!manifest.externally_connectable, meta: manifest.service_worker || "service worker not detected" },
+    { label: "Dedicated profile", ok: true, meta: profile.path || "not configured" },
+    { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
+    { label: "npx", ok: status?.npx?.exists, meta: status?.npx?.path || "not found" },
+    { label: "Claude MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+  ];
+
+  return (
+    <section data-screen-label="06 Antigravity Browser" className="col" style={{ gap: 16 }}>
+      <SectionHd
+        title="Antigravity browser"
+        sub="Claude Code browser tools run through a dedicated Chrome DevTools MCP sidecar with the Antigravity extension loaded."
+        actions={
+          <>
+            <Pill tone={ready ? "ok" : "warn"}>{ready ? "Ready" : "Needs attention"}</Pill>
+            <button className="btn btn-sm btn-ghost" onClick={refresh}><Icon name="refresh" size={11}/>Refresh</button>
+            <button className="btn btn-sm" onClick={openBridge}><Icon name="bolt" size={11}/>Open bridge probe</button>
+          </>
+        }
+      />
+
+      <div className="col-2">
+        <Card title="Local bridge status" flush>
+          <ul className="checklist" style={{padding:"4px 14px"}}>
+            {rows.map((row, i) => (
+              <li key={i}>
+                <span className="check" data-state={row.ok ? "ok" : "warn"}><Icon name={row.ok ? "check" : "warn"} size={9}/></span>
+                <span>{row.label}</span>
+                <span className="meta">{row.meta}</span>
+              </li>
+            ))}
+          </ul>
+        </Card>
+
+        <Card title="Bridge probe">
+          {probe ? (
+            <div className="kv" style={{ gridTemplateColumns: "140px 1fr", rowGap: 8 }}>
+              <div className="k">Received</div>
+              <div className="v mono">{probe.received_at || "—"}</div>
+              <div className="k">Runtime</div>
+              <div className="v">{probe.runtime_available ? <Pill tone="ok">available</Pill> : <Pill tone="warn">unavailable</Pill>}</div>
+              <div className="k">Wake</div>
+              <div className="v mono">{prettyProbe(probe.wake)}</div>
+              <div className="k">Connection</div>
+              <div className="v mono">{prettyProbe(probe.connection)}</div>
+            </div>
+          ) : (
+            <div className="txt-2" style={{fontSize: 12}}>
+              No bridge probe has reported yet. Open the bridge probe in the dedicated Chrome profile or from any Chrome page that can message the Antigravity extension.
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <Card title="MCP launcher">
+        <div className="grid-2">
+          <div>
+            <div className="txt-3" style={{fontSize:10.5, textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:6}}>Launcher</div>
+            <CodeBox lang="PowerShell" code={launcher}/>
+          </div>
+          <div className="kv" style={{ gridTemplateColumns: "130px 1fr", rowGap: 8 }}>
+            <div className="k">Mode</div>
+            <div className="v mono">{status?.mode || "hybrid_cdp_first"}</div>
+            <div className="k">Extension ID</div>
+            <div className="v mono">{status?.extension_id || "—"}</div>
+            <div className="k">Extension path</div>
+            <div className="v mono">{ext.path || "—"}</div>
+            <div className="k">Bridge URL</div>
+            <div className="v mono">{status?.bridge_url || "—"}</div>
+          </div>
+        </div>
+      </Card>
+    </section>
+  );
+};
+
+function prettyProbe(value) {
+  if (!value) return "—";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
 // ─────────────────────────── SETUP ───────────────────────────
 
 const Setup = () => {
@@ -400,11 +502,13 @@ claude --model gpt-5.3-codex`;
     { ok: "ok",   label: "GET /v1/models returns 4 entries",                                   meta: "200 · 4 ms" },
     { ok: "ok",   label: "POST /v1/messages succeeds against gpt-5.3-codex",                   meta: "200 · 1.28 s" },
     { ok: status?.claude_settings?.mode === "anthropic_auth_token" && !status?.claude_settings?.api_key_present ? "ok" : "warn", label: "Claude settings use ANTHROPIC_AUTH_TOKEN", meta: `api key ${status?.claude_settings?.api_key_present ? "present" : "absent"} · cache ${status?.claude_settings?.gateway_cache_present ? "present" : "absent"}` },
+    { ok: status?.antigravity?.mcp?.present ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: status?.antigravity?.mcp?.present ? "server antigravity-browser" : "start endpoints to inject MCP settings" },
+    { ok: status?.antigravity?.ready ? "ok" : "warn", label: "Antigravity dedicated browser bridge ready", meta: status?.antigravity?.extension?.exists ? `extension ${status?.antigravity?.extension?.manifest?.version || "installed"}` : "extension not found" },
     { ok: status?.claude_version ? "ok" : "warn", label: "Claude Code CLI detected on PATH",   meta: status?.claude_version || "not detected" },
   ];
 
   return (
-    <section data-screen-label="06 Setup" className="col" style={{ gap: 16 }}>
+    <section data-screen-label="07 Setup" className="col" style={{ gap: 16 }}>
       <SectionHd
         title="Claude Code setup"
         sub="Point Claude Code at this proxy. Use the launcher script for the smoothest experience, or set environment variables manually."
@@ -515,4 +619,5 @@ function highlightShell(code) {
 
 window.TestRequest = TestRequest;
 window.Logs = Logs;
+window.BrowserBridge = BrowserBridge;
 window.Setup = Setup;

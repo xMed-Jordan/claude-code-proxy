@@ -202,6 +202,16 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
                 <span style={{color:"var(--fg)"}}>{liveStatus?.codex_sessions?.count || 0}</span>
                 <span className="txt-3"> · prompt key {liveStatus?.codex_sessions?.prompt_cache_key_enabled ? "on" : "off"} · one-shot {liveStatus?.codex_sessions?.side_thread_count || 0}</span>
               </div>
+              <div className="k">Browser bridge</div>
+              <div className="v">
+                {liveStatus?.antigravity?.ready
+                  ? <Pill tone="ok">Ready</Pill>
+                  : <Pill tone="warn">Needs check</Pill>}
+                <span className="txt-3 mono">
+                  {liveStatus?.antigravity?.mcp?.present ? " antigravity-browser MCP" : " MCP not injected"}
+                  {liveStatus?.antigravity?.extension?.manifest?.version ? ` · ext ${liveStatus.antigravity.extension.manifest.version}` : ""}
+                </span>
+              </div>
               <div className="k">Active aliases</div>
               <div className="v mono"><span style={{color:"var(--fg)"}}>{liveStatus?.models?.length || 0}</span><span className="txt-3"> · opus[1m], sonnet[1m], gpt-5.3-codex</span></div>
               <div className="k">Last request</div>

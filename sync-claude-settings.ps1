@@ -99,6 +99,27 @@ function Clear-GatewayModelsCache {
     }
 }
 
+function Ensure-AntigravityBrowserMcp {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Settings
+    )
+
+    if (-not ($Settings.PSObject.Properties.Name -contains 'mcpServers') -or $null -eq $Settings.mcpServers) {
+        Set-JsonProperty -Object $Settings -Name 'mcpServers' -Value ([pscustomobject]@{})
+    }
+
+    $launcherPath = Join-Path $basePath 'start-antigravity-browser-mcp.ps1'
+    $server = [pscustomobject]@{
+        command = 'pwsh'
+        args    = @('-NoProfile', '-File', $launcherPath)
+        env     = [pscustomobject]@{
+            CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
+        }
+    }
+
+    Set-JsonProperty -Object $Settings.mcpServers -Name 'antigravity-browser' -Value $server
+}
+
 function Apply-ProxySettings {
     Ensure-Snapshot
     Clear-GatewayModelsCache
@@ -160,6 +181,7 @@ function Apply-ProxySettings {
     Set-JsonProperty -Object $settings.env -Name 'API_TIMEOUT_MS' -Value $apiTimeoutMs
     Set-JsonProperty -Object $settings.env -Name 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' -Value $disableNonessential
     Set-JsonProperty -Object $settings -Name 'model' -Value 'opus[1m]'
+    Ensure-AntigravityBrowserMcp -Settings $settings
 
     $settings | ConvertTo-Json -Depth 100 | Set-Content -Path $settingsPath -Encoding UTF8
     Write-Host "Applied proxy env to Claude Code settings: $settingsPath"

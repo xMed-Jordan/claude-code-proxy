@@ -7,6 +7,7 @@ It also includes a local control panel at `http://127.0.0.1:4000/`.
 Claude Code's `WebSearch` tool is translated to Codex Responses web search, and Claude Code `/fast` requests are translated to a supported Codex model with `service_tier=priority`.
 Codex reasoning summaries are returned as Anthropic `thinking` blocks so Claude Code can place them in its thinking UI separately from the final answer.
 Claude Code sessions are isolated by mapping `X-Claude-Code-Session-Id` to a local Codex `prompt_cache_key`; `/btw` and compact-style one-shot requests get separate child keys.
+Claude Code browser automation is exposed as a separate MCP sidecar named `antigravity-browser`, powered by Chrome DevTools MCP with the Antigravity extension loaded in a dedicated Chrome profile.
 
 ## Endpoints
 
@@ -16,6 +17,8 @@ Claude Code sessions are isolated by mapping `X-Claude-Code-Session-Id` to a loc
 - `POST /v1/messages/count_tokens`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `GET /ui/api/antigravity`
+- `GET /antigravity/bridge`
 
 ## Quick Start
 
@@ -41,6 +44,7 @@ Starting the proxy applies local Claude Code settings:
 - `ANTHROPIC_AUTH_TOKEN=<PROXY_API_KEY>`
 - `API_TIMEOUT_MS=3000000`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+- MCP server `antigravity-browser`, launched by `start-antigravity-browser-mcp.ps1`
 
 Fast mode and web search are controlled by:
 
@@ -55,6 +59,25 @@ Fast mode and web search are controlled by:
 Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
 
 Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
+
+## Antigravity Browser Bridge
+
+The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses Chrome DevTools MCP tools for navigation, screenshots, page snapshots, clicks, forms, console, and network inspection.
+
+The launcher validates:
+
+- Google Chrome is installed.
+- `npx` is available.
+- Antigravity extension `eeijfnjmjelapkebgockoeaadonbchdd` is installed in Chrome.
+- A dedicated profile at `.antigravity-browser-profile` can be used without touching your normal Chrome profile.
+
+Optional overrides:
+
+- `ANTIGRAVITY_CHROME_PATH`
+- `ANTIGRAVITY_EXTENSION_PATH`
+- `ANTIGRAVITY_BROWSER_PROFILE`
+
+Open `http://127.0.0.1:4000/antigravity/bridge` from the dedicated browser profile to run a safe extension wake/connection probe. The probe records only local status fields; it does not log tokens or browsing history.
 
 ## Safety
 
