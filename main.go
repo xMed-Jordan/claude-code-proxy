@@ -236,6 +236,8 @@ type responsesOutputItem struct {
 	ID        string                   `json:"id"`
 	CallID    string                   `json:"call_id"`
 	Name      string                   `json:"name"`
+	Status    string                   `json:"status,omitempty"`
+	Action    any                      `json:"action,omitempty"`
 	Arguments string                   `json:"arguments"`
 	Content   []responsesOutputContent `json:"content"`
 	Summary   []responsesReasoningPart `json:"summary,omitempty"`
@@ -587,7 +589,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 			}
 			setRequestNote(r, note+" trace="+traceID)
 			if in.Stream {
-				streamCodex(ctx, cfg, responsesReq, in.Model, w, r)
+				streamCodex(ctx, cfg, responsesReq, in, w, r)
 				return
 			}
 			callCodex(ctx, cfg, responsesReq, in.Model, w, r)
@@ -1255,10 +1257,38 @@ func swapCodexWebSearchToolType(out responsesRequest, toolType string) responses
 	return out
 }
 
-func streamCodex(ctx context.Context, cfg config, out responsesRequest, requestedModel string, w http.ResponseWriter, r *http.Request) {
+func streamCodex(ctx context.Context, cfg config, out responsesRequest, in anthropicRequest, w http.ResponseWriter, r *http.Request) {
 	out.Stream = true
+	preflightThinking := webSearchPreflightThinking(in, out)
+	streamStarted := preflightThinking != ""
+	nextIndex := 0
+	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if streamStarted {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		inputTokens := estimateAnthropicRequestTokens(in)
+		sendAnthropicMessageStart(w, messageID, firstNonEmpty(in.Model, out.Model), inputTokens, 0)
+		traceLog(ctx, "anthropic.out.event", map[string]any{"event": "message_start", "message_id": messageID, "model": firstNonEmpty(in.Model, out.Model), "input_tokens_estimated": inputTokens})
+		writeAnthropicThinkingBlock(ctx, w, nextIndex, preflightThinking, syntheticThinkingSignature("codex-web-search-preflight", preflightThinking))
+		nextIndex++
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 	res, status, msg, err := callCodexResponses(ctx, cfg, out)
 	if err != nil {
+		if streamStarted {
+			writeAnthropicTextBlock(ctx, w, nextIndex, "Proxy upstream error: "+msg)
+			content := []any{map[string]any{"type": "text", "text": msg}}
+			sendAnthropicMessageDeltaStop(w, anthropicStopReason(content), 0)
+			sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return
+		}
 		writeAnthropicError(w, status, msg)
 		return
 	}
@@ -1269,13 +1299,14 @@ func streamCodex(ctx context.Context, cfg config, out responsesRequest, requeste
 		stat.StopReason = stopReason
 	})
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
-	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	sendAnthropicMessageStart(w, messageID, firstNonEmpty(requestedModel, out.Model), res.Usage.InputTokens, 0)
-	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "message_start", "message_id": messageID, "model": firstNonEmpty(requestedModel, out.Model)})
-	writeAnthropicBufferedStream(ctx, w, res)
+	if !streamStarted {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		sendAnthropicMessageStart(w, messageID, firstNonEmpty(in.Model, out.Model), res.Usage.InputTokens, 0)
+		traceLog(ctx, "anthropic.out.event", map[string]any{"event": "message_start", "message_id": messageID, "model": firstNonEmpty(in.Model, out.Model)})
+	}
+	writeAnthropicBufferedStreamFrom(ctx, w, res, nextIndex)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	traceLog(ctx, "anthropic.out.done", map[string]any{"done": true})
 	if flusher != nil {
@@ -1391,6 +1422,12 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		}
 		if item.Name == "" {
 			item.Name = existing.Name
+		}
+		if item.Status == "" {
+			item.Status = existing.Status
+		}
+		if item.Action == nil {
+			item.Action = existing.Action
 		}
 		if item.Arguments == "" {
 			item.Arguments = existing.Arguments
@@ -1546,6 +1583,10 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 				"name":  item.Name,
 				"input": input,
 			})
+		case "web_search_call":
+			if summary := webSearchCallThinkingText(item); summary != "" {
+				content = append(content, map[string]any{"type": "thinking", "thinking": summary, "signature": toolActivityThinkingSignature(item, summary)})
+			}
 		}
 	}
 	return content
@@ -1585,6 +1626,92 @@ func toolActivityThinkingText(toolName string, input any) string {
 func toolActivityThinkingSignature(item responsesOutputItem, thinking string) string {
 	sum := sha256.Sum256([]byte(firstNonEmpty(item.CallID, item.ID, item.Name, item.Type) + "\n" + thinking))
 	return "codex-tool-activity:" + base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
+func syntheticThinkingSignature(prefix, thinking string) string {
+	sum := sha256.Sum256([]byte(prefix + "\n" + thinking))
+	return prefix + ":" + base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
+func webSearchPreflightThinking(in anthropicRequest, out responsesRequest) string {
+	if !hasCodexWebSearchTool(out) {
+		return ""
+	}
+	latest := strings.TrimSpace(latestUserText(in))
+	if !requestLikelyNeedsWebSearch(latest) {
+		return ""
+	}
+	if latest == "" {
+		return "Tool activity: Codex web_search is enabled for this request. Waiting for Codex to report search activity."
+	}
+	return "Tool activity: Codex web_search is enabled. Codex will choose internal search queries from the latest user request: " + truncateString(latest, 500) + "\n\nIf the upstream exposes exact web_search query/action data, the proxy will show it in a later thinking block."
+}
+
+func requestLikelyNeedsWebSearch(text string) bool {
+	text = strings.ToLower(text)
+	for _, marker := range []string{"search the web", "web search", "search online", "look up", "find the official website", "official website", "homepage content", "latest", "current"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func webSearchCallThinkingText(item responsesOutputItem) string {
+	parts := []string{"Tool activity: Codex web_search"}
+	if item.Status != "" {
+		parts = append(parts, "status="+item.Status)
+	}
+	if query := webSearchActionQuery(item.Action); query != "" {
+		parts = append(parts, "query="+strconv.Quote(query))
+	} else {
+		parts = append(parts, "exact_query_not_exposed_by_upstream")
+	}
+	if item.ID != "" {
+		parts = append(parts, "id="+shortID(item.ID))
+	}
+	return strings.Join(parts, " ")
+}
+
+func webSearchActionQuery(action any) string {
+	switch v := action.(type) {
+	case map[string]any:
+		for _, key := range []string{"query", "search_query", "q"} {
+			if query := strings.TrimSpace(fmt.Sprint(v[key])); query != "" && query != "<nil>" {
+				return query
+			}
+		}
+		for _, value := range v {
+			if query := webSearchActionQuery(value); query != "" {
+				return query
+			}
+		}
+	case []any:
+		for _, value := range v {
+			if query := webSearchActionQuery(value); query != "" {
+				return query
+			}
+		}
+	}
+	return ""
+}
+
+func shortID(value string) string {
+	if len(value) <= 14 {
+		return value
+	}
+	return value[:10] + "..." + value[len(value)-4:]
+}
+
+func estimateAnthropicRequestTokens(in anthropicRequest) int {
+	chars := len(contentToText(in.System)) + len(in.Model)
+	for _, msg := range in.Messages {
+		chars += len(contentToText(msg.Content))
+	}
+	if chars <= 0 {
+		return 1
+	}
+	return max(1, chars/4)
 }
 
 func safeToolActivityInput(input any) any {
@@ -1650,56 +1777,71 @@ func sendAnthropicMessageStart(w io.Writer, messageID, model string, inputTokens
 }
 
 func writeAnthropicBufferedStream(ctx context.Context, w io.Writer, resp responsesResponse) {
+	writeAnthropicBufferedStreamFrom(ctx, w, resp, 0)
+}
+
+func writeAnthropicBufferedStreamFrom(ctx context.Context, w io.Writer, resp responsesResponse, startIndex int) {
 	content := anthropicContentBlocks(resp)
 	for i, block := range content {
+		index := startIndex + i
 		m, ok := block.(map[string]any)
 		if !ok {
 			continue
 		}
 		switch m["type"] {
 		case "thinking":
-			thinking := fmt.Sprint(m["thinking"])
-			signature := fmt.Sprint(m["signature"])
-			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": i, "block_type": "thinking"})
-			if thinking != "" {
-				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "thinking_delta", "thinking": thinking}})
-				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "thinking_delta", "thinking_chars": len(thinking), "thinking_preview": truncateString(thinking, 500)})
-			}
-			if signature != "" {
-				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "signature_delta", "signature": signature}})
-				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "signature_delta"})
-			}
-			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": i})
+			writeAnthropicThinkingBlock(ctx, w, index, fmt.Sprint(m["thinking"]), fmt.Sprint(m["signature"]))
 		case "text":
-			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": i, "block_type": "text"})
-			if text := fmt.Sprint(m["text"]); text != "" {
-				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": text}})
-				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "text_delta", "text_chars": len(text), "text_preview": truncateString(text, 500)})
-			}
-			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": i})
+			writeAnthropicTextBlock(ctx, w, index, fmt.Sprint(m["text"]))
 		case "tool_use":
 			id := fmt.Sprint(m["id"])
 			name := fmt.Sprint(m["name"])
 			input := m["input"]
-			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}}})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": i, "block_type": "tool_use", "id": id, "name": name})
+			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}}})
+			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": index, "block_type": "tool_use", "id": id, "name": name})
 			rawInput, _ := json.Marshal(input)
 			if string(rawInput) != "{}" && string(rawInput) != "null" {
-				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(rawInput)}})
-				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "input_json_delta", "json_chars": len(rawInput), "json_preview": truncateString(string(rawInput), 500)})
+				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(rawInput)}})
+				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": index, "delta_type": "input_json_delta", "json_chars": len(rawInput), "json_preview": truncateString(string(rawInput), 500)})
 			}
-			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
-			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": i})
+			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": index})
 		}
 	}
-	sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": anthropicStopReason(content), "stop_sequence": nil}, "usage": map[string]any{"output_tokens": resp.Usage.OutputTokens}})
+	sendAnthropicMessageDeltaStop(w, anthropicStopReason(content), resp.Usage.OutputTokens)
 	sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
 	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "message_delta", "stop_reason": anthropicStopReason(content), "output_tokens": resp.Usage.OutputTokens})
 	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "message_stop"})
+}
+
+func writeAnthropicThinkingBlock(ctx context.Context, w io.Writer, index int, thinking, signature string) {
+	sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
+	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": index, "block_type": "thinking"})
+	if thinking != "" {
+		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "thinking_delta", "thinking": thinking}})
+		traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": index, "delta_type": "thinking_delta", "thinking_chars": len(thinking), "thinking_preview": truncateString(thinking, 500)})
+	}
+	if signature != "" {
+		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "signature_delta", "signature": signature}})
+		traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": index, "delta_type": "signature_delta"})
+	}
+	sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": index})
+}
+
+func writeAnthropicTextBlock(ctx context.Context, w io.Writer, index int, text string) {
+	sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "text", "text": ""}})
+	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": index, "block_type": "text"})
+	if text != "" {
+		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": text}})
+		traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": index, "delta_type": "text_delta", "text_chars": len(text), "text_preview": truncateString(text, 500)})
+	}
+	sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+	traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": index})
+}
+
+func sendAnthropicMessageDeltaStop(w io.Writer, stopReason string, outputTokens int) {
+	sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
 }
 
 func openAIChatToResponses(cfg config, in openAIRequest) responsesRequest {
@@ -2345,6 +2487,8 @@ func summarizeResponsesResponse(resp responsesResponse) map[string]any {
 			"id":               item.ID,
 			"call_id":          item.CallID,
 			"name":             item.Name,
+			"status":           item.Status,
+			"action":           safeToolActivityInput(item.Action),
 			"arguments_chars":  len(item.Arguments),
 			"arguments":        truncateString(item.Arguments, 1000),
 			"text_chars":       len(text),
@@ -2387,6 +2531,8 @@ func summarizeResponsesStreamEvent(event responsesStreamEvent) map[string]any {
 			"id":              event.Item.ID,
 			"call_id":         event.Item.CallID,
 			"name":            event.Item.Name,
+			"status":          event.Item.Status,
+			"action":          safeToolActivityInput(event.Item.Action),
 			"arguments_chars": len(event.Item.Arguments),
 			"arguments":       truncateString(event.Item.Arguments, 1000),
 			"content_parts":   len(event.Item.Content),
@@ -2784,7 +2930,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
 	var b strings.Builder
 	for _, k := range keys {
 		if v, ok := vals[k]; ok {

@@ -314,6 +314,42 @@ func TestFunctionCallAddsToolActivityThinkingBlock(t *testing.T) {
 	}
 }
 
+func TestWebSearchCallAddsToolActivityThinkingBlock(t *testing.T) {
+	resp := responsesResponse{
+		ID: "resp_test",
+		Output: []responsesOutputItem{{
+			Type:   "web_search_call",
+			ID:     "ws_1234567890abcdef",
+			Status: "completed",
+			Action: map[string]any{"query": "Shalabi Clinic official website"},
+		}},
+	}
+	out := toAnthropicResponsesResponse(resp, "opus[1m]")
+	content := out["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("content = %#v, want one thinking block", content)
+	}
+	thinking := content[0].(map[string]any)
+	text := fmt.Sprint(thinking["thinking"])
+	if thinking["type"] != "thinking" || !strings.Contains(text, "web_search") || !strings.Contains(text, "Shalabi Clinic official website") {
+		t.Fatalf("web search thinking block = %#v", thinking)
+	}
+}
+
+func TestWebSearchPreflightThinkingUsesLatestUserRequest(t *testing.T) {
+	out := responsesRequest{Tools: []responsesTool{{Type: "web_search"}}}
+	in := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{map[string]any{"type": "text", "text": "Find the official website for Shalabi Clinic"}}}}}
+	text := webSearchPreflightThinking(in, out)
+	if !strings.Contains(text, "Codex web_search is enabled") || !strings.Contains(text, "Find the official website") {
+		t.Fatalf("preflight thinking = %q", text)
+	}
+
+	in = anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	if text := webSearchPreflightThinking(in, out); text != "" {
+		t.Fatalf("generic request should not get web preflight thinking: %q", text)
+	}
+}
+
 func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
 	events := []responsesStreamEvent{
 		{Type: "response.reasoning_summary_text.delta", ItemID: "rs_1", OutputIndex: 0, SummaryIndex: 0, Delta: "Checked "},
