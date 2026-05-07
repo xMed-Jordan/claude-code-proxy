@@ -7,6 +7,10 @@ function Restore-ClaudeSettings {
     & (Join-Path $basePath 'sync-claude-settings.ps1') -Action Restore
 }
 
+function Stop-AntigravityBrowser {
+    & (Join-Path $basePath 'start-antigravity-browser.ps1') -Stop -Quiet
+}
+
 if (-not (Test-Path $pidFile)) {
     Write-Host 'No .proxy.pid file found.'
     Restore-ClaudeSettings
@@ -24,5 +28,6 @@ try {
     }
 } finally {
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    Stop-AntigravityBrowser
     Restore-ClaudeSettings
 }

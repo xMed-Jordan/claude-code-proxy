@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2663,6 +2664,9 @@ func antigravityStatus() map[string]any {
 	npxPath := executablePath("npx.cmd", "npx.exe", "npx")
 	launcherPath := filepath.Join(mustGetwd(), "start-antigravity-browser-mcp.ps1")
 	bridgeURL := "http://127.0.0.1:" + getenv("PROXY_PORT", getenv("LITELLM_PORT", "4000")) + "/antigravity/bridge"
+	browserMode := antigravityBrowserMode()
+	debugPort := antigravityBrowserDebugPort()
+	browserURL := "http://127.0.0.1:" + debugPort
 
 	antigravityMu.Lock()
 	lastProbe := cloneMap(antigravityLastProbe)
@@ -2681,8 +2685,13 @@ func antigravityStatus() map[string]any {
 			"exists": fileExists(profilePath),
 		},
 		"chrome": map[string]any{
-			"path":   chromePath,
-			"exists": chromePath != "",
+			"path":            chromePath,
+			"exists":          chromePath != "",
+			"mode":            browserMode,
+			"startup_enabled": envFlag("ANTIGRAVITY_BROWSER_START_WITH_WINDOWS", false),
+			"browser_url":     browserURL,
+			"debug_port":      debugPort,
+			"debug_running":   antigravityBrowserEndpointRunning(browserURL),
 		},
 		"npx": map[string]any{
 			"path":   npxPath,
@@ -2699,6 +2708,40 @@ func antigravityStatus() map[string]any {
 		"mode":         "hybrid_cdp_first",
 		"extension_id": antigravityExtensionID,
 	}
+}
+
+func antigravityBrowserMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("ANTIGRAVITY_BROWSER_MODE")))
+	if mode == "" && envFlag("ANTIGRAVITY_USE_DEFAULT_BROWSER", false) {
+		return "default"
+	}
+	switch mode {
+	case "default", "existing", "normal":
+		return "default"
+	default:
+		return "dedicated"
+	}
+}
+
+func antigravityBrowserDebugPort() string {
+	port := strings.TrimSpace(os.Getenv("ANTIGRAVITY_BROWSER_DEBUG_PORT"))
+	if port == "" {
+		return "9233"
+	}
+	if n, err := strconv.Atoi(port); err == nil && n > 0 && n < 65536 {
+		return port
+	}
+	return "9233"
+}
+
+func antigravityBrowserEndpointRunning(browserURL string) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(strings.TrimRight(browserURL, "/") + "/json/version")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 func antigravityExtensionPath() string {
@@ -2785,7 +2828,7 @@ func antigravityManifestInfo(extensionPath string) map[string]any {
 }
 
 func antigravityMCPSettings() map[string]any {
-	settingsPath := filepath.Join(os.Getenv("USERPROFILE"), ".claude", "settings.json")
+	settingsPath := filepath.Join(os.Getenv("USERPROFILE"), ".claude.json")
 	out := map[string]any{
 		"name":     "antigravity-browser",
 		"path":     settingsPath,
@@ -2800,8 +2843,10 @@ func antigravityMCPSettings() map[string]any {
 	}
 	var settings struct {
 		MCPServers map[string]struct {
-			Command string   `json:"command"`
-			Args    []string `json:"args"`
+			Type    string            `json:"type"`
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
 		} `json:"mcpServers"`
 	}
 	if json.Unmarshal(raw, &settings) != nil {
@@ -2812,8 +2857,10 @@ func antigravityMCPSettings() map[string]any {
 		return out
 	}
 	out["present"] = true
+	out["type"] = server.Type
 	out["command"] = server.Command
 	out["args"] = server.Args
+	out["env_keys"] = sortedMapKeys(server.Env)
 	for i, arg := range server.Args {
 		if strings.EqualFold(arg, "-File") && i+1 < len(server.Args) {
 			out["launcher"] = server.Args[i+1]
@@ -2821,6 +2868,15 @@ func antigravityMCPSettings() map[string]any {
 		}
 	}
 	return out
+}
+
+func sortedMapKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func chromeExecutablePath() string {

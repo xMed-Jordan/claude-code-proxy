@@ -1,11 +1,14 @@
 param(
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$Stop,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
 
 $basePath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $extensionId = 'eeijfnjmjelapkebgockoeaadonbchdd'
+$pidFile = Join-Path $basePath '.antigravity-browser.pid'
 
 function Import-ProxyEnv {
     $envFile = Join-Path $basePath '.env'
@@ -26,6 +29,13 @@ function Import-ProxyEnv {
 }
 
 Import-ProxyEnv
+
+function Write-Info {
+    param([string]$Message)
+    if (-not $Quiet) {
+        Write-Host $Message
+    }
+}
 
 function Get-BrowserProfilePath {
     $envPath = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_PROFILE', 'Process')
@@ -60,11 +70,6 @@ function Get-DebugPort {
         return $port
     }
     return 9233
-}
-
-function Write-McpError {
-    param([string]$Message)
-    [Console]::Error.WriteLine($Message)
 }
 
 function Get-ChromePath {
@@ -106,16 +111,6 @@ function Get-AntigravityExtensionPath {
     return $versions[0].FullName
 }
 
-function Get-NpxPath {
-    foreach ($name in @('npx.cmd', 'npx.exe', 'npx')) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) {
-            return $cmd.Source
-        }
-    }
-    return $null
-}
-
 function Test-BrowserEndpoint {
     param([int]$Port)
     try {
@@ -126,87 +121,118 @@ function Test-BrowserEndpoint {
     }
 }
 
+function Stop-AntigravityBrowser {
+    if ((Get-BrowserMode) -eq 'default') {
+        Write-Info 'Default browser mode is active; no dedicated Antigravity browser is stopped.'
+        Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $profilePath = Get-BrowserProfilePath
+    if (-not (Test-Path -LiteralPath $pidFile)) {
+        Write-Info 'No Antigravity browser PID file found.'
+        return
+    }
+
+    try {
+        $pid = [int](Get-Content -Path $pidFile -Raw).Trim()
+        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        if ($null -eq $proc) {
+            Write-Info "No running Antigravity browser process found for PID $pid."
+            return
+        }
+
+        $commandLine = ''
+        try {
+            $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction Stop
+            $commandLine = [string]$cim.CommandLine
+        } catch {
+            $commandLine = ''
+        }
+
+        if ($commandLine -and -not $commandLine.Contains($profilePath)) {
+            Write-Info "Refusing to stop PID $pid because it does not use the Antigravity profile."
+            return
+        }
+
+        Stop-Process -Id $pid -Force
+        Write-Info "Stopped Antigravity browser (PID $pid)."
+    } finally {
+        Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $profileDir = Get-BrowserProfilePath
 $browserMode = Get-BrowserMode
 $debugPort = Get-DebugPort
 $browserUrl = "http://127.0.0.1:$debugPort"
 $chromePath = Get-ChromePath
 $extensionPath = Get-AntigravityExtensionPath
-$npxPath = Get-NpxPath
-$browserRunning = Test-BrowserEndpoint -Port $debugPort
 
-$problems = @()
-if ([string]::IsNullOrWhiteSpace($chromePath)) {
-    $problems += 'Google Chrome was not found. Set ANTIGRAVITY_CHROME_PATH to chrome.exe if it is installed in a custom location.'
+if ($Stop) {
+    Stop-AntigravityBrowser
+    return
 }
-if ([string]::IsNullOrWhiteSpace($extensionPath)) {
-    $problems += "Antigravity extension $extensionId was not found in the Chrome Default profile. Install it once in Chrome, or set ANTIGRAVITY_EXTENSION_PATH."
-}
-if ([string]::IsNullOrWhiteSpace($npxPath)) {
-    $problems += 'npx was not found on PATH. Install Node.js 20+ or add npm to PATH.'
-}
+
+$configured = (-not [string]::IsNullOrWhiteSpace($extensionPath))
+$ready = $configured -and (-not [string]::IsNullOrWhiteSpace($chromePath))
+$running = Test-BrowserEndpoint -Port $debugPort
 
 if ($ValidateOnly) {
-    $exitCode = 1
-    if ($problems.Count -eq 0) {
-        $exitCode = 0
-    }
     [pscustomobject]@{
-        ok             = ($problems.Count -eq 0)
+        ok             = $ready
         mode           = $browserMode
+        configured     = $configured
+        running        = $running
+        browser_url    = $browserUrl
         chrome_path    = $chromePath
         extension_id   = $extensionId
         extension_path = $extensionPath
         profile_path   = $profileDir
-        browser_url    = $browserUrl
-        browser_running = $browserRunning
-        npx_path       = $npxPath
-        problems       = $problems
+        pid_file       = $pidFile
     } | ConvertTo-Json -Depth 4
-    exit $exitCode
+    if ($ready) { exit 0 }
+    exit 1
 }
 
-if ($problems.Count -gt 0) {
-    foreach ($problem in $problems) {
-        Write-McpError $problem
-    }
-    exit 1
+if (-not $configured) {
+    Write-Info "Antigravity extension $extensionId is not configured; startup browser skipped."
+    return
+}
+if ([string]::IsNullOrWhiteSpace($chromePath)) {
+    Write-Info 'Google Chrome was not found; Antigravity startup browser skipped.'
+    return
+}
+if ($browserMode -eq 'default') {
+    Write-Info 'Default browser mode is active; Claude Code will auto-connect to your regular Chrome when the MCP starts.'
+    return
+}
+if ($running) {
+    Write-Info "Antigravity browser already responds at $browserUrl."
+    return
 }
 
 if (-not (Test-Path -LiteralPath $profileDir)) {
     New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
 }
 
-$env:CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
-
-$mcpArgs = @(
-    '-y',
-    'chrome-devtools-mcp@latest',
-    '--redact-network-headers=true',
-    '--usage-statistics=false',
-    '--performance-crux=false'
+$chromeArgs = @(
+    "--remote-debugging-address=127.0.0.1",
+    "--remote-debugging-port=$debugPort",
+    "--user-data-dir=$profileDir",
+    "--load-extension=$extensionPath",
+    "--disable-extensions-except=$extensionPath",
+    '--no-first-run',
+    '--no-default-browser-check',
+    'about:blank'
 )
 
-if ($browserMode -eq 'default') {
-    $mcpArgs += '--autoConnect=true'
-} elseif ($browserRunning) {
-    $mcpArgs += "--browserUrl=$browserUrl"
+$process = Start-Process -FilePath $chromePath -ArgumentList $chromeArgs -PassThru -WindowStyle Hidden
+Set-Content -Path $pidFile -Value $process.Id
+Start-Sleep -Milliseconds 800
+
+if (Test-BrowserEndpoint -Port $debugPort) {
+    Write-Info "Started Antigravity browser at $browserUrl (PID $($process.Id))."
 } else {
-    $chromeArgs = @(
-        "--load-extension=$extensionPath",
-        "--disable-extensions-except=$extensionPath",
-        '--no-first-run',
-        '--no-default-browser-check'
-    )
-
-    $mcpArgs += "--executable-path=$chromePath"
-    $mcpArgs += "--user-data-dir=$profileDir"
-    $mcpArgs += '--category-extensions=true'
-
-    foreach ($arg in $chromeArgs) {
-        $mcpArgs += "--chrome-arg=$arg"
-    }
+    Write-Info "Antigravity browser was started but is not responding at $browserUrl yet."
 }
-
-& $npxPath @mcpArgs
-exit $LASTEXITCODE
