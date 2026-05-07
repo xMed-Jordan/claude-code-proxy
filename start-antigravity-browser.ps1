@@ -60,6 +60,11 @@ function Get-BrowserMode {
     return 'dedicated'
 }
 
+function Test-ForceDefaultCdp {
+    $flag = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP', 'Process')
+    return (-not [string]::IsNullOrWhiteSpace($flag) -and $flag -match '^(1|true|yes|on)$')
+}
+
 function Get-DebugPort {
     $value = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_DEBUG_PORT', 'Process')
     if ([string]::IsNullOrWhiteSpace($value)) {
@@ -125,10 +130,65 @@ function Test-ChromeProcessRunning {
     return $null -ne (Get-Process -Name chrome -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
+function Get-ChromeProcessInfo {
+    @(Get-Process -Name chrome -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{
+            Id        = $_.Id
+            Title     = [string]$_.MainWindowTitle
+            IsVisible = ($_.MainWindowHandle -ne 0)
+        }
+    })
+}
+
+function Test-SafeChromeWindowTitle {
+    param([string]$Title)
+    $normalized = $Title.Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $true
+    }
+    if ($normalized -eq 'about:blank - google chrome' -or $normalized -eq 'new tab - google chrome' -or $normalized -eq 'olemainthreadwndname') {
+        return $true
+    }
+    foreach ($part in @('claude code codex proxy', 'codex proxy control panel', '127.0.0.1:4000', 'localhost:4000')) {
+        if ($normalized.Contains($part)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-CanRelaunchDefaultChrome {
+    $flag = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($flag) -and $flag -match '^(0|false|no|off)$') {
+        return $false
+    }
+    $visible = @(Get-ChromeProcessInfo | Where-Object { $_.IsVisible })
+    if ($visible.Count -eq 0) {
+        return $true
+    }
+    foreach ($item in $visible) {
+        if (-not (Test-SafeChromeWindowTitle -Title $item.Title)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Stop-ChromeProcessesForDefaultBridge {
+    taskkill.exe /IM chrome.exe /F /T *> $null
+    $deadline = (Get-Date).AddSeconds(3)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-ChromeProcessRunning)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return (-not (Test-ChromeProcessRunning))
+}
+
 function Stop-AntigravityBrowser {
-    if ((Get-BrowserMode) -eq 'default') {
-        Write-Info 'Default browser mode is active; no dedicated Antigravity browser is stopped.'
-        Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+    if ((Get-BrowserMode) -eq 'default' -and -not (Test-Path -LiteralPath $pidFile)) {
+        Write-Info 'Default browser mode is active and no controlled Antigravity browser PID file exists.'
         return
     }
 
@@ -194,6 +254,7 @@ if ($ValidateOnly) {
         extension_path = $extensionPath
         profile_path   = $profileDir
         pid_file       = $pidFile
+        default_cdp_forced = Test-ForceDefaultCdp
     } | ConvertTo-Json -Depth 4
     if ($ready) { exit 0 }
     exit 1
@@ -214,9 +275,20 @@ if ($browserMode -eq 'default') {
     }
 
     $effectiveMode = 'default'
-    if (Test-ChromeProcessRunning) {
+    if (-not (Test-ForceDefaultCdp)) {
         $effectiveMode = 'dedicated_fallback'
-        Write-Info "Default Chrome is already running without DevTools at $browserUrl. Starting a visible isolated Chrome fallback for Claude Code browser control."
+        Write-Info 'Modern Chrome blocks DevTools control on the normal Default profile. Starting a visible controlled Chrome profile for Claude Code browser actions.'
+    } elseif (Test-ChromeProcessRunning) {
+        if (Test-CanRelaunchDefaultChrome) {
+            Write-Info "Chrome is running only in the background or on the proxy dashboard; relaunching the Default profile with DevTools at $browserUrl."
+            if (-not (Stop-ChromeProcessesForDefaultBridge)) {
+                Write-Info 'Could not stop existing Chrome processes; starting a visible isolated Chrome fallback for Claude Code browser control.'
+                $effectiveMode = 'dedicated_fallback'
+            }
+        } else {
+            $effectiveMode = 'dedicated_fallback'
+            Write-Info "Default Chrome has user windows open without DevTools at $browserUrl. Starting a visible isolated Chrome fallback for Claude Code browser control."
+        }
     }
 
     if ($effectiveMode -eq 'dedicated_fallback') {
@@ -249,9 +321,9 @@ if ($browserMode -eq 'default') {
     Start-Sleep -Milliseconds 800
 
     if (Test-BrowserEndpoint -Port $debugPort) {
-        Write-Info "Started default Chrome browser control at $browserUrl (PID $($process.Id))."
+        Write-Info "Started Chrome browser control at $browserUrl (mode $effectiveMode, PID $($process.Id))."
     } else {
-        Write-Info "Chrome opened, but DevTools is not responding at $browserUrl. If Chrome was already open, close it once and start the proxy again."
+        Write-Info "Chrome opened, but DevTools is not responding at $browserUrl. Modern Chrome requires a non-default data directory for browser control unless ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1 works on this Chrome build."
     }
     return
 }

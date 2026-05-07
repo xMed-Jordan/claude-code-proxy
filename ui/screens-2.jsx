@@ -381,7 +381,8 @@ const BrowserBridge = () => {
     { label: "Manifest bridge", ok: !!manifest.externally_connectable, meta: manifest.service_worker || "service worker not detected" },
     { label: "Browser mode", ok: true, meta: `${status?.chrome?.mode || "default"} · ${status?.chrome?.browser_url || "debug port pending"}` },
     { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
-    { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : "will start when MCP runs; close Chrome once if it stays unavailable" },
+    { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : (status?.chrome?.default_cdp_forced ? (status?.chrome?.can_relaunch_default ? "forced Default relaunch available" : "forced Default mode waiting") : "Default profile blocked by Chrome; controlled profile will be used") },
+    { label: "Chrome windows", ok: true, meta: `${status?.chrome?.process_count || 0} processes · ${status?.chrome?.visible_count || 0} visible` },
     { label: "Claude MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
     { label: "Visible control", ok: !!status?.visible_overlay, meta: bridgeState?.connected_now ? `connected · ${bridgeState.last_action || "ready"}` : "cursor overlay tools ready when Claude starts MCP" },
   ];
@@ -390,7 +391,7 @@ const BrowserBridge = () => {
     <section data-screen-label="06 Antigravity Browser" className="col" style={{ gap: 16 }}>
       <SectionHd
         title="Antigravity browser"
-        sub="Claude Code browser tools use your normal Chrome profile with a visible cursor overlay for move, click, type, page reads, and screenshots."
+        sub="Claude Code browser tools use a visible cursor overlay for move, click, type, page reads, and screenshots. Modern Chrome uses a controlled profile when the normal profile blocks DevTools."
         actions={
           <>
             <Pill tone={ready ? "ok" : "warn"}>{ready ? "Ready" : "Needs attention"}</Pill>
@@ -436,7 +437,7 @@ const BrowserBridge = () => {
       <Card title="Visible browser control">
         <div className="kv" style={{ gridTemplateColumns: "140px 1fr", rowGap: 8 }}>
           <div className="k">Connection</div>
-          <div className="v">{bridgeState?.connected_now ? <Pill tone="ok">Chrome control connected</Pill> : <Pill tone="warn">waiting for Chrome DevTools</Pill>}</div>
+          <div className="v">{bridgeState?.connected_now ? <Pill tone="ok">Chrome control connected</Pill> : <Pill tone="warn">waiting for controlled Chrome</Pill>}</div>
           <div className="k">Current page</div>
           <div className="v mono">{bridgeState?.current_url || "—"}</div>
           <div className="k">Title</div>
@@ -522,7 +523,7 @@ claude --model gpt-5.3-codex`;
     { ok: "ok",   label: "POST /v1/messages succeeds against gpt-5.3-codex",                   meta: "200 · 1.28 s" },
     { ok: status?.claude_settings?.mode === "anthropic_auth_token" && !status?.claude_settings?.api_key_present ? "ok" : "warn", label: "Claude settings use ANTHROPIC_AUTH_TOKEN", meta: `api key ${status?.claude_settings?.api_key_present ? "present" : "absent"} · cache ${status?.claude_settings?.gateway_cache_present ? "present" : "absent"}` },
     { ok: status?.antigravity?.mcp?.present ? "ok" : "warn", label: "Antigravity browser MCP configured", meta: status?.antigravity?.mcp?.present ? "server antigravity-browser" : "start endpoints to inject MCP settings" },
-    { ok: status?.antigravity?.ready ? "ok" : "warn", label: "Antigravity dedicated browser bridge ready", meta: status?.antigravity?.extension?.exists ? `extension ${status?.antigravity?.extension?.manifest?.version || "installed"}` : "extension not found" },
+    { ok: status?.antigravity?.ready ? "ok" : "warn", label: "Antigravity browser bridge ready", meta: status?.antigravity?.extension?.exists ? `extension ${status?.antigravity?.extension?.manifest?.version || "installed"}` : "extension not found" },
     { ok: status?.claude_version ? "ok" : "warn", label: "Claude Code CLI detected on PATH",   meta: status?.claude_version || "not detected" },
   ];
 

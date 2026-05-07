@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,6 +80,12 @@ type antigravityBrowserState struct {
 	LastTool     string `json:"last_tool"`
 	LastAction   string `json:"last_action"`
 	LastError    string `json:"last_error"`
+}
+
+type chromeProcessInfo struct {
+	ID        int    `json:"id"`
+	Title     string `json:"title"`
+	IsVisible bool   `json:"is_visible"`
 }
 
 func loadDotEnvIntoProcess() {
@@ -600,6 +607,7 @@ func toolBrowserWait(ctx context.Context, args map[string]any) (mcpToolResult, e
 
 func antigravityRuntimeStatus(ctx context.Context) map[string]any {
 	baseURL := antigravityCDPBaseURL()
+	debugRunning := antigravityBrowserEndpointRunning(baseURL)
 	status := map[string]any{
 		"server": map[string]any{
 			"name":    antigravityMCPName,
@@ -610,7 +618,7 @@ func antigravityRuntimeStatus(ctx context.Context) map[string]any {
 			"path":          chromeExecutablePath(),
 			"mode":          antigravityBrowserMode(),
 			"browser_url":   baseURL,
-			"debug_running": antigravityBrowserEndpointRunning(baseURL),
+			"debug_running": debugRunning,
 		},
 		"extension": map[string]any{
 			"id":       antigravityExtensionID,
@@ -619,9 +627,10 @@ func antigravityRuntimeStatus(ctx context.Context) map[string]any {
 		},
 		"state": readAntigravityBrowserState(),
 	}
-	if err := ensureChromeDebugEndpoint(ctx); err != nil {
-		status["ok"] = false
-		status["error"] = err.Error()
+	if !debugRunning {
+		status["ok"] = true
+		status["pages"] = 0
+		status["note"] = "Browser control is idle. It will open only when a browser action tool is called."
 		return status
 	}
 	targets, err := listCDPTargets(ctx)
@@ -769,7 +778,7 @@ func ensureChromeDebugEndpoint(ctx context.Context) error {
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("Chrome is not exposing DevTools at %s. Close Chrome and let the MCP start it with remote debugging, or set ANTIGRAVITY_BROWSER_MODE=dedicated", baseURL)
+	return fmt.Errorf("Chrome did not expose DevTools at %s. Modern Chrome blocks DevTools control on the normal Default profile; the bridge uses a controlled profile unless ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1 is set", baseURL)
 }
 
 func startChromeForCDP() error {
@@ -780,6 +789,7 @@ func startChromeForCDP() error {
 	debugPort := antigravityBrowserDebugPort()
 	mode := antigravityBrowserMode()
 	effectiveMode := mode
+	lastAction := "started Chrome for browser control"
 	args := []string{
 		"--remote-debugging-address=127.0.0.1",
 		"--remote-debugging-port=" + debugPort,
@@ -787,7 +797,23 @@ func startChromeForCDP() error {
 		"--no-default-browser-check",
 	}
 	if mode != "dedicated" && chromeProcessRunning() {
+		if !defaultChromeCDPForced() {
+			effectiveMode = "dedicated_fallback"
+			lastAction = "started dedicated fallback because Chrome blocks DevTools on the Default profile"
+		} else if canRelaunchDefaultChrome() {
+			if err := stopChromeProcessesForDefaultBridge(); err != nil {
+				return err
+			}
+			effectiveMode = "default_relaunched"
+			lastAction = "relaunched default Chrome for browser control"
+		} else {
+			effectiveMode = "dedicated_fallback"
+			lastAction = "started dedicated fallback because default Chrome has user windows without DevTools"
+		}
+	}
+	if mode != "dedicated" && !chromeProcessRunning() && !defaultChromeCDPForced() {
 		effectiveMode = "dedicated_fallback"
+		lastAction = "started dedicated fallback because Chrome blocks DevTools on the Default profile"
 	}
 	if effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback" {
 		profilePath := antigravityProfilePath()
@@ -813,20 +839,141 @@ func startChromeForCDP() error {
 		Mode:       effectiveMode,
 		BrowserURL: antigravityCDPBaseURL(),
 		Connected:  false,
-		LastAction: "started Chrome for browser control",
+		LastAction: lastAction,
 	})
 	return nil
 }
 
 func chromeProcessRunning() bool {
+	return len(chromeProcesses()) > 0
+}
+
+func chromeProcesses() []chromeProcessInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "tasklist.exe", "/FI", "IMAGENAME eq chrome.exe", "/NH").Output()
+	out, err := exec.CommandContext(ctx, "tasklist.exe", "/FI", "IMAGENAME eq chrome.exe", "/V", "/FO", "CSV", "/NH").Output()
 	if err != nil {
+		return nil
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" || strings.Contains(strings.ToLower(raw), "no tasks are running") {
+		return nil
+	}
+	reader := csv.NewReader(strings.NewReader(raw))
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil
+	}
+	processes := make([]chromeProcessInfo, 0, len(records))
+	for _, record := range records {
+		if len(record) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(record[1]))
+		if err != nil {
+			continue
+		}
+		title := ""
+		if len(record) > 0 {
+			title = strings.TrimSpace(record[len(record)-1])
+		}
+		if strings.EqualFold(title, "N/A") {
+			title = ""
+		}
+		processes = append(processes, chromeProcessInfo{
+			ID:        pid,
+			Title:     title,
+			IsVisible: title != "",
+		})
+	}
+	return processes
+}
+
+func canRelaunchDefaultChrome() bool {
+	return canRelaunchDefaultChromeFrom(chromeProcesses())
+}
+
+func canRelaunchDefaultChromeFrom(processes []chromeProcessInfo) bool {
+	if !defaultChromeCDPForced() {
 		return false
 	}
-	text := strings.ToLower(string(out))
-	return strings.Contains(text, "chrome.exe")
+	if !envFlag("ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", true) {
+		return false
+	}
+	visible := visibleChromeWindowsFrom(processes)
+	if len(visible) == 0 {
+		return true
+	}
+	for _, proc := range visible {
+		if !safeChromeWindowTitle(proc.Title) {
+			return false
+		}
+	}
+	return true
+}
+
+func visibleChromeWindows() []chromeProcessInfo {
+	return visibleChromeWindowsFrom(chromeProcesses())
+}
+
+func visibleChromeWindowsFrom(processes []chromeProcessInfo) []chromeProcessInfo {
+	visible := make([]chromeProcessInfo, 0, len(processes))
+	for _, proc := range processes {
+		if proc.IsVisible {
+			visible = append(visible, proc)
+		}
+	}
+	return visible
+}
+
+func safeChromeWindowTitle(title string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(title))
+	if normalized == "" {
+		return true
+	}
+	if normalized == "about:blank - google chrome" || normalized == "new tab - google chrome" || normalized == "olemainthreadwndname" {
+		return true
+	}
+	safeParts := []string{
+		"claude code codex proxy",
+		"codex proxy control panel",
+		"127.0.0.1:4000",
+		"localhost:4000",
+	}
+	for _, part := range safeParts {
+		if strings.Contains(normalized, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func stopChromeProcessesForDefaultBridge() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "taskkill.exe", "/IM", "chrome.exe", "/F", "/T").Run()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !chromeProcessRunning() {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if chromeProcessRunning() {
+		return errors.New("could not stop existing Chrome background processes before launching the default profile with DevTools")
+	}
+	return nil
+}
+
+func defaultChromeCDPForced() bool {
+	return envFlag("ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", false)
+}
+
+func defaultChromeCDPNote() string {
+	if defaultChromeCDPForced() {
+		return "Default profile CDP is forced by ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP=1. This is intended only for older or custom Chrome builds."
+	}
+	return "Modern Chrome blocks DevTools control on the normal Default profile. Claude Code browser actions use a controlled profile unless Chrome is already exposing a DevTools endpoint."
 }
 
 func listCDPTargets(ctx context.Context) ([]cdpTarget, error) {

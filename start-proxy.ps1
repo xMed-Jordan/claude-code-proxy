@@ -27,8 +27,8 @@ if ([string]::IsNullOrWhiteSpace($port)) { $port = '4000' }
 
 & (Join-Path $basePath 'sync-claude-settings.ps1') -Action Apply
 
-$startAntigravity = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_START_WITH_WINDOWS', 'Process')
-if ($startAntigravity -match '^(1|true|yes|on)$') {
+$prelaunchAntigravity = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY', 'Process')
+if ($prelaunchAntigravity -match '^(1|true|yes|on)$') {
     & (Join-Path $basePath 'start-antigravity-browser.ps1') -Quiet
 }
 

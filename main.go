@@ -2675,6 +2675,19 @@ func antigravityStatus() map[string]any {
 	bridgeState := readAntigravityBrowserState()
 	debugRunning := antigravityBrowserEndpointRunning(browserURL)
 	bridgeState["connected_now"] = debugRunning
+	if !debugRunning {
+		bridgeState["mode"] = "idle"
+		bridgeState["connected"] = false
+		bridgeState["last_action"] = "idle; browser opens on first action"
+	}
+	chromeProcesses := chromeProcesses()
+	visibleWindows := visibleChromeWindowsFrom(chromeProcesses)
+	visibleTitles := make([]string, 0, len(visibleWindows))
+	for _, proc := range visibleWindows {
+		if strings.TrimSpace(proc.Title) != "" {
+			visibleTitles = append(visibleTitles, truncateString(proc.Title, 160))
+		}
+	}
 
 	antigravityMu.Lock()
 	lastProbe := cloneMap(antigravityLastProbe)
@@ -2693,13 +2706,19 @@ func antigravityStatus() map[string]any {
 			"exists": fileExists(profilePath),
 		},
 		"chrome": map[string]any{
-			"path":            chromePath,
-			"exists":          chromePath != "",
-			"mode":            browserMode,
-			"startup_enabled": envFlag("ANTIGRAVITY_BROWSER_START_WITH_WINDOWS", false),
-			"browser_url":     browserURL,
-			"debug_port":      debugPort,
-			"debug_running":   debugRunning,
+			"path":                 chromePath,
+			"exists":               chromePath != "",
+			"mode":                 browserMode,
+			"startup_enabled":      envFlag("ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", false),
+			"browser_url":          browserURL,
+			"debug_port":           debugPort,
+			"debug_running":        debugRunning,
+			"process_count":        len(chromeProcesses),
+			"visible_count":        len(visibleWindows),
+			"visible_titles":       visibleTitles,
+			"can_relaunch_default": canRelaunchDefaultChromeFrom(chromeProcesses),
+			"default_cdp_forced":   defaultChromeCDPForced(),
+			"default_cdp_note":     defaultChromeCDPNote(),
 		},
 		"launcher": map[string]any{
 			"path":   launcherPath,
