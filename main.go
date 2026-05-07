@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -192,7 +194,8 @@ type responsesRequest struct {
 }
 
 type responsesReasoning struct {
-	Effort string `json:"effort,omitempty"`
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type responseInput struct {
@@ -233,6 +236,7 @@ type responsesOutputItem struct {
 	Name      string                   `json:"name"`
 	Arguments string                   `json:"arguments"`
 	Content   []responsesOutputContent `json:"content"`
+	Summary   []responsesReasoningPart `json:"summary,omitempty"`
 }
 
 type responsesOutputContent struct {
@@ -240,15 +244,21 @@ type responsesOutputContent struct {
 	Text string `json:"text"`
 }
 
+type responsesReasoningPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 type responsesStreamEvent struct {
-	Type        string              `json:"type"`
-	Delta       string              `json:"delta"`
-	Text        string              `json:"text"`
-	Arguments   string              `json:"arguments"`
-	ItemID      string              `json:"item_id"`
-	OutputIndex int                 `json:"output_index"`
-	Item        responsesOutputItem `json:"item"`
-	Response    responsesResponse   `json:"response"`
+	Type         string              `json:"type"`
+	Delta        string              `json:"delta"`
+	Text         string              `json:"text"`
+	Arguments    string              `json:"arguments"`
+	ItemID       string              `json:"item_id"`
+	OutputIndex  int                 `json:"output_index"`
+	SummaryIndex int                 `json:"summary_index"`
+	Item         responsesOutputItem `json:"item"`
+	Response     responsesResponse   `json:"response"`
 }
 
 type uiLogRow struct {
@@ -685,7 +695,7 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
 	}
 	if effort := requestReasoningEffort(cfg, in); effort != "" {
-		out.Reasoning = &responsesReasoning{Effort: effort}
+		out.Reasoning = &responsesReasoning{Effort: effort, Summary: codexReasoningSummaryMode()}
 	}
 	hasWebSearch := false
 	for _, tool := range in.Tools {
@@ -729,6 +739,17 @@ func requestUsesClaudeFastMode(r *http.Request, in anthropicRequest) bool {
 func isClaudeFastModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(model, "[1m]", "")))
 	return model == "claude-opus-4-6"
+}
+
+func codexReasoningSummaryMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_REASONING_SUMMARY"))) {
+	case "none", "off", "false", "0":
+		return ""
+	case "concise", "detailed", "auto":
+		return strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_REASONING_SUMMARY")))
+	default:
+		return "auto"
+	}
 }
 
 func isClaudeWebSearchTool(tool anthropicTool) bool {
@@ -800,6 +821,8 @@ func convertAnthropicMessageToResponses(role string, content any) []any {
 			continue
 		}
 		switch fmt.Sprint(m["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
 		case "text":
 			messageParts = append(messageParts, map[string]any{"type": inputTextType(role), "text": fmt.Sprint(m["text"])})
 		case "image":
@@ -960,6 +983,10 @@ func retryCodexRequestAfter400(out responsesRequest, status int, msg string) (co
 		return codexRetryRequest{}, false
 	}
 	lower := strings.ToLower(msg)
+	if out.Reasoning != nil && out.Reasoning.Summary != "" && strings.Contains(lower, "summary") {
+		out.Reasoning.Summary = ""
+		return codexRetryRequest{reason: "reasoning_summary_not_accepted", request: out}, true
+	}
 	if hasCodexWebSearchTool(out) && strings.Contains(lower, "web_search") {
 		return codexRetryRequest{reason: "alternate_web_search_tool_type", request: swapCodexWebSearchToolType(out, alternateCodexWebSearchToolType(out))}, true
 	}
@@ -1146,6 +1173,9 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		if len(item.Content) == 0 {
 			item.Content = existing.Content
 		}
+		if len(item.Summary) == 0 {
+			item.Summary = existing.Summary
+		}
 		items[idx] = item
 	}
 	scanner := newSSEScanner(r)
@@ -1190,6 +1220,13 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 			}
 			rememberItem(event.OutputIndex, item)
 		}
+		if strings.Contains(event.Type, "reasoning_summary_text") && (event.Delta != "" || event.Text != "") {
+			item := items[event.OutputIndex]
+			item.Type = "reasoning"
+			item.ID = firstNonEmpty(item.ID, event.ItemID)
+			item.Summary = mergeReasoningSummaryText(item.Summary, event.SummaryIndex, firstNonEmpty(event.Text, event.Delta), event.Text != "")
+			rememberItem(event.OutputIndex, item)
+		}
 		if delta := codexStreamText(event); delta != "" {
 			text.WriteString(delta)
 		}
@@ -1222,6 +1259,25 @@ func codexStreamText(event responsesStreamEvent) string {
 	}
 }
 
+func mergeReasoningSummaryText(parts []responsesReasoningPart, idx int, text string, replace bool) []responsesReasoningPart {
+	if text == "" {
+		return parts
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	for len(parts) <= idx {
+		parts = append(parts, responsesReasoningPart{Type: "summary_text"})
+	}
+	parts[idx].Type = firstNonEmpty(parts[idx].Type, "summary_text")
+	if replace {
+		parts[idx].Text = text
+	} else {
+		parts[idx].Text += text
+	}
+	return parts
+}
+
 func toAnthropicResponsesResponse(resp responsesResponse, requestedModel string) map[string]any {
 	content := anthropicContentBlocks(resp)
 	return map[string]any{"id": resp.ID, "type": "message", "role": "assistant", "model": firstNonEmpty(requestedModel, resp.Model), "content": content, "stop_reason": anthropicStopReason(content), "stop_sequence": nil, "usage": map[string]any{"input_tokens": resp.Usage.InputTokens, "output_tokens": resp.Usage.OutputTokens}}
@@ -1242,6 +1298,10 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 	content := []any{}
 	for _, item := range resp.Output {
 		switch item.Type {
+		case "reasoning":
+			if thinking := reasoningSummaryText(item); thinking != "" {
+				content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": codexThinkingSignature(item, thinking)})
+			}
 		case "message":
 			for _, part := range item.Content {
 				if part.Text != "" {
@@ -1258,6 +1318,21 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 		}
 	}
 	return content
+}
+
+func reasoningSummaryText(item responsesOutputItem) string {
+	var parts []string
+	for _, part := range item.Summary {
+		if strings.TrimSpace(part.Text) != "" {
+			parts = append(parts, part.Text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func codexThinkingSignature(item responsesOutputItem, thinking string) string {
+	sum := sha256.Sum256([]byte(firstNonEmpty(item.ID, item.Type) + "\n" + thinking))
+	return "codex-reasoning-summary:" + base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
 func functionArgumentsToInput(arguments string) any {
@@ -1297,6 +1372,21 @@ func writeAnthropicBufferedStream(ctx context.Context, w io.Writer, resp respons
 			continue
 		}
 		switch m["type"] {
+		case "thinking":
+			thinking := fmt.Sprint(m["thinking"])
+			signature := fmt.Sprint(m["signature"])
+			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
+			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": i, "block_type": "thinking"})
+			if thinking != "" {
+				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "thinking_delta", "thinking": thinking}})
+				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "thinking_delta", "thinking_chars": len(thinking), "thinking_preview": truncateString(thinking, 500)})
+			}
+			if signature != "" {
+				sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "signature_delta", "signature": signature}})
+				traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_delta", "index": i, "delta_type": "signature_delta"})
+			}
+			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
+			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_stop", "index": i})
 		case "text":
 			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
 			traceLog(ctx, "anthropic.out.event", map[string]any{"event": "content_block_start", "index": i, "block_type": "text"})
@@ -1910,8 +2000,10 @@ func summarizeResponsesRequest(out responsesRequest) map[string]any {
 		tools = append(tools, firstNonEmpty(tool.Name, tool.Type))
 	}
 	effort := ""
+	summary := ""
 	if out.Reasoning != nil {
 		effort = out.Reasoning.Effort
+		summary = out.Reasoning.Summary
 	}
 	return map[string]any{
 		"model":              out.Model,
@@ -1922,6 +2014,7 @@ func summarizeResponsesRequest(out responsesRequest) map[string]any {
 		"tools":              tools,
 		"tool_count":         len(out.Tools),
 		"reasoning_effort":   effort,
+		"reasoning_summary":  summary,
 		"service_tier":       out.ServiceTier,
 		"temperature":        out.Temperature,
 	}
@@ -1945,17 +2038,20 @@ func summarizeResponsesResponse(resp responsesResponse) map[string]any {
 		for _, part := range item.Content {
 			text += part.Text
 		}
+		thinking := reasoningSummaryText(item)
 		items = append(items, map[string]any{
-			"index":           i,
-			"type":            item.Type,
-			"role":            item.Role,
-			"id":              item.ID,
-			"call_id":         item.CallID,
-			"name":            item.Name,
-			"arguments_chars": len(item.Arguments),
-			"arguments":       truncateString(item.Arguments, 1000),
-			"text_chars":      len(text),
-			"text_preview":    truncateString(text, 1000),
+			"index":            i,
+			"type":             item.Type,
+			"role":             item.Role,
+			"id":               item.ID,
+			"call_id":          item.CallID,
+			"name":             item.Name,
+			"arguments_chars":  len(item.Arguments),
+			"arguments":        truncateString(item.Arguments, 1000),
+			"text_chars":       len(text),
+			"text_preview":     truncateString(text, 1000),
+			"thinking_chars":   len(thinking),
+			"thinking_preview": truncateString(thinking, 1000),
 		})
 	}
 	return map[string]any{
@@ -1969,11 +2065,12 @@ func summarizeResponsesResponse(resp responsesResponse) map[string]any {
 
 func summarizeResponsesStreamEvent(event responsesStreamEvent) map[string]any {
 	out := map[string]any{
-		"type":         event.Type,
-		"delta_chars":  len(event.Delta),
-		"text_chars":   len(event.Text),
-		"output_index": event.OutputIndex,
-		"item_id":      event.ItemID,
+		"type":          event.Type,
+		"delta_chars":   len(event.Delta),
+		"text_chars":    len(event.Text),
+		"output_index":  event.OutputIndex,
+		"summary_index": event.SummaryIndex,
+		"item_id":       event.ItemID,
 	}
 	if event.Delta != "" {
 		out["delta_preview"] = truncateString(event.Delta, 500)
@@ -1994,6 +2091,7 @@ func summarizeResponsesStreamEvent(event responsesStreamEvent) map[string]any {
 			"arguments_chars": len(event.Item.Arguments),
 			"arguments":       truncateString(event.Item.Arguments, 1000),
 			"content_parts":   len(event.Item.Content),
+			"summary_parts":   len(event.Item.Summary),
 		}
 	}
 	if event.Response.ID != "" {
@@ -2359,7 +2457,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT"}
 	var b strings.Builder
 	for _, k := range keys {
 		if v, ok := vals[k]; ok {

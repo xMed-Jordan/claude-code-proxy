@@ -224,3 +224,70 @@ func TestHistoricalWebSearchBlocksBecomePlainMessages(t *testing.T) {
 		t.Fatalf("historical WebSearch result should not remain a function output: %s", raw)
 	}
 }
+
+func TestReasoningSummaryConvertsToAnthropicThinkingBlock(t *testing.T) {
+	resp := responsesResponse{
+		ID: "resp_test",
+		Output: []responsesOutputItem{
+			{Type: "reasoning", ID: "rs_1", Summary: []responsesReasoningPart{{Type: "summary_text", Text: "Checked the likely fix."}}},
+			{Type: "message", Role: "assistant", Content: []responsesOutputContent{{Type: "output_text", Text: "Done."}}},
+		},
+	}
+	out := toAnthropicResponsesResponse(resp, "opus[1m]")
+	content := out["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("content = %#v, want thinking and text", content)
+	}
+	thinking := content[0].(map[string]any)
+	if thinking["type"] != "thinking" || thinking["thinking"] != "Checked the likely fix." {
+		t.Fatalf("thinking block = %#v", thinking)
+	}
+	if thinking["signature"] == "" {
+		t.Fatalf("thinking signature missing: %#v", thinking)
+	}
+}
+
+func TestBufferedStreamWritesThinkingEventsBeforeText(t *testing.T) {
+	resp := responsesResponse{
+		Output: []responsesOutputItem{
+			{Type: "reasoning", ID: "rs_1", Summary: []responsesReasoningPart{{Type: "summary_text", Text: "Reasoning summary."}}},
+			{Type: "message", Role: "assistant", Content: []responsesOutputContent{{Type: "output_text", Text: "Answer."}}},
+		},
+	}
+	var buf bytes.Buffer
+	writeAnthropicBufferedStream(context.Background(), &buf, resp)
+	raw := buf.String()
+	order := []string{`"type":"thinking"`, `"type":"thinking_delta"`, `"type":"signature_delta"`, `"type":"text_delta"`}
+	last := -1
+	for _, want := range order {
+		idx := strings.Index(raw, want)
+		if idx <= last {
+			t.Fatalf("stream order missing or wrong for %q in %s", want, raw)
+		}
+		last = idx
+	}
+}
+
+func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
+	events := []responsesStreamEvent{
+		{Type: "response.reasoning_summary_text.delta", ItemID: "rs_1", OutputIndex: 0, SummaryIndex: 0, Delta: "Checked "},
+		{Type: "response.reasoning_summary_text.done", ItemID: "rs_1", OutputIndex: 0, SummaryIndex: 0, Text: "Checked the fix."},
+		{Type: "response.output_text.delta", ItemID: "msg_1", OutputIndex: 1, Delta: "Done."},
+	}
+	var raw strings.Builder
+	for _, event := range events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.WriteString("data: " + string(payload) + "\n\n")
+	}
+	raw.WriteString("data: [DONE]\n\n")
+	resp := collectCodexStream(context.Background(), strings.NewReader(raw.String()), "gpt-5.5")
+	if len(resp.Output) < 2 {
+		t.Fatalf("output = %#v", resp.Output)
+	}
+	if got := reasoningSummaryText(resp.Output[0]); got != "Checked the fix." {
+		t.Fatalf("reasoning summary = %q, want Checked the fix.", got)
+	}
+}
