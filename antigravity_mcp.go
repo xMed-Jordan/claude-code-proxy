@@ -779,13 +779,17 @@ func startChromeForCDP() error {
 	}
 	debugPort := antigravityBrowserDebugPort()
 	mode := antigravityBrowserMode()
+	effectiveMode := mode
 	args := []string{
 		"--remote-debugging-address=127.0.0.1",
 		"--remote-debugging-port=" + debugPort,
 		"--no-first-run",
 		"--no-default-browser-check",
 	}
-	if mode == "dedicated" {
+	if mode != "dedicated" && chromeProcessRunning() {
+		effectiveMode = "dedicated_fallback"
+	}
+	if effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback" {
 		profilePath := antigravityProfilePath()
 		_ = os.MkdirAll(profilePath, 0700)
 		args = append(args, "--user-data-dir="+profilePath)
@@ -793,9 +797,6 @@ func startChromeForCDP() error {
 			args = append(args, "--load-extension="+extensionPath, "--disable-extensions-except="+extensionPath)
 		}
 	} else {
-		if chromeProcessRunning() {
-			return fmt.Errorf("Chrome is already running but DevTools is not available at %s. Close all Chrome windows once, then let the Antigravity MCP start Chrome with remote debugging", antigravityCDPBaseURL())
-		}
 		args = append(args, "--profile-directory=Default")
 	}
 	args = append(args, "about:blank")
@@ -803,9 +804,17 @@ func startChromeForCDP() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("could not start Chrome for browser control: %w", err)
 	}
-	if mode == "dedicated" && cmd.Process != nil {
+	if (effectiveMode == "dedicated" || effectiveMode == "dedicated_fallback") && cmd.Process != nil {
 		_ = os.WriteFile(filepath.Join(mustGetwd(), ".antigravity-browser.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600)
 	}
+	writeAntigravityBrowserState(antigravityBrowserState{
+		UpdatedAt:  time.Now().Format(time.RFC3339),
+		PID:        os.Getpid(),
+		Mode:       effectiveMode,
+		BrowserURL: antigravityCDPBaseURL(),
+		Connected:  false,
+		LastAction: "started Chrome for browser control",
+	})
 	return nil
 }
 

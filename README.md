@@ -46,6 +46,7 @@ Starting the proxy applies local Claude Code settings:
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 - MCP server `antigravity-browser` in `~/.claude.json`, launched by `start-antigravity-browser-mcp.ps1`
 - Claude Code isolation hooks for subagent worktrees and child Codex sessions
+- A proxy-managed `~/.claude/CLAUDE.md` memory block that tells Claude Code to use `antigravity-browser` for browser navigation, clicking, typing, page reads, and screenshots
 
 Fast mode and web search are controlled by:
 
@@ -61,7 +62,7 @@ Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code
 
 When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting.
 
-Before applying settings, the proxy creates snapshots of the current Claude Code settings and root MCP config. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
+Before applying settings, the proxy creates snapshots of the current Claude Code settings, root MCP config, and user memory file. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
 
 ## Antigravity Browser Bridge
 
@@ -73,7 +74,7 @@ The launcher validates:
 - Antigravity extension `eeijfnjmjelapkebgockoeaadonbchdd` is installed in Chrome.
 - `bin\claude-code-proxy.exe` exists and can run `--antigravity-mcp`.
 
-Set `ANTIGRAVITY_BROWSER_MODE=default` to use your regular Chrome profile where the Antigravity extension is already installed. In that mode the MCP attaches to Chrome at `ANTIGRAVITY_BROWSER_DEBUG_PORT`. If Chrome is not already exposing DevTools, the bridge starts normal Chrome with `--remote-debugging-port` and the Default profile. If Chrome was already open without remote debugging, close Chrome once and start the proxy again.
+Set `ANTIGRAVITY_BROWSER_MODE=default` to use your regular Chrome profile where the Antigravity extension is already installed. In that mode the MCP attaches to Chrome at `ANTIGRAVITY_BROWSER_DEBUG_PORT`. If Chrome is not already exposing DevTools, the bridge starts normal Chrome with `--remote-debugging-port` and the Default profile. If Chrome was already open without remote debugging, the bridge automatically opens a visible isolated Chrome fallback instead of blocking Claude Code.
 
 Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. If `ANTIGRAVITY_BROWSER_START_WITH_WINDOWS=1`, `start-proxy.ps1` pre-launches the browser only when the Antigravity extension is installed or `ANTIGRAVITY_EXTENSION_PATH` points to a valid extension folder. Claude Code still launches the stdio MCP process itself; Windows startup only prepares the browser control endpoint.
 

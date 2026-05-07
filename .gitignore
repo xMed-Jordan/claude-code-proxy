@@ -4,6 +4,8 @@
 .claude-settings.snapshot.meta.json
 .claude-json.snapshot.json
 .claude-json.snapshot.meta.json
+.claude-memory.snapshot.md
+.claude-memory.snapshot.meta.json
 
 # Runtime state
 .proxy.pid

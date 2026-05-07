@@ -9,13 +9,18 @@ $ErrorActionPreference = 'Stop'
 $basePath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $settingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
 $settingsDir = Split-Path -Parent $settingsPath
+$claudeMemoryPath = Join-Path $env:USERPROFILE '.claude\CLAUDE.md'
 $claudeJsonPath = Join-Path $env:USERPROFILE '.claude.json'
 $snapshotPath = Join-Path $basePath '.claude-settings.snapshot.json'
 $snapshotMetaPath = Join-Path $basePath '.claude-settings.snapshot.meta.json'
 $claudeJsonSnapshotPath = Join-Path $basePath '.claude-json.snapshot.json'
 $claudeJsonSnapshotMetaPath = Join-Path $basePath '.claude-json.snapshot.meta.json'
+$claudeMemorySnapshotPath = Join-Path $basePath '.claude-memory.snapshot.md'
+$claudeMemorySnapshotMetaPath = Join-Path $basePath '.claude-memory.snapshot.meta.json'
 $envFile = Join-Path $basePath '.env'
 $gatewayModelsCachePath = Join-Path $env:USERPROFILE '.claude\cache\gateway-models.json'
+$browserMemoryStart = '<!-- claude-code-proxy-browser-routing:start -->'
+$browserMemoryEnd = '<!-- claude-code-proxy-browser-routing:end -->'
 
 function Read-ProxyEnv {
     if (-not (Test-Path $envFile)) {
@@ -101,6 +106,41 @@ function Ensure-ClaudeJsonSnapshot {
     Write-Host "Created Claude Code root config snapshot: $claudeJsonSnapshotPath"
 }
 
+function Ensure-ClaudeMemorySnapshot {
+    if (Test-Path $claudeMemorySnapshotPath) {
+        if (-not (Test-Path $claudeMemorySnapshotMetaPath)) {
+            [pscustomobject]@{
+                memory_path = $claudeMemoryPath
+                existed     = $true
+                saved_at    = $null
+                reused      = $true
+                note        = 'Existing Claude Code memory snapshot preserved; not overwritten during proxy start.'
+            } | ConvertTo-Json -Depth 4 | Set-Content -Path $claudeMemorySnapshotMetaPath -Encoding UTF8
+        }
+        Write-Host "Existing Claude Code memory snapshot preserved: $claudeMemorySnapshotPath"
+        return
+    }
+
+    if (-not (Test-Path $settingsDir)) {
+        New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+    }
+
+    $existed = Test-Path $claudeMemoryPath
+    if ($existed) {
+        Copy-Item -Path $claudeMemoryPath -Destination $claudeMemorySnapshotPath -Force
+    } else {
+        Set-Content -Path $claudeMemorySnapshotPath -Value '' -Encoding UTF8
+    }
+
+    [pscustomobject]@{
+        memory_path = $claudeMemoryPath
+        existed     = $existed
+        saved_at    = (Get-Date).ToString('o')
+        reused      = $false
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $claudeMemorySnapshotMetaPath -Encoding UTF8
+    Write-Host "Created Claude Code memory snapshot: $claudeMemorySnapshotPath"
+}
+
 function Set-JsonProperty {
     param(
         [Parameter(Mandatory = $true)] [object]$Object,
@@ -124,6 +164,66 @@ function Remove-JsonProperty {
     if ($Object.PSObject.Properties.Name -contains $Name) {
         $Object.PSObject.Properties.Remove($Name)
     }
+}
+
+function Ensure-PermissionAllow {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Settings,
+        [Parameter(Mandatory = $true)] [string[]]$Tools
+    )
+
+    if (-not ($Settings.PSObject.Properties.Name -contains 'permissions') -or $null -eq $Settings.permissions) {
+        Set-JsonProperty -Object $Settings -Name 'permissions' -Value ([pscustomobject]@{})
+    }
+    if (-not ($Settings.permissions.PSObject.Properties.Name -contains 'allow') -or $null -eq $Settings.permissions.allow) {
+        Set-JsonProperty -Object $Settings.permissions -Name 'allow' -Value @()
+    }
+
+    $allow = @($Settings.permissions.allow)
+    foreach ($tool in $Tools) {
+        if ($allow -notcontains $tool) {
+            $allow += $tool
+        }
+    }
+    Set-JsonProperty -Object $Settings.permissions -Name 'allow' -Value $allow
+}
+
+function Ensure-ClaudeBrowserMemory {
+    Ensure-ClaudeMemorySnapshot
+
+    $body = @"
+$browserMemoryStart
+## Claude Code Proxy Browser Routing
+
+When a user asks to open a website, browse, search in a browser, inspect a page, click, type into a web page, or take a screenshot, use the antigravity-browser MCP tools first.
+
+Prefer these tools over PowerShell, Node, Python, browser CLI commands, or generic command-line discovery for browser tasks:
+- antigravity-browser browser_navigate for opening URLs and search pages.
+- antigravity-browser browser_snapshot for reading page text and finding elements.
+- antigravity-browser browser_move, browser_click, browser_type, and browser_press_key for visible browser actions.
+- antigravity-browser browser_screenshot for screenshots.
+
+Use shell commands for browser tasks only when antigravity-browser is unavailable or explicitly fails, and explain that fallback clearly.
+$browserMemoryEnd
+"@
+
+    $current = ''
+    if (Test-Path $claudeMemoryPath) {
+        $current = Get-Content -Path $claudeMemoryPath -Raw
+    }
+
+    $pattern = [regex]::Escape($browserMemoryStart) + '(?s).*?' + [regex]::Escape($browserMemoryEnd)
+    if ($current -match $pattern) {
+        $updated = [regex]::Replace($current, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $body.Trim() })
+    } else {
+        $separator = ''
+        if (-not [string]::IsNullOrWhiteSpace($current) -and -not $current.EndsWith("`n")) {
+            $separator = "`r`n"
+        }
+        $updated = $current + $separator + "`r`n" + $body.Trim() + "`r`n"
+    }
+    Set-Content -Path $claudeMemoryPath -Value $updated -Encoding UTF8
+    Write-Host "Applied browser routing memory to Claude Code: $claudeMemoryPath"
 }
 
 function Clear-GatewayModelsCache {
@@ -321,8 +421,21 @@ function Apply-ProxySettings {
     Set-JsonProperty -Object $settings.env -Name 'API_TIMEOUT_MS' -Value $apiTimeoutMs
     Set-JsonProperty -Object $settings.env -Name 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' -Value $disableNonessential
     Set-JsonProperty -Object $settings -Name 'model' -Value 'opus[1m]'
+    Ensure-PermissionAllow -Settings $settings -Tools @(
+        'mcp__antigravity-browser__browser_status',
+        'mcp__antigravity-browser__browser_pages',
+        'mcp__antigravity-browser__browser_navigate',
+        'mcp__antigravity-browser__browser_snapshot',
+        'mcp__antigravity-browser__browser_screenshot',
+        'mcp__antigravity-browser__browser_move',
+        'mcp__antigravity-browser__browser_click',
+        'mcp__antigravity-browser__browser_type',
+        'mcp__antigravity-browser__browser_press_key',
+        'mcp__antigravity-browser__browser_wait'
+    )
     Ensure-AntigravityBrowserMcp -Settings $settings
     Ensure-ClaudeIsolationHooks -Settings $settings
+    Ensure-ClaudeBrowserMemory
 
     $settings | ConvertTo-Json -Depth 100 | Set-Content -Path $settingsPath -Encoding UTF8
     Ensure-AntigravityBrowserUserMcp
@@ -381,9 +494,37 @@ function Restore-ClaudeJsonConfig {
     Remove-Item -Path $claudeJsonSnapshotMetaPath -Force -ErrorAction SilentlyContinue
 }
 
+function Restore-ClaudeMemory {
+    if (-not (Test-Path $claudeMemorySnapshotPath)) {
+        Write-Host 'No Claude Code memory snapshot found to restore.'
+        return
+    }
+
+    $existed = $true
+    if (Test-Path $claudeMemorySnapshotMetaPath) {
+        $meta = Get-Content $claudeMemorySnapshotMetaPath -Raw | ConvertFrom-Json
+        $existed = [bool]$meta.existed
+    }
+
+    if ($existed) {
+        if (-not (Test-Path $settingsDir)) {
+            New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+        }
+        Copy-Item -Path $claudeMemorySnapshotPath -Destination $claudeMemoryPath -Force
+        Write-Host "Restored Claude Code memory from snapshot: $claudeMemoryPath"
+    } else {
+        Remove-Item -Path $claudeMemoryPath -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed Claude Code memory created for proxy: $claudeMemoryPath"
+    }
+
+    Remove-Item -Path $claudeMemorySnapshotPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $claudeMemorySnapshotMetaPath -Force -ErrorAction SilentlyContinue
+}
+
 if ($Action -eq 'Apply') {
     Apply-ProxySettings
 } else {
     Restore-OriginalSettings
     Restore-ClaudeJsonConfig
+    Restore-ClaudeMemory
 }

@@ -212,19 +212,37 @@ if ($browserMode -eq 'default') {
         Write-Info "Default Chrome already exposes DevTools at $browserUrl."
         return
     }
+
+    $effectiveMode = 'default'
     if (Test-ChromeProcessRunning) {
-        Write-Info "Default Chrome is already running without DevTools at $browserUrl. Close Chrome once, then start the proxy again to enable visible browser control."
-        return
+        $effectiveMode = 'dedicated_fallback'
+        Write-Info "Default Chrome is already running without DevTools at $browserUrl. Starting a visible isolated Chrome fallback for Claude Code browser control."
     }
 
-    $chromeArgs = @(
-        "--remote-debugging-address=127.0.0.1",
-        "--remote-debugging-port=$debugPort",
-        '--profile-directory=Default',
-        '--no-first-run',
-        '--no-default-browser-check',
-        'about:blank'
-    )
+    if ($effectiveMode -eq 'dedicated_fallback') {
+        if (-not (Test-Path -LiteralPath $profileDir)) {
+            New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+        }
+        $chromeArgs = @(
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=$debugPort",
+            "--user-data-dir=$profileDir",
+            "--load-extension=$extensionPath",
+            "--disable-extensions-except=$extensionPath",
+            '--no-first-run',
+            '--no-default-browser-check',
+            'about:blank'
+        )
+    } else {
+        $chromeArgs = @(
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=$debugPort",
+            '--profile-directory=Default',
+            '--no-first-run',
+            '--no-default-browser-check',
+            'about:blank'
+        )
+    }
 
     $process = Start-Process -FilePath $chromePath -ArgumentList $chromeArgs -PassThru
     Set-Content -Path $pidFile -Value $process.Id
@@ -257,7 +275,7 @@ $chromeArgs = @(
     'about:blank'
 )
 
-$process = Start-Process -FilePath $chromePath -ArgumentList $chromeArgs -PassThru -WindowStyle Hidden
+$process = Start-Process -FilePath $chromePath -ArgumentList $chromeArgs -PassThru
 Set-Content -Path $pidFile -Value $process.Id
 Start-Sleep -Milliseconds 800
 
