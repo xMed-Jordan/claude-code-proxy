@@ -683,6 +683,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 			proxyOpenAIResponses(r.Context(), cfg, in, w)
 			return
 		}
+		in.Temperature = nil
 		setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
 		if in.Stream {
 			streamCodexResponsesRaw(r.Context(), cfg, in, w)
@@ -711,7 +712,7 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 	if instructions == "" {
 		instructions = "You are a helpful coding assistant."
 	}
-	out := responsesRequest{Model: model, Instructions: instructions, Temperature: in.Temperature, Stream: in.Stream, Store: false}
+	out := responsesRequest{Model: model, Instructions: instructions, Stream: in.Stream, Store: false}
 	if in.FastMode {
 		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
 	}
@@ -1258,6 +1259,10 @@ func retryCodexRequestAfter400(out responsesRequest, status int, msg string) (co
 	if out.PromptCacheKey != "" && strings.Contains(lower, "prompt_cache_key") {
 		out.PromptCacheKey = ""
 		return codexRetryRequest{reason: "prompt_cache_key_not_accepted", request: out}, true
+	}
+	if out.Temperature != nil && strings.Contains(lower, "temperature") {
+		out.Temperature = nil
+		return codexRetryRequest{reason: "temperature_not_accepted", request: out}, true
 	}
 	return codexRetryRequest{}, false
 }
@@ -1887,7 +1892,7 @@ func openAIChatToResponses(cfg config, in openAIRequest) responsesRequest {
 	if !ok {
 		model = cleanModel(in.Model)
 	}
-	out := responsesRequest{Model: model, Temperature: in.Temperature, Stream: in.Stream, Store: false}
+	out := responsesRequest{Model: model, Stream: in.Stream, Store: false}
 	if effort := normalizeReasoningEffort(firstNonEmpty(in.ReasoningEffort, cfg.ReasoningEffort)); effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: effort}
 	}

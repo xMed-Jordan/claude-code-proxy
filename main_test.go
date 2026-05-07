@@ -515,3 +515,35 @@ func TestRetryRemovesPromptCacheKeyWhenRejected(t *testing.T) {
 		t.Fatalf("prompt_cache_key still set: %#v", retry.request)
 	}
 }
+
+func TestCodexRequestsOmitTemperature(t *testing.T) {
+	temp := 1.0
+	out := toResponses(config{}, anthropicRequest{
+		Model:       "claude-sonnet-4-6",
+		Temperature: &temp,
+		Messages:    []anthropicMessage{{Role: "user", Content: "hi"}},
+	})
+	if out.Temperature != nil {
+		t.Fatalf("Codex Anthropic conversion kept temperature: %#v", out.Temperature)
+	}
+
+	chatOut := openAIChatToResponses(config{}, openAIRequest{
+		Model:       "gpt-5.5",
+		Temperature: &temp,
+		Messages:    []openAIMessage{{Role: "user", Content: "hi"}},
+	})
+	if chatOut.Temperature != nil {
+		t.Fatalf("Codex chat conversion kept temperature: %#v", chatOut.Temperature)
+	}
+
+	retry, ok := retryCodexRequestAfter400(responsesRequest{Temperature: &temp}, http.StatusBadRequest, `{"detail":"Unsupported parameter: temperature"}`)
+	if !ok {
+		t.Fatal("temperature retry was not requested")
+	}
+	if retry.reason != "temperature_not_accepted" {
+		t.Fatalf("retry reason = %q", retry.reason)
+	}
+	if retry.request.Temperature != nil {
+		t.Fatalf("temperature still set after retry: %#v", retry.request.Temperature)
+	}
+}
