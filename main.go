@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,6 +69,7 @@ type config struct {
 	ProxyKey           string
 	Host               string
 	Port               string
+	PublicURL          string
 	Models             map[string]string
 	ModelContexts      map[string]string
 	ModelCustom        map[string]bool
@@ -403,6 +405,7 @@ func loadConfig() config {
 	if host == "" {
 		host = "127.0.0.1"
 	}
+	publicURL := normalizePublicBaseURL(getenv("PROXY_PUBLIC_URL", getenv("PUBLIC_BASE_URL", "")))
 	baseURL := strings.TrimRight(getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/")
 	codexAuthFile := os.Getenv("CODEX_AUTH_FILE")
 	if codexAuthFile == "" {
@@ -422,6 +425,7 @@ func loadConfig() config {
 		ProxyKey:           getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
 		Host:               host,
 		Port:               port,
+		PublicURL:          publicURL,
 		ReasoningEffort:    normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
 		ClaudeDefaults:     claudeDefaults,
 		Models:             models,
@@ -431,6 +435,60 @@ func loadConfig() config {
 		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
 		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
 	}
+}
+
+func normalizePublicBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimRight(raw, "/")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := parsed.Hostname()
+	port := parsed.Port()
+	if host != "" {
+		if port != "" && !isDefaultPublicPort(scheme, port) {
+			parsed.Host = net.JoinHostPort(host, port)
+		} else if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+			parsed.Host = "[" + host + "]"
+		} else {
+			parsed.Host = host
+		}
+	}
+	parsed.Scheme = scheme
+	if parsed.Path == "/" {
+		parsed.Path = ""
+	} else {
+		parsed.Path = strings.TrimRight(parsed.Path, "/")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func isDefaultPublicPort(scheme, port string) bool {
+	return (scheme == "https" && port == "443") || (scheme == "http" && port == "80")
+}
+
+func localProxyBaseURL(cfg config) string {
+	port := strings.TrimSpace(cfg.Port)
+	if port == "" {
+		port = "4000"
+	}
+	return "http://127.0.0.1:" + port
+}
+
+func clientFacingBaseURL(cfg config) string {
+	if cfg.PublicURL != "" {
+		return cfg.PublicURL
+	}
+	return localProxyBaseURL(cfg)
 }
 
 type envValueFunc func(key, fallback string) string
@@ -3716,8 +3774,8 @@ func apiDocRoutes() []apiDocRoute {
 		},
 		{
 			Group: "Admin control panel", OperationID: "getUIStatus", Method: http.MethodGet, Path: "/ui/api/status", Summary: "Get dashboard status", Auth: apiDocAuthAdmin,
-			Description:    "Returns runtime status, local URLs, model rows, auth metadata, dashboard metrics, and the latest request summary.",
-			ResponseSchema: "UIStatusResponse", ResponseExample: map[string]any{"running": true, "proxy_running": true, "local_url": "http://127.0.0.1:4000", "anthropic_url": "http://127.0.0.1:4000/anthropic", "openai_url": "http://127.0.0.1:4000/openai/v1", "upstream": "codex"},
+			Description:    "Returns runtime status, local and public URLs, model rows, auth metadata, dashboard metrics, and the latest request summary.",
+			ResponseSchema: "UIStatusResponse", ResponseExample: map[string]any{"running": true, "proxy_running": true, "local_url": "http://127.0.0.1:4000", "public_url": "https://proxy.example.com", "display_url": "https://proxy.example.com", "anthropic_url": "https://proxy.example.com/anthropic", "openai_url": "https://proxy.example.com/openai/v1", "upstream": "codex"},
 		},
 		{
 			Group: "Admin control panel", OperationID: "getUIConfig", Method: http.MethodGet, Path: "/ui/api/config", Summary: "Read editable proxy config", Auth: apiDocAuthAdmin,
@@ -3743,7 +3801,7 @@ func apiDocRoutes() []apiDocRoute {
 		},
 		{
 			Group: "Admin control panel", OperationID: "getUIKeys", Method: http.MethodGet, Path: "/ui/api/keys", Summary: "List provider and client keys", Auth: apiDocAuthAdmin,
-			ResponseSchema: "UIKeysResponse", ResponseExample: map[string]any{"providers": []map[string]any{}, "clients": []map[string]any{}, "defaults": map[string]any{"anthropic_base": "http://127.0.0.1:4000/anthropic", "openai_local_url": "http://127.0.0.1:4000/openai/v1"}},
+			ResponseSchema: "UIKeysResponse", ResponseExample: map[string]any{"providers": []map[string]any{}, "clients": []map[string]any{}, "defaults": map[string]any{"anthropic_base": "https://proxy.example.com/anthropic", "openai_local_url": "https://proxy.example.com/openai/v1"}},
 		},
 		{
 			Group: "Admin control panel", OperationID: "saveUIProviderKey", Method: http.MethodPost, Path: "/ui/api/keys/provider", Summary: "Create or renew a provider key", Auth: apiDocAuthAdmin,
@@ -3837,11 +3895,7 @@ func handlePostmanCollection(cfg config) http.HandlerFunc {
 }
 
 func apiDocsBaseURL(cfg config) string {
-	port := strings.TrimSpace(cfg.Port)
-	if port == "" {
-		port = "4000"
-	}
-	return "http://127.0.0.1:" + port
+	return clientFacingBaseURL(cfg)
 }
 
 func renderAPIDocsHTML(cfg config) string {
@@ -4217,7 +4271,7 @@ func openAPISchemas() map[string]any {
 		"ProviderPassThroughResponse":  map[string]any{"type": "object", "additionalProperties": true, "description": "Provider-shaped OpenAI-compatible response."},
 		"UIAuthStatusResponse":         schemaObject(map[string]any{"configured": schemaBoolean("Admin auth is configured."), "authenticated": schemaBoolean("Current request has a valid admin cookie."), "username": schemaString("Configured admin username.")}, "configured", "authenticated", "username"),
 		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password.")}, "username", "password"),
-		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "local_url": schemaString("Local control panel URL."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "port": schemaString("Local port."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
+		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "local_url": schemaString("Local control panel URL."), "public_url": schemaString("Public reverse-proxy URL when configured."), "display_url": schemaString("Preferred URL for the control panel to show."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "host": schemaString("Local bind host."), "port": schemaString("Local port."), "bind_url": schemaString("Local bind address."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
 		"UIConfigResponse":             schemaObject(map[string]any{"config": stringMap, "secrets": stringMap, "aliases": schemaArray(modelAlias)}, "config", "secrets", "aliases"),
 		"UIConfigRequest":              schemaObject(map[string]any{"config": stringMap, "aliases": schemaArray(schemaObject(map[string]any{"From": schemaString("Alias."), "To": schemaString("Model id."), "Context": schemaString("Context label.")}))}),
 		"UIModelsResponse":             schemaOpenObject(map[string]any{"models": schemaArray(modelAlias), "ok": schemaBoolean("Whether save succeeded."), "message": schemaString("Status message.")}),
@@ -5199,7 +5253,8 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 		}
 		auth := codexAuthMetadata(cfg)
 		claudeVersion := commandOutput(2*time.Second, "claude", "--version")
-		localURL := "http://127.0.0.1:" + cfg.Port
+		localURL := localProxyBaseURL(cfg)
+		displayURL := clientFacingBaseURL(cfg)
 		desktopTargets := claudeDesktopConfigTargets()
 		desktopPaths := make([]string, 0, len(desktopTargets))
 		for _, target := range desktopTargets {
@@ -5219,10 +5274,13 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"browser":              map[string]any{"visibility_supported": runtime.GOOS == "windows"},
 			"uptime_seconds":       int(time.Since(startedAt).Seconds()),
 			"local_url":            localURL,
-			"anthropic_url":        localURL + "/anthropic",
-			"openai_url":           localURL + "/openai/v1",
+			"public_url":           cfg.PublicURL,
+			"display_url":          displayURL,
+			"anthropic_url":        displayURL + "/anthropic",
+			"openai_url":           displayURL + "/openai/v1",
 			"host":                 cfg.Host,
 			"port":                 cfg.Port,
+			"bind_url":             cfg.Host + ":" + cfg.Port,
 			"upstream":             cfg.Upstream,
 			"codex_auth":           auth,
 			"codex_sessions":       codexSessionMetadata(cfg),
@@ -5389,14 +5447,15 @@ func handleUIKeys(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		baseURL := clientFacingBaseURL(cfg)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"providers": providers,
 			"clients":   clients,
 			"defaults": map[string]string{
 				"openai_base_url":  defaultProviderBaseURL("openai"),
 				"gemini_base_url":  defaultProviderBaseURL("gemini"),
-				"anthropic_base":   "http://127.0.0.1:" + cfg.Port + "/anthropic",
-				"openai_local_url": "http://127.0.0.1:" + cfg.Port + "/openai/v1",
+				"anthropic_base":   baseURL + "/anthropic",
+				"openai_local_url": baseURL + "/openai/v1",
 			},
 		})
 	}
@@ -5825,7 +5884,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_PORT", "PROXY_DB_PATH", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
 	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {

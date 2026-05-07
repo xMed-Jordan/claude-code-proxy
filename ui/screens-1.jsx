@@ -122,7 +122,7 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
     return `${n > 0 ? "▲" : "▼"} ${Math.abs(n).toFixed(0)}%`;
   };
   const validationOk = validation.length > 0 && validation.every(s => s.tone === "ok");
-  const rootUrl = liveStatus?.local_url || "http://127.0.0.1:4000";
+  const rootUrl = liveStatus?.display_url || liveStatus?.public_url || liveStatus?.local_url || "http://127.0.0.1:4000";
   const anthropicUrl = liveStatus?.anthropic_url || `${rootUrl}/anthropic`;
   const openaiUrl = liveStatus?.openai_url || `${rootUrl}/openai/v1`;
 
@@ -187,7 +187,7 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
                 <Icon name="bolt" size={12}/>Validate
               </button>
               <div className="spacer"></div>
-              <span className="hdr-bind"><Icon name="lock" size={11}/>Local-only · bound to 127.0.0.1</span>
+              <span className="hdr-bind"><Icon name="lock" size={11}/>{liveStatus?.public_url ? "Public HTTPS · local app remains private" : "Local-only · bound to 127.0.0.1"}</span>
             </div>
           </div>
           <div style={{ padding: "18px 20px" }}>
@@ -420,6 +420,16 @@ const Configuration = ({ pushToast }) => {
       <Card title="Local proxy" flush>
         <div className="frm-row">
           <div className="lbl">
+            <span className="name">PROXY_PUBLIC_URL</span>
+            <span className="desc">Public HTTPS/domain URL shown to clients. Standard ports stay hidden.</span>
+          </div>
+          <div className="ctl">
+            <input className="inp" value={cfg.PROXY_PUBLIC_URL || ""} onChange={e => update("PROXY_PUBLIC_URL", e.target.value)} placeholder="https://ai-api1.cus.cx"/>
+            <div className="hint"><Icon name="info" size={11}/>Leave empty for local-only installs.</div>
+          </div>
+        </div>
+        <div className="frm-row">
+          <div className="lbl">
             <span className="name">PROXY_PORT</span>
             <span className="desc">Port to bind on 127.0.0.1.</span>
           </div>
@@ -519,7 +529,7 @@ const ApiKeys = ({ pushToast = () => {}, liveStatus }) => {
   const defaults = data.defaults || {};
   const providerOptions = data.providers || [];
   const selectedProviderKeys = providerOptions.filter(p => p.provider === clientForm.provider && p.enabled);
-  const rootUrl = liveStatus?.local_url || "http://127.0.0.1:4000";
+  const rootUrl = liveStatus?.display_url || liveStatus?.public_url || liveStatus?.local_url || "http://127.0.0.1:4000";
   const anthropicUrl = liveStatus?.anthropic_url || defaults.anthropic_base || `${rootUrl}/anthropic`;
   const openaiUrl = liveStatus?.openai_url || defaults.openai_local_url || `${rootUrl}/openai/v1`;
   const providerBaseDefault = providerForm.provider === "gemini" ? defaults.gemini_base_url : defaults.openai_base_url;

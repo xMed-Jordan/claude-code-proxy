@@ -91,7 +91,7 @@ For a static HTTPS domain, run the installer normally and answer yes when prompt
 ./install-linux.sh --server --https --domain proxy.example.com --email admin@example.com --confirm-dns
 ```
 
-HTTPS mode keeps the Go proxy bound to `127.0.0.1`, installs/configures Caddy, uses HTTP only for ACME validation and redirect, and exposes the public endpoint through HTTPS. Defaults are internal proxy port `4000`, public HTTP port `80`, and public HTTPS port `443`; the installer asks before changing them. DNS must already point to the server before certificate setup.
+HTTPS mode keeps the Go proxy bound to `127.0.0.1`, installs/configures Caddy, uses HTTP only for ACME validation and redirect, and exposes the public endpoint through HTTPS. Defaults are internal proxy port `4000`, public HTTP port `80`, and public HTTPS port `443`; the installer asks before changing them. DNS must already point to the server before certificate setup. The installer writes `PROXY_PUBLIC_URL` so the dashboard, docs, OpenAPI, and Postman exports show the public HTTPS domain; standard ports `80` and `443` are omitted from that displayed URL.
 
 Service commands:
 
@@ -121,6 +121,7 @@ Troubleshooting notes:
 - If Claude Code is missing, the installer installs it; if `claude` is still not on `PATH`, fix the global npm bin path and rerun the installer.
 - If Codex login is incomplete, run `codex` as the installing user and finish sign-in, then rerun the installer.
 - If HTTPS fails, confirm DNS A/AAAA records point to the server and inbound ports `80` and `443` are open.
+- If the dashboard shows `127.0.0.1` on a server install, set `PROXY_PUBLIC_URL=https://your-domain` in `/opt/connect-ai-proxy/.env` and restart `connect-ai-proxy`.
 - If browser tools are enabled later, rerun with `--browser-tools`; install the Antigravity Chrome extension in Chrome/Chromium before using browser MCP actions.
 - Caddy status and reload are managed with `sudo systemctl status caddy` and `sudo systemctl reload caddy`.
 

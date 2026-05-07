@@ -13,6 +13,32 @@ import (
 	"testing"
 )
 
+func TestPublicBaseURLNormalization(t *testing.T) {
+	cases := map[string]string{
+		"ai-api1.cus.cx":              "https://ai-api1.cus.cx",
+		"https://ai-api1.cus.cx:443":  "https://ai-api1.cus.cx",
+		"http://ai-api1.cus.cx:80":    "http://ai-api1.cus.cx",
+		"https://ai-api1.cus.cx:8443": "https://ai-api1.cus.cx:8443",
+		"https://ai-api1.cus.cx/":     "https://ai-api1.cus.cx",
+	}
+	for in, want := range cases {
+		if got := normalizePublicBaseURL(in); got != want {
+			t.Fatalf("normalizePublicBaseURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestClientFacingBaseURLPrefersPublicURL(t *testing.T) {
+	cfg := config{Port: "4000", PublicURL: normalizePublicBaseURL("https://ai-api1.cus.cx:443")}
+	if got := clientFacingBaseURL(cfg); got != "https://ai-api1.cus.cx" {
+		t.Fatalf("clientFacingBaseURL() = %q", got)
+	}
+	cfg.PublicURL = ""
+	if got := clientFacingBaseURL(cfg); got != "http://127.0.0.1:4000" {
+		t.Fatalf("clientFacingBaseURL() fallback = %q", got)
+	}
+}
+
 func anthropicToolUseBlock(t *testing.T, out map[string]any) map[string]any {
 	t.Helper()
 	content, ok := out["content"].([]any)

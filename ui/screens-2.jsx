@@ -491,7 +491,7 @@ function prettyProbe(value) {
 const Setup = () => {
   const { data: status } = usePolling("/ui/api/status", 3000);
   const launcher = status?.launcher_commands?.launch_claude || "connect-ai-proxy launch-claude";
-  const rootUrl = status?.local_url || "http://127.0.0.1:4000";
+  const rootUrl = status?.display_url || status?.public_url || status?.local_url || "http://127.0.0.1:4000";
   const baseUrl = status?.anthropic_url || `${rootUrl}/anthropic`;
   const openAIBaseUrl = status?.openai_url || `${rootUrl}/openai/v1`;
   const apiKey = status?.proxy_key || "YOUR_LOCAL_PROXY_TOKEN";

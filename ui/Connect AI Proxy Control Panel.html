@@ -187,13 +187,13 @@
             <div className="hdr-mid">
               <span className="hdr-url" data-state={stateMeta.urlState}>
                 <span className="dot"></span>
-                {liveStatus?.local_url || "http://127.0.0.1:4000"}
+                {liveStatus?.display_url || liveStatus?.public_url || liveStatus?.local_url || "http://127.0.0.1:4000"}
               </span>
               <Pill tone={stateMeta.tone} pulse={t.proxyState !== "stopped"}>{stateMeta.label}</Pill>
             </div>
 
             <div className="hdr-right">
-              <span className="hdr-bind"><Icon name="lock" size={11}/>local-only</span>
+              <span className="hdr-bind"><Icon name="lock" size={11}/>{liveStatus?.public_url ? "HTTPS public" : "local-only"}</span>
               <a className="btn btn-sm btn-ghost" href="/docs" target="_blank" rel="noreferrer"><Icon name="book" size={11}/>API Docs</a>
               <button className="btn btn-sm btn-ghost" onClick={onLogout}><Icon name="x" size={11}/>Logout</button>
               <span className="hdr-kbd">⌘K</span>
@@ -251,7 +251,8 @@
             <div className="side-foot">
               <div className="side-foot-row"><span>build</span><span className="v">0.4.2-rc1</span></div>
               <div className="side-foot-row"><span>upstream</span><span className="v">{liveStatus?.upstream || "codex"}</span></div>
-              <div className="side-foot-row"><span>bind</span><span className="v">127.0.0.1:{liveStatus?.port || "4000"}</span></div>
+              <div className="side-foot-row"><span>bind</span><span className="v">{liveStatus?.bind_url || `${liveStatus?.host || "127.0.0.1"}:${liveStatus?.port || "4000"}`}</span></div>
+              {liveStatus?.public_url && <div className="side-foot-row"><span>public</span><span className="v">{liveStatus.public_url.replace(/^https?:\/\//, "")}</span></div>}
             </div>
           </aside>
 

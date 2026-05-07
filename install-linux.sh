@@ -27,6 +27,7 @@ HTTPS_MODE="ask"
 BROWSER_TOOLS="ask"
 DOMAIN=""
 EMAIL=""
+PROXY_PUBLIC_URL=""
 DNS_CONFIRMED=0
 EXPOSE_HTTP="ask"
 PKG_MANAGER=""
@@ -80,6 +81,7 @@ Options:
   --no-https             Skip HTTPS reverse proxy setup
   --http-port PORT       Public HTTP redirect/ACME port (default: ${DEFAULT_HTTP_PORT})
   --https-port PORT      Public HTTPS port (default: ${DEFAULT_HTTPS_PORT})
+  --public-url URL       Public base URL shown in the control panel
   --confirm-dns          Confirm the HTTPS domain already points to this server
   --browser-tools        Install/configure Chrome or Chromium browser tools
   --no-browser-tools     Skip Chrome/Chromium and browser MCP setup
@@ -136,6 +138,11 @@ parse_args() {
         shift
         [[ $# -gt 0 ]] || die "--https-port needs a port"
         HTTPS_PORT="$1"
+        ;;
+      --public-url)
+        shift
+        [[ $# -gt 0 ]] || die "--public-url needs a URL"
+        PROXY_PUBLIC_URL="$1"
         ;;
       --confirm-dns) DNS_CONFIRMED=1 ;;
       --browser-tools) BROWSER_TOOLS="yes" ;;
@@ -207,6 +214,19 @@ validate_port() {
   local label="$2"
   [[ "${value}" =~ ^[0-9]+$ ]] || die "${label} must be a number"
   (( value > 0 && value < 65536 )) || die "${label} must be between 1 and 65535"
+}
+
+public_url_for_port() {
+  local scheme="$1"
+  local domain="$2"
+  local port="$3"
+  if [[ "${scheme}" == "https" && "${port}" == "443" ]]; then
+    printf 'https://%s' "${domain}"
+  elif [[ "${scheme}" == "http" && "${port}" == "80" ]]; then
+    printf 'http://%s' "${domain}"
+  else
+    printf '%s://%s:%s' "${scheme}" "${domain}" "${port}"
+  fi
 }
 
 prompt_yes_no() {
@@ -709,6 +729,9 @@ resolve_install_choices() {
     validate_port "${HTTP_PORT}" "HTTP port"
     validate_port "${HTTPS_PORT}" "HTTPS port"
     PROXY_HOST="127.0.0.1"
+    if [[ -z "${PROXY_PUBLIC_URL}" ]]; then
+      PROXY_PUBLIC_URL="$(public_url_for_port "https" "${DOMAIN}" "${HTTPS_PORT}")"
+    fi
     if [[ "${DNS_CONFIRMED}" -ne 1 ]] && ! prompt_yes_no "Have this domain's DNS records already been pointed to this server?" "no"; then
       die "DNS must point to this server before Caddy can issue a trusted HTTPS certificate."
     fi
@@ -723,6 +746,9 @@ resolve_install_choices() {
     if [[ "${EXPOSE_HTTP}" == "yes" ]]; then
       PROXY_HOST="0.0.0.0"
       warn "Public unencrypted HTTP is enabled. Use HTTPS whenever possible."
+      if [[ -n "${DOMAIN}" && -z "${PROXY_PUBLIC_URL}" ]]; then
+        PROXY_PUBLIC_URL="$(public_url_for_port "http" "${DOMAIN}" "${PROXY_PORT}")"
+      fi
     else
       PROXY_HOST="127.0.0.1"
     fi
@@ -856,6 +882,7 @@ configure_env_file() {
   set_env_value "${env_file}" "CODEX_AUTH_FILE" "$(codex_auth_file)"
   set_env_value "${env_file}" "PROXY_HOST" "${PROXY_HOST}"
   set_env_value "${env_file}" "PROXY_PORT" "${PROXY_PORT}"
+  set_env_value "${env_file}" "PROXY_PUBLIC_URL" "${PROXY_PUBLIC_URL}"
   if [[ "${BROWSER_TOOLS}" == "yes" ]]; then
     set_env_value "${env_file}" "ANTIGRAVITY_BROWSER_ENABLED" "1"
   else
@@ -1061,7 +1088,7 @@ install_all() {
   log "Install complete."
   log "Local health check: http://127.0.0.1:${PROXY_PORT}/health"
   if [[ "${HTTPS_MODE}" == "yes" ]]; then
-    log "HTTPS endpoint: https://${DOMAIN}/health"
+    log "HTTPS endpoint: ${PROXY_PUBLIC_URL}/health"
   fi
 }
 
