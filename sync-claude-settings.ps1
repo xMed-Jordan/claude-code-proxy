@@ -120,6 +120,84 @@ function Ensure-AntigravityBrowserMcp {
     Set-JsonProperty -Object $Settings.mcpServers -Name 'antigravity-browser' -Value $server
 }
 
+function New-ProxyCommandHook {
+    param(
+        [Parameter(Mandatory = $true)] [string]$ScriptPath
+    )
+
+    return [pscustomobject]@{
+        type    = 'command'
+        command = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    }
+}
+
+function Test-HookListContainsScript {
+    param(
+        [object[]]$HookGroups = @(),
+        [Parameter(Mandatory = $true)] [string]$ScriptPath
+    )
+
+    foreach ($group in $HookGroups) {
+        foreach ($hook in @($group.hooks)) {
+            if ($hook.command -and ([string]$hook.command).Contains($ScriptPath)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Ensure-HookEvent {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Settings,
+        [Parameter(Mandatory = $true)] [string]$EventName,
+        [Parameter(Mandatory = $true)] [string]$ScriptPath,
+        [string]$Matcher = '',
+        [switch]$OnlyWhenEmpty
+    )
+
+    if (-not ($Settings.PSObject.Properties.Name -contains 'hooks') -or $null -eq $Settings.hooks) {
+        Set-JsonProperty -Object $Settings -Name 'hooks' -Value ([pscustomobject]@{})
+    }
+
+    $current = @()
+    if ($Settings.hooks.PSObject.Properties.Name -contains $EventName -and $null -ne $Settings.hooks.$EventName) {
+        $current = @($Settings.hooks.$EventName)
+    }
+
+    if (Test-HookListContainsScript -HookGroups $current -ScriptPath $ScriptPath) {
+        return
+    }
+
+    if ($OnlyWhenEmpty -and $current.Count -gt 0) {
+        Write-Host "Existing Claude Code $EventName hook preserved; proxy hook not added."
+        return
+    }
+
+    $group = [pscustomobject]@{
+        hooks = @(New-ProxyCommandHook -ScriptPath $ScriptPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Matcher)) {
+        Set-JsonProperty -Object $group -Name 'matcher' -Value $Matcher
+    }
+
+    Set-JsonProperty -Object $Settings.hooks -Name $EventName -Value @($current + $group)
+}
+
+function Ensure-ClaudeIsolationHooks {
+    param(
+        [Parameter(Mandatory = $true)] [object]$Settings
+    )
+
+    $worktreeCreatePath = Join-Path $basePath 'claude-worktree-create.ps1'
+    $worktreeRemovePath = Join-Path $basePath 'claude-worktree-remove.ps1'
+    $subagentContextPath = Join-Path $basePath 'claude-subagent-context.ps1'
+
+    Ensure-HookEvent -Settings $Settings -EventName 'WorktreeCreate' -ScriptPath $worktreeCreatePath -OnlyWhenEmpty
+    Ensure-HookEvent -Settings $Settings -EventName 'WorktreeRemove' -ScriptPath $worktreeRemovePath -OnlyWhenEmpty
+    Ensure-HookEvent -Settings $Settings -EventName 'SubagentStart' -ScriptPath $subagentContextPath -Matcher '*'
+}
+
 function Apply-ProxySettings {
     Ensure-Snapshot
     Clear-GatewayModelsCache
@@ -182,6 +260,7 @@ function Apply-ProxySettings {
     Set-JsonProperty -Object $settings.env -Name 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' -Value $disableNonessential
     Set-JsonProperty -Object $settings -Name 'model' -Value 'opus[1m]'
     Ensure-AntigravityBrowserMcp -Settings $settings
+    Ensure-ClaudeIsolationHooks -Settings $settings
 
     $settings | ConvertTo-Json -Depth 100 | Set-Content -Path $settingsPath -Encoding UTF8
     Write-Host "Applied proxy env to Claude Code settings: $settingsPath"

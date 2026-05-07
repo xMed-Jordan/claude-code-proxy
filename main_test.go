@@ -457,6 +457,51 @@ func TestCodexSideThreadGetsChildSession(t *testing.T) {
 	}
 }
 
+func TestCodexSubagentMarkerGetsStableChildSession(t *testing.T) {
+	t.Setenv("CODEX_SESSION_ISOLATION", "1")
+	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")
+	cfg := config{CodexSessionFile: filepath.Join(t.TempDir(), "sessions.json")}
+	normal := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	firstAgent := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},
+		map[string]any{"type": "text", "text": "Inspect downloads."},
+	}}}}
+	secondAgent := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},
+		map[string]any{"type": "text", "text": "Continue inspecting downloads."},
+	}}}}
+
+	normalOut := responsesRequest{}
+	normalReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)))
+	normalReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	configureCodexSession(cfg, normalReq, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), normal, &normalOut)
+
+	firstOut := responsesRequest{}
+	firstBody := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},{"type":"text","text":"Inspect downloads."}]}]}`)
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	firstReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	firstInfo := configureCodexSession(cfg, firstReq, firstBody, firstAgent, &firstOut)
+
+	secondOut := responsesRequest{}
+	secondBody := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Internal proxy routing note: codex_proxy_subagent_id=agent-downloads; codex_proxy_subagent_type=general-purpose."},{"type":"text","text":"Continue inspecting downloads."}]}]}`)
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	secondReq.Header.Set("X-Claude-Code-Session-Id", "flow-a")
+	secondInfo := configureCodexSession(cfg, secondReq, secondBody, secondAgent, &secondOut)
+
+	if !firstInfo.SideThread || firstInfo.SideThreadKind != "subagent" {
+		t.Fatalf("subagent marker not detected: %#v", firstInfo)
+	}
+	if firstOut.PromptCacheKey == normalOut.PromptCacheKey {
+		t.Fatalf("subagent shared parent prompt_cache_key %q", firstOut.PromptCacheKey)
+	}
+	if firstOut.PromptCacheKey != secondOut.PromptCacheKey {
+		t.Fatalf("same subagent did not keep a stable prompt_cache_key: %q vs %q", firstOut.PromptCacheKey, secondOut.PromptCacheKey)
+	}
+	if firstInfo.RegistryKey != secondInfo.RegistryKey {
+		t.Fatalf("same subagent did not keep a stable registry key: %q vs %q", firstInfo.RegistryKey, secondInfo.RegistryKey)
+	}
+}
+
 func TestRetryRemovesPromptCacheKeyWhenRejected(t *testing.T) {
 	out := responsesRequest{PromptCacheKey: "ccp_test"}
 	retry, ok := retryCodexRequestAfter400(out, http.StatusBadRequest, `{"error":{"message":"Unknown parameter: 'prompt_cache_key'."}}`)

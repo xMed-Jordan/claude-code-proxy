@@ -779,11 +779,13 @@ func configureCodexSession(cfg config, r *http.Request, rawBody []byte, in anthr
 	}
 	flowID, source := extractClaudeFlowID(r, rawBody, in)
 	flowHash := hashString(flowID)[:16]
-	sideThread, sideKind := detectOneShotClaudeRequest(in)
+	sideThread, sideKind, sideKey := detectIsolatedClaudeRequest(r, rawBody, in)
 	registryKey := flowHash
 	if sideThread {
-		bodyHash := hashString(string(rawBody))[:16]
-		registryKey = flowHash + ":one-shot:" + firstNonEmpty(sideKind, "request") + ":" + bodyHash
+		if sideKey == "" {
+			sideKey = hashString(string(rawBody))[:16]
+		}
+		registryKey = flowHash + ":isolated:" + firstNonEmpty(sideKind, "request") + ":" + sideKey
 	}
 	sessionID := stableCodexSessionID(registryKey)
 	info := codexSessionInfo{
@@ -842,20 +844,50 @@ func extractClaudeFlowID(r *http.Request, rawBody []byte, in anthropicRequest) (
 	return "fallback:" + hashString(seed), "fallback_request_hash"
 }
 
-func detectOneShotClaudeRequest(in anthropicRequest) (bool, string) {
+func detectIsolatedClaudeRequest(r *http.Request, rawBody []byte, in anthropicRequest) (bool, string, string) {
+	if agentID := firstNonEmpty(
+		r.Header.Get("X-Claude-Code-Agent-Id"),
+		r.Header.Get("X-Claude-Agent-Id"),
+		r.Header.Get("X-Agent-Id"),
+		extractMarkerValue(string(rawBody), "codex_proxy_subagent_id="),
+	); agentID != "" {
+		return true, "subagent", hashString("subagent:" + agentID)[:16]
+	}
+
 	text := strings.ToLower(latestUserText(in))
 	switch {
 	case strings.Contains(text, "<command-name>/btw</command-name>") || strings.HasPrefix(strings.TrimSpace(text), "/btw") || strings.Contains(text, "\n/btw"):
-		return true, "btw"
+		return true, "btw", ""
 	case strings.Contains(text, "this session is being continued from a previous conversation that ran out of context"):
-		return true, "compact"
+		return true, "compact", ""
 	case strings.Contains(text, "compact summary") || strings.Contains(text, "conversation compacted"):
-		return true, "compact"
+		return true, "compact", ""
 	case strings.Contains(text, "critical: respond with text only") && strings.Contains(text, "do not call any tools"):
-		return true, "one-shot"
+		return true, "one-shot", ""
 	default:
-		return false, ""
+		return false, "", ""
 	}
+}
+
+func extractMarkerValue(text, marker string) string {
+	lower := strings.ToLower(text)
+	idx := strings.Index(lower, strings.ToLower(marker))
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(marker)
+	if start >= len(text) {
+		return ""
+	}
+	var b strings.Builder
+	for _, ch := range text[start:] {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == ':' {
+			b.WriteRune(ch)
+			continue
+		}
+		break
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func latestUserText(in anthropicRequest) string {

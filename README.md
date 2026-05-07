@@ -6,7 +6,7 @@ It also includes a local control panel at `http://127.0.0.1:4000/`.
 
 Claude Code's `WebSearch` tool is translated to Codex Responses web search, and Claude Code `/fast` requests are translated to a supported Codex model with `service_tier=priority`.
 Codex reasoning summaries are returned as Anthropic `thinking` blocks so Claude Code can place them in its thinking UI separately from the final answer.
-Claude Code sessions are isolated by mapping `X-Claude-Code-Session-Id` to a local Codex `prompt_cache_key`; `/btw` and compact-style one-shot requests get separate child keys.
+Claude Code sessions are isolated by mapping `X-Claude-Code-Session-Id` to a local Codex `prompt_cache_key`; subagents, `/btw`, and compact-style one-shot requests get separate child keys.
 Claude Code browser automation is exposed as a separate MCP sidecar named `antigravity-browser`, powered by Chrome DevTools MCP with the Antigravity extension loaded in a dedicated Chrome profile.
 
 ## Endpoints
@@ -45,6 +45,7 @@ Starting the proxy applies local Claude Code settings:
 - `API_TIMEOUT_MS=3000000`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 - MCP server `antigravity-browser`, launched by `start-antigravity-browser-mcp.ps1`
+- Claude Code isolation hooks for subagent worktrees and child Codex sessions
 
 Fast mode and web search are controlled by:
 
@@ -57,6 +58,8 @@ Fast mode and web search are controlled by:
 - `CLAUDE_TOOL_ACTIVITY_THINKING=1`
 
 Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
+
+When Claude Code launches a subagent with `isolation: "worktree"`, the proxy settings add a WorktreeCreate fallback. In git repositories it creates a real git worktree under `.claude-worktrees`; outside git repositories it creates a temporary empty isolated workspace so read-only agents can still launch. A SubagentStart hook injects a local routing marker so the proxy gives that child agent its own stable Codex session key and token accounting.
 
 Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
 

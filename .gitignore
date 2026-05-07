@@ -11,6 +11,7 @@
 .proxy.trace.log.old
 .proxy.sessions.json
 .antigravity-browser-profile/
+.claude-worktrees/
 *.log
 
 # Build outputs
