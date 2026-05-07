@@ -317,6 +317,12 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 }
 
 func main() {
+	loadDotEnvIntoProcess()
+	if len(os.Args) > 1 && os.Args[1] == "--antigravity-mcp" {
+		runAntigravityMCP()
+		return
+	}
+
 	cfg := loadConfig()
 	proxyEnabled.Store(true)
 	mux := http.NewServeMux()
@@ -2661,12 +2667,14 @@ func antigravityStatus() map[string]any {
 	manifest := antigravityManifestInfo(extensionPath)
 	profilePath := antigravityProfilePath()
 	chromePath := chromeExecutablePath()
-	npxPath := executablePath("npx.cmd", "npx.exe", "npx")
 	launcherPath := filepath.Join(mustGetwd(), "start-antigravity-browser-mcp.ps1")
 	bridgeURL := "http://127.0.0.1:" + getenv("PROXY_PORT", getenv("LITELLM_PORT", "4000")) + "/antigravity/bridge"
 	browserMode := antigravityBrowserMode()
 	debugPort := antigravityBrowserDebugPort()
 	browserURL := "http://127.0.0.1:" + debugPort
+	bridgeState := readAntigravityBrowserState()
+	debugRunning := antigravityBrowserEndpointRunning(browserURL)
+	bridgeState["connected_now"] = debugRunning
 
 	antigravityMu.Lock()
 	lastProbe := cloneMap(antigravityLastProbe)
@@ -2691,22 +2699,20 @@ func antigravityStatus() map[string]any {
 			"startup_enabled": envFlag("ANTIGRAVITY_BROWSER_START_WITH_WINDOWS", false),
 			"browser_url":     browserURL,
 			"debug_port":      debugPort,
-			"debug_running":   antigravityBrowserEndpointRunning(browserURL),
-		},
-		"npx": map[string]any{
-			"path":   npxPath,
-			"exists": npxPath != "",
+			"debug_running":   debugRunning,
 		},
 		"launcher": map[string]any{
 			"path":   launcherPath,
 			"exists": fileExists(launcherPath),
 		},
-		"mcp":          antigravityMCPSettings(),
-		"bridge_url":   bridgeURL,
-		"last_probe":   lastProbe,
-		"ready":        extensionPath != "" && chromePath != "" && npxPath != "" && fileExists(launcherPath),
-		"mode":         "hybrid_cdp_first",
-		"extension_id": antigravityExtensionID,
+		"mcp":             antigravityMCPSettings(),
+		"bridge_url":      bridgeURL,
+		"last_probe":      lastProbe,
+		"bridge_state":    bridgeState,
+		"visible_overlay": true,
+		"ready":           extensionPath != "" && chromePath != "" && fileExists(launcherPath),
+		"mode":            "visible_overlay_cdp",
+		"extension_id":    antigravityExtensionID,
 	}
 }
 

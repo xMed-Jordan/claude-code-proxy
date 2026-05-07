@@ -7,7 +7,7 @@ It also includes a local control panel at `http://127.0.0.1:4000/`.
 Claude Code's `WebSearch` tool is translated to Codex Responses web search, and Claude Code `/fast` requests are translated to a supported Codex model with `service_tier=priority`.
 Codex reasoning summaries are returned as Anthropic `thinking` blocks so Claude Code can place them in its thinking UI separately from the final answer.
 Claude Code sessions are isolated by mapping `X-Claude-Code-Session-Id` to a local Codex `prompt_cache_key`; subagents, `/btw`, and compact-style one-shot requests get separate child keys.
-Claude Code browser automation is exposed as a separate MCP sidecar named `antigravity-browser`, powered by Chrome DevTools MCP with the Antigravity extension loaded in a dedicated Chrome profile.
+Claude Code browser automation is exposed as a separate MCP sidecar named `antigravity-browser`, powered by the proxy's built-in Chrome DevTools Protocol bridge with a visible in-page cursor overlay.
 
 ## Endpoints
 
@@ -65,18 +65,17 @@ Before applying settings, the proxy creates snapshots of the current Claude Code
 
 ## Antigravity Browser Bridge
 
-The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses Chrome DevTools MCP tools for navigation, screenshots, page snapshots, clicks, forms, console, and network inspection.
+The Antigravity browser bridge is intentionally separate from `/v1/messages`. Claude Code discovers it through MCP, then uses built-in browser tools for navigation, screenshots, page snapshots, visible cursor movement, clicks, typing, key presses, and waits.
 
 The launcher validates:
 
 - Google Chrome is installed.
-- `npx` is available.
 - Antigravity extension `eeijfnjmjelapkebgockoeaadonbchdd` is installed in Chrome.
-- A dedicated profile at `.antigravity-browser-profile` can be used without touching your normal Chrome profile.
+- `bin\claude-code-proxy.exe` exists and can run `--antigravity-mcp`.
 
-Set `ANTIGRAVITY_BROWSER_MODE=default` to use your regular Chrome profile where the Antigravity extension is already installed. In that mode Claude Code launches the stdio MCP process and Chrome DevTools MCP uses `--autoConnect` to attach to your normal Chrome session. Chrome 144+ is required, and Chrome may need its local remote-debugging session enabled from `chrome://inspect/#remote-debugging`.
+Set `ANTIGRAVITY_BROWSER_MODE=default` to use your regular Chrome profile where the Antigravity extension is already installed. In that mode the MCP attaches to Chrome at `ANTIGRAVITY_BROWSER_DEBUG_PORT`. If Chrome is not already exposing DevTools, the bridge starts normal Chrome with `--remote-debugging-port` and the Default profile. If Chrome was already open without remote debugging, close Chrome once and start the proxy again.
 
-Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. If `ANTIGRAVITY_BROWSER_START_WITH_WINDOWS=1`, `start-proxy.ps1` pre-launches that dedicated Chrome profile when Windows starts the proxy scheduled task. The browser is started only when the Antigravity extension is installed or `ANTIGRAVITY_EXTENSION_PATH` points to a valid extension folder. Claude Code still launches the stdio MCP process itself, but that process attaches to the already-running browser at `ANTIGRAVITY_BROWSER_DEBUG_PORT` instead of opening another Chrome instance.
+Set `ANTIGRAVITY_BROWSER_MODE=dedicated` to use an isolated profile under `.antigravity-browser-profile`. If `ANTIGRAVITY_BROWSER_START_WITH_WINDOWS=1`, `start-proxy.ps1` pre-launches the browser only when the Antigravity extension is installed or `ANTIGRAVITY_EXTENSION_PATH` points to a valid extension folder. Claude Code still launches the stdio MCP process itself; Windows startup only prepares the browser control endpoint.
 
 Optional overrides:
 
@@ -87,7 +86,7 @@ Optional overrides:
 - `ANTIGRAVITY_BROWSER_START_WITH_WINDOWS`
 - `ANTIGRAVITY_BROWSER_DEBUG_PORT`
 
-Open `http://127.0.0.1:4000/antigravity/bridge` from the dedicated browser profile to run a safe extension wake/connection probe. The probe records only local status fields; it does not log tokens or browsing history.
+Open `http://127.0.0.1:4000/antigravity/bridge` from Chrome to run a safe extension wake/connection probe. The probe records only local status fields; it does not log tokens or browsing history. Real browser-control activity is reported in the dashboard from `.antigravity-browser-state.json`, which stores only current URL/title, last action, and last error.
 
 ## Safety
 

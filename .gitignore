@@ -13,6 +13,7 @@
 .proxy.trace.log.old
 .proxy.sessions.json
 .antigravity-browser.pid
+.antigravity-browser-state.json
 .antigravity-browser-profile/
 .claude-worktrees/
 *.log

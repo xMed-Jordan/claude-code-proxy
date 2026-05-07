@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $basePath = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $basePath
 $extensionId = 'eeijfnjmjelapkebgockoeaadonbchdd'
 
 function Import-ProxyEnv {
@@ -26,14 +27,6 @@ function Import-ProxyEnv {
 }
 
 Import-ProxyEnv
-
-function Get-BrowserProfilePath {
-    $envPath = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_PROFILE', 'Process')
-    if (-not [string]::IsNullOrWhiteSpace($envPath)) {
-        return $envPath
-    }
-    return (Join-Path $basePath '.antigravity-browser-profile')
-}
 
 function Get-BrowserMode {
     $mode = [Environment]::GetEnvironmentVariable('ANTIGRAVITY_BROWSER_MODE', 'Process')
@@ -60,11 +53,6 @@ function Get-DebugPort {
         return $port
     }
     return 9233
-}
-
-function Write-McpError {
-    param([string]$Message)
-    [Console]::Error.WriteLine($Message)
 }
 
 function Get-ChromePath {
@@ -106,16 +94,6 @@ function Get-AntigravityExtensionPath {
     return $versions[0].FullName
 }
 
-function Get-NpxPath {
-    foreach ($name in @('npx.cmd', 'npx.exe', 'npx')) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) {
-            return $cmd.Source
-        }
-    }
-    return $null
-}
-
 function Test-BrowserEndpoint {
     param([int]$Port)
     try {
@@ -126,87 +104,49 @@ function Test-BrowserEndpoint {
     }
 }
 
-$profileDir = Get-BrowserProfilePath
+$exePath = Join-Path $basePath 'bin\claude-code-proxy.exe'
+$chromePath = Get-ChromePath
+$extensionPath = Get-AntigravityExtensionPath
 $browserMode = Get-BrowserMode
 $debugPort = Get-DebugPort
 $browserUrl = "http://127.0.0.1:$debugPort"
-$chromePath = Get-ChromePath
-$extensionPath = Get-AntigravityExtensionPath
-$npxPath = Get-NpxPath
 $browserRunning = Test-BrowserEndpoint -Port $debugPort
 
 $problems = @()
+if (-not (Test-Path -LiteralPath $exePath)) {
+    $problems += "Proxy executable was not found at $exePath. Build the project first."
+}
 if ([string]::IsNullOrWhiteSpace($chromePath)) {
     $problems += 'Google Chrome was not found. Set ANTIGRAVITY_CHROME_PATH to chrome.exe if it is installed in a custom location.'
 }
 if ([string]::IsNullOrWhiteSpace($extensionPath)) {
     $problems += "Antigravity extension $extensionId was not found in the Chrome Default profile. Install it once in Chrome, or set ANTIGRAVITY_EXTENSION_PATH."
 }
-if ([string]::IsNullOrWhiteSpace($npxPath)) {
-    $problems += 'npx was not found on PATH. Install Node.js 20+ or add npm to PATH.'
-}
 
 if ($ValidateOnly) {
-    $exitCode = 1
-    if ($problems.Count -eq 0) {
-        $exitCode = 0
-    }
     [pscustomobject]@{
-        ok             = ($problems.Count -eq 0)
-        mode           = $browserMode
-        chrome_path    = $chromePath
-        extension_id   = $extensionId
-        extension_path = $extensionPath
-        profile_path   = $profileDir
-        browser_url    = $browserUrl
+        ok              = ($problems.Count -eq 0)
+        mode            = $browserMode
+        executable_path = $exePath
+        chrome_path     = $chromePath
+        extension_id    = $extensionId
+        extension_path  = $extensionPath
+        browser_url     = $browserUrl
         browser_running = $browserRunning
-        npx_path       = $npxPath
-        problems       = $problems
+        visible_overlay = $true
+        mcp_server      = 'custom'
+        problems        = $problems
     } | ConvertTo-Json -Depth 4
-    exit $exitCode
+    if ($problems.Count -eq 0) { exit 0 }
+    exit 1
 }
 
 if ($problems.Count -gt 0) {
     foreach ($problem in $problems) {
-        Write-McpError $problem
+        [Console]::Error.WriteLine($problem)
     }
     exit 1
 }
 
-if (-not (Test-Path -LiteralPath $profileDir)) {
-    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
-}
-
-$env:CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
-
-$mcpArgs = @(
-    '-y',
-    'chrome-devtools-mcp@latest',
-    '--redact-network-headers=true',
-    '--usage-statistics=false',
-    '--performance-crux=false'
-)
-
-if ($browserMode -eq 'default') {
-    $mcpArgs += '--autoConnect=true'
-} elseif ($browserRunning) {
-    $mcpArgs += "--browserUrl=$browserUrl"
-} else {
-    $chromeArgs = @(
-        "--load-extension=$extensionPath",
-        "--disable-extensions-except=$extensionPath",
-        '--no-first-run',
-        '--no-default-browser-check'
-    )
-
-    $mcpArgs += "--executable-path=$chromePath"
-    $mcpArgs += "--user-data-dir=$profileDir"
-    $mcpArgs += '--category-extensions=true'
-
-    foreach ($arg in $chromeArgs) {
-        $mcpArgs += "--chrome-arg=$arg"
-    }
-}
-
-& $npxPath @mcpArgs
+& $exePath --antigravity-mcp
 exit $LASTEXITCODE

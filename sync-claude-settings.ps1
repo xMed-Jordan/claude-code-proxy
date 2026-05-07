@@ -147,7 +147,7 @@ function Ensure-AntigravityBrowserMcp {
         command = 'pwsh'
         args    = @('-NoProfile', '-File', $launcherPath)
         env     = [pscustomobject]@{
-            CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
+            CCP_BROWSER_MCP = 'antigravity-browser'
         }
     }
 
@@ -173,7 +173,7 @@ function Ensure-AntigravityBrowserUserMcp {
         command = 'pwsh'
         args    = @('-NoProfile', '-File', $launcherPath)
         env     = [pscustomobject]@{
-            CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS = '1'
+            CCP_BROWSER_MCP = 'antigravity-browser'
         }
     }
 

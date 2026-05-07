@@ -369,6 +369,7 @@ const BrowserBridge = () => {
   const profile = status?.profile || {};
   const mcp = status?.mcp || {};
   const probe = status?.last_probe || null;
+  const bridgeState = status?.bridge_state || {};
   const ready = !!status?.ready;
   const openBridge = () => {
     if (status?.bridge_url) window.open(status.bridge_url, "_blank", "noopener,noreferrer");
@@ -378,17 +379,18 @@ const BrowserBridge = () => {
   const rows = [
     { label: "Extension", ok: ext.exists, meta: ext.exists ? `${manifest.name || "Antigravity"} ${manifest.version || ""}` : "not found" },
     { label: "Manifest bridge", ok: !!manifest.externally_connectable, meta: manifest.service_worker || "service worker not detected" },
-    { label: "Dedicated profile", ok: true, meta: profile.path || "not configured" },
+    { label: "Browser mode", ok: true, meta: `${status?.chrome?.mode || "default"} · ${status?.chrome?.browser_url || "debug port pending"}` },
     { label: "Chrome", ok: status?.chrome?.exists, meta: status?.chrome?.path || "not found" },
-    { label: "npx", ok: status?.npx?.exists, meta: status?.npx?.path || "not found" },
+    { label: "DevTools port", ok: !!status?.chrome?.debug_running, meta: status?.chrome?.debug_running ? "connected" : "will start when MCP runs; close Chrome once if it stays unavailable" },
     { label: "Claude MCP", ok: mcp.present, meta: mcp.present ? `${mcp.command || "pwsh"} ${Array.isArray(mcp.args) ? mcp.args.join(" ") : ""}` : "antigravity-browser not injected yet" },
+    { label: "Visible control", ok: !!status?.visible_overlay, meta: bridgeState?.connected_now ? `connected · ${bridgeState.last_action || "ready"}` : "cursor overlay tools ready when Claude starts MCP" },
   ];
 
   return (
     <section data-screen-label="06 Antigravity Browser" className="col" style={{ gap: 16 }}>
       <SectionHd
         title="Antigravity browser"
-        sub="Claude Code browser tools run through a dedicated Chrome DevTools MCP sidecar with the Antigravity extension loaded."
+        sub="Claude Code browser tools use your normal Chrome profile with a visible cursor overlay for move, click, type, page reads, and screenshots."
         actions={
           <>
             <Pill tone={ready ? "ok" : "warn"}>{ready ? "Ready" : "Needs attention"}</Pill>
@@ -425,11 +427,26 @@ const BrowserBridge = () => {
             </div>
           ) : (
             <div className="txt-2" style={{fontSize: 12}}>
-              No bridge probe has reported yet. Open the bridge probe in the dedicated Chrome profile or from any Chrome page that can message the Antigravity extension.
+              No extension probe has reported yet. Open the bridge probe from Chrome to check the Antigravity extension messaging wake path.
             </div>
           )}
         </Card>
       </div>
+
+      <Card title="Visible browser control">
+        <div className="kv" style={{ gridTemplateColumns: "140px 1fr", rowGap: 8 }}>
+          <div className="k">Connection</div>
+          <div className="v">{bridgeState?.connected_now ? <Pill tone="ok">Chrome control connected</Pill> : <Pill tone="warn">waiting for Chrome DevTools</Pill>}</div>
+          <div className="k">Current page</div>
+          <div className="v mono">{bridgeState?.current_url || "—"}</div>
+          <div className="k">Title</div>
+          <div className="v">{bridgeState?.current_title || "—"}</div>
+          <div className="k">Last action</div>
+          <div className="v mono">{bridgeState?.last_action || "—"}</div>
+          <div className="k">Last error</div>
+          <div className="v mono">{bridgeState?.last_error || "—"}</div>
+        </div>
+      </Card>
 
       <Card title="MCP launcher">
         <div className="grid-2">
@@ -439,11 +456,13 @@ const BrowserBridge = () => {
           </div>
           <div className="kv" style={{ gridTemplateColumns: "130px 1fr", rowGap: 8 }}>
             <div className="k">Mode</div>
-            <div className="v mono">{status?.mode || "hybrid_cdp_first"}</div>
+            <div className="v mono">{status?.mode || "visible_overlay_cdp"}</div>
             <div className="k">Extension ID</div>
             <div className="v mono">{status?.extension_id || "—"}</div>
             <div className="k">Extension path</div>
             <div className="v mono">{ext.path || "—"}</div>
+            <div className="k">Profile path</div>
+            <div className="v mono">{profile.path || "—"}</div>
             <div className="k">Bridge URL</div>
             <div className="v mono">{status?.bridge_url || "—"}</div>
           </div>

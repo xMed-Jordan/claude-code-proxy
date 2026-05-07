@@ -121,6 +121,10 @@ function Test-BrowserEndpoint {
     }
 }
 
+function Test-ChromeProcessRunning {
+    return $null -ne (Get-Process -Name chrome -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
 function Stop-AntigravityBrowser {
     if ((Get-BrowserMode) -eq 'default') {
         Write-Info 'Default browser mode is active; no dedicated Antigravity browser is stopped.'
@@ -135,28 +139,28 @@ function Stop-AntigravityBrowser {
     }
 
     try {
-        $pid = [int](Get-Content -Path $pidFile -Raw).Trim()
-        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        $browserPid = [int](Get-Content -Path $pidFile -Raw).Trim()
+        $proc = Get-Process -Id $browserPid -ErrorAction SilentlyContinue
         if ($null -eq $proc) {
-            Write-Info "No running Antigravity browser process found for PID $pid."
+            Write-Info "No running Antigravity browser process found for PID $browserPid."
             return
         }
 
         $commandLine = ''
         try {
-            $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction Stop
+            $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$browserPid" -ErrorAction Stop
             $commandLine = [string]$cim.CommandLine
         } catch {
             $commandLine = ''
         }
 
         if ($commandLine -and -not $commandLine.Contains($profilePath)) {
-            Write-Info "Refusing to stop PID $pid because it does not use the Antigravity profile."
+            Write-Info "Refusing to stop PID $browserPid because it does not use the Antigravity profile."
             return
         }
 
-        Stop-Process -Id $pid -Force
-        Write-Info "Stopped Antigravity browser (PID $pid)."
+        Stop-Process -Id $browserPid -Force
+        Write-Info "Stopped Antigravity browser (PID $browserPid)."
     } finally {
         Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
     }
@@ -204,7 +208,33 @@ if ([string]::IsNullOrWhiteSpace($chromePath)) {
     return
 }
 if ($browserMode -eq 'default') {
-    Write-Info 'Default browser mode is active; Claude Code will auto-connect to your regular Chrome when the MCP starts.'
+    if ($running) {
+        Write-Info "Default Chrome already exposes DevTools at $browserUrl."
+        return
+    }
+    if (Test-ChromeProcessRunning) {
+        Write-Info "Default Chrome is already running without DevTools at $browserUrl. Close Chrome once, then start the proxy again to enable visible browser control."
+        return
+    }
+
+    $chromeArgs = @(
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=$debugPort",
+        '--profile-directory=Default',
+        '--no-first-run',
+        '--no-default-browser-check',
+        'about:blank'
+    )
+
+    $process = Start-Process -FilePath $chromePath -ArgumentList $chromeArgs -PassThru
+    Set-Content -Path $pidFile -Value $process.Id
+    Start-Sleep -Milliseconds 800
+
+    if (Test-BrowserEndpoint -Port $debugPort) {
+        Write-Info "Started default Chrome browser control at $browserUrl (PID $($process.Id))."
+    } else {
+        Write-Info "Chrome opened, but DevTools is not responding at $browserUrl. If Chrome was already open, close it once and start the proxy again."
+    }
     return
 }
 if ($running) {
