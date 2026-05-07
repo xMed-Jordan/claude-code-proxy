@@ -50,6 +50,9 @@ Fast mode and web search are controlled by:
 - `CODEX_REASONING_SUMMARY=auto`
 - `CODEX_SESSION_ISOLATION=1`
 - `CODEX_PROMPT_CACHE_KEY=1`
+- `CLAUDE_TOOL_ACTIVITY_THINKING=1`
+
+Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
 
 Before applying settings, the proxy creates a snapshot of the current Claude Code settings. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshot.
 

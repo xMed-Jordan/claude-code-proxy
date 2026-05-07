@@ -1534,11 +1534,17 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 				}
 			}
 		case "function_call":
+			input := functionArgumentsToInput(item.Arguments)
+			if toolActivityThinkingEnabled() {
+				if summary := toolActivityThinkingText(item.Name, input); summary != "" {
+					content = append(content, map[string]any{"type": "thinking", "thinking": summary, "signature": toolActivityThinkingSignature(item, summary)})
+				}
+			}
 			content = append(content, map[string]any{
 				"type":  "tool_use",
 				"id":    firstNonEmpty(item.CallID, item.ID, "toolu_"+strconv.FormatInt(time.Now().UnixNano(), 36)),
 				"name":  item.Name,
-				"input": functionArgumentsToInput(item.Arguments),
+				"input": input,
 			})
 		}
 	}
@@ -1558,6 +1564,60 @@ func reasoningSummaryText(item responsesOutputItem) string {
 func codexThinkingSignature(item responsesOutputItem, thinking string) string {
 	sum := sha256.Sum256([]byte(firstNonEmpty(item.ID, item.Type) + "\n" + thinking))
 	return "codex-reasoning-summary:" + base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
+func toolActivityThinkingEnabled() bool {
+	return envFlag("CLAUDE_TOOL_ACTIVITY_THINKING", true)
+}
+
+func toolActivityThinkingText(toolName string, input any) string {
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return ""
+	}
+	raw, _ := json.Marshal(safeToolActivityInput(input))
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+		return "Tool activity: requesting " + toolName + " with no arguments."
+	}
+	return "Tool activity: requesting " + toolName + " with arguments " + truncateString(string(raw), 2000)
+}
+
+func toolActivityThinkingSignature(item responsesOutputItem, thinking string) string {
+	sum := sha256.Sum256([]byte(firstNonEmpty(item.CallID, item.ID, item.Name, item.Type) + "\n" + thinking))
+	return "codex-tool-activity:" + base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
+func safeToolActivityInput(input any) any {
+	switch v := input.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for key, value := range v {
+			if sensitiveFieldName(key) {
+				out[key] = "[redacted]"
+				continue
+			}
+			out[key] = safeToolActivityInput(value)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, safeToolActivityInput(item))
+		}
+		return out
+	default:
+		return input
+	}
+}
+
+func sensitiveFieldName(name string) bool {
+	name = strings.ToLower(name)
+	for _, marker := range []string{"authorization", "api_key", "apikey", "token", "secret", "password", "cookie"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func functionArgumentsToInput(arguments string) any {

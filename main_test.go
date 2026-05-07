@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -42,7 +43,17 @@ func TestResponsesFunctionCallConvertsToAnthropicToolUse(t *testing.T) {
 		t.Fatalf("stop_reason = %v, want tool_use", out["stop_reason"])
 	}
 	content := out["content"].([]any)
-	block := content[0].(map[string]any)
+	var block map[string]any
+	for _, item := range content {
+		candidate := item.(map[string]any)
+		if candidate["type"] == "tool_use" {
+			block = candidate
+			break
+		}
+	}
+	if block == nil {
+		t.Fatalf("tool_use block missing: %#v", content)
+	}
 	if block["type"] != "tool_use" || block["id"] != "call_1" || block["name"] != "read_file" {
 		t.Fatalf("tool block = %#v", block)
 	}
@@ -267,6 +278,39 @@ func TestBufferedStreamWritesThinkingEventsBeforeText(t *testing.T) {
 			t.Fatalf("stream order missing or wrong for %q in %s", want, raw)
 		}
 		last = idx
+	}
+}
+
+func TestFunctionCallAddsToolActivityThinkingBlock(t *testing.T) {
+	t.Setenv("CLAUDE_TOOL_ACTIVITY_THINKING", "1")
+	resp := responsesResponse{
+		ID: "resp_test",
+		Output: []responsesOutputItem{{
+			Type:      "function_call",
+			ID:        "fc_1",
+			CallID:    "call_1",
+			Name:      "Wolfram Search",
+			Arguments: `{"query":"integral of sin x","api_key":"secret-value"}`,
+		}},
+	}
+	out := toAnthropicResponsesResponse(resp, "opus[1m]")
+	content := out["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("content = %#v, want thinking and tool_use", content)
+	}
+	thinking := content[0].(map[string]any)
+	if thinking["type"] != "thinking" {
+		t.Fatalf("first block = %#v, want thinking", thinking)
+	}
+	text := fmt.Sprint(thinking["thinking"])
+	if !strings.Contains(text, "Wolfram Search") || !strings.Contains(text, "integral of sin x") {
+		t.Fatalf("thinking text missing tool details: %q", text)
+	}
+	if strings.Contains(text, "secret-value") || !strings.Contains(text, "[redacted]") {
+		t.Fatalf("thinking text did not redact sensitive field: %q", text)
+	}
+	if content[1].(map[string]any)["type"] != "tool_use" {
+		t.Fatalf("second block = %#v, want tool_use", content[1])
 	}
 }
 
