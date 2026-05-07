@@ -818,8 +818,10 @@ copy_proxy_files() {
   run_sudo mkdir -p "${INSTALL_DIR}"
   run_sudo chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
   run mkdir -p "${INSTALL_DIR}"
-  run cp "${REPO_DIR}/bin/${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
-  run chmod 0755 "${INSTALL_DIR}/${APP_NAME}"
+  local binary_tmp="${INSTALL_DIR}/.${APP_NAME}.new.$$"
+  run cp "${REPO_DIR}/bin/${APP_NAME}" "${binary_tmp}"
+  run chmod 0755 "${binary_tmp}"
+  run mv -f "${binary_tmp}" "${INSTALL_DIR}/${APP_NAME}"
   run rm -rf "${INSTALL_DIR}/ui"
   run cp -R "${REPO_DIR}/ui" "${INSTALL_DIR}/ui"
   if [[ -f "${REPO_DIR}/.env.example" ]]; then
@@ -1102,4 +1104,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

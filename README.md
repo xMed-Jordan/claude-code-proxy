@@ -114,6 +114,20 @@ Installer helper actions:
 ./install-linux.sh uninstall
 ```
 
+Maintenance scripts:
+
+```sh
+chmod +x install-linux.sh reinstall-linux.sh uninstall-linux.sh update-linux.sh
+./update-linux.sh
+./reinstall-linux.sh --server --https --domain proxy.example.com --email admin@example.com --confirm-dns
+./uninstall-linux.sh --app-only
+./uninstall-linux.sh --clean
+```
+
+- `update-linux.sh` updates OS packages, pulls the latest code from `https://github.com/xMed-Jordan/claude-code-proxy.git`, updates Go from official Go metadata, updates the Codex and Claude Code npm CLIs, rebuilds, reinstalls, and restarts the service. It preserves the installed public URL when `/opt/connect-ai-proxy/.env` or Caddy already points at the proxy.
+- `reinstall-linux.sh` stops the service, restores synced Claude settings if possible, removes the service, symlink, and install directory, then runs a fresh install. It keeps Codex auth by default so a reinstall does not force a new device login unless `--remove-codex-auth` is passed.
+- `uninstall-linux.sh --app-only` removes only the app service, symlink, and install directory. `--clean` also checks Caddy, Go, Node/npm, Codex/Claude CLI packages, and browser packages; it skips anything that appears to be used by another process, systemd unit, or project on the server.
+
 Troubleshooting notes:
 
 - If `sudo` fails, run as a sudo-capable user or as root.
@@ -121,6 +135,7 @@ Troubleshooting notes:
 - If Claude Code is missing, the installer installs it; if `claude` is still not on `PATH`, fix the global npm bin path and rerun the installer.
 - If Codex login is incomplete, run `codex` as the installing user and finish sign-in, then rerun the installer.
 - If HTTPS fails, confirm DNS A/AAAA records point to the server and inbound ports `80` and `443` are open.
+- If reinstalling over a running service ever reports `Text file busy`, pull the latest repository and rerun the installer or `./update-linux.sh`; new installs replace the running binary through an atomic file move.
 - If the dashboard shows `127.0.0.1` on a server install, set `PROXY_PUBLIC_URL=https://your-domain` in `/opt/connect-ai-proxy/.env` and restart `connect-ai-proxy`.
 - If browser tools are enabled later, rerun with `--browser-tools`; install the Antigravity Chrome extension in Chrome/Chromium before using browser MCP actions.
 - Caddy status and reload are managed with `sudo systemctl status caddy` and `sudo systemctl reload caddy`.
