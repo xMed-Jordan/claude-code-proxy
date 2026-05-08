@@ -61,7 +61,7 @@ const (
 	appVersionFallback     = "0.0.0-dev"
 	defaultVersionURL      = "https://raw.githubusercontent.com/xMed-Jordan/claude-code-proxy/main/VERSION"
 	defaultTokenHintAt     = 250000
-	defaultTokenHardLimit  = 260000
+	defaultTokenHardLimit  = 1050000
 )
 
 type updateLatestCache struct {
@@ -2387,7 +2387,9 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 			}
 		}
 		if isContextLengthError(msg) {
-			msg = codexContextLengthErrorMessage(msg, out)
+			decision := codexContextLengthHintDecision(msg, out)
+			traceLog(ctx, "codex.context_length_hint", map[string]any{"status": resp.StatusCode, "input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
+			return tokenLimitResponsesResponse(out.Model, decision), http.StatusOK, "", nil
 		}
 		return responsesResponse{}, resp.StatusCode, msg, fmt.Errorf("codex upstream returned %s", resp.Status)
 	}
@@ -2397,7 +2399,9 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 		streamMsg := strings.TrimSpace(collected.StreamError)
 		msg := "Codex upstream stream failed: " + streamMsg
 		if isContextLengthError(streamMsg) {
-			msg = codexContextLengthErrorMessage(streamMsg, out)
+			decision := codexContextLengthHintDecision(streamMsg, out)
+			traceLog(ctx, "codex.stream_context_length_hint", map[string]any{"input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
+			return tokenLimitResponsesResponse(out.Model, decision), http.StatusOK, "", nil
 		}
 		traceLog(ctx, "codex.stream_failure", map[string]any{"error": truncateString(msg, traceBodyLimit)})
 		return responsesResponse{}, http.StatusBadGateway, msg, errors.New(msg)
@@ -2548,7 +2552,14 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 		raw, _ := io.ReadAll(resp.Body)
 		msg := strings.TrimSpace(string(raw))
 		if isContextLengthError(msg) {
-			msg = codexContextLengthErrorMessage(msg, out)
+			decision := codexContextLengthHintDecision(msg, out)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			sendEvent(w, "response.output_text.delta", responsesStreamEvent{Type: "response.output_text.delta", Delta: decision.Message, OutputIndex: 0})
+			sendEvent(w, "response.completed", responsesStreamEvent{Type: "response.completed", Response: tokenLimitResponsesResponse(out.Model, decision)})
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
 		}
 		writeOpenAIError(w, resp.StatusCode, msg)
 		return
@@ -2638,7 +2649,17 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 		raw, _ := io.ReadAll(resp.Body)
 		msg := strings.TrimSpace(string(raw))
 		if isContextLengthError(msg) {
-			msg = codexContextLengthErrorMessage(msg, out)
+			decision := codexContextLengthHintDecision(msg, out)
+			id := "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			created := time.Now().Unix()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"role": "assistant"}, nil)
+			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": decision.Message}, nil)
+			stop := "stop"
+			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{}, &stop)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
 		}
 		writeOpenAIError(w, resp.StatusCode, msg)
 		return
@@ -3132,14 +3153,23 @@ func codexTokenLimitDecision(inputTokens, requestedOutputTokens int) tokenLimitD
 	totalTokens := inputTokens + outputTokens
 	decision := tokenLimitDecision{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, HintAt: hintAt, HardLimit: hardLimit}
 	switch {
-	case hardLimit > 0 && inputTokens >= hardLimit:
+	case hardLimit > 0 && inputTokens >= hardLimit && codexBlockAtHardEnabled():
 		decision.Action = "error"
 		decision.Reason = "input"
-	case hardLimit > 0 && outputTokens >= hardLimit:
+	case hardLimit > 0 && outputTokens >= hardLimit && codexBlockAtHardEnabled():
 		decision.Action = "error"
 		decision.Reason = "output"
-	case hardLimit > 0 && totalTokens >= hardLimit:
+	case hardLimit > 0 && totalTokens >= hardLimit && codexBlockAtHardEnabled():
 		decision.Action = "error"
+		decision.Reason = "total"
+	case hardLimit > 0 && inputTokens >= hardLimit:
+		decision.Action = "hint"
+		decision.Reason = "input"
+	case hardLimit > 0 && outputTokens >= hardLimit:
+		decision.Action = "hint"
+		decision.Reason = "output"
+	case hardLimit > 0 && totalTokens >= hardLimit:
+		decision.Action = "hint"
 		decision.Reason = "total"
 	case hintAt > 0 && inputTokens >= hintAt:
 		decision.Action = "hint"
@@ -3162,12 +3192,16 @@ func codexTokenLimitDecision(inputTokens, requestedOutputTokens int) tokenLimitD
 	return decision
 }
 
+func codexBlockAtHardEnabled() bool {
+	return envFlag("CODEX_UPSTREAM_BLOCK_AT_HARD", false)
+}
+
 func tokenLimitHardText(decision tokenLimitDecision) string {
-	return fmt.Sprintf("Codex upstream stream failed: context_length_exceeded: this request is estimated at %s tokens against the live upstream limit of about %s tokens. Please compact the conversation and retry with a smaller prompt or output budget.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit))
+	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: context_length_exceeded preflight block. This request is estimated at %s tokens against the live upstream limit of about %s tokens. Compact or summarize the conversation context now, then retry the user's task with a smaller prompt or output budget.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit))
 }
 
 func tokenLimitHintText(decision tokenLimitDecision) string {
-	return fmt.Sprintf("Context window warning: this request is estimated at %s tokens and is close to the live upstream limit of about %s tokens. Please compact the conversation now, then continue from the compacted summary. The proxy still advertises the full 1M model window, but this live backend currently needs compaction around %s tokens to avoid a context_length_exceeded failure.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit), formatTokenCount(decision.HintAt))
+	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: this request is estimated at %s tokens. The proxy compaction hint threshold is %s tokens, while GPT-5.5's advertised context window is %s tokens with up to 128k output tokens. Compact or summarize the conversation context now, then continue the user's task from the compacted summary. Do not treat this as the final answer to the human user.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HintAt), formatTokenCount(decision.HardLimit))
 }
 
 func isContextLengthError(msg string) bool {
@@ -3185,7 +3219,23 @@ func codexContextLengthErrorMessage(upstreamMsg string, out responsesRequest) st
 	if hardLimit > 0 {
 		limitText = "about " + formatTokenCount(hardLimit) + " tokens"
 	}
-	return fmt.Sprintf("Codex upstream stream failed: context_length_exceeded: the live backend rejected this request. The visible Claude UI token counter can be much lower than the hidden payload sent to the proxy. Proxy estimate: %s input tokens, %s requested output tokens, %s total, against %s. Please compact the conversation, then retry. Original upstream message: %s", formatTokenCount(inputTokens), formatTokenCount(outputTokens), formatTokenCount(totalTokens), limitText, strings.TrimSpace(upstreamMsg))
+	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: the live backend rejected this request as too large. The visible Claude UI token counter can be much lower than the hidden payload sent to the proxy because tool history, transformed request JSON, and child-agent context are included upstream. Proxy estimate: %s input tokens, %s requested output tokens, %s total, against %s. Compact or summarize the conversation context now, then continue the user's task from the compacted summary. Do not treat this as the final answer to the human user. Original upstream message: %s", formatTokenCount(inputTokens), formatTokenCount(outputTokens), formatTokenCount(totalTokens), limitText, strings.TrimSpace(upstreamMsg))
+}
+
+func codexContextLengthHintDecision(upstreamMsg string, out responsesRequest) tokenLimitDecision {
+	inputTokens := estimateCodexRequestTokens(out)
+	outputTokens := max(0, out.MaxOutputTokens)
+	totalTokens := inputTokens + outputTokens
+	return tokenLimitDecision{
+		Action:       "hint",
+		Reason:       "upstream_context_length",
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  totalTokens,
+		HintAt:       envIntDefault("CODEX_UPSTREAM_HINT_TOKENS", defaultTokenHintAt),
+		HardLimit:    envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit),
+		Message:      codexContextLengthErrorMessage(upstreamMsg, out),
+	}
 }
 
 func formatTokenCount(tokens int) string {
@@ -6838,7 +6888,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HINT_TOKENS", "CODEX_UPSTREAM_HARD_TOKENS", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HINT_TOKENS", "CODEX_UPSTREAM_HARD_TOKENS", "CODEX_UPSTREAM_BLOCK_AT_HARD", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
 	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {

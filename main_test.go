@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -502,7 +503,7 @@ func TestCodexTokenLimitGuardReturnsCompactHint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Please compact the conversation now") {
+	if !strings.Contains(rec.Body.String(), "Agent recovery instruction, not a user-facing reply") {
 		t.Fatalf("body missing compact hint: %s", rec.Body.String())
 	}
 }
@@ -523,17 +524,39 @@ func TestCodexTokenLimitGuardAppliesToRequestedOutput(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "close to the live upstream limit") {
+	if !strings.Contains(rec.Body.String(), "proxy compaction hint threshold") {
 		t.Fatalf("body missing output compact hint: %s", rec.Body.String())
 	}
 }
 
-func TestCodexTokenLimitGuardHardLimitKeepsContextError(t *testing.T) {
+func TestCodexTokenLimitGuardHardLimitDefaultsToCompactHint(t *testing.T) {
 	restoreProxyEnabled := proxyEnabled.Load()
 	proxyEnabled.Store(true)
 	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
 	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
 	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+
+	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":1,"messages":[{"role":"user","content":"`+strings.Repeat("x", 88)+`"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Agent recovery instruction, not a user-facing reply") {
+		t.Fatalf("body missing compact hint: %s", rec.Body.String())
+	}
+}
+
+func TestCodexTokenLimitGuardHardBlockCanBeEnabled(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+	t.Setenv("CODEX_UPSTREAM_BLOCK_AT_HARD", "1")
 
 	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
 	handler := newProxyMux(cfg)
@@ -550,7 +573,7 @@ func TestCodexTokenLimitGuardHardLimitKeepsContextError(t *testing.T) {
 }
 
 func TestCodexContextLengthErrorMessageExplainsVisibleCounterGap(t *testing.T) {
-	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "260000")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "1050000")
 	msg := codexContextLengthErrorMessage("context_length_exceeded: Your input exceeds the context window.", responsesRequest{
 		Model:           "gpt-5.5",
 		Instructions:    strings.Repeat("read this carefully ", 20),
@@ -560,8 +583,41 @@ func TestCodexContextLengthErrorMessageExplainsVisibleCounterGap(t *testing.T) {
 	if !strings.Contains(msg, "visible Claude UI token counter") {
 		t.Fatalf("message does not explain hidden payload gap: %s", msg)
 	}
+	if !strings.Contains(msg, "not a user-facing reply") {
+		t.Fatalf("message does not tell the agent to compact: %s", msg)
+	}
 	if !strings.Contains(msg, "Original upstream message") {
 		t.Fatalf("message omits original upstream error: %s", msg)
+	}
+}
+
+func TestCodexContextLengthUpstreamErrorReturnsAssistantHint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream path = %s, want /responses", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"detail":"context_length_exceeded: Your input exceeds the context window."}`)
+	}))
+	defer upstream.Close()
+
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-token","account_id":"test-account"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, status, msg, err := callCodexResponses(context.Background(), config{CodexBaseURL: upstream.URL, CodexAuthFile: authFile}, responsesRequest{
+		Model: "gpt-5.5",
+		Input: []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("callCodexResponses returned error: %v (%s)", err, msg)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; msg=%s", status, msg)
+	}
+	if len(resp.Output) == 0 || len(resp.Output[0].Content) == 0 || !strings.Contains(resp.Output[0].Content[0].Text, "Agent recovery instruction, not a user-facing reply") {
+		t.Fatalf("response missing assistant compact hint: %#v", resp.Output)
 	}
 }
 

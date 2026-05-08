@@ -204,7 +204,7 @@ Fast mode and web search are controlled by:
 - `CODEX_PROMPT_CACHE_KEY=1`
 - `CLAUDE_TOOL_ACTIVITY_THINKING=1`
 
-The proxy still advertises configured large context windows such as `1m`, but live Codex/ChatGPT routing can enforce a practical compaction guard. Set `CODEX_UPSTREAM_HINT_TOKENS` and `CODEX_UPSTREAM_HARD_TOKENS` to control when the proxy returns a "compact now" assistant message and when it returns a `context_length_exceeded` error. Defaults are `250000` and `260000`, and the guard applies to input size, requested output budget, and long streamed output.
+The proxy still advertises configured large context windows such as `1m`, but live Codex/ChatGPT routing benefits from a practical compaction guard before the session becomes too heavy. Set `CODEX_UPSTREAM_HINT_TOKENS` to control when the proxy returns a normal assistant message addressed to the AI agent, not the human user. The default hint is `250000` tokens because Codex runtimes may show an active window near `258000` even when the routed GPT model advertises more. `CODEX_UPSTREAM_HARD_TOKENS` defaults to GPT-5.5's advertised `1050000` context window, and `CODEX_UPSTREAM_BLOCK_AT_HARD=0` keeps the agent from receiving a hard 502 preflight failure. Set `CODEX_UPSTREAM_BLOCK_AT_HARD=1` only if you explicitly want hard preflight blocking. If the upstream still returns `context_length_exceeded`, the proxy converts it into the same agent recovery hint so Claude Code can recover instead of stopping.
 
 Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
 
