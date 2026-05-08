@@ -928,6 +928,27 @@ func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
 	}
 }
 
+func TestCollectCodexStreamCapturesStreamError(t *testing.T) {
+	events := []responsesStreamEvent{
+		{Type: "response.created"},
+		{Type: "error", Error: responsesStreamError{Code: "context_length_exceeded", Message: "The request is too large."}},
+		{Type: "response.failed", Response: responsesResponse{Error: responsesStreamError{Message: "Response failed."}}},
+	}
+	var raw strings.Builder
+	for _, event := range events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.WriteString("data: " + string(payload) + "\n\n")
+	}
+	raw.WriteString("data: [DONE]\n\n")
+	resp := collectCodexStream(context.Background(), strings.NewReader(raw.String()), "gpt-5.5")
+	if !strings.Contains(resp.StreamError, "context_length_exceeded") || !strings.Contains(resp.StreamError, "too large") {
+		t.Fatalf("stream error = %q", resp.StreamError)
+	}
+}
+
 func TestCodexSessionKeyStablePerClaudeFlow(t *testing.T) {
 	t.Setenv("CODEX_SESSION_ISOLATION", "1")
 	t.Setenv("CODEX_PROMPT_CACHE_KEY", "1")

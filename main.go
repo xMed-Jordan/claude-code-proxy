@@ -254,10 +254,12 @@ type responsesTool struct {
 }
 
 type responsesResponse struct {
-	ID     string                `json:"id"`
-	Model  string                `json:"model"`
-	Output []responsesOutputItem `json:"output"`
-	Usage  struct {
+	ID          string                `json:"id"`
+	Model       string                `json:"model"`
+	Output      []responsesOutputItem `json:"output"`
+	Error       responsesStreamError  `json:"error,omitempty"`
+	StreamError string                `json:"-"`
+	Usage       struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
@@ -287,15 +289,25 @@ type responsesReasoningPart struct {
 }
 
 type responsesStreamEvent struct {
-	Type         string              `json:"type"`
-	Delta        string              `json:"delta"`
-	Text         string              `json:"text"`
-	Arguments    string              `json:"arguments"`
-	ItemID       string              `json:"item_id"`
-	OutputIndex  int                 `json:"output_index"`
-	SummaryIndex int                 `json:"summary_index"`
-	Item         responsesOutputItem `json:"item"`
-	Response     responsesResponse   `json:"response"`
+	Type         string               `json:"type"`
+	Code         string               `json:"code"`
+	Message      string               `json:"message"`
+	Delta        string               `json:"delta"`
+	Text         string               `json:"text"`
+	Arguments    string               `json:"arguments"`
+	ItemID       string               `json:"item_id"`
+	OutputIndex  int                  `json:"output_index"`
+	SummaryIndex int                  `json:"summary_index"`
+	Item         responsesOutputItem  `json:"item"`
+	Response     responsesResponse    `json:"response"`
+	Error        responsesStreamError `json:"error"`
+}
+
+type responsesStreamError struct {
+	Type    string `json:"type,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+	Param   string `json:"param,omitempty"`
 }
 
 type uiLogRow struct {
@@ -2301,6 +2313,11 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 	}
 	collected := collectCodexStream(ctx, resp.Body, out.Model)
 	traceLog(ctx, "codex.collected", summarizeResponsesResponse(collected))
+	if strings.TrimSpace(collected.StreamError) != "" {
+		msg := "Codex upstream stream failed: " + strings.TrimSpace(collected.StreamError)
+		traceLog(ctx, "codex.stream_failure", map[string]any{"error": truncateString(msg, traceBodyLimit)})
+		return responsesResponse{}, http.StatusBadGateway, msg, errors.New(msg)
+	}
 	return collected, http.StatusOK, "", nil
 }
 
@@ -2575,6 +2592,13 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		if event.Response.Model != "" {
 			resp.Model = event.Response.Model
 		}
+		if event.Response.Error.Message != "" || event.Response.Error.Code != "" || event.Response.Error.Type != "" {
+			resp.Error = event.Response.Error
+		}
+		if msg := responsesStreamEventErrorMessage(event); msg != "" {
+			resp.StreamError = firstNonEmpty(resp.StreamError, msg)
+			traceLog(ctx, "codex.stream.error", map[string]any{"type": event.Type, "error": truncateString(msg, traceBodyLimit)})
+		}
 		if event.Response.Usage.InputTokens != 0 || event.Response.Usage.OutputTokens != 0 {
 			resp.Usage = event.Response.Usage
 		}
@@ -2607,6 +2631,7 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 	}
 	if err := scanner.Err(); err != nil {
 		traceLog(ctx, "codex.stream.scan_error", map[string]any{"error": err.Error()})
+		resp.StreamError = firstNonEmpty(resp.StreamError, "stream scan error: "+err.Error())
 	}
 	traceLog(ctx, "codex.stream.complete", map[string]any{"event_counts": eventCounts, "text_chars": text.Len(), "output_items": len(resp.Output)})
 	if len(resp.Output) == 0 {
@@ -2622,6 +2647,35 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		})
 	}
 	return resp
+}
+
+func responsesStreamEventErrorMessage(event responsesStreamEvent) string {
+	msg := strings.TrimSpace(firstNonEmpty(
+		event.Error.Message,
+		event.Message,
+		event.Response.Error.Message,
+		event.Text,
+		event.Delta,
+	))
+	code := strings.TrimSpace(firstNonEmpty(event.Error.Code, event.Code, event.Response.Error.Code, event.Response.Error.Type, event.Error.Type))
+	switch event.Type {
+	case "error":
+		if msg == "" {
+			msg = "stream error event without message"
+		}
+	case "response.failed":
+		if msg == "" {
+			msg = "response failed before returning output"
+		}
+	default:
+		if msg == "" {
+			return ""
+		}
+	}
+	if code != "" && !strings.Contains(strings.ToLower(msg), strings.ToLower(code)) {
+		msg = code + ": " + msg
+	}
+	return msg
 }
 
 func codexStreamText(event responsesStreamEvent) string {
@@ -4687,6 +4741,7 @@ func summarizeResponsesResponse(resp responsesResponse) map[string]any {
 		"output_items":  items,
 		"input_tokens":  resp.Usage.InputTokens,
 		"output_tokens": resp.Usage.OutputTokens,
+		"stream_error":  truncateString(resp.StreamError, 1000),
 	}
 }
 
@@ -4708,6 +4763,9 @@ func summarizeResponsesStreamEvent(event responsesStreamEvent) map[string]any {
 	if event.Arguments != "" {
 		out["arguments_chars"] = len(event.Arguments)
 		out["arguments"] = truncateString(event.Arguments, 1000)
+	}
+	if msg := responsesStreamEventErrorMessage(event); msg != "" {
+		out["error"] = truncateString(msg, 1000)
 	}
 	if event.Item.Type != "" {
 		out["item"] = map[string]any{
