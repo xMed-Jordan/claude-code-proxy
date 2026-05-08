@@ -17,9 +17,11 @@ Claude Code browser automation is exposed as a separate MCP sidecar named `antig
 - `GET /openapi.json`
 - `GET /postman.json`
 - `GET /anthropic/v1/models`
+- `GET /anthropic/v1/model-capabilities`
 - `POST /anthropic/v1/messages`
 - `POST /anthropic/v1/messages/count_tokens`
 - `GET /openai/v1/models`
+- `GET /openai/v1/model-capabilities`
 - `POST /openai/v1/chat/completions`
 - `POST /openai/v1/responses`
 - `/openai/v1/files...` provider pass-through for OpenAI-compatible file upload/list/retrieve/delete calls

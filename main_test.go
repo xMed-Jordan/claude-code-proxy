@@ -174,7 +174,7 @@ func TestNamespacedModelRoutesAndLegacyV1Removed(t *testing.T) {
 	cfg := config{Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
 	handler := newProxyMux(cfg)
 
-	for _, path := range []string{"/anthropic/v1/models", "/openai/v1/models"} {
+	for _, path := range []string{"/anthropic/v1/models", "/anthropic/v1/model-capabilities", "/openai/v1/models", "/openai/v1/model-capabilities"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -223,7 +223,7 @@ func TestDocumentationRoutesPublicAndValid(t *testing.T) {
 	if !ok {
 		t.Fatalf("openapi paths missing: %#v", openAPI["paths"])
 	}
-	for _, path := range []string{"/anthropic/v1/messages", "/openai/v1/chat/completions", "/ui/api/status"} {
+	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities", "/openai/v1/chat/completions", "/ui/api/status"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("openapi path %s missing", path)
 		}
@@ -278,9 +278,11 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 		"GET /health",
 		"GET /antigravity/bridge",
 		"GET /anthropic/v1/models",
+		"GET /anthropic/v1/model-capabilities",
 		"POST /anthropic/v1/messages",
 		"POST /anthropic/v1/messages/count_tokens",
 		"GET /openai/v1/models",
+		"GET /openai/v1/model-capabilities",
 		"POST /openai/v1/chat/completions",
 		"POST /openai/v1/responses",
 		"GET /openai/v1/files",
@@ -328,10 +330,104 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 		t.Fatalf("%s %s not found in docs manifest", method, path)
 	}
 	assertAuth(http.MethodGet, "/health", apiDocAuthPublic)
+	assertAuth(http.MethodGet, "/anthropic/v1/model-capabilities", apiDocAuthProxy)
 	assertAuth(http.MethodPost, "/anthropic/v1/messages", apiDocAuthProxy)
+	assertAuth(http.MethodGet, "/openai/v1/model-capabilities", apiDocAuthProxy)
 	assertAuth(http.MethodPost, "/openai/v1/chat/completions", apiDocAuthProxy)
 	assertAuth(http.MethodGet, "/ui/api/auth/status", apiDocAuthPublic)
 	assertAuth(http.MethodGet, "/ui/api/status", apiDocAuthAdmin)
+}
+
+func TestModelCapabilitiesEndpoint(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+
+	cfg := config{
+		ProxyKey: "sk-local",
+		Models: map[string]string{
+			"sonnet[1m]":     "gpt-5.5",
+			"custom-small":   "local-model",
+			"claude-3-haiku": "legacy-hidden",
+		},
+		ModelContexts: map[string]string{
+			"custom-small": "200k",
+		},
+		ModelCustom: map[string]bool{
+			"custom-small": true,
+		},
+	}
+	handler := newProxyMux(cfg)
+
+	for _, path := range []string{"/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("x-api-key", "sk-local")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+		}
+
+		var out struct {
+			Object string           `json:"object"`
+			Units  string           `json:"units"`
+			Data   []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("GET %s returned invalid JSON: %v", path, err)
+		}
+		if out.Object != "list" || out.Units != "tokens" {
+			t.Fatalf("GET %s metadata = object:%q units:%q, want list/tokens", path, out.Object, out.Units)
+		}
+
+		sonnet := findCapabilityRow(out.Data, "sonnet[1m]")
+		if sonnet == nil {
+			t.Fatalf("GET %s missing sonnet[1m] row: %#v", path, out.Data)
+		}
+		assertJSONNumber(t, sonnet, "context_window_tokens", 1000000)
+		assertJSONNumber(t, sonnet, "max_output_tokens", 128000)
+		assertJSONNumber(t, sonnet, "max_input_tokens", 872000)
+		if got := sonnet["upstream_model"]; got != "gpt-5.5" {
+			t.Fatalf("upstream_model = %#v, want gpt-5.5", got)
+		}
+		if got := sonnet["limits_known"]; got != true {
+			t.Fatalf("limits_known = %#v, want true", got)
+		}
+
+		custom := findCapabilityRow(out.Data, "custom-small")
+		if custom == nil {
+			t.Fatalf("GET %s missing custom-small row: %#v", path, out.Data)
+		}
+		assertJSONNumber(t, custom, "context_window_tokens", 200000)
+		assertJSONNumber(t, custom, "max_output_tokens", 0)
+		assertJSONNumber(t, custom, "max_input_tokens", 200000)
+		if got := custom["limits_known"]; got != false {
+			t.Fatalf("custom limits_known = %#v, want false", got)
+		}
+		if hidden := findCapabilityRow(out.Data, "claude-3-haiku"); hidden != nil {
+			t.Fatalf("legacy-hidden model should not be advertised: %#v", hidden)
+		}
+	}
+}
+
+func findCapabilityRow(rows []map[string]any, id string) map[string]any {
+	for _, row := range rows {
+		if row["id"] == id {
+			return row
+		}
+	}
+	return nil
+}
+
+func assertJSONNumber(t *testing.T, row map[string]any, key string, want float64) {
+	t.Helper()
+	got, ok := row[key].(float64)
+	if !ok {
+		t.Fatalf("%s = %#v, want JSON number", key, row[key])
+	}
+	if got != want {
+		t.Fatalf("%s = %v, want %v", key, got, want)
+	}
 }
 
 func TestAnthropicNamespaceRoutes(t *testing.T) {

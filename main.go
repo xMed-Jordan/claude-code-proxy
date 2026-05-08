@@ -374,9 +374,11 @@ func main() {
 func newProxyMux(cfg config) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/anthropic/v1/models", requireAuth(cfg, requireProxyEnabled(handleModels(cfg))))
+	mux.HandleFunc("/anthropic/v1/model-capabilities", requireAuth(cfg, requireProxyEnabled(handleModelCapabilities(cfg))))
 	mux.HandleFunc("/anthropic/v1/messages", requireAuth(cfg, requireProxyEnabled(handleMessages(cfg))))
 	mux.HandleFunc("/anthropic/v1/messages/count_tokens", requireAuth(cfg, requireProxyEnabled(handleCountTokens)))
 	mux.HandleFunc("/openai/v1/models", requireAuth(cfg, requireProxyEnabled(handleModels(cfg))))
+	mux.HandleFunc("/openai/v1/model-capabilities", requireAuth(cfg, requireProxyEnabled(handleModelCapabilities(cfg))))
 	mux.HandleFunc("/openai/v1/chat/completions", requireAuth(cfg, requireProxyEnabled(handleChatCompletions(cfg))))
 	mux.HandleFunc("/openai/v1/responses", requireAuth(cfg, requireProxyEnabled(handleResponses(cfg))))
 	mux.HandleFunc("/openai/v1/files", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
@@ -1398,6 +1400,16 @@ func handleModels(cfg config) http.HandlerFunc {
 			data = append(data, map[string]any{"id": name, "type": "model", "display_name": name})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	}
+}
+
+func handleModelCapabilities(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": modelCapabilityRows(cfg), "units": "tokens"})
 	}
 }
 
@@ -3759,6 +3771,12 @@ func apiDocRoutes() []apiDocRoute {
 			ResponseSchema: "ModelListResponse", ResponseExample: map[string]any{"object": "list", "data": []map[string]any{{"id": "sonnet[1m]", "type": "model", "display_name": "sonnet[1m]"}}},
 		},
 		{
+			Group: "Anthropic-compatible", OperationID: "listAnthropicModelCapabilities", Method: http.MethodGet, Path: "/anthropic/v1/model-capabilities", Summary: "List Claude-compatible model token limits", Auth: apiDocAuthProxy,
+			Description:    "Lists exposed model aliases with upstream model ids, context windows, maximum input budget, and maximum output tokens.",
+			Headers:        []apiDocParam{anthropicVersionHeader},
+			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "sonnet[1m]", "type": "model_capability", "display_name": "sonnet[1m]", "upstream_model": "gpt-5.5", "context": "1m", "context_window_tokens": 1000000, "max_input_tokens": 872000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
+		},
+		{
 			Group: "Anthropic-compatible", OperationID: "createAnthropicMessage", Method: http.MethodPost, Path: "/anthropic/v1/messages", Summary: "Create a Claude-compatible message", Auth: apiDocAuthProxy,
 			Description: "Accepts Claude Messages API style requests, then routes them to Codex or an OpenAI-compatible provider. Streaming is supported with server-sent events.",
 			Headers:     []apiDocParam{anthropicVersionHeader, sessionHeader}, RequestSchema: "AnthropicMessageRequest", ResponseSchema: "AnthropicMessageResponse",
@@ -3776,6 +3794,11 @@ func apiDocRoutes() []apiDocRoute {
 			Group: "OpenAI-compatible", OperationID: "listOpenAIModels", Method: http.MethodGet, Path: "/openai/v1/models", Summary: "List OpenAI-compatible model aliases", Auth: apiDocAuthProxy,
 			Description:    "Lists model aliases exposed through the OpenAI-compatible namespace.",
 			ResponseSchema: "ModelListResponse", ResponseExample: map[string]any{"object": "list", "data": []map[string]any{{"id": "gpt-5.5", "type": "model", "display_name": "gpt-5.5"}}},
+		},
+		{
+			Group: "OpenAI-compatible", OperationID: "listOpenAIModelCapabilities", Method: http.MethodGet, Path: "/openai/v1/model-capabilities", Summary: "List OpenAI-compatible model token limits", Auth: apiDocAuthProxy,
+			Description:    "Lists exposed model aliases with upstream model ids, context windows, maximum input budget, and maximum output tokens.",
+			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "gpt-5.3-codex", "type": "model_capability", "display_name": "gpt-5.3-codex", "upstream_model": "gpt-5.3-codex", "context": "1m", "context_window_tokens": 1000000, "max_input_tokens": 872000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
 		},
 		{
 			Group: "OpenAI-compatible", OperationID: "createChatCompletion", Method: http.MethodPost, Path: "/openai/v1/chat/completions", Summary: "Create an OpenAI-compatible chat completion", Auth: apiDocAuthProxy,
@@ -4316,6 +4339,22 @@ func openAPISchemas() map[string]any {
 	anyMap := map[string]any{"type": "object", "additionalProperties": true}
 	message := schemaObject(map[string]any{"role": schemaString("Message role."), "content": anyValue}, "role")
 	modelRow := schemaObject(map[string]any{"id": schemaString("Model id."), "type": schemaString("Object type."), "display_name": schemaString("Display name.")})
+	modelCapabilityRow := schemaObject(map[string]any{
+		"id":                    schemaString("Local model alias."),
+		"type":                  schemaString("Object type."),
+		"display_name":          schemaString("Display name."),
+		"alias":                 schemaString("Local model alias."),
+		"upstream_model":        schemaString("Resolved upstream model id."),
+		"context":               schemaString("Configured context label."),
+		"context_window_tokens": schemaInteger("Maximum context window in tokens."),
+		"max_input_tokens":      schemaInteger("Maximum input budget after reserving output tokens."),
+		"max_output_tokens":     schemaInteger("Maximum output tokens for one request."),
+		"limits_known":          schemaBoolean("Whether the proxy has a known output limit for this upstream model."),
+		"limits_source":         schemaString("Source for the limit value."),
+		"status":                schemaString("Proxy support status for the upstream model."),
+		"default":               schemaBoolean("Whether this alias is a default choice."),
+		"recommended":           schemaBoolean("Whether this alias is the recommended choice."),
+	}, "id", "type", "context_window_tokens", "max_input_tokens", "max_output_tokens", "limits_known")
 	providerKey := schemaOpenObject(map[string]any{"id": schemaString("Provider key id."), "provider": schemaString("Provider name."), "schema": schemaString("Provider schema."), "label": schemaString("Label."), "base_url": schemaString("Provider base URL."), "key_preview": schemaString("Masked key preview."), "enabled": schemaBoolean("Whether the key is enabled."), "created_at": schemaString("Created timestamp."), "updated_at": schemaString("Updated timestamp.")})
 	clientKey := schemaOpenObject(map[string]any{"id": schemaString("Client key id."), "label": schemaString("Label."), "key_preview": schemaString("Masked key preview."), "schema": schemaString("anthropic, openai, or both."), "provider": schemaString("Provider route."), "provider_key_id": schemaString("Provider key id."), "provider_label": schemaString("Provider label."), "enabled": schemaBoolean("Whether the key is enabled."), "created_at": schemaString("Created timestamp."), "updated_at": schemaString("Updated timestamp."), "last_used_at": schemaString("Last-used timestamp.")})
 	modelAlias := schemaObject(map[string]any{"alias": schemaString("Local model alias."), "real": schemaString("Upstream model id."), "context": schemaString("Optional context label.")})
@@ -4327,6 +4366,7 @@ func openAPISchemas() map[string]any {
 		"OKResponse":                   schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether the operation succeeded."), "message": schemaString("Human-readable status message."), "running": schemaBoolean("Proxy running state.")}),
 		"HealthResponse":               schemaObject(map[string]any{"ok": schemaBoolean("Process is reachable."), "proxy_running": schemaBoolean("Proxy endpoints are enabled.")}, "ok", "proxy_running"),
 		"ModelListResponse":            schemaObject(map[string]any{"object": schemaString("list"), "data": schemaArray(modelRow)}, "object", "data"),
+		"ModelCapabilitiesResponse":    schemaObject(map[string]any{"object": schemaString("list"), "data": schemaArray(modelCapabilityRow), "units": schemaString("Token unit label.")}, "object", "data", "units"),
 		"AnthropicMessageRequest":      schemaOpenObject(map[string]any{"model": schemaString("Claude-compatible model alias."), "max_tokens": schemaInteger("Maximum output tokens."), "system": anyValue, "messages": schemaArray(message), "tools": schemaArray(anyMap), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "speed": schemaString("Optional speed hint."), "output_config": anyMap}, "model", "messages"),
 		"AnthropicMessageResponse":     schemaOpenObject(map[string]any{"id": schemaString("Message id."), "type": schemaString("message"), "role": schemaString("assistant"), "content": schemaArray(anyMap), "model": schemaString("Requested model alias."), "stop_reason": schemaString("Stop reason."), "stop_sequence": anyValue, "usage": anyMap}),
 		"CountTokensResponse":          schemaObject(map[string]any{"input_tokens": schemaInteger("Approximate input token count.")}, "input_tokens"),
@@ -6188,8 +6228,15 @@ func replaceBoolMap(dst map[string]bool, src map[string]bool) {
 	}
 }
 
+var supportedUpstreamModels = map[string]bool{
+	"gpt-5.5":             true,
+	"gpt-5.4":             true,
+	"gpt-5.4-mini":        true,
+	"gpt-5.3-codex":       true,
+	"gpt-5.3-codex-spark": true,
+}
+
 func modelRows(cfg config) []map[string]any {
-	supported := map[string]bool{"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true, "gpt-5.3-codex": true}
 	rows := []map[string]any{}
 	modelConfigMu.RLock()
 	defer modelConfigMu.RUnlock()
@@ -6197,13 +6244,29 @@ func modelRows(cfg config) []map[string]any {
 		if !isAdvertisedModel(alias) && !cfg.ModelCustom[alias] {
 			continue
 		}
-		status := "unsupported"
-		if supported[real] {
-			status = "ok"
-		} else if real != "" {
-			status = "untested"
+		context := contextForAlias(cfg, alias)
+		contextWindow := contextWindowTokensForLabel(context)
+		maxOutput, limitsSource := maxOutputTokensForModel(real)
+		maxInput := contextWindow
+		if maxOutput > 0 {
+			maxInput = contextWindow - maxOutput
+			if maxInput < 0 {
+				maxInput = 0
+			}
 		}
-		rows = append(rows, map[string]any{"alias": alias, "real": real, "status": status, "context": contextForAlias(cfg, alias), "default": alias == "sonnet" || alias == "sonnet[1m]", "recommended": alias == "gpt-5.3-codex"})
+		rows = append(rows, map[string]any{
+			"alias":                 alias,
+			"real":                  real,
+			"status":                modelStatus(real),
+			"context":               context,
+			"context_window_tokens": contextWindow,
+			"max_input_tokens":      maxInput,
+			"max_output_tokens":     maxOutput,
+			"limits_known":          maxOutput > 0,
+			"limits_source":         limitsSource,
+			"default":               isDefaultModelAlias(alias),
+			"recommended":           isRecommendedModelAlias(alias),
+		})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		left := fmt.Sprint(rows[i]["alias"])
@@ -6211,6 +6274,94 @@ func modelRows(cfg config) []map[string]any {
 		return left < right
 	})
 	return rows
+}
+
+func modelCapabilityRows(cfg config) []map[string]any {
+	models := modelRows(cfg)
+	rows := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		alias := fmt.Sprint(model["alias"])
+		real := fmt.Sprint(model["real"])
+		rows = append(rows, map[string]any{
+			"id":                    alias,
+			"type":                  "model_capability",
+			"display_name":          alias,
+			"alias":                 alias,
+			"upstream_model":        real,
+			"context":               model["context"],
+			"context_window_tokens": model["context_window_tokens"],
+			"max_input_tokens":      model["max_input_tokens"],
+			"max_output_tokens":     model["max_output_tokens"],
+			"limits_known":          model["limits_known"],
+			"limits_source":         model["limits_source"],
+			"status":                model["status"],
+			"default":               model["default"],
+			"recommended":           model["recommended"],
+		})
+	}
+	return rows
+}
+
+func modelStatus(real string) string {
+	real = strings.ToLower(strings.TrimSpace(real))
+	if supportedUpstreamModels[real] {
+		return "ok"
+	}
+	if real != "" {
+		return "untested"
+	}
+	return "unsupported"
+}
+
+func isDefaultModelAlias(alias string) bool {
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	return alias == "sonnet" || alias == "sonnet[1m]"
+}
+
+func isRecommendedModelAlias(alias string) bool {
+	return strings.EqualFold(strings.TrimSpace(alias), "gpt-5.3-codex")
+}
+
+func contextWindowTokensForLabel(context string) int {
+	context = strings.ToLower(strings.TrimSpace(context))
+	switch context {
+	case "1m", "1m tokens", "1000k":
+		return 1000000
+	case "200k", "200k tokens", "":
+		return 200000
+	}
+	if strings.HasSuffix(context, "k") {
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(context, "k"))); err == nil && n > 0 {
+			return n * 1000
+		}
+	}
+	if strings.HasSuffix(context, "m") {
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(context, "m"))); err == nil && n > 0 {
+			return n * 1000000
+		}
+	}
+	if n, err := strconv.Atoi(context); err == nil && n > 0 {
+		return n
+	}
+	return 200000
+}
+
+func maxOutputTokensForModel(model string) (int, string) {
+	model = strings.ToLower(cleanModel(model))
+	switch {
+	case model == "":
+		return 0, "unknown"
+	case strings.Contains(model, "gpt-5") || strings.Contains(model, "codex"):
+		return 128000, "built_in"
+	case strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4"):
+		return 100000, "built_in"
+	case strings.HasPrefix(model, "gpt-4.1"):
+		return 32768, "built_in"
+	case strings.HasPrefix(model, "gpt-4o") || strings.HasPrefix(model, "gpt-4.5"):
+		return 16384, "built_in"
+	default:
+		return 0, "unknown"
+	}
 }
 
 func isAdvertisedModel(alias string) bool {
