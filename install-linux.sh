@@ -83,6 +83,8 @@ Options:
   --https-port PORT      Public HTTPS port (default: ${DEFAULT_HTTPS_PORT})
   --public-url URL       Public base URL shown in the control panel
   --confirm-dns          Confirm the HTTPS domain already points to this server
+  --public-http          Expose the Go proxy on 0.0.0.0 without HTTPS
+  --no-public-http       Keep the Go proxy local-only when HTTPS is not configured
   --browser-tools        Install/configure Chrome or Chromium browser tools
   --no-browser-tools     Skip Chrome/Chromium and browser MCP setup
   --server               Use server-oriented defaults
@@ -145,6 +147,8 @@ parse_args() {
         PROXY_PUBLIC_URL="$1"
         ;;
       --confirm-dns) DNS_CONFIRMED=1 ;;
+      --public-http) EXPOSE_HTTP="yes" ;;
+      --no-public-http) EXPOSE_HTTP="no" ;;
       --browser-tools) BROWSER_TOOLS="yes" ;;
       --no-browser-tools) BROWSER_TOOLS="no" ;;
       --server) INSTALL_KIND="server" ;;
@@ -824,6 +828,11 @@ copy_proxy_files() {
   run mv -f "${binary_tmp}" "${INSTALL_DIR}/${APP_NAME}"
   run rm -rf "${INSTALL_DIR}/ui"
   run cp -R "${REPO_DIR}/ui" "${INSTALL_DIR}/ui"
+  for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh; do
+    if [[ -f "${REPO_DIR}/${helper}" ]]; then
+      run cp "${REPO_DIR}/${helper}" "${INSTALL_DIR}/${helper}"
+    fi
+  done
   if [[ -f "${REPO_DIR}/.env.example" ]]; then
     run cp "${REPO_DIR}/.env.example" "${INSTALL_DIR}/.env.example"
   fi
@@ -885,6 +894,7 @@ configure_env_file() {
   set_env_value "${env_file}" "PROXY_HOST" "${PROXY_HOST}"
   set_env_value "${env_file}" "PROXY_PORT" "${PROXY_PORT}"
   set_env_value "${env_file}" "PROXY_PUBLIC_URL" "${PROXY_PUBLIC_URL}"
+  set_env_value "${env_file}" "PROXY_UPDATE_REPO_DIR" "${REPO_DIR}"
   if [[ "${BROWSER_TOOLS}" == "yes" ]]; then
     set_env_value "${env_file}" "ANTIGRAVITY_BROWSER_ENABLED" "1"
   else

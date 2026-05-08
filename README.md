@@ -26,6 +26,9 @@ Claude Code browser automation is exposed as a separate MCP sidecar named `antig
 - `POST /openai/v1/responses`
 - `/openai/v1/files...` provider pass-through for OpenAI-compatible file upload/list/retrieve/delete calls
 - `GET /ui/api/antigravity`
+- `GET /ui/api/update/status`
+- `POST /ui/api/update/start`
+- `POST /ui/api/update/settings`
 - `GET /antigravity/bridge`
 
 The old root `/v1/...` API paths are intentionally not registered. Claude Code should use `ANTHROPIC_BASE_URL=http://127.0.0.1:4000/anthropic`; OpenAI-compatible clients should use `http://127.0.0.1:4000/openai/v1`.
@@ -130,6 +133,8 @@ chmod +x install-linux.sh reinstall-linux.sh uninstall-linux.sh update-linux.sh
 - `reinstall-linux.sh` stops the service, restores synced Claude settings if possible, removes the service, symlink, and install directory, then runs a fresh install. It keeps Codex auth by default so a reinstall does not force a new device login unless `--remove-codex-auth` is passed.
 - `uninstall-linux.sh --app-only` removes only the app service, symlink, and install directory. `--clean` also checks Caddy, Go, Node/npm, Codex/Claude CLI packages, and browser packages; it skips anything that appears to be used by another process, systemd unit, or project on the server.
 
+The installed version is read from `VERSION` and shown in the dashboard. The dashboard can start the non-interactive Linux updater, show progress while the service restarts, and reconnect when `/health` returns again. Automatic updates check the configured GitHub `VERSION` URL and run an app-scoped update without OS package upgrades; manual dashboard updates use the full updater unless `PROXY_DASHBOARD_FULL_SYSTEM_UPDATE=0`.
+
 Troubleshooting notes:
 
 - If `sudo` fails, run as a sudo-capable user or as root.
@@ -197,6 +202,8 @@ Fast mode and web search are controlled by:
 - `CODEX_SESSION_ISOLATION=1`
 - `CODEX_PROMPT_CACHE_KEY=1`
 - `CLAUDE_TOOL_ACTIVITY_THINKING=1`
+
+The proxy still advertises configured large context windows such as `1m`, but live Codex/ChatGPT routing can enforce a practical compaction guard. Set `CODEX_UPSTREAM_HINT_TOKENS` and `CODEX_UPSTREAM_HARD_TOKENS` to control when the proxy returns a "compact now" assistant message and when it returns a `context_length_exceeded` error. Defaults are `250000` and `260000`, and the guard applies to input size, requested output budget, and long streamed output.
 
 Tool calls are also mirrored as short synthetic `thinking` blocks so Claude Code can show the requested tool name and arguments in its thinking UI. Sensitive-looking argument fields such as tokens, passwords, cookies, and API keys are redacted.
 

@@ -99,6 +99,7 @@ func runServe() error {
 		return fmt.Errorf("proxy database init failed: %w", err)
 	}
 	proxyEnabled.Store(true)
+	startAutoUpdateWatcher(cfg)
 	mux := newProxyMux(cfg)
 	server := &http.Server{Addr: net.JoinHostPort(cfg.Host, cfg.Port), Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
 	fmt.Printf("connect-ai-proxy listening on http://%s\n", server.Addr)

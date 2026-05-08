@@ -80,7 +80,7 @@ const stateMeta = {
 
 // ─────────────────────────── DASHBOARD ───────────────────────────
 
-const Dashboard = ({ proxyState, onAction, liveStatus }) => {
+const Dashboard = ({ proxyState, onAction, liveStatus, statusError }) => {
   const m = stateMeta[proxyState];
   const isUp = proxyState !== "stopped";
   const [validation, setValidation] = useState(VALIDATION_STEPS);
@@ -125,6 +125,17 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
   const rootUrl = liveStatus?.display_url || liveStatus?.public_url || liveStatus?.local_url || "http://127.0.0.1:4000";
   const anthropicUrl = liveStatus?.anthropic_url || `${rootUrl}/anthropic`;
   const openaiUrl = liveStatus?.openai_url || `${rootUrl}/openai/v1`;
+  const update = liveStatus?.update || {};
+  const updateRunning = !!update.running;
+  const updateFailed = update.state === "failed";
+  const updateAvailable = !!update.update_available;
+  const currentVersion = update.current_version || liveStatus?.version || "unknown";
+  const latestVersion = update.latest_version || update.latest?.latest_version || "checking";
+  const updateTone = updateRunning ? "info" : updateFailed ? "err" : updateAvailable ? "warn" : "ok";
+  const updateLabel = updateRunning ? "Updating" : updateFailed ? "Failed" : updateAvailable ? "Available" : "Current";
+  const updateMessage = statusError && updateRunning
+    ? "Reconnecting while the service restarts"
+    : update.message || (updateAvailable ? `Latest ${latestVersion}` : "No update pending");
 
   return (
     <section data-screen-label="01 Dashboard" className="col" style={{ gap: 16 }}>
@@ -227,6 +238,22 @@ const Dashboard = ({ proxyState, onAction, liveStatus }) => {
               </div>
               <div className="k">Active aliases</div>
               <div className="v mono"><span style={{color:"var(--fg)"}}>{liveStatus?.models?.length || 0}</span><span className="txt-3"> · opus[1m], sonnet[1m], gpt-5.3-codex</span></div>
+              <div className="k">Version</div>
+              <div className="v update-line">
+                <Pill tone={updateTone} pulse={updateRunning}>{updateLabel}</Pill>
+                <span className="mono">{currentVersion}</span>
+                <span className="txt-3 mono">latest {latestVersion || "checking"}</span>
+              </div>
+              <div className="k">Update</div>
+              <div className="v update-line">
+                <button className={`btn btn-sm ${updateAvailable ? "btn-warn" : ""}`} disabled={updateRunning} onClick={() => onAction("update")}>
+                  <Icon name={updateRunning ? "refresh" : "download"} size={11}/>{updateRunning ? "Working" : "Update"}
+                </button>
+                <button className={`btn btn-sm ${update.auto_update ? "btn-ok" : "btn-ghost"}`} onClick={() => onAction("toggle-auto-update")}>
+                  <Icon name={update.auto_update ? "check" : "refresh"} size={11}/>{update.auto_update ? "Auto on" : "Auto off"}
+                </button>
+                <span className="txt-3 mono update-message">{updateMessage}</span>
+              </div>
               <div className="k">Last request</div>
               <div className="v mono">{liveStatus?.last_request ? `${liveStatus.last_request.meth} ${liveStatus.last_request.path} · ${liveStatus.last_request.status}` : "—"}</div>
             </div>

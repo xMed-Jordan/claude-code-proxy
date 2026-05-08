@@ -8,6 +8,7 @@ HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 YES=0
 NO_SYSTEM_UPGRADE=0
 SKIP_GO_LATEST=0
+STATUS_FILE=""
 REPO_URL="https://github.com/xMed-Jordan/claude-code-proxy.git"
 BRANCH="main"
 ORIGINAL_ARGS=("$@")
@@ -27,6 +28,7 @@ Options:
   --branch NAME          Git branch to pull (default: ${BRANCH})
   --no-system-upgrade    Skip OS package upgrade
   --skip-go-latest       Keep the current Go version if it satisfies go.mod
+  --status-file PATH     Write machine-readable update progress for the dashboard
   -h, --help             Show this help
 USAGE
 }
@@ -68,6 +70,12 @@ parse_update_args() {
         SKIP_GO_LATEST=1
         shift
         ;;
+      --status-file)
+        shift
+        [[ $# -gt 0 ]] || die "--status-file needs a path"
+        STATUS_FILE="$1"
+        shift
+        ;;
       -h|--help)
         script_usage
         exit 0
@@ -90,6 +98,66 @@ confirm_or_exit() {
   fi
 }
 
+update_version_from_file() {
+  if [[ -f "${HELPER_DIR}/VERSION" ]]; then
+    sed -n '1s/[[:space:]]//gp' "${HELPER_DIR}/VERSION" | head -n 1
+  else
+    printf 'unknown'
+  fi
+}
+
+write_update_status() {
+  [[ -n "${STATUS_FILE}" ]] || return 0
+  local state="$1"
+  local phase="$2"
+  local message="$3"
+  local version=""
+  version="$(update_version_from_file)"
+  python3 - "${STATUS_FILE}" "${state}" "${phase}" "${message}" "${version}" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path, state, phase, message, version = sys.argv[1:6]
+now = datetime.now(timezone.utc).isoformat()
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        current = json.load(handle)
+        if not isinstance(current, dict):
+            current = {}
+except Exception:
+    current = {}
+
+if state in {"queued", "running"} and not current.get("started_at"):
+    current["started_at"] = now
+if state in {"succeeded", "failed"}:
+    current["finished_at"] = now
+
+current.update({
+    "state": state,
+    "phase": phase,
+    "message": message,
+    "version": version,
+    "updated_at": now,
+})
+current["running"] = state in {"queued", "running"}
+directory = os.path.dirname(path)
+if directory:
+    os.makedirs(directory, exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+mark_update_failed() {
+  local line="$1"
+  write_update_status "failed" "failed" "Update failed near line ${line}. Check update-linux.sh output or journal logs."
+}
+
 update_system_packages() {
   if [[ "${NO_SYSTEM_UPGRADE}" -eq 1 ]]; then
     log "Skipping OS package upgrade."
@@ -99,8 +167,8 @@ update_system_packages() {
   case "${PKG_MANAGER}" in
     apt)
       run_sudo apt-get update
-      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
       ;;
     dnf)
       run_sudo dnf upgrade -y
@@ -198,7 +266,7 @@ current_install_args() {
   fi
   browser_enabled="$(get_env_value "${env_file}" "ANTIGRAVITY_BROWSER_ENABLED" || printf '0')"
 
-  printf '%s\0' "--server" "--no-https" "--install-dir" "${INSTALL_DIR}" "--proxy-port" "${current_port}"
+  printf '%s\0' "--server" "--no-https" "--no-public-http" "--install-dir" "${INSTALL_DIR}" "--proxy-port" "${current_port}"
   if [[ -n "${current_public_url}" ]]; then
     printf '%s\0' "--public-url" "${current_public_url}"
   fi
@@ -249,6 +317,27 @@ reload_caddy_if_present() {
   fi
 }
 
+wait_for_url() {
+  local label="$1"
+  local url="$2"
+  local timeout_seconds="${3:-120}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local attempt=1
+  while (( SECONDS < deadline )); do
+    if run curl -fsS "${url}" >/dev/null; then
+      log "${label} health check passed."
+      return 0
+    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      return 0
+    fi
+    write_update_status "running" "health" "Waiting for ${label} endpoint to come back online (attempt ${attempt})."
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+  die "${label} health check did not pass within ${timeout_seconds}s: ${url}"
+}
+
 run_health_checks() {
   local env_file="${INSTALL_DIR}/.env"
   local current_port=""
@@ -257,29 +346,39 @@ run_health_checks() {
   current_public_url="$(get_env_value "${env_file}" "PROXY_PUBLIC_URL" || true)"
   command_exists curl || return
   log "Checking local health endpoint."
-  run curl -fsS "http://127.0.0.1:${current_port}/health" || warn "Local health check failed."
+  wait_for_url "Local" "http://127.0.0.1:${current_port}/health" 120
   if [[ -n "${current_public_url}" ]]; then
     log "Checking public health endpoint: ${current_public_url}/health"
-    run curl -fsS "${current_public_url}/health" || warn "Public health check failed. Check Caddy logs and ACME rate limits."
+    wait_for_url "Public" "${current_public_url}/health" 120
   fi
 }
 
 main_update() {
   [[ "$(uname -s)" == "Linux" ]] || die "this script is only for Linux"
   parse_update_args "$@"
+  trap 'mark_update_failed "${LINENO}"' ERR
+  write_update_status "running" "starting" "Preparing update."
   require_sudo
   detect_install_user
   detect_os_and_package_manager
 
   confirm_or_exit "Update system packages, pull latest code, update runtimes, rebuild, and restart ${APP_NAME}?" "yes"
+  write_update_status "running" "dependencies" "Checking base dependencies."
   install_base_dependencies
+  write_update_status "running" "repository" "Pulling latest code from GitHub."
   update_repository
+  write_update_status "running" "system" "Updating system packages."
   update_system_packages
+  write_update_status "running" "runtimes" "Updating Go, Codex, and Claude Code runtimes."
   update_go_runtime
   update_global_clis
+  write_update_status "running" "installing" "Rebuilding and reinstalling the proxy."
   reinstall_proxy_from_current_checkout
+  write_update_status "running" "caddy" "Reloading HTTPS reverse proxy."
   reload_caddy_if_present
+  write_update_status "running" "health" "Waiting for proxy health checks."
   run_health_checks
+  write_update_status "succeeded" "done" "Update complete."
   log "Update complete."
 }
 

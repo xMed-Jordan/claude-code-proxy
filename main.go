@@ -48,6 +48,8 @@ var (
 	lastValidation       map[string]any
 	antigravityMu        sync.Mutex
 	antigravityLastProbe map[string]any
+	updateMu             sync.Mutex
+	latestVersionCache   updateLatestCache
 )
 
 const (
@@ -56,7 +58,17 @@ const (
 	traceMaxBytes          = 10 * 1024 * 1024
 	sseMaxLineSize         = 64 * 1024 * 1024
 	antigravityExtensionID = "eeijfnjmjelapkebgockoeaadonbchdd"
+	appVersionFallback     = "0.0.0-dev"
+	defaultVersionURL      = "https://raw.githubusercontent.com/xMed-Jordan/claude-code-proxy/main/VERSION"
+	defaultTokenHintAt     = 250000
+	defaultTokenHardLimit  = 260000
 )
+
+type updateLatestCache struct {
+	Version   string
+	CheckedAt time.Time
+	Error     string
+}
 
 type config struct {
 	OpenAIAPIKey       string
@@ -143,6 +155,7 @@ type openAIRequest struct {
 
 type openAIMessage struct {
 	Role       string           `json:"role"`
+	Name       string           `json:"name,omitempty"`
 	Content    any              `json:"content,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
@@ -216,16 +229,17 @@ type openAIChatCompletion struct {
 }
 
 type responsesRequest struct {
-	Model          string              `json:"model"`
-	Instructions   string              `json:"instructions,omitempty"`
-	Input          []any               `json:"input"`
-	Tools          []responsesTool     `json:"tools,omitempty"`
-	Reasoning      *responsesReasoning `json:"reasoning,omitempty"`
-	Temperature    *float64            `json:"temperature,omitempty"`
-	ServiceTier    string              `json:"service_tier,omitempty"`
-	PromptCacheKey string              `json:"prompt_cache_key,omitempty"`
-	Stream         bool                `json:"stream,omitempty"`
-	Store          bool                `json:"store"`
+	Model           string              `json:"model"`
+	Instructions    string              `json:"instructions,omitempty"`
+	Input           []any               `json:"input"`
+	Tools           []responsesTool     `json:"tools,omitempty"`
+	Reasoning       *responsesReasoning `json:"reasoning,omitempty"`
+	Temperature     *float64            `json:"temperature,omitempty"`
+	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
+	ServiceTier     string              `json:"service_tier,omitempty"`
+	PromptCacheKey  string              `json:"prompt_cache_key,omitempty"`
+	Stream          bool                `json:"stream,omitempty"`
+	Store           bool                `json:"store"`
 }
 
 type responsesReasoning struct {
@@ -399,6 +413,9 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/logs", requireAdmin(cfg, handleUILogs))
 	mux.HandleFunc("/ui/api/antigravity", requireAdmin(cfg, handleUIAntigravityStatus))
 	mux.HandleFunc("/ui/api/antigravity/probe", requireAdmin(cfg, handleUIAntigravityProbe))
+	mux.HandleFunc("/ui/api/update/status", requireAdmin(cfg, handleUIUpdateStatus(cfg)))
+	mux.HandleFunc("/ui/api/update/start", requireAdmin(cfg, handleUIUpdateStart(cfg)))
+	mux.HandleFunc("/ui/api/update/settings", requireAdmin(cfg, handleUIUpdateSettings(cfg)))
 	mux.HandleFunc("/ui/api/proxy/stop", requireAdmin(cfg, handleUIStop))
 	mux.HandleFunc("/ui/api/proxy/start", requireAdmin(cfg, handleUIStart))
 	mux.HandleFunc("/ui/api/proxy/restart", requireAdmin(cfg, handleUIRestart(cfg)))
@@ -1487,6 +1504,16 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		if cfg.Upstream == "codex" {
 			responsesReq := toResponses(cfg, in)
+			if decision := codexTokenLimitDecision(estimateAnthropicRequestTokens(in), in.MaxTokens); decision.Action != "" {
+				traceLogID(traceID, "codex.token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
+				applyTokenLimitHintStat(r, decision, in.Model, responsesReq.Model)
+				if decision.Action == "error" {
+					writeAnthropicError(w, http.StatusBadGateway, decision.Message)
+				} else {
+					writeAnthropicTokenLimitHint(w, in.Model, decision)
+				}
+				return
+			}
 			session := configureCodexSession(cfg, r, rawBody, in, &responsesReq)
 			if session.Enabled {
 				traceLogID(traceID, "codex.session", summarizeCodexSession(session))
@@ -1548,6 +1575,15 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
+		if decision := codexTokenLimitDecision(estimateOpenAIChatRequestTokens(in), requestedOpenAIOutputTokens(in)); decision.Action != "" {
+			applyTokenLimitHintStat(r, decision, in.Model, out.Model)
+			if decision.Action == "error" {
+				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
+			} else {
+				writeOpenAIChatTokenLimitHint(w, firstNonEmpty(in.Model, out.Model), decision)
+			}
+			return
+		}
 		session := configureOpenAICompatibleSession(cfg, r, in, &out)
 		setRequestStat(r, requestStat{Model: in.Model, Upstream: out.Model, Stream: in.Stream})
 		if session.Enabled {
@@ -1604,6 +1640,15 @@ func handleResponses(cfg config) http.HandlerFunc {
 			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
 			return
 		}
+		if decision := codexTokenLimitDecision(estimateResponsesRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
+			applyTokenLimitHintStat(r, decision, in.Model, in.Model)
+			if decision.Action == "error" {
+				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
+			} else {
+				writeOpenAIResponsesTokenLimitHint(w, in.Model, decision)
+			}
+			return
+		}
 		session := configureResponsesCustomSession(cfg, r, &in)
 		in.Temperature = nil
 		setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
@@ -1648,7 +1693,7 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 	if instructions == "" {
 		instructions = "You are a helpful coding assistant."
 	}
-	out := responsesRequest{Model: model, Instructions: instructions, Stream: in.Stream, Store: false}
+	out := responsesRequest{Model: model, Instructions: instructions, MaxOutputTokens: in.MaxTokens, Stream: in.Stream, Store: false}
 	if in.FastMode {
 		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
 	}
@@ -2476,7 +2521,69 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, resp.Body)
+	flusher, _ := w.(http.Flusher)
+	scanner := newSSEScanner(resp.Body)
+	var outputText strings.Builder
+	eventLines := []string{}
+	flushEvent := func(lines []string) bool {
+		data := ""
+		for _, line := range lines {
+			fmt.Fprint(w, line, "\n")
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "data:") {
+				data = strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			}
+		}
+		fmt.Fprint(w, "\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if data == "" || data == "[DONE]" {
+			return false
+		}
+		var event responsesStreamEvent
+		if json.Unmarshal([]byte(data), &event) != nil {
+			return false
+		}
+		if text := codexStreamText(event); text != "" {
+			outputText.WriteString(text)
+			if decision := codexTokenLimitDecision(0, estimateTextTokens(outputText.String())); decision.Action == "hint" {
+				traceLog(ctx, "codex.responses_raw.output_token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
+				sendEvent(w, "response.output_text.delta", responsesStreamEvent{Type: "response.output_text.delta", Delta: decision.Message, OutputIndex: 0})
+				sendEvent(w, "response.completed", responsesStreamEvent{Type: "response.completed", Response: tokenLimitResponsesResponse(out.Model, decision)})
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return true
+			}
+		}
+		return false
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			if len(eventLines) > 0 {
+				if flushEvent(eventLines) {
+					return
+				}
+				eventLines = nil
+				continue
+			}
+			fmt.Fprint(w, "\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			continue
+		}
+		eventLines = append(eventLines, line)
+	}
+	if len(eventLines) > 0 {
+		_ = flushEvent(eventLines)
+	}
+	if err := scanner.Err(); err != nil {
+		traceLog(ctx, "codex.responses_raw.scan_error", map[string]any{"error": err.Error()})
+	}
 }
 
 func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
@@ -2507,6 +2614,7 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 		flusher.Flush()
 	}
 	scanner := newSSEScanner(resp.Body)
+	var outputText strings.Builder
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
@@ -2521,6 +2629,14 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 			continue
 		}
 		if text := codexStreamText(event); text != "" {
+			outputText.WriteString(text)
+			if decision := codexTokenLimitDecision(0, estimateTextTokens(outputText.String())); decision.Action == "hint" {
+				sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": decision.Message}, nil)
+				if flusher != nil {
+					flusher.Flush()
+				}
+				break
+			}
 			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": text}, nil)
 			if flusher != nil {
 				flusher.Flush()
@@ -2639,6 +2755,10 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		}
 		if delta := codexStreamText(event); delta != "" {
 			text.WriteString(delta)
+			if decision := codexTokenLimitDecision(0, estimateTextTokens(text.String())); decision.Action == "hint" {
+				traceLog(ctx, "codex.output_token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
+				return tokenLimitResponsesResponse(model, decision)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -2898,10 +3018,180 @@ func estimateAnthropicRequestTokens(in anthropicRequest) int {
 	for _, msg := range in.Messages {
 		chars += len(contentToText(msg.Content))
 	}
+	return estimateTextTokensFromChars(chars)
+}
+
+func estimateOpenAIChatRequestTokens(in openAIRequest) int {
+	chars := len(in.Model)
+	for _, msg := range in.Messages {
+		chars += len(msg.Role) + len(msg.Name) + len(msg.ToolCallID) + len(contentToText(msg.Content))
+		for _, call := range msg.ToolCalls {
+			chars += len(call.ID) + len(call.Type) + len(call.Function.Name) + len(call.Function.Arguments)
+		}
+	}
+	for _, tool := range in.Tools {
+		chars += len(tool.Type) + len(tool.Function.Name) + len(tool.Function.Description) + len(contentToText(tool.Function.Parameters))
+	}
+	return estimateTextTokensFromChars(chars)
+}
+
+func estimateResponsesRequestTokens(in responsesRequest) int {
+	chars := len(in.Model) + len(in.Instructions) + len(in.PromptCacheKey)
+	for _, item := range in.Input {
+		chars += len(contentToText(item))
+	}
+	for _, tool := range in.Tools {
+		chars += len(tool.Type) + len(tool.Name) + len(tool.Description) + len(contentToText(tool.Parameters))
+	}
+	return estimateTextTokensFromChars(chars)
+}
+
+func estimateTextTokens(text string) int {
+	return estimateTextTokensFromChars(len(text))
+}
+
+func estimateTextTokensFromChars(chars int) int {
 	if chars <= 0 {
 		return 1
 	}
 	return max(1, chars/4)
+}
+
+type tokenLimitDecision struct {
+	Action       string
+	Reason       string
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	HintAt       int
+	HardLimit    int
+	Message      string
+}
+
+func codexTokenLimitDecision(inputTokens, requestedOutputTokens int) tokenLimitDecision {
+	hintAt := envIntDefault("CODEX_UPSTREAM_HINT_TOKENS", defaultTokenHintAt)
+	hardLimit := envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit)
+	if hintAt <= 0 && hardLimit <= 0 {
+		return tokenLimitDecision{}
+	}
+	if hardLimit > 0 && hintAt > hardLimit {
+		hintAt = hardLimit
+	}
+	outputTokens := max(0, requestedOutputTokens)
+	totalTokens := inputTokens + outputTokens
+	decision := tokenLimitDecision{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, HintAt: hintAt, HardLimit: hardLimit}
+	switch {
+	case hardLimit > 0 && inputTokens >= hardLimit:
+		decision.Action = "error"
+		decision.Reason = "input"
+	case hardLimit > 0 && outputTokens >= hardLimit:
+		decision.Action = "error"
+		decision.Reason = "output"
+	case hardLimit > 0 && totalTokens >= hardLimit:
+		decision.Action = "error"
+		decision.Reason = "total"
+	case hintAt > 0 && inputTokens >= hintAt:
+		decision.Action = "hint"
+		decision.Reason = "input"
+	case hintAt > 0 && outputTokens >= hintAt:
+		decision.Action = "hint"
+		decision.Reason = "output"
+	case hintAt > 0 && totalTokens >= hintAt:
+		decision.Action = "hint"
+		decision.Reason = "total"
+	}
+	if decision.Action == "" {
+		return tokenLimitDecision{}
+	}
+	if decision.Action == "error" {
+		decision.Message = tokenLimitHardText(decision)
+	} else {
+		decision.Message = tokenLimitHintText(decision)
+	}
+	return decision
+}
+
+func tokenLimitHardText(decision tokenLimitDecision) string {
+	return fmt.Sprintf("Codex upstream stream failed: context_length_exceeded: this request is estimated at %s tokens against the live upstream limit of about %s tokens. Please compact the conversation and retry with a smaller prompt or output budget.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit))
+}
+
+func tokenLimitHintText(decision tokenLimitDecision) string {
+	return fmt.Sprintf("Context window warning: this request is estimated at %s tokens and is close to the live upstream limit of about %s tokens. Please compact the conversation now, then continue from the compacted summary. The proxy still advertises the full 1M model window, but this live backend currently needs compaction around %s tokens to avoid a context_length_exceeded failure.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit), formatTokenCount(decision.HintAt))
+}
+
+func formatTokenCount(tokens int) string {
+	if tokens >= 1000000 {
+		return fmt.Sprintf("%.1fm", float64(tokens)/1000000)
+	}
+	if tokens >= 1000 {
+		return fmt.Sprintf("%.0fk", float64(tokens)/1000)
+	}
+	return strconv.Itoa(tokens)
+}
+
+func envIntDefault(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func requestedOpenAIOutputTokens(in openAIRequest) int {
+	return max(in.MaxTokens, in.MaxCompletionTokens)
+}
+
+func writeAnthropicTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
+	outputTokens := estimateTextTokens(decision.Message)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       []map[string]any{{"type": "text", "text": decision.Message}},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage":         map[string]any{"input_tokens": decision.InputTokens, "output_tokens": outputTokens},
+	})
+}
+
+func writeOpenAIChatTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
+	outputTokens := estimateTextTokens(decision.Message)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": decision.Message}, "finish_reason": "stop"}},
+		"usage":   map[string]any{"prompt_tokens": decision.InputTokens, "completion_tokens": outputTokens, "total_tokens": decision.InputTokens + outputTokens},
+	})
+}
+
+func writeOpenAIResponsesTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
+	writeJSON(w, http.StatusOK, responsesToOpenAIResponse(tokenLimitResponsesResponse(model, decision)))
+}
+
+func tokenLimitResponsesResponse(model string, decision tokenLimitDecision) responsesResponse {
+	resp := responsesResponse{
+		ID:    "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		Model: model,
+		Output: []responsesOutputItem{{
+			Type:    "message",
+			Role:    "assistant",
+			Content: []responsesOutputContent{{Type: "output_text", Text: decision.Message}},
+		}},
+	}
+	resp.Usage.InputTokens = decision.InputTokens
+	resp.Usage.OutputTokens = estimateTextTokens(decision.Message)
+	return resp
+}
+
+func applyTokenLimitHintStat(r *http.Request, decision tokenLimitDecision, model, upstream string) {
+	setRequestStat(r, requestStat{Model: model, Upstream: upstream, InputTokens: decision.InputTokens, OutputTokens: estimateTextTokens(decision.Message), StopReason: "token_limit_hint"})
 }
 
 func safeToolActivityInput(input any) any {
@@ -3073,7 +3363,7 @@ func sendAnthropicMessageDeltaStop(w io.Writer, stopReason string, outputTokens 
 
 func openAIChatToResponses(cfg config, in openAIRequest) responsesRequest {
 	model := resolveModel(cfg, in.Model)
-	out := responsesRequest{Model: model, Stream: in.Stream, Store: false}
+	out := responsesRequest{Model: model, MaxOutputTokens: requestedOpenAIOutputTokens(in), Stream: in.Stream, Store: false}
 	if effort := normalizeReasoningEffort(firstNonEmpty(in.ReasoningEffort, cfg.ReasoningEffort)); effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: effort}
 	}
@@ -3864,7 +4154,24 @@ func apiDocRoutes() []apiDocRoute {
 		{
 			Group: "Admin control panel", OperationID: "getUIStatus", Method: http.MethodGet, Path: "/ui/api/status", Summary: "Get dashboard status", Auth: apiDocAuthAdmin,
 			Description:    "Returns runtime status, local and public URLs, model rows, auth metadata, dashboard metrics, and the latest request summary.",
-			ResponseSchema: "UIStatusResponse", ResponseExample: map[string]any{"running": true, "proxy_running": true, "local_url": "http://127.0.0.1:4000", "public_url": "https://proxy.example.com", "display_url": "https://proxy.example.com", "anthropic_url": "https://proxy.example.com/anthropic", "openai_url": "https://proxy.example.com/openai/v1", "upstream": "codex"},
+			ResponseSchema: "UIStatusResponse", ResponseExample: map[string]any{"running": true, "proxy_running": true, "version": "0.4.3", "local_url": "http://127.0.0.1:4000", "public_url": "https://proxy.example.com", "display_url": "https://proxy.example.com", "anthropic_url": "https://proxy.example.com/anthropic", "openai_url": "https://proxy.example.com/openai/v1", "upstream": "codex", "update": map[string]any{"current_version": "0.4.3", "latest_version": "0.4.4", "update_available": true, "running": false}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "getUIUpdateStatus", Method: http.MethodGet, Path: "/ui/api/update/status", Summary: "Get update status", Auth: apiDocAuthAdmin,
+			Description:    "Returns the installed version, latest GitHub version check, auto-update setting, and the last dashboard-started update status.",
+			ResponseSchema: "UIUpdateStatusResponse", ResponseExample: map[string]any{"current_version": "0.4.3", "latest_version": "0.4.4", "update_available": true, "auto_update": false, "state": "idle", "running": false},
+		},
+		{
+			Group: "Admin control panel", OperationID: "startDashboardUpdate", Method: http.MethodPost, Path: "/ui/api/update/start", Summary: "Start non-interactive update", Auth: apiDocAuthAdmin,
+			Description:    "Starts update-linux.sh in the background with a status file so the dashboard can reconnect after the service restarts.",
+			ResponseSchema: "UIUpdateStartResponse", ResponseExample: map[string]any{"ok": true, "message": "Update started.", "update": map[string]any{"state": "queued", "running": true}},
+		},
+		{
+			Group: "Admin control panel", OperationID: "saveDashboardUpdateSettings", Method: http.MethodPost, Path: "/ui/api/update/settings", Summary: "Save update settings", Auth: apiDocAuthAdmin,
+			Description:   "Enables or disables automatic app updates from the configured GitHub branch.",
+			RequestSchema: "UIUpdateSettingsRequest", ResponseSchema: "UIUpdateSettingsResponse",
+			RequestExample:  map[string]any{"auto_update": true},
+			ResponseExample: map[string]any{"ok": true, "auto_update": true, "update": map[string]any{"auto_update": true}},
 		},
 		{
 			Group: "Admin control panel", OperationID: "getUIConfig", Method: http.MethodGet, Path: "/ui/api/config", Summary: "Read editable proxy config", Auth: apiDocAuthAdmin,
@@ -4372,12 +4679,16 @@ func openAPISchemas() map[string]any {
 		"CountTokensResponse":          schemaObject(map[string]any{"input_tokens": schemaInteger("Approximate input token count.")}, "input_tokens"),
 		"OpenAIChatCompletionRequest":  schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "messages": schemaArray(message), "tools": schemaArray(anyMap), "max_tokens": schemaInteger("Maximum output tokens."), "max_completion_tokens": schemaInteger("Maximum output tokens."), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "reasoning_effort": schemaString("Optional reasoning effort."), "user": schemaString("Optional user/session id."), "metadata": anyMap, "extra_body": anyValue}, "model", "messages"),
 		"OpenAIChatCompletionResponse": schemaOpenObject(map[string]any{"id": schemaString("Completion id."), "object": schemaString("chat.completion"), "created": schemaInteger("Unix timestamp."), "model": schemaString("Model id."), "choices": schemaArray(anyMap), "usage": anyMap}),
-		"ResponsesRequest":             schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "instructions": schemaString("Optional system instructions."), "input": schemaArray(anyValue), "tools": schemaArray(anyMap), "reasoning": anyMap, "temperature": map[string]any{"type": "number"}, "service_tier": schemaString("Optional service tier."), "prompt_cache_key": schemaString("Optional prompt cache key."), "stream": schemaBoolean("Enable SSE streaming."), "store": schemaBoolean("Ignored locally and forced false.")}, "model", "input"),
+		"ResponsesRequest":             schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "instructions": schemaString("Optional system instructions."), "input": schemaArray(anyValue), "tools": schemaArray(anyMap), "reasoning": anyMap, "temperature": map[string]any{"type": "number"}, "max_output_tokens": schemaInteger("Maximum output tokens."), "service_tier": schemaString("Optional service tier."), "prompt_cache_key": schemaString("Optional prompt cache key."), "stream": schemaBoolean("Enable SSE streaming."), "store": schemaBoolean("Ignored locally and forced false.")}, "model", "input"),
 		"ResponsesResponse":            schemaOpenObject(map[string]any{"id": schemaString("Response id."), "object": schemaString("response"), "model": schemaString("Model id."), "output": schemaArray(anyMap), "usage": anyMap}),
 		"ProviderPassThroughResponse":  map[string]any{"type": "object", "additionalProperties": true, "description": "Provider-shaped OpenAI-compatible response."},
 		"UIAuthStatusResponse":         schemaObject(map[string]any{"configured": schemaBoolean("Admin auth is configured."), "authenticated": schemaBoolean("Current request has a valid admin cookie."), "username": schemaString("Configured admin username.")}, "configured", "authenticated", "username"),
 		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password.")}, "username", "password"),
-		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "local_url": schemaString("Local control panel URL."), "public_url": schemaString("Public reverse-proxy URL when configured."), "display_url": schemaString("Preferred URL for the control panel to show."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "host": schemaString("Local bind host."), "port": schemaString("Local port."), "bind_url": schemaString("Local bind address."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
+		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "version": schemaString("Installed proxy version."), "update": anyMap, "local_url": schemaString("Local control panel URL."), "public_url": schemaString("Public reverse-proxy URL when configured."), "display_url": schemaString("Preferred URL for the control panel to show."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "host": schemaString("Local bind host."), "port": schemaString("Local port."), "bind_url": schemaString("Local bind address."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
+		"UIUpdateStatusResponse":       schemaOpenObject(map[string]any{"current_version": schemaString("Installed proxy version."), "latest_version": schemaString("Latest version from GitHub."), "update_available": schemaBoolean("A newer version is available."), "auto_update": schemaBoolean("Automatic app updates are enabled."), "state": schemaString("idle, queued, running, succeeded, or failed."), "phase": schemaString("Current update phase."), "message": schemaString("Human-readable update status."), "running": schemaBoolean("An update is currently active."), "updated_at": schemaString("Last status update time."), "started_at": schemaString("Update start time."), "finished_at": schemaString("Update finish time."), "repo_dir": schemaString("Repository directory used by the updater."), "branch": schemaString("Git branch used by the updater."), "status_file": schemaString("Machine-readable status file path."), "latest": anyMap}),
+		"UIUpdateStartResponse":        schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether the update was queued."), "message": schemaString("Human-readable status."), "update": anyMap}),
+		"UIUpdateSettingsRequest":      schemaObject(map[string]any{"auto_update": schemaBoolean("Enable automatic app updates.")}, "auto_update"),
+		"UIUpdateSettingsResponse":     schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether settings were saved."), "auto_update": schemaBoolean("Automatic update setting."), "update": anyMap}),
 		"UIConfigResponse":             schemaObject(map[string]any{"config": stringMap, "secrets": stringMap, "aliases": schemaArray(modelAlias)}, "config", "secrets", "aliases"),
 		"UIConfigRequest":              schemaObject(map[string]any{"config": stringMap, "aliases": schemaArray(schemaObject(map[string]any{"From": schemaString("Alias."), "To": schemaString("Model id."), "Context": schemaString("Context label.")}))}),
 		"UIModelsResponse":             schemaOpenObject(map[string]any{"models": schemaArray(modelAlias), "ok": schemaBoolean("Whether save succeeded."), "message": schemaString("Status message.")}),
@@ -5374,6 +5685,7 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"running":              proxyEnabled.Load(),
 			"proxy_running":        proxyEnabled.Load(),
 			"pid":                  os.Getpid(),
+			"version":              appVersion(),
 			"platform":             platformName(),
 			"goos":                 runtime.GOOS,
 			"goarch":               runtime.GOARCH,
@@ -5397,6 +5709,7 @@ func handleUIStatus(cfg config) http.HandlerFunc {
 			"claude_settings":      claudeSettingsMetadata(cfg),
 			"antigravity":          antigravityStatus(),
 			"dashboard":            dashboardMetrics(),
+			"update":               updateStatusPayload(cfg),
 			"models":               modelRows(cfg),
 			"last_request":         lastRequest(),
 			"claude_version":       strings.TrimSpace(claudeVersion),
@@ -5475,6 +5788,360 @@ func claudeSettingsMetadata(cfg config) map[string]any {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func appVersion() string {
+	if v := strings.TrimSpace(os.Getenv("PROXY_VERSION")); v != "" {
+		return v
+	}
+	for _, path := range candidateVersionFiles() {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			if v := strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0]); v != "" {
+				return v
+			}
+		}
+	}
+	return appVersionFallback
+}
+
+func candidateVersionFiles() []string {
+	paths := []string{filepath.Join(".", "VERSION")}
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), "VERSION"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		paths = append(paths, filepath.Join(wd, "VERSION"))
+	}
+	return paths
+}
+
+func updateStatusFilePath() string {
+	if v := strings.TrimSpace(os.Getenv("PROXY_UPDATE_STATUS_FILE")); v != "" {
+		return v
+	}
+	return filepath.Join(".", ".proxy.update.json")
+}
+
+func updateRepoDir() string {
+	if v := strings.TrimSpace(os.Getenv("PROXY_UPDATE_REPO_DIR")); v != "" {
+		return v
+	}
+	if wd, err := os.Getwd(); err == nil && fileExists(filepath.Join(wd, ".git")) {
+		return wd
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, "claude-code-proxy")
+	}
+	return "."
+}
+
+func updateBranch() string {
+	if v := strings.TrimSpace(os.Getenv("PROXY_UPDATE_BRANCH")); v != "" {
+		return v
+	}
+	return "main"
+}
+
+func autoUpdateEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(firstNonEmpty(os.Getenv("PROXY_AUTO_UPDATE"), readEnvMap()["PROXY_AUTO_UPDATE"])))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func updateStatusPayload(cfg config) map[string]any {
+	maybeRefreshLatestVersion()
+	state := readUpdateState()
+	latest := latestVersionInfo()
+	current := appVersion()
+	latestVersion, _ := latest["latest_version"].(string)
+	if latestVersion == "" {
+		if v, ok := latest["version"].(string); ok {
+			latestVersion = v
+		}
+	}
+	updateAvailable := latestVersion != "" && versionCompare(latestVersion, current) > 0
+	state["current_version"] = current
+	state["latest_version"] = latestVersion
+	state["update_available"] = updateAvailable
+	state["auto_update"] = autoUpdateEnabled()
+	state["repo_dir"] = updateRepoDir()
+	state["branch"] = updateBranch()
+	state["status_file"] = updateStatusFilePath()
+	state["latest"] = latest
+	state["public_url"] = cfg.PublicURL
+	return state
+}
+
+func readUpdateState() map[string]any {
+	state := map[string]any{
+		"state":      "idle",
+		"phase":      "",
+		"message":    "",
+		"running":    false,
+		"updated_at": "",
+	}
+	raw, err := os.ReadFile(updateStatusFilePath())
+	if err != nil {
+		return state
+	}
+	var loaded map[string]any
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		state["state"] = "unknown"
+		state["message"] = "Update status file is unreadable."
+		return state
+	}
+	for k, v := range loaded {
+		state[k] = v
+	}
+	return state
+}
+
+func writeUpdateState(state, phase, message, source string) {
+	path := updateStatusFilePath()
+	current := readUpdateState()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if state == "queued" || state == "running" {
+		if fmt.Sprint(current["started_at"]) == "" {
+			current["started_at"] = now
+		}
+	}
+	if state == "succeeded" || state == "failed" {
+		current["finished_at"] = now
+	}
+	current["state"] = state
+	current["phase"] = phase
+	current["message"] = message
+	current["source"] = source
+	current["version"] = appVersion()
+	current["updated_at"] = now
+	current["running"] = state == "queued" || state == "running"
+	writeJSONFileAtomic(path, current, 0600)
+}
+
+func writeJSONFileAtomic(path string, value any, mode os.FileMode) {
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return
+	}
+	raw = append(raw, '\n')
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0700)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, mode); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+func latestVersionInfo() map[string]any {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	out := map[string]any{
+		"latest_version": latestVersionCache.Version,
+		"checked_at":     "",
+		"error":          latestVersionCache.Error,
+	}
+	if !latestVersionCache.CheckedAt.IsZero() {
+		out["checked_at"] = latestVersionCache.CheckedAt.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+func maybeRefreshLatestVersion() {
+	updateMu.Lock()
+	stale := latestVersionCache.CheckedAt.IsZero() || time.Since(latestVersionCache.CheckedAt) > 10*time.Minute
+	updateMu.Unlock()
+	if stale {
+		go refreshLatestVersion()
+	}
+}
+
+func refreshLatestVersion() {
+	url := strings.TrimSpace(os.Getenv("PROXY_UPDATE_VERSION_URL"))
+	if url == "" {
+		url = defaultVersionURL
+	}
+	client := http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(url)
+	version := ""
+	errMsg := ""
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			if readErr == nil {
+				version = strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
+			} else {
+				errMsg = readErr.Error()
+			}
+		} else {
+			errMsg = fmt.Sprintf("version check returned HTTP %d", resp.StatusCode)
+		}
+	} else {
+		errMsg = err.Error()
+	}
+	updateMu.Lock()
+	if version != "" {
+		latestVersionCache.Version = version
+		latestVersionCache.Error = ""
+	} else {
+		latestVersionCache.Error = errMsg
+	}
+	latestVersionCache.CheckedAt = time.Now()
+	updateMu.Unlock()
+}
+
+func versionCompare(a, b string) int {
+	aa := versionParts(a)
+	bb := versionParts(b)
+	maxLen := len(aa)
+	if len(bb) > maxLen {
+		maxLen = len(bb)
+	}
+	for i := 0; i < maxLen; i++ {
+		av, bv := 0, 0
+		if i < len(aa) {
+			av = aa[i]
+		}
+		if i < len(bb) {
+			bv = bb[i]
+		}
+		if av > bv {
+			return 1
+		}
+		if av < bv {
+			return -1
+		}
+	}
+	return 0
+}
+
+func versionParts(version string) []int {
+	version = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(version)), "v")
+	version = strings.NewReplacer("-", ".", "_", ".", "+", ".").Replace(version)
+	parts := []int{}
+	for _, part := range strings.Split(version, ".") {
+		n := 0
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+func startAutoUpdateWatcher(cfg config) {
+	go func() {
+		timer := time.NewTimer(20 * time.Second)
+		defer timer.Stop()
+		for {
+			<-timer.C
+			refreshLatestVersion()
+			if autoUpdateEnabled() {
+				status := updateStatusPayload(cfg)
+				if available, _ := status["update_available"].(bool); available {
+					_ = startDashboardUpdate(cfg, "auto")
+				}
+			}
+			timer.Reset(30 * time.Minute)
+		}
+	}()
+}
+
+func handleUIUpdateStatus(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, updateStatusPayload(cfg))
+	}
+}
+
+func handleUIUpdateStart(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if err := startDashboardUpdate(cfg, "manual"); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error(), "update": updateStatusPayload(cfg)})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Update started.", "update": updateStatusPayload(cfg)})
+	}
+}
+
+func handleUIUpdateSettings(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			AutoUpdate bool `json:"auto_update"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		current := readEnvMap()
+		if body.AutoUpdate {
+			current["PROXY_AUTO_UPDATE"] = "1"
+		} else {
+			current["PROXY_AUTO_UPDATE"] = "0"
+		}
+		if err := writeEnvMap(current); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		syncProcessEnvKeys(current, "PROXY_AUTO_UPDATE")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "auto_update": body.AutoUpdate, "update": updateStatusPayload(cfg)})
+	}
+}
+
+func startDashboardUpdate(cfg config, source string) error {
+	updateMu.Lock()
+	state := readUpdateState()
+	if running, _ := state["running"].(bool); running {
+		updateMu.Unlock()
+		return errors.New("update already in progress")
+	}
+	writeUpdateState("queued", "queued", "Update queued.", source)
+	updateMu.Unlock()
+
+	repoDir := updateRepoDir()
+	scriptPath := filepath.Join(repoDir, "update-linux.sh")
+	if !fileExists(scriptPath) {
+		writeUpdateState("failed", "missing-script", "Cannot find update-linux.sh. Check PROXY_UPDATE_REPO_DIR.", source)
+		return fmt.Errorf("cannot find update-linux.sh at %s", scriptPath)
+	}
+	statusFile := updateStatusFilePath()
+	branch := updateBranch()
+	cmdText := fmt.Sprintf("cd %s && chmod +x update-linux.sh install-linux.sh && ./update-linux.sh -y --branch %s --status-file %s", shellQuote(repoDir), shellQuote(branch), shellQuote(statusFile))
+	if source == "auto" || strings.EqualFold(os.Getenv("PROXY_DASHBOARD_FULL_SYSTEM_UPDATE"), "0") {
+		cmdText += " --no-system-upgrade --skip-go-latest"
+	}
+	if runtime.GOOS == "linux" {
+		if systemdRunPath, err := exec.LookPath("systemd-run"); err == nil {
+			unit := "connect-ai-proxy-dashboard-update"
+			cmd := exec.Command(systemdRunPath, "--unit", unit, "--collect", "bash", "-lc", cmdText)
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+			if err := cmd.Start(); err == nil {
+				return nil
+			}
+		}
+	}
+	cmd := exec.Command("sh", "-c", "nohup sh -c "+shellQuote(cmdText)+" >/dev/null 2>&1 &")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Start()
 }
 
 func handleUIConfig(cfg config) http.HandlerFunc {
@@ -6044,7 +6711,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HINT_TOKENS", "CODEX_UPSTREAM_HARD_TOKENS", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
 	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {

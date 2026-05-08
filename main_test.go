@@ -223,7 +223,7 @@ func TestDocumentationRoutesPublicAndValid(t *testing.T) {
 	if !ok {
 		t.Fatalf("openapi paths missing: %#v", openAPI["paths"])
 	}
-	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities", "/openai/v1/chat/completions", "/ui/api/status"} {
+	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities", "/openai/v1/chat/completions", "/ui/api/status", "/ui/api/update/status", "/ui/api/update/start", "/ui/api/update/settings"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("openapi path %s missing", path)
 		}
@@ -294,6 +294,9 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 		"POST /ui/api/auth/login",
 		"POST /ui/api/auth/logout",
 		"GET /ui/api/status",
+		"GET /ui/api/update/status",
+		"POST /ui/api/update/start",
+		"POST /ui/api/update/settings",
 		"GET /ui/api/config",
 		"POST /ui/api/config",
 		"GET /ui/api/models",
@@ -336,6 +339,9 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 	assertAuth(http.MethodPost, "/openai/v1/chat/completions", apiDocAuthProxy)
 	assertAuth(http.MethodGet, "/ui/api/auth/status", apiDocAuthPublic)
 	assertAuth(http.MethodGet, "/ui/api/status", apiDocAuthAdmin)
+	assertAuth(http.MethodGet, "/ui/api/update/status", apiDocAuthAdmin)
+	assertAuth(http.MethodPost, "/ui/api/update/start", apiDocAuthAdmin)
+	assertAuth(http.MethodPost, "/ui/api/update/settings", apiDocAuthAdmin)
 }
 
 func TestModelCapabilitiesEndpoint(t *testing.T) {
@@ -475,6 +481,69 @@ func TestAnthropicNamespaceRoutes(t *testing.T) {
 	}
 	if !strings.Contains(msgRec.Body.String(), "hello from upstream") {
 		t.Fatalf("messages body missing upstream text: %s", msgRec.Body.String())
+	}
+}
+
+func TestCodexTokenLimitGuardReturnsCompactHint(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+
+	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":1,"messages":[{"role":"user","content":"`+strings.Repeat("x", 44)+`"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Please compact the conversation now") {
+		t.Fatalf("body missing compact hint: %s", rec.Body.String())
+	}
+}
+
+func TestCodexTokenLimitGuardAppliesToRequestedOutput(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+
+	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":12,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "close to the live upstream limit") {
+		t.Fatalf("body missing output compact hint: %s", rec.Body.String())
+	}
+}
+
+func TestCodexTokenLimitGuardHardLimitKeepsContextError(t *testing.T) {
+	restoreProxyEnabled := proxyEnabled.Load()
+	proxyEnabled.Store(true)
+	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+
+	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	handler := newProxyMux(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":1,"messages":[{"role":"user","content":"`+strings.Repeat("x", 88)+`"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "context_length_exceeded") {
+		t.Fatalf("body missing context error: %s", rec.Body.String())
 	}
 }
 

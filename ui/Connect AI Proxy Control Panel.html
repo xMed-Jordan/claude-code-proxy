@@ -102,7 +102,7 @@
       const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
       const [route, setRoute] = useState("dashboard");
       const [toasts, setToasts] = useState([]);
-      const { data: liveStatus, refresh: refreshStatus } = usePolling("/ui/api/status", 2000);
+      const { data: liveStatus, error: statusError, refresh: refreshStatus } = usePolling("/ui/api/status", 2000);
       const tIdRef = useRef(0);
 
       useEffect(() => {
@@ -160,8 +160,21 @@
             const passed = res.steps.filter(s => s.ok).length;
             pushToast(`Validation complete · ${passed}/${res.steps.length} checks passed`);
           }
+          if (action === "update") {
+            await api.post("/ui/api/update/start");
+            pushToast("Update started · waiting for reconnect");
+          }
+          if (action === "toggle-auto-update") {
+            const enabled = !liveStatus?.update?.auto_update;
+            await api.post("/ui/api/update/settings", { auto_update: enabled });
+            pushToast(enabled ? "Auto update enabled" : "Auto update disabled");
+          }
           refreshStatus();
         } catch (e) {
+          if (action === "update") {
+            pushToast("Update is running · reconnecting soon");
+            return;
+          }
           pushToast(`Action failed · ${e.message || e}`);
         }
       };
@@ -249,7 +262,7 @@
             </div>
 
             <div className="side-foot">
-              <div className="side-foot-row"><span>build</span><span className="v">0.4.2-rc1</span></div>
+              <div className="side-foot-row"><span>build</span><span className="v">{liveStatus?.version || "unknown"}</span></div>
               <div className="side-foot-row"><span>upstream</span><span className="v">{liveStatus?.upstream || "codex"}</span></div>
               <div className="side-foot-row"><span>bind</span><span className="v">{liveStatus?.bind_url || `${liveStatus?.host || "127.0.0.1"}:${liveStatus?.port || "4000"}`}</span></div>
               {liveStatus?.public_url && <div className="side-foot-row"><span>public</span><span className="v">{liveStatus.public_url.replace(/^https?:\/\//, "")}</span></div>}
@@ -258,7 +271,7 @@
 
           {/* MAIN */}
           <main className="main">
-            {route === "dashboard" && <Dashboard proxyState={t.proxyState} onAction={handleAction} liveStatus={liveStatus}/>}
+            {route === "dashboard" && <Dashboard proxyState={t.proxyState} onAction={handleAction} liveStatus={liveStatus} statusError={statusError}/>}
             {route === "config"    && <Configuration pushToast={pushToast}/>}
             {route === "models"    && <Models pushToast={pushToast}/>}
             {route === "keys"      && <ApiKeys pushToast={pushToast} liveStatus={liveStatus}/>}
