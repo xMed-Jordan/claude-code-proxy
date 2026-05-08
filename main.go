@@ -2631,7 +2631,9 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 	}
 	if err := scanner.Err(); err != nil {
 		traceLog(ctx, "codex.stream.scan_error", map[string]any{"error": err.Error()})
-		resp.StreamError = firstNonEmpty(resp.StreamError, "stream scan error: "+err.Error())
+		if !isContextCanceledError(err) {
+			resp.StreamError = firstNonEmpty(resp.StreamError, "stream scan error: "+err.Error())
+		}
 	}
 	traceLog(ctx, "codex.stream.complete", map[string]any{"event_counts": eventCounts, "text_chars": text.Len(), "output_items": len(resp.Output)})
 	if len(resp.Output) == 0 {
@@ -2650,32 +2652,42 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 }
 
 func responsesStreamEventErrorMessage(event responsesStreamEvent) string {
-	msg := strings.TrimSpace(firstNonEmpty(
-		event.Error.Message,
-		event.Message,
-		event.Response.Error.Message,
-		event.Text,
-		event.Delta,
-	))
-	code := strings.TrimSpace(firstNonEmpty(event.Error.Code, event.Code, event.Response.Error.Code, event.Response.Error.Type, event.Error.Type))
 	switch event.Type {
 	case "error":
-		if msg == "" {
-			msg = "stream error event without message"
-		}
+		return formatResponsesStreamError(
+			firstNonEmpty(event.Error.Code, event.Code, event.Error.Type),
+			firstNonEmpty(event.Error.Message, event.Message, event.Text, event.Delta, "stream error event without message"),
+		)
 	case "response.failed":
-		if msg == "" {
-			msg = "response failed before returning output"
-		}
+		return formatResponsesStreamError(
+			firstNonEmpty(event.Response.Error.Code, event.Response.Error.Type, event.Error.Code, event.Code, event.Error.Type),
+			firstNonEmpty(event.Response.Error.Message, event.Error.Message, event.Message, "response failed before returning output"),
+		)
 	default:
-		if msg == "" {
+		if event.Response.Error.Message == "" && event.Response.Error.Code == "" && event.Response.Error.Type == "" {
 			return ""
 		}
+		return formatResponsesStreamError(
+			firstNonEmpty(event.Response.Error.Code, event.Response.Error.Type),
+			firstNonEmpty(event.Response.Error.Message, "response contains error"),
+		)
 	}
+}
+
+func formatResponsesStreamError(code, msg string) string {
+	code = strings.TrimSpace(code)
+	msg = strings.TrimSpace(msg)
 	if code != "" && !strings.Contains(strings.ToLower(msg), strings.ToLower(code)) {
 		msg = code + ": " + msg
 	}
 	return msg
+}
+
+func isContextCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || strings.Contains(strings.ToLower(err.Error()), "context canceled")
 }
 
 func codexStreamText(event responsesStreamEvent) string {

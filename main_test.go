@@ -920,6 +920,9 @@ func TestCollectCodexStreamCapturesReasoningSummary(t *testing.T) {
 	}
 	raw.WriteString("data: [DONE]\n\n")
 	resp := collectCodexStream(context.Background(), strings.NewReader(raw.String()), "gpt-5.5")
+	if resp.StreamError != "" {
+		t.Fatalf("stream error = %q", resp.StreamError)
+	}
 	if len(resp.Output) < 2 {
 		t.Fatalf("output = %#v", resp.Output)
 	}
@@ -946,6 +949,20 @@ func TestCollectCodexStreamCapturesStreamError(t *testing.T) {
 	resp := collectCodexStream(context.Background(), strings.NewReader(raw.String()), "gpt-5.5")
 	if !strings.Contains(resp.StreamError, "context_length_exceeded") || !strings.Contains(resp.StreamError, "too large") {
 		t.Fatalf("stream error = %q", resp.StreamError)
+	}
+}
+
+func TestResponsesStreamEventErrorMessageIgnoresNormalDeltas(t *testing.T) {
+	events := []responsesStreamEvent{
+		{Type: "response.output_text.delta", Delta: "The answer is "},
+		{Type: "response.output_text.done", Text: "The answer is done."},
+		{Type: "response.reasoning_summary_text.delta", Delta: "Checked "},
+		{Type: "response.reasoning_summary_text.done", Text: "Checked the logs."},
+	}
+	for _, event := range events {
+		if msg := responsesStreamEventErrorMessage(event); msg != "" {
+			t.Fatalf("%s reported stream error %q", event.Type, msg)
+		}
 	}
 }
 
