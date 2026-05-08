@@ -5882,12 +5882,62 @@ func handleUIStart(w http.ResponseWriter, r *http.Request) {
 
 func handleUIRestart(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if scheduled, err := scheduleSystemdRestart(); scheduled {
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Proxy service restarting."})
+			return
+		}
 		bin := preferredProxyBinaryPath()
 		cmd := exec.Command(bin, "start")
-		_ = cmd.Start()
+		if err := cmd.Start(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Proxy restarting."})
 		go func() { time.Sleep(250 * time.Millisecond); os.Exit(0) }()
 	}
+}
+
+func scheduleSystemdRestart() (bool, error) {
+	if runtime.GOOS != "linux" {
+		return false, nil
+	}
+	serviceName := startupName + ".service"
+	if !systemdServiceInstalled(serviceName) {
+		return false, nil
+	}
+	systemctlPath, err := exec.LookPath("systemctl")
+	if err != nil {
+		return true, err
+	}
+	if systemdRunPath, err := exec.LookPath("systemd-run"); err == nil {
+		cmd := exec.Command(systemdRunPath, "--unit", startupName+"-dashboard-restart", "--on-active=1s", "--collect", systemctlPath, "restart", serviceName)
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+		if err := cmd.Start(); err == nil {
+			return true, nil
+		}
+	}
+	cmd := exec.Command("sh", "-c", "nohup sh -c 'sleep 1; systemctl restart connect-ai-proxy.service' >/dev/null 2>&1 &")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return true, cmd.Start()
+}
+
+func systemdServiceInstalled(serviceName string) bool {
+	for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"} {
+		if _, err := os.Stat(filepath.Join(dir, serviceName)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func validateHTTP(method, url string, headers map[string]string, body []byte, name string) map[string]any {
