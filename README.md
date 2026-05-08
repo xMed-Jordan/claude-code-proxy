@@ -27,6 +27,7 @@ Claude Code browser automation is exposed as a separate MCP sidecar named `antig
 - `/openai/v1/files...` provider pass-through for OpenAI-compatible file upload/list/retrieve/delete calls
 - `GET /ui/api/antigravity`
 - `GET /ui/api/update/status`
+- `POST /ui/api/update/check`
 - `POST /ui/api/update/start`
 - `POST /ui/api/update/settings`
 - `GET /antigravity/bridge`
@@ -133,7 +134,7 @@ chmod +x install-linux.sh reinstall-linux.sh uninstall-linux.sh update-linux.sh
 - `reinstall-linux.sh` stops the service, restores synced Claude settings if possible, removes the service, symlink, and install directory, then runs a fresh install. It keeps Codex auth by default so a reinstall does not force a new device login unless `--remove-codex-auth` is passed.
 - `uninstall-linux.sh --app-only` removes only the app service, symlink, and install directory. `--clean` also checks Caddy, Go, Node/npm, Codex/Claude CLI packages, and browser packages; it skips anything that appears to be used by another process, systemd unit, or project on the server.
 
-The installed version is read from `VERSION` and shown in the dashboard. The dashboard can start the non-interactive Linux updater, show progress while the service restarts, and reconnect when `/health` returns again. Automatic updates check the configured GitHub `VERSION` URL and run an app-scoped update without OS package upgrades; manual dashboard updates use the full updater unless `PROXY_DASHBOARD_FULL_SYSTEM_UPDATE=0`.
+The installed version is read from `VERSION` and shown in the dashboard. The dashboard Updates page can check the configured `VERSION` URL, edit the update branch, repository path, status-file path, auto-update toggle, and whether manual dashboard updates run the full system updater. It can start the non-interactive Linux updater, show progress while the service restarts, and reconnect when `/health` returns again. Automatic updates run an app-scoped update without OS package upgrades; manual dashboard updates use the full updater unless `PROXY_DASHBOARD_FULL_SYSTEM_UPDATE=0`.
 
 Troubleshooting notes:
 

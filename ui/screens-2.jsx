@@ -223,6 +223,212 @@ function prettyJson(obj) {
   ));
 }
 
+// UPDATES
+
+const DEFAULT_VERSION_URL = "https://raw.githubusercontent.com/xMed-Jordan/claude-code-proxy/main/VERSION";
+
+const ToggleRow = ({ checked, onChange, label, sub }) => (
+  <div
+    className="update-toggle-row"
+    role="button"
+    tabIndex={0}
+    onClick={() => onChange(!checked)}
+    onKeyDown={e => {
+      if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        onChange(!checked);
+      }
+    }}
+  >
+    <span className="toggle" aria-checked={!!checked} role="checkbox"/>
+    <div className="update-toggle-copy">
+      <div className="txt-2">{label}</div>
+      {sub && <div className="txt-3">{sub}</div>}
+    </div>
+  </div>
+);
+
+const updateTone = (update) => {
+  if (update?.running) return "info";
+  if (update?.state === "failed") return "err";
+  if (update?.update_available) return "warn";
+  if (update?.state === "succeeded") return "ok";
+  return "muted";
+};
+
+const updateLabel = (update) => {
+  if (update?.running) return update.phase || "running";
+  if (update?.update_available) return "update available";
+  return update?.state || "idle";
+};
+
+const Updates = ({ liveStatus, statusError, pushToast, refreshStatus, onAction }) => {
+  const update = liveStatus?.update || {};
+  const [form, setForm] = useState2({
+    auto_update: false,
+    full_system_update: true,
+    branch: "main",
+    version_url: DEFAULT_VERSION_URL,
+    repo_dir: "",
+    status_file: "",
+  });
+  const [busy, setBusy] = useState2("");
+
+  useEffect2(() => {
+    setForm({
+      auto_update: !!update.auto_update,
+      full_system_update: update.full_system_update !== false,
+      branch: update.branch || "main",
+      version_url: update.version_url || DEFAULT_VERSION_URL,
+      repo_dir: update.repo_dir || "",
+      status_file: update.status_file || "",
+    });
+  }, [update.auto_update, update.full_system_update, update.branch, update.version_url, update.repo_dir, update.status_file]);
+
+  const set = (key, value) => setForm(current => ({ ...current, [key]: value }));
+  const save = async () => {
+    setBusy("save");
+    try {
+      await api.post("/ui/api/update/settings", form);
+      pushToast("Update options saved");
+      refreshStatus();
+    } catch (err) {
+      pushToast(`Save failed · ${err.message || err}`);
+    } finally {
+      setBusy("");
+    }
+  };
+  const check = async () => {
+    setBusy("check");
+    try {
+      await api.post("/ui/api/update/check");
+      pushToast("Update check complete");
+      refreshStatus();
+    } catch (err) {
+      pushToast(`Check failed · ${err.message || err}`);
+    } finally {
+      setBusy("");
+    }
+  };
+  const runUpdate = async () => {
+    setBusy("update");
+    try {
+      await onAction("update");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const latest = update.latest || {};
+  const reconnecting = !!statusError && !!update.running;
+  const rows = [
+    ["Message", reconnecting ? "Reconnecting while the service restarts." : (update.message || "No update has run yet.")],
+    ["Phase", update.phase || "idle"],
+    ["Source", update.source || "manual"],
+    ["Checked", latest.checked_at || "not checked"],
+    ["Started", update.started_at || "-"],
+    ["Finished", update.finished_at || "-"],
+    ["Status file", update.status_file || form.status_file || "-"],
+    ["Public URL", update.public_url || liveStatus?.public_url || "-"],
+  ];
+
+  return (
+    <section data-screen-label="06 Updates" className="col" style={{ gap: 16 }}>
+      <SectionHd
+        title="Updates"
+        sub="Version checks, automatic update behavior, and live-server updater paths."
+        actions={
+          <div className="update-actions">
+            <button className="btn btn-sm btn-ghost" onClick={check} disabled={!!busy || update.running}>
+              <Icon name="refresh" size={11}/>{busy === "check" ? "Checking" : "Check now"}
+            </button>
+            <button className="btn btn-sm btn-primary" onClick={save} disabled={!!busy || update.running}>
+              <Icon name="check" size={11}/>{busy === "save" ? "Saving" : "Save options"}
+            </button>
+            <button className="btn btn-sm btn-warn" onClick={runUpdate} disabled={!!busy || update.running}>
+              <Icon name="download" size={11}/>{busy === "update" || update.running ? "Updating" : "Run update"}
+            </button>
+          </div>
+        }
+      />
+
+      <div className="update-summary">
+        <div className="update-summary-cell">
+          <span className="lbl">Current</span>
+          <span className="val mono">{update.current_version || liveStatus?.version || "unknown"}</span>
+        </div>
+        <div className="update-summary-cell">
+          <span className="lbl">Latest</span>
+          <span className="val mono">{update.latest_version || "not checked"}</span>
+        </div>
+        <div className="update-summary-cell">
+          <span className="lbl">State</span>
+          <span className="val"><Pill tone={updateTone(update)} pulse={!!update.running}>{updateLabel(update)}</Pill></span>
+        </div>
+        <div className="update-summary-cell">
+          <span className="lbl">Mode</span>
+          <span className="val">{form.full_system_update ? "Full updater" : "App only"}</span>
+        </div>
+      </div>
+
+      <div className="col-2">
+        <Card title="Update Options">
+          <div className="update-options">
+            <ToggleRow
+              checked={form.auto_update}
+              onChange={value => set("auto_update", value)}
+              label="Automatic updates"
+              sub="Checks the VERSION URL and runs an app-scoped update when a newer version appears."
+            />
+            <ToggleRow
+              checked={form.full_system_update}
+              onChange={value => set("full_system_update", value)}
+              label="Full manual updater"
+              sub="Manual dashboard updates may update OS packages, Go, Codex, Claude CLI, rebuild, and restart."
+            />
+            <label className="update-option">
+              <span className="meta"><span className="txt-2">Branch</span><span className="txt-3">Git branch used by update-linux.sh.</span></span>
+              <input className="inp inp-sans" value={form.branch} onChange={e => set("branch", e.target.value)} placeholder="main"/>
+            </label>
+            <label className="update-option">
+              <span className="meta"><span className="txt-2">VERSION URL</span><span className="txt-3">Used by Check now and auto update.</span></span>
+              <div className="row" style={{ gap: 6 }}>
+                <input className="inp inp-sans" value={form.version_url} onChange={e => set("version_url", e.target.value)} placeholder={DEFAULT_VERSION_URL}/>
+                <CopyBtn text={form.version_url || DEFAULT_VERSION_URL} label="Copy"/>
+              </div>
+            </label>
+            <label className="update-option">
+              <span className="meta"><span className="txt-2">Repository path</span><span className="txt-3">Where update-linux.sh is run on the server.</span></span>
+              <input className="inp inp-sans" value={form.repo_dir} onChange={e => set("repo_dir", e.target.value)} placeholder="/root/claude-code-proxy"/>
+            </label>
+            <label className="update-option">
+              <span className="meta"><span className="txt-2">Status file</span><span className="txt-3">Progress file read while the service reconnects.</span></span>
+              <input className="inp inp-sans" value={form.status_file} onChange={e => set("status_file", e.target.value)} placeholder=".proxy.update.json"/>
+            </label>
+          </div>
+        </Card>
+
+        <Card title="Last Update Status" actions={<CopyBtn text={JSON.stringify(update, null, 2)} label="Copy JSON"/>}>
+          <div className="kv">
+            {rows.map(([label, value]) => (
+              <React.Fragment key={label}>
+                <div className="k">{label}</div>
+                <div className="v mono update-line"><span className="update-message">{value}</span></div>
+              </React.Fragment>
+            ))}
+            {latest.error && (
+              <>
+                <div className="k">Check error</div>
+                <div className="v mono update-line"><span className="update-message">{latest.error}</span></div>
+              </>
+            )}
+          </div>
+        </Card>
+      </div>
+    </section>
+  );
+};
+
 // ─────────────────────────── LOGS ───────────────────────────
 
 const Logs = ({ proxyState }) => {

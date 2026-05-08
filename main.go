@@ -414,6 +414,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/antigravity", requireAdmin(cfg, handleUIAntigravityStatus))
 	mux.HandleFunc("/ui/api/antigravity/probe", requireAdmin(cfg, handleUIAntigravityProbe))
 	mux.HandleFunc("/ui/api/update/status", requireAdmin(cfg, handleUIUpdateStatus(cfg)))
+	mux.HandleFunc("/ui/api/update/check", requireAdmin(cfg, handleUIUpdateCheck(cfg)))
 	mux.HandleFunc("/ui/api/update/start", requireAdmin(cfg, handleUIUpdateStart(cfg)))
 	mux.HandleFunc("/ui/api/update/settings", requireAdmin(cfg, handleUIUpdateSettings(cfg)))
 	mux.HandleFunc("/ui/api/proxy/stop", requireAdmin(cfg, handleUIStop))
@@ -1504,7 +1505,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		if cfg.Upstream == "codex" {
 			responsesReq := toResponses(cfg, in)
-			if decision := codexTokenLimitDecision(estimateAnthropicRequestTokens(in), in.MaxTokens); decision.Action != "" {
+			estimatedInput := max(estimateAnthropicRequestTokens(in), estimateCodexRequestTokens(responsesReq))
+			if decision := codexTokenLimitDecision(estimatedInput, in.MaxTokens); decision.Action != "" {
 				traceLogID(traceID, "codex.token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
 				applyTokenLimitHintStat(r, decision, in.Model, responsesReq.Model)
 				if decision.Action == "error" {
@@ -1575,7 +1577,8 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
-		if decision := codexTokenLimitDecision(estimateOpenAIChatRequestTokens(in), requestedOpenAIOutputTokens(in)); decision.Action != "" {
+		estimatedInput := max(estimateOpenAIChatRequestTokens(in), estimateCodexRequestTokens(out))
+		if decision := codexTokenLimitDecision(estimatedInput, requestedOpenAIOutputTokens(in)); decision.Action != "" {
 			applyTokenLimitHintStat(r, decision, in.Model, out.Model)
 			if decision.Action == "error" {
 				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
@@ -1640,7 +1643,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
 			return
 		}
-		if decision := codexTokenLimitDecision(estimateResponsesRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
+		if decision := codexTokenLimitDecision(estimateCodexRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
 			applyTokenLimitHintStat(r, decision, in.Model, in.Model)
 			if decision.Action == "error" {
 				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
@@ -2383,12 +2386,19 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 				return callCodexResponsesOnce(ctx, cfg, retry.request, false)
 			}
 		}
+		if isContextLengthError(msg) {
+			msg = codexContextLengthErrorMessage(msg, out)
+		}
 		return responsesResponse{}, resp.StatusCode, msg, fmt.Errorf("codex upstream returned %s", resp.Status)
 	}
 	collected := collectCodexStream(ctx, resp.Body, out.Model)
 	traceLog(ctx, "codex.collected", summarizeResponsesResponse(collected))
 	if strings.TrimSpace(collected.StreamError) != "" {
-		msg := "Codex upstream stream failed: " + strings.TrimSpace(collected.StreamError)
+		streamMsg := strings.TrimSpace(collected.StreamError)
+		msg := "Codex upstream stream failed: " + streamMsg
+		if isContextLengthError(streamMsg) {
+			msg = codexContextLengthErrorMessage(streamMsg, out)
+		}
 		traceLog(ctx, "codex.stream_failure", map[string]any{"error": truncateString(msg, traceBodyLimit)})
 		return responsesResponse{}, http.StatusBadGateway, msg, errors.New(msg)
 	}
@@ -2536,7 +2546,11 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
-		writeOpenAIError(w, resp.StatusCode, strings.TrimSpace(string(raw)))
+		msg := strings.TrimSpace(string(raw))
+		if isContextLengthError(msg) {
+			msg = codexContextLengthErrorMessage(msg, out)
+		}
+		writeOpenAIError(w, resp.StatusCode, msg)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2622,7 +2636,11 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
-		writeOpenAIError(w, resp.StatusCode, strings.TrimSpace(string(raw)))
+		msg := strings.TrimSpace(string(raw))
+		if isContextLengthError(msg) {
+			msg = codexContextLengthErrorMessage(msg, out)
+		}
+		writeOpenAIError(w, resp.StatusCode, msg)
 		return
 	}
 	id := "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -3067,6 +3085,18 @@ func estimateResponsesRequestTokens(in responsesRequest) int {
 	return estimateTextTokensFromChars(chars)
 }
 
+func estimateCodexRequestTokens(in responsesRequest) int {
+	return max(estimateResponsesRequestTokens(in), estimateJSONTokens(codexRequestBody(in)))
+}
+
+func estimateJSONTokens(v any) int {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return estimateTextTokensFromChars(len(raw))
+}
+
 func estimateTextTokens(text string) int {
 	return estimateTextTokensFromChars(len(text))
 }
@@ -3138,6 +3168,24 @@ func tokenLimitHardText(decision tokenLimitDecision) string {
 
 func tokenLimitHintText(decision tokenLimitDecision) string {
 	return fmt.Sprintf("Context window warning: this request is estimated at %s tokens and is close to the live upstream limit of about %s tokens. Please compact the conversation now, then continue from the compacted summary. The proxy still advertises the full 1M model window, but this live backend currently needs compaction around %s tokens to avoid a context_length_exceeded failure.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit), formatTokenCount(decision.HintAt))
+}
+
+func isContextLengthError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "context_length_exceeded") ||
+		(strings.Contains(lower, "context") && strings.Contains(lower, "exceed"))
+}
+
+func codexContextLengthErrorMessage(upstreamMsg string, out responsesRequest) string {
+	inputTokens := estimateCodexRequestTokens(out)
+	outputTokens := max(0, out.MaxOutputTokens)
+	totalTokens := inputTokens + outputTokens
+	hardLimit := envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit)
+	limitText := "the configured live backend limit"
+	if hardLimit > 0 {
+		limitText = "about " + formatTokenCount(hardLimit) + " tokens"
+	}
+	return fmt.Sprintf("Codex upstream stream failed: context_length_exceeded: the live backend rejected this request. The visible Claude UI token counter can be much lower than the hidden payload sent to the proxy. Proxy estimate: %s input tokens, %s requested output tokens, %s total, against %s. Please compact the conversation, then retry. Original upstream message: %s", formatTokenCount(inputTokens), formatTokenCount(outputTokens), formatTokenCount(totalTokens), limitText, strings.TrimSpace(upstreamMsg))
 }
 
 func formatTokenCount(tokens int) string {
@@ -4183,16 +4231,22 @@ func apiDocRoutes() []apiDocRoute {
 			ResponseSchema: "UIUpdateStatusResponse", ResponseExample: map[string]any{"current_version": "0.4.3", "latest_version": "0.4.4", "update_available": true, "auto_update": false, "state": "idle", "running": false},
 		},
 		{
+			Group: "Admin control panel", OperationID: "checkDashboardUpdate", Method: http.MethodPost, Path: "/ui/api/update/check", Summary: "Check for updates", Auth: apiDocAuthAdmin,
+			Description:     "Refreshes the configured VERSION URL and returns the current update status without starting an update.",
+			ResponseSchema:  "UIUpdateStartResponse",
+			ResponseExample: map[string]any{"ok": true, "message": "Update check complete.", "update": map[string]any{"current_version": "0.4.3", "latest_version": "0.4.4", "update_available": true}},
+		},
+		{
 			Group: "Admin control panel", OperationID: "startDashboardUpdate", Method: http.MethodPost, Path: "/ui/api/update/start", Summary: "Start non-interactive update", Auth: apiDocAuthAdmin,
 			Description:    "Starts update-linux.sh in the background with a status file so the dashboard can reconnect after the service restarts.",
 			ResponseSchema: "UIUpdateStartResponse", ResponseExample: map[string]any{"ok": true, "message": "Update started.", "update": map[string]any{"state": "queued", "running": true}},
 		},
 		{
 			Group: "Admin control panel", OperationID: "saveDashboardUpdateSettings", Method: http.MethodPost, Path: "/ui/api/update/settings", Summary: "Save update settings", Auth: apiDocAuthAdmin,
-			Description:   "Enables or disables automatic app updates from the configured GitHub branch.",
+			Description:   "Saves automatic-update, branch, VERSION URL, repository path, status-file path, and full-system updater options.",
 			RequestSchema: "UIUpdateSettingsRequest", ResponseSchema: "UIUpdateSettingsResponse",
-			RequestExample:  map[string]any{"auto_update": true},
-			ResponseExample: map[string]any{"ok": true, "auto_update": true, "update": map[string]any{"auto_update": true}},
+			RequestExample:  map[string]any{"auto_update": true, "full_system_update": false, "branch": "main", "version_url": defaultVersionURL, "repo_dir": "/root/claude-code-proxy", "status_file": "/opt/connect-ai-proxy/.proxy.update.json"},
+			ResponseExample: map[string]any{"ok": true, "auto_update": true, "full_system_update": false, "update": map[string]any{"auto_update": true}},
 		},
 		{
 			Group: "Admin control panel", OperationID: "getUIConfig", Method: http.MethodGet, Path: "/ui/api/config", Summary: "Read editable proxy config", Auth: apiDocAuthAdmin,
@@ -4706,10 +4760,10 @@ func openAPISchemas() map[string]any {
 		"UIAuthStatusResponse":         schemaObject(map[string]any{"configured": schemaBoolean("Admin auth is configured."), "authenticated": schemaBoolean("Current request has a valid admin cookie."), "username": schemaString("Configured admin username.")}, "configured", "authenticated", "username"),
 		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password.")}, "username", "password"),
 		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "version": schemaString("Installed proxy version."), "update": anyMap, "local_url": schemaString("Local control panel URL."), "public_url": schemaString("Public reverse-proxy URL when configured."), "display_url": schemaString("Preferred URL for the control panel to show."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "host": schemaString("Local bind host."), "port": schemaString("Local port."), "bind_url": schemaString("Local bind address."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
-		"UIUpdateStatusResponse":       schemaOpenObject(map[string]any{"current_version": schemaString("Installed proxy version."), "latest_version": schemaString("Latest version from GitHub."), "update_available": schemaBoolean("A newer version is available."), "auto_update": schemaBoolean("Automatic app updates are enabled."), "state": schemaString("idle, queued, running, succeeded, or failed."), "phase": schemaString("Current update phase."), "message": schemaString("Human-readable update status."), "running": schemaBoolean("An update is currently active."), "updated_at": schemaString("Last status update time."), "started_at": schemaString("Update start time."), "finished_at": schemaString("Update finish time."), "repo_dir": schemaString("Repository directory used by the updater."), "branch": schemaString("Git branch used by the updater."), "status_file": schemaString("Machine-readable status file path."), "latest": anyMap}),
+		"UIUpdateStatusResponse":       schemaOpenObject(map[string]any{"current_version": schemaString("Installed proxy version."), "latest_version": schemaString("Latest version from GitHub."), "update_available": schemaBoolean("A newer version is available."), "auto_update": schemaBoolean("Automatic app updates are enabled."), "full_system_update": schemaBoolean("Manual dashboard updates may run the full system updater."), "state": schemaString("idle, queued, running, succeeded, or failed."), "phase": schemaString("Current update phase."), "message": schemaString("Human-readable update status."), "running": schemaBoolean("An update is currently active."), "updated_at": schemaString("Last status update time."), "started_at": schemaString("Update start time."), "finished_at": schemaString("Update finish time."), "repo_dir": schemaString("Repository directory used by the updater."), "branch": schemaString("Git branch used by the updater."), "version_url": schemaString("VERSION URL checked for newer releases."), "status_file": schemaString("Machine-readable status file path."), "latest": anyMap}),
 		"UIUpdateStartResponse":        schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether the update was queued."), "message": schemaString("Human-readable status."), "update": anyMap}),
-		"UIUpdateSettingsRequest":      schemaObject(map[string]any{"auto_update": schemaBoolean("Enable automatic app updates.")}, "auto_update"),
-		"UIUpdateSettingsResponse":     schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether settings were saved."), "auto_update": schemaBoolean("Automatic update setting."), "update": anyMap}),
+		"UIUpdateSettingsRequest":      schemaOpenObject(map[string]any{"auto_update": schemaBoolean("Enable automatic app updates."), "full_system_update": schemaBoolean("Allow manual dashboard updates to run the full system updater."), "branch": schemaString("Git branch used by the updater."), "version_url": schemaString("VERSION URL checked for newer releases."), "repo_dir": schemaString("Repository directory used by the updater."), "status_file": schemaString("Machine-readable status file path.")}),
+		"UIUpdateSettingsResponse":     schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether settings were saved."), "auto_update": schemaBoolean("Automatic update setting."), "full_system_update": schemaBoolean("Full system update setting."), "update": anyMap}),
 		"UIConfigResponse":             schemaObject(map[string]any{"config": stringMap, "secrets": stringMap, "aliases": schemaArray(modelAlias)}, "config", "secrets", "aliases"),
 		"UIConfigRequest":              schemaObject(map[string]any{"config": stringMap, "aliases": schemaArray(schemaObject(map[string]any{"From": schemaString("Alias."), "To": schemaString("Model id."), "Context": schemaString("Context label.")}))}),
 		"UIModelsResponse":             schemaOpenObject(map[string]any{"models": schemaArray(modelAlias), "ok": schemaBoolean("Whether save succeeded."), "message": schemaString("Status message.")}),
@@ -5869,6 +5923,15 @@ func autoUpdateEnabled() bool {
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
+func dashboardFullSystemUpdateEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(firstNonEmpty(os.Getenv("PROXY_DASHBOARD_FULL_SYSTEM_UPDATE"), readEnvMap()["PROXY_DASHBOARD_FULL_SYSTEM_UPDATE"])))
+	return v == "" || v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func updateVersionURL() string {
+	return firstNonEmpty(os.Getenv("PROXY_UPDATE_VERSION_URL"), readEnvMap()["PROXY_UPDATE_VERSION_URL"], defaultVersionURL)
+}
+
 func updateStatusPayload(cfg config) map[string]any {
 	maybeRefreshLatestVersion()
 	state := readUpdateState()
@@ -5885,8 +5948,10 @@ func updateStatusPayload(cfg config) map[string]any {
 	state["latest_version"] = latestVersion
 	state["update_available"] = updateAvailable
 	state["auto_update"] = autoUpdateEnabled()
+	state["full_system_update"] = dashboardFullSystemUpdateEnabled()
 	state["repo_dir"] = updateRepoDir()
 	state["branch"] = updateBranch()
+	state["version_url"] = updateVersionURL()
 	state["status_file"] = updateStatusFilePath()
 	state["latest"] = latest
 	state["public_url"] = cfg.PublicURL
@@ -5980,10 +6045,7 @@ func maybeRefreshLatestVersion() {
 }
 
 func refreshLatestVersion() {
-	url := strings.TrimSpace(os.Getenv("PROXY_UPDATE_VERSION_URL"))
-	if url == "" {
-		url = defaultVersionURL
-	}
+	url := updateVersionURL()
 	client := http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Get(url)
 	version := ""
@@ -6098,6 +6160,17 @@ func handleUIUpdateStart(cfg config) http.HandlerFunc {
 	}
 }
 
+func handleUIUpdateCheck(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		refreshLatestVersion()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Update check complete.", "update": updateStatusPayload(cfg)})
+	}
+}
+
 func handleUIUpdateSettings(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -6105,24 +6178,57 @@ func handleUIUpdateSettings(cfg config) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			AutoUpdate bool `json:"auto_update"`
+			AutoUpdate       *bool   `json:"auto_update"`
+			FullSystemUpdate *bool   `json:"full_system_update"`
+			Branch           *string `json:"branch"`
+			VersionURL       *string `json:"version_url"`
+			RepoDir          *string `json:"repo_dir"`
+			StatusFile       *string `json:"status_file"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
 		current := readEnvMap()
-		if body.AutoUpdate {
-			current["PROXY_AUTO_UPDATE"] = "1"
-		} else {
-			current["PROXY_AUTO_UPDATE"] = "0"
+		changed := []string{}
+		setBool := func(key string, value *bool) {
+			if value == nil {
+				return
+			}
+			if *value {
+				current[key] = "1"
+			} else {
+				current[key] = "0"
+			}
+			changed = append(changed, key)
 		}
+		setString := func(key string, value *string) {
+			if value == nil {
+				return
+			}
+			current[key] = strings.TrimSpace(*value)
+			changed = append(changed, key)
+		}
+		setBool("PROXY_AUTO_UPDATE", body.AutoUpdate)
+		setBool("PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", body.FullSystemUpdate)
+		setString("PROXY_UPDATE_BRANCH", body.Branch)
+		setString("PROXY_UPDATE_VERSION_URL", body.VersionURL)
+		setString("PROXY_UPDATE_REPO_DIR", body.RepoDir)
+		setString("PROXY_UPDATE_STATUS_FILE", body.StatusFile)
 		if err := writeEnvMap(current); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		syncProcessEnvKeys(current, "PROXY_AUTO_UPDATE")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "auto_update": body.AutoUpdate, "update": updateStatusPayload(cfg)})
+		syncProcessEnvKeys(current, changed...)
+		if body.VersionURL != nil {
+			refreshLatestVersion()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":                 true,
+			"auto_update":        autoUpdateEnabled(),
+			"full_system_update": dashboardFullSystemUpdateEnabled(),
+			"update":             updateStatusPayload(cfg),
+		})
 	}
 }
 
@@ -6145,7 +6251,7 @@ func startDashboardUpdate(cfg config, source string) error {
 	statusFile := updateStatusFilePath()
 	branch := updateBranch()
 	cmdText := fmt.Sprintf("cd %s && chmod +x update-linux.sh install-linux.sh && ./update-linux.sh -y --branch %s --status-file %s", shellQuote(repoDir), shellQuote(branch), shellQuote(statusFile))
-	if source == "auto" || strings.EqualFold(os.Getenv("PROXY_DASHBOARD_FULL_SYSTEM_UPDATE"), "0") {
+	if source == "auto" || !dashboardFullSystemUpdateEnabled() {
 		cmdText += " --no-system-upgrade --skip-go-latest"
 	}
 	if runtime.GOOS == "linux" {

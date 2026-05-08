@@ -38,10 +38,11 @@
       { id: "models",    label: "Models",          icon: "models",    kbd: "3", badge: "8" },
       { id: "keys",      label: "API keys",        icon: "key",       kbd: "4" },
       { id: "test",      label: "Test request",    icon: "test",      kbd: "5" },
-      { id: "logs",      label: "Logs",            icon: "logs",      kbd: "6", badge: "live" },
-      { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "7" },
-      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "8" },
-      { id: "docs",      label: "API Docs",        icon: "book",      kbd: "9", href: "/docs" },
+      { id: "updates",   label: "Updates",         icon: "download",  kbd: "6" },
+      { id: "logs",      label: "Logs",            icon: "logs",      kbd: "7", badge: "live" },
+      { id: "browser",   label: "Antigravity browser", icon: "setup", kbd: "8" },
+      { id: "setup",     label: "Claude Code setup", icon: "setup",   kbd: "9" },
+      { id: "docs",      label: "API Docs",        icon: "book",      kbd: "D", href: "/docs" },
     ];
 
     function LoginScreen({ auth, onAuthenticated }) {
@@ -128,6 +129,10 @@
             }
             setRoute(navItem.id);
           }
+          if (e.key.toLowerCase() === "d") {
+            const docs = NAV.find(n => n.id === "docs");
+            if (docs?.href) window.open(docs.href, "_blank", "noopener,noreferrer");
+          }
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
@@ -163,6 +168,10 @@
           if (action === "update") {
             await api.post("/ui/api/update/start");
             pushToast("Update started · waiting for reconnect");
+          }
+          if (action === "check-update") {
+            await api.post("/ui/api/update/check");
+            pushToast("Update check complete");
           }
           if (action === "toggle-auto-update") {
             const enabled = !liveStatus?.update?.auto_update;
@@ -276,6 +285,7 @@
             {route === "models"    && <Models pushToast={pushToast}/>}
             {route === "keys"      && <ApiKeys pushToast={pushToast} liveStatus={liveStatus}/>}
             {route === "test"      && <TestRequest/>}
+            {route === "updates"   && <Updates liveStatus={liveStatus} statusError={statusError} pushToast={pushToast} refreshStatus={refreshStatus} onAction={handleAction}/>}
             {route === "logs"      && <Logs proxyState={t.proxyState}/>}
             {route === "browser"   && <BrowserBridge/>}
             {route === "setup"     && <Setup/>}

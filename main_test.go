@@ -223,7 +223,7 @@ func TestDocumentationRoutesPublicAndValid(t *testing.T) {
 	if !ok {
 		t.Fatalf("openapi paths missing: %#v", openAPI["paths"])
 	}
-	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities", "/openai/v1/chat/completions", "/ui/api/status", "/ui/api/update/status", "/ui/api/update/start", "/ui/api/update/settings"} {
+	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/model-capabilities", "/openai/v1/model-capabilities", "/openai/v1/chat/completions", "/ui/api/status", "/ui/api/update/status", "/ui/api/update/check", "/ui/api/update/start", "/ui/api/update/settings"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("openapi path %s missing", path)
 		}
@@ -295,6 +295,7 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 		"POST /ui/api/auth/logout",
 		"GET /ui/api/status",
 		"GET /ui/api/update/status",
+		"POST /ui/api/update/check",
 		"POST /ui/api/update/start",
 		"POST /ui/api/update/settings",
 		"GET /ui/api/config",
@@ -340,6 +341,7 @@ func TestAPIDocumentationManifestCoverageAndAuth(t *testing.T) {
 	assertAuth(http.MethodGet, "/ui/api/auth/status", apiDocAuthPublic)
 	assertAuth(http.MethodGet, "/ui/api/status", apiDocAuthAdmin)
 	assertAuth(http.MethodGet, "/ui/api/update/status", apiDocAuthAdmin)
+	assertAuth(http.MethodPost, "/ui/api/update/check", apiDocAuthAdmin)
 	assertAuth(http.MethodPost, "/ui/api/update/start", apiDocAuthAdmin)
 	assertAuth(http.MethodPost, "/ui/api/update/settings", apiDocAuthAdmin)
 }
@@ -488,13 +490,13 @@ func TestCodexTokenLimitGuardReturnsCompactHint(t *testing.T) {
 	restoreProxyEnabled := proxyEnabled.Load()
 	proxyEnabled.Store(true)
 	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
-	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
-	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "50")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "400")
 
 	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
 	handler := newProxyMux(cfg)
 
-	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":1,"messages":[{"role":"user","content":"`+strings.Repeat("x", 44)+`"}]}`))
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":1,"messages":[{"role":"user","content":"`+strings.Repeat("x", 220)+`"}]}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -509,13 +511,13 @@ func TestCodexTokenLimitGuardAppliesToRequestedOutput(t *testing.T) {
 	restoreProxyEnabled := proxyEnabled.Load()
 	proxyEnabled.Store(true)
 	t.Cleanup(func() { proxyEnabled.Store(restoreProxyEnabled) })
-	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "10")
-	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "20")
+	t.Setenv("CODEX_UPSTREAM_HINT_TOKENS", "60")
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "400")
 
 	cfg := config{Upstream: "codex", Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
 	handler := newProxyMux(cfg)
 
-	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":12,"messages":[{"role":"user","content":"hi"}]}`))
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"sonnet[1m]","max_tokens":70,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -544,6 +546,22 @@ func TestCodexTokenLimitGuardHardLimitKeepsContextError(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "context_length_exceeded") {
 		t.Fatalf("body missing context error: %s", rec.Body.String())
+	}
+}
+
+func TestCodexContextLengthErrorMessageExplainsVisibleCounterGap(t *testing.T) {
+	t.Setenv("CODEX_UPSTREAM_HARD_TOKENS", "260000")
+	msg := codexContextLengthErrorMessage("context_length_exceeded: Your input exceeds the context window.", responsesRequest{
+		Model:           "gpt-5.5",
+		Instructions:    strings.Repeat("read this carefully ", 20),
+		Input:           []any{map[string]any{"role": "user", "content": strings.Repeat("x", 1024)}},
+		MaxOutputTokens: 128,
+	})
+	if !strings.Contains(msg, "visible Claude UI token counter") {
+		t.Fatalf("message does not explain hidden payload gap: %s", msg)
+	}
+	if !strings.Contains(msg, "Original upstream message") {
+		t.Fatalf("message omits original upstream error: %s", msg)
 	}
 }
 
