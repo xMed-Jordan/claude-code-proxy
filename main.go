@@ -60,8 +60,8 @@ const (
 	antigravityExtensionID = "eeijfnjmjelapkebgockoeaadonbchdd"
 	appVersionFallback     = "0.0.0-dev"
 	defaultVersionURL      = "https://raw.githubusercontent.com/xMed-Jordan/claude-code-proxy/main/VERSION"
-	defaultTokenHintAt     = 250000
-	defaultTokenHardLimit  = 1050000
+	defaultTokenHardLimit  = 200000
+	defaultCodexWindow     = 200000
 )
 
 type updateLatestCache struct {
@@ -1508,12 +1508,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 			estimatedInput := max(estimateAnthropicRequestTokens(in), estimateCodexRequestTokens(responsesReq))
 			if decision := codexTokenLimitDecision(estimatedInput, in.MaxTokens); decision.Action != "" {
 				traceLogID(traceID, "codex.token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
-				applyTokenLimitHintStat(r, decision, in.Model, responsesReq.Model)
-				if decision.Action == "error" {
-					writeAnthropicError(w, http.StatusBadGateway, decision.Message)
-				} else {
-					writeAnthropicTokenLimitHint(w, in.Model, decision)
-				}
+				applyTokenLimitErrorStat(r, decision, in.Model, responsesReq.Model)
+				writeAnthropicError(w, http.StatusBadGateway, decision.Message)
 				return
 			}
 			session := configureCodexSession(cfg, r, rawBody, in, &responsesReq)
@@ -1579,12 +1575,8 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		out := openAIChatToResponses(cfg, in)
 		estimatedInput := max(estimateOpenAIChatRequestTokens(in), estimateCodexRequestTokens(out))
 		if decision := codexTokenLimitDecision(estimatedInput, requestedOpenAIOutputTokens(in)); decision.Action != "" {
-			applyTokenLimitHintStat(r, decision, in.Model, out.Model)
-			if decision.Action == "error" {
-				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
-			} else {
-				writeOpenAIChatTokenLimitHint(w, firstNonEmpty(in.Model, out.Model), decision)
-			}
+			applyTokenLimitErrorStat(r, decision, in.Model, out.Model)
+			writeOpenAIError(w, http.StatusBadGateway, decision.Message)
 			return
 		}
 		session := configureOpenAICompatibleSession(cfg, r, in, &out)
@@ -1644,12 +1636,8 @@ func handleResponses(cfg config) http.HandlerFunc {
 			return
 		}
 		if decision := codexTokenLimitDecision(estimateCodexRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
-			applyTokenLimitHintStat(r, decision, in.Model, in.Model)
-			if decision.Action == "error" {
-				writeOpenAIError(w, http.StatusBadGateway, decision.Message)
-			} else {
-				writeOpenAIResponsesTokenLimitHint(w, in.Model, decision)
-			}
+			applyTokenLimitErrorStat(r, decision, in.Model, in.Model)
+			writeOpenAIError(w, http.StatusBadGateway, decision.Message)
 			return
 		}
 		session := configureResponsesCustomSession(cfg, r, &in)
@@ -2386,11 +2374,6 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 				return callCodexResponsesOnce(ctx, cfg, retry.request, false)
 			}
 		}
-		if isContextLengthError(msg) {
-			decision := codexContextLengthHintDecision(msg, out)
-			traceLog(ctx, "codex.context_length_hint", map[string]any{"status": resp.StatusCode, "input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
-			return tokenLimitResponsesResponse(out.Model, decision), http.StatusOK, "", nil
-		}
 		return responsesResponse{}, resp.StatusCode, msg, fmt.Errorf("codex upstream returned %s", resp.Status)
 	}
 	collected := collectCodexStream(ctx, resp.Body, out.Model)
@@ -2398,11 +2381,6 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 	if strings.TrimSpace(collected.StreamError) != "" {
 		streamMsg := strings.TrimSpace(collected.StreamError)
 		msg := "Codex upstream stream failed: " + streamMsg
-		if isContextLengthError(streamMsg) {
-			decision := codexContextLengthHintDecision(streamMsg, out)
-			traceLog(ctx, "codex.stream_context_length_hint", map[string]any{"input_tokens": decision.InputTokens, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
-			return tokenLimitResponsesResponse(out.Model, decision), http.StatusOK, "", nil
-		}
 		traceLog(ctx, "codex.stream_failure", map[string]any{"error": truncateString(msg, traceBodyLimit)})
 		return responsesResponse{}, http.StatusBadGateway, msg, errors.New(msg)
 	}
@@ -2551,16 +2529,6 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		msg := strings.TrimSpace(string(raw))
-		if isContextLengthError(msg) {
-			decision := codexContextLengthHintDecision(msg, out)
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.WriteHeader(http.StatusOK)
-			sendEvent(w, "response.output_text.delta", responsesStreamEvent{Type: "response.output_text.delta", Delta: decision.Message, OutputIndex: 0})
-			sendEvent(w, "response.completed", responsesStreamEvent{Type: "response.completed", Response: tokenLimitResponsesResponse(out.Model, decision)})
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			return
-		}
 		writeOpenAIError(w, resp.StatusCode, msg)
 		return
 	}
@@ -2593,16 +2561,6 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 		}
 		if text := codexStreamText(event); text != "" {
 			outputText.WriteString(text)
-			if decision := codexTokenLimitDecision(0, estimateTextTokens(outputText.String())); decision.Action == "hint" {
-				traceLog(ctx, "codex.responses_raw.output_token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
-				sendEvent(w, "response.output_text.delta", responsesStreamEvent{Type: "response.output_text.delta", Delta: decision.Message, OutputIndex: 0})
-				sendEvent(w, "response.completed", responsesStreamEvent{Type: "response.completed", Response: tokenLimitResponsesResponse(out.Model, decision)})
-				fmt.Fprint(w, "data: [DONE]\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
-				return true
-			}
 		}
 		return false
 	}
@@ -2648,19 +2606,6 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		msg := strings.TrimSpace(string(raw))
-		if isContextLengthError(msg) {
-			decision := codexContextLengthHintDecision(msg, out)
-			id := "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-			created := time.Now().Unix()
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"role": "assistant"}, nil)
-			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": decision.Message}, nil)
-			stop := "stop"
-			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{}, &stop)
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			return
-		}
 		writeOpenAIError(w, resp.StatusCode, msg)
 		return
 	}
@@ -2690,13 +2635,6 @@ func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesReque
 		}
 		if text := codexStreamText(event); text != "" {
 			outputText.WriteString(text)
-			if decision := codexTokenLimitDecision(0, estimateTextTokens(outputText.String())); decision.Action == "hint" {
-				sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": decision.Message}, nil)
-				if flusher != nil {
-					flusher.Flush()
-				}
-				break
-			}
 			sendOpenAIChatChunk(w, id, created, out.Model, map[string]any{"content": text}, nil)
 			if flusher != nil {
 				flusher.Flush()
@@ -2815,10 +2753,6 @@ func collectCodexStream(ctx context.Context, r io.Reader, model string) response
 		}
 		if delta := codexStreamText(event); delta != "" {
 			text.WriteString(delta)
-			if decision := codexTokenLimitDecision(0, estimateTextTokens(text.String())); decision.Action == "hint" {
-				traceLog(ctx, "codex.output_token_limit_guard", map[string]any{"action": decision.Action, "reason": decision.Reason, "output_tokens": decision.OutputTokens, "total_tokens": decision.TotalTokens})
-				return tokenLimitResponsesResponse(model, decision)
-			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -3135,60 +3069,33 @@ type tokenLimitDecision struct {
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
-	HintAt       int
 	HardLimit    int
 	Message      string
 }
 
 func codexTokenLimitDecision(inputTokens, requestedOutputTokens int) tokenLimitDecision {
-	hintAt := envIntDefault("CODEX_UPSTREAM_HINT_TOKENS", defaultTokenHintAt)
 	hardLimit := envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit)
-	if hintAt <= 0 && hardLimit <= 0 {
+	if hardLimit <= 0 || !codexBlockAtHardEnabled() {
 		return tokenLimitDecision{}
-	}
-	if hardLimit > 0 && hintAt > hardLimit {
-		hintAt = hardLimit
 	}
 	outputTokens := max(0, requestedOutputTokens)
 	totalTokens := inputTokens + outputTokens
-	decision := tokenLimitDecision{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, HintAt: hintAt, HardLimit: hardLimit}
+	decision := tokenLimitDecision{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, HardLimit: hardLimit}
 	switch {
-	case hardLimit > 0 && inputTokens >= hardLimit && codexBlockAtHardEnabled():
+	case inputTokens >= hardLimit:
 		decision.Action = "error"
 		decision.Reason = "input"
-	case hardLimit > 0 && outputTokens >= hardLimit && codexBlockAtHardEnabled():
+	case outputTokens >= hardLimit:
 		decision.Action = "error"
 		decision.Reason = "output"
-	case hardLimit > 0 && totalTokens >= hardLimit && codexBlockAtHardEnabled():
+	case totalTokens >= hardLimit:
 		decision.Action = "error"
-		decision.Reason = "total"
-	case hardLimit > 0 && inputTokens >= hardLimit:
-		decision.Action = "hint"
-		decision.Reason = "input"
-	case hardLimit > 0 && outputTokens >= hardLimit:
-		decision.Action = "hint"
-		decision.Reason = "output"
-	case hardLimit > 0 && totalTokens >= hardLimit:
-		decision.Action = "hint"
-		decision.Reason = "total"
-	case hintAt > 0 && inputTokens >= hintAt:
-		decision.Action = "hint"
-		decision.Reason = "input"
-	case hintAt > 0 && outputTokens >= hintAt:
-		decision.Action = "hint"
-		decision.Reason = "output"
-	case hintAt > 0 && totalTokens >= hintAt:
-		decision.Action = "hint"
 		decision.Reason = "total"
 	}
 	if decision.Action == "" {
 		return tokenLimitDecision{}
 	}
-	if decision.Action == "error" {
-		decision.Message = tokenLimitHardText(decision)
-	} else {
-		decision.Message = tokenLimitHintText(decision)
-	}
+	decision.Message = tokenLimitHardText(decision)
 	return decision
 }
 
@@ -3197,45 +3104,13 @@ func codexBlockAtHardEnabled() bool {
 }
 
 func tokenLimitHardText(decision tokenLimitDecision) string {
-	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: context_length_exceeded preflight block. This request is estimated at %s tokens against the live upstream limit of about %s tokens. Compact or summarize the conversation context now, then retry the user's task with a smaller prompt or output budget.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit))
-}
-
-func tokenLimitHintText(decision tokenLimitDecision) string {
-	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: this request is estimated at %s tokens. The proxy compaction hint threshold is %s tokens, while GPT-5.5's advertised context window is %s tokens with up to 128k output tokens. Compact or summarize the conversation context now, then continue the user's task from the compacted summary. Do not treat this as the final answer to the human user.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HintAt), formatTokenCount(decision.HardLimit))
+	return fmt.Sprintf("context_length_exceeded: request is estimated at %s tokens against the configured hard limit of %s tokens.", formatTokenCount(decision.TotalTokens), formatTokenCount(decision.HardLimit))
 }
 
 func isContextLengthError(msg string) bool {
 	lower := strings.ToLower(msg)
 	return strings.Contains(lower, "context_length_exceeded") ||
 		(strings.Contains(lower, "context") && strings.Contains(lower, "exceed"))
-}
-
-func codexContextLengthErrorMessage(upstreamMsg string, out responsesRequest) string {
-	inputTokens := estimateCodexRequestTokens(out)
-	outputTokens := max(0, out.MaxOutputTokens)
-	totalTokens := inputTokens + outputTokens
-	hardLimit := envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit)
-	limitText := "the configured live backend limit"
-	if hardLimit > 0 {
-		limitText = "about " + formatTokenCount(hardLimit) + " tokens"
-	}
-	return fmt.Sprintf("Agent recovery instruction, not a user-facing reply: the live backend rejected this request as too large. The visible Claude UI token counter can be much lower than the hidden payload sent to the proxy because tool history, transformed request JSON, and child-agent context are included upstream. Proxy estimate: %s input tokens, %s requested output tokens, %s total, against %s. Compact or summarize the conversation context now, then continue the user's task from the compacted summary. Do not treat this as the final answer to the human user. Original upstream message: %s", formatTokenCount(inputTokens), formatTokenCount(outputTokens), formatTokenCount(totalTokens), limitText, strings.TrimSpace(upstreamMsg))
-}
-
-func codexContextLengthHintDecision(upstreamMsg string, out responsesRequest) tokenLimitDecision {
-	inputTokens := estimateCodexRequestTokens(out)
-	outputTokens := max(0, out.MaxOutputTokens)
-	totalTokens := inputTokens + outputTokens
-	return tokenLimitDecision{
-		Action:       "hint",
-		Reason:       "upstream_context_length",
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  totalTokens,
-		HintAt:       envIntDefault("CODEX_UPSTREAM_HINT_TOKENS", defaultTokenHintAt),
-		HardLimit:    envIntDefault("CODEX_UPSTREAM_HARD_TOKENS", defaultTokenHardLimit),
-		Message:      codexContextLengthErrorMessage(upstreamMsg, out),
-	}
 }
 
 func formatTokenCount(tokens int) string {
@@ -3264,53 +3139,8 @@ func requestedOpenAIOutputTokens(in openAIRequest) int {
 	return max(in.MaxTokens, in.MaxCompletionTokens)
 }
 
-func writeAnthropicTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
-	outputTokens := estimateTextTokens(decision.Message)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":            "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-		"type":          "message",
-		"role":          "assistant",
-		"model":         model,
-		"content":       []map[string]any{{"type": "text", "text": decision.Message}},
-		"stop_reason":   "end_turn",
-		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": decision.InputTokens, "output_tokens": outputTokens},
-	})
-}
-
-func writeOpenAIChatTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
-	outputTokens := estimateTextTokens(decision.Message)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":      "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": decision.Message}, "finish_reason": "stop"}},
-		"usage":   map[string]any{"prompt_tokens": decision.InputTokens, "completion_tokens": outputTokens, "total_tokens": decision.InputTokens + outputTokens},
-	})
-}
-
-func writeOpenAIResponsesTokenLimitHint(w http.ResponseWriter, model string, decision tokenLimitDecision) {
-	writeJSON(w, http.StatusOK, responsesToOpenAIResponse(tokenLimitResponsesResponse(model, decision)))
-}
-
-func tokenLimitResponsesResponse(model string, decision tokenLimitDecision) responsesResponse {
-	resp := responsesResponse{
-		ID:    "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-		Model: model,
-		Output: []responsesOutputItem{{
-			Type:    "message",
-			Role:    "assistant",
-			Content: []responsesOutputContent{{Type: "output_text", Text: decision.Message}},
-		}},
-	}
-	resp.Usage.InputTokens = decision.InputTokens
-	resp.Usage.OutputTokens = estimateTextTokens(decision.Message)
-	return resp
-}
-
-func applyTokenLimitHintStat(r *http.Request, decision tokenLimitDecision, model, upstream string) {
-	setRequestStat(r, requestStat{Model: model, Upstream: upstream, InputTokens: decision.InputTokens, OutputTokens: estimateTextTokens(decision.Message), StopReason: "token_limit_hint"})
+func applyTokenLimitErrorStat(r *http.Request, decision tokenLimitDecision, model, upstream string) {
+	setRequestStat(r, requestStat{Model: model, Upstream: upstream, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, StopReason: "context_length_exceeded"})
 }
 
 func safeToolActivityInput(input any) any {
@@ -4181,9 +4011,9 @@ func apiDocRoutes() []apiDocRoute {
 		},
 		{
 			Group: "Anthropic-compatible", OperationID: "listAnthropicModelCapabilities", Method: http.MethodGet, Path: "/anthropic/v1/model-capabilities", Summary: "List Claude-compatible model token limits", Auth: apiDocAuthProxy,
-			Description:    "Lists exposed model aliases with upstream model ids, context windows, maximum input budget, and maximum output tokens.",
+			Description:    "Lists exposed model aliases with upstream model ids, the active context window, maximum input budget, and maximum output tokens.",
 			Headers:        []apiDocParam{anthropicVersionHeader},
-			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "sonnet[1m]", "type": "model_capability", "display_name": "sonnet[1m]", "upstream_model": "gpt-5.5", "context": "1m", "context_window_tokens": 1000000, "max_input_tokens": 872000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
+			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "sonnet[1m]", "type": "model_capability", "display_name": "sonnet[1m]", "upstream_model": "gpt-5.5", "context": "200k", "context_window_tokens": 200000, "max_input_tokens": 72000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
 		},
 		{
 			Group: "Anthropic-compatible", OperationID: "createAnthropicMessage", Method: http.MethodPost, Path: "/anthropic/v1/messages", Summary: "Create a Claude-compatible message", Auth: apiDocAuthProxy,
@@ -4206,8 +4036,8 @@ func apiDocRoutes() []apiDocRoute {
 		},
 		{
 			Group: "OpenAI-compatible", OperationID: "listOpenAIModelCapabilities", Method: http.MethodGet, Path: "/openai/v1/model-capabilities", Summary: "List OpenAI-compatible model token limits", Auth: apiDocAuthProxy,
-			Description:    "Lists exposed model aliases with upstream model ids, context windows, maximum input budget, and maximum output tokens.",
-			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "gpt-5.3-codex", "type": "model_capability", "display_name": "gpt-5.3-codex", "upstream_model": "gpt-5.3-codex", "context": "1m", "context_window_tokens": 1000000, "max_input_tokens": 872000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
+			Description:    "Lists exposed model aliases with upstream model ids, the active context window, maximum input budget, and maximum output tokens.",
+			ResponseSchema: "ModelCapabilitiesResponse", ResponseExample: map[string]any{"object": "list", "units": "tokens", "data": []map[string]any{{"id": "gpt-5.3-codex", "type": "model_capability", "display_name": "gpt-5.3-codex", "upstream_model": "gpt-5.3-codex", "context": "200k", "context_window_tokens": 200000, "max_input_tokens": 72000, "max_output_tokens": 128000, "limits_known": true, "limits_source": "built_in"}}},
 		},
 		{
 			Group: "OpenAI-compatible", OperationID: "createChatCompletion", Method: http.MethodPost, Path: "/openai/v1/chat/completions", Summary: "Create an OpenAI-compatible chat completion", Auth: apiDocAuthProxy,
@@ -4778,7 +4608,7 @@ func openAPISchemas() map[string]any {
 		"alias":                 schemaString("Local model alias."),
 		"upstream_model":        schemaString("Resolved upstream model id."),
 		"context":               schemaString("Configured context label."),
-		"context_window_tokens": schemaInteger("Maximum context window in tokens."),
+		"context_window_tokens": schemaInteger("Active context window advertised to clients."),
 		"max_input_tokens":      schemaInteger("Maximum input budget after reserving output tokens."),
 		"max_output_tokens":     schemaInteger("Maximum output tokens for one request."),
 		"limits_known":          schemaBoolean("Whether the proxy has a known output limit for this upstream model."),
@@ -4799,7 +4629,7 @@ func openAPISchemas() map[string]any {
 		"HealthResponse":               schemaObject(map[string]any{"ok": schemaBoolean("Process is reachable."), "proxy_running": schemaBoolean("Proxy endpoints are enabled.")}, "ok", "proxy_running"),
 		"ModelListResponse":            schemaObject(map[string]any{"object": schemaString("list"), "data": schemaArray(modelRow)}, "object", "data"),
 		"ModelCapabilitiesResponse":    schemaObject(map[string]any{"object": schemaString("list"), "data": schemaArray(modelCapabilityRow), "units": schemaString("Token unit label.")}, "object", "data", "units"),
-		"AnthropicMessageRequest":      schemaOpenObject(map[string]any{"model": schemaString("Claude-compatible model alias."), "max_tokens": schemaInteger("Maximum output tokens."), "system": anyValue, "messages": schemaArray(message), "tools": schemaArray(anyMap), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "speed": schemaString("Optional speed hint."), "output_config": anyMap}, "model", "messages"),
+		"AnthropicMessageRequest":      schemaOpenObject(map[string]any{"model": schemaString("Claude-compatible model alias."), "max_tokens": schemaInteger("Maximum output tokens."), "system": anyValue, "messages": schemaArray(message), "tools": schemaArray(anyMap), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "speed": schemaString("Optional speed setting."), "output_config": anyMap}, "model", "messages"),
 		"AnthropicMessageResponse":     schemaOpenObject(map[string]any{"id": schemaString("Message id."), "type": schemaString("message"), "role": schemaString("assistant"), "content": schemaArray(anyMap), "model": schemaString("Requested model alias."), "stop_reason": schemaString("Stop reason."), "stop_sequence": anyValue, "usage": anyMap}),
 		"CountTokensResponse":          schemaObject(map[string]any{"input_tokens": schemaInteger("Approximate input token count.")}, "input_tokens"),
 		"OpenAIChatCompletionRequest":  schemaOpenObject(map[string]any{"model": schemaString("OpenAI-compatible model id or local alias."), "messages": schemaArray(message), "tools": schemaArray(anyMap), "max_tokens": schemaInteger("Maximum output tokens."), "max_completion_tokens": schemaInteger("Maximum output tokens."), "temperature": map[string]any{"type": "number"}, "stream": schemaBoolean("Enable SSE streaming."), "reasoning_effort": schemaString("Optional reasoning effort."), "user": schemaString("Optional user/session id."), "metadata": anyMap, "extra_body": anyValue}, "model", "messages"),
@@ -6888,7 +6718,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HINT_TOKENS", "CODEX_UPSTREAM_HARD_TOKENS", "CODEX_UPSTREAM_BLOCK_AT_HARD", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HARD_TOKENS", "CODEX_UPSTREAM_BLOCK_AT_HARD", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
 	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {
@@ -7089,7 +6919,10 @@ func modelRows(cfg config) []map[string]any {
 			continue
 		}
 		context := contextForAlias(cfg, alias)
-		contextWindow := contextWindowTokensForLabel(context)
+		contextWindow := contextWindowTokensForModelContext(cfg, context)
+		if strings.EqualFold(strings.TrimSpace(cfg.Upstream), "codex") {
+			context = "200k"
+		}
 		maxOutput, limitsSource := maxOutputTokensForModel(real)
 		maxInput := contextWindow
 		if maxOutput > 0 {
@@ -7188,6 +7021,13 @@ func contextWindowTokensForLabel(context string) int {
 		return n
 	}
 	return 200000
+}
+
+func contextWindowTokensForModelContext(cfg config, context string) int {
+	if strings.EqualFold(strings.TrimSpace(cfg.Upstream), "codex") {
+		return defaultCodexWindow
+	}
+	return contextWindowTokensForLabel(context)
 }
 
 func maxOutputTokensForModel(model string) (int, string) {
