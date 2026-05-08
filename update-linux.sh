@@ -12,6 +12,7 @@ STATUS_FILE=""
 REPO_URL="https://github.com/xMed-Jordan/claude-code-proxy.git"
 BRANCH="main"
 ORIGINAL_ARGS=("$@")
+SERVICE_STOPPED_FOR_UPDATE=0
 
 script_usage() {
   cat <<USAGE
@@ -158,6 +159,24 @@ mark_update_failed() {
   write_update_status "failed" "failed" "Update failed near line ${line}. Check update-linux.sh output or journal logs."
 }
 
+recover_service_after_failed_update() {
+  [[ "${SERVICE_STOPPED_FOR_UPDATE:-0}" -eq 1 ]] || return 0
+  [[ "${DRY_RUN:-0}" -eq 1 ]] && return 0
+  command_exists systemctl || return 0
+  warn "Update failed after stopping ${SERVICE_NAME}; attempting to start it again."
+  if run_sudo systemctl start "${SERVICE_NAME}"; then
+    write_update_status "failed" "recovered" "Update failed, but ${SERVICE_NAME} was started again."
+  else
+    warn "Could not restart ${SERVICE_NAME}; run: systemctl start ${SERVICE_NAME}"
+  fi
+}
+
+handle_update_error() {
+  local line="$1"
+  mark_update_failed "${line}"
+  recover_service_after_failed_update
+}
+
 update_system_packages() {
   if [[ "${NO_SYSTEM_UPGRADE}" -eq 1 ]]; then
     log "Skipping OS package upgrade."
@@ -300,10 +319,12 @@ reinstall_proxy_from_current_checkout() {
   done < <(current_install_args)
 
   if command_exists systemctl; then
+    SERVICE_STOPPED_FOR_UPDATE=1
     run_sudo systemctl stop "${SERVICE_NAME}" || true
   fi
   log "Rebuilding and reinstalling ${APP_NAME} from the updated checkout."
   run bash "${HELPER_DIR}/install-linux.sh" install "${install_args[@]}"
+  SERVICE_STOPPED_FOR_UPDATE=0
 }
 
 reload_caddy_if_present() {
@@ -356,7 +377,7 @@ run_health_checks() {
 main_update() {
   [[ "$(uname -s)" == "Linux" ]] || die "this script is only for Linux"
   parse_update_args "$@"
-  trap 'mark_update_failed "${LINENO}"' ERR
+  trap 'handle_update_error "${LINENO}"' ERR
   write_update_status "running" "starting" "Preparing update."
   require_sudo
   detect_install_user
