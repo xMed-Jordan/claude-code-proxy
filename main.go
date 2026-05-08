@@ -2295,7 +2295,7 @@ func newCodexRequest(ctx context.Context, cfg config, path string, body any) (*h
 	if err != nil {
 		return nil, err
 	}
-	raw, _ := json.Marshal(body)
+	raw, _ := json.Marshal(codexRequestBody(body))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CodexBaseURL+path, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
@@ -2308,6 +2308,23 @@ func newCodexRequest(ctx context.Context, cfg config, path string, body any) (*h
 		req.Header.Set("ChatGPT-Account-ID", auth.Tokens.AccountID)
 	}
 	return req, nil
+}
+
+func codexRequestBody(body any) any {
+	switch v := body.(type) {
+	case responsesRequest:
+		v.MaxOutputTokens = 0
+		return v
+	case *responsesRequest:
+		if v == nil {
+			return body
+		}
+		next := *v
+		next.MaxOutputTokens = 0
+		return next
+	default:
+		return body
+	}
 }
 
 func callCodex(ctx context.Context, cfg config, out responsesRequest, requestedModel string, w http.ResponseWriter, r *http.Request) {
@@ -2402,6 +2419,10 @@ func retryCodexRequestAfter400(out responsesRequest, status int, msg string) (co
 	if out.PromptCacheKey != "" && strings.Contains(lower, "prompt_cache_key") {
 		out.PromptCacheKey = ""
 		return codexRetryRequest{reason: "prompt_cache_key_not_accepted", request: out}, true
+	}
+	if out.MaxOutputTokens != 0 && strings.Contains(lower, "max_output_tokens") {
+		out.MaxOutputTokens = 0
+		return codexRetryRequest{reason: "max_output_tokens_not_accepted", request: out}, true
 	}
 	if out.Temperature != nil && strings.Contains(lower, "temperature") {
 		out.Temperature = nil

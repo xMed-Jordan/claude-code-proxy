@@ -547,6 +547,23 @@ func TestCodexTokenLimitGuardHardLimitKeepsContextError(t *testing.T) {
 	}
 }
 
+func TestCodexRequestBodyStripsMaxOutputTokens(t *testing.T) {
+	body := codexRequestBody(responsesRequest{
+		Model:           "gpt-5.5",
+		Input:           []any{"hello"},
+		MaxOutputTokens: 1234,
+		Stream:          true,
+		Store:           false,
+	})
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal sanitized body: %v", err)
+	}
+	if strings.Contains(string(raw), "max_output_tokens") {
+		t.Fatalf("codex request leaked unsupported max_output_tokens: %s", raw)
+	}
+}
+
 func TestAnthropicNamespaceStreamingRoute(t *testing.T) {
 	restoreProxyEnabled := proxyEnabled.Load()
 	proxyEnabled.Store(true)
