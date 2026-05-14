@@ -1705,6 +1705,9 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 	if hasWebSearch {
 		out.Instructions = strings.TrimSpace(out.Instructions + "\n\nUse the built-in web search tool when current web information is needed. Return cited source links in the final answer.")
 	}
+	if len(in.Tools) > 0 {
+		out.Instructions = strings.TrimSpace(out.Instructions + "\n\n" + noFakeToolJSONGuard)
+	}
 	for _, msg := range in.Messages {
 		role := msg.Role
 		if role != "user" && role != "assistant" && role != "system" {
@@ -2870,8 +2873,9 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 			}
 		case "message":
 			for _, part := range item.Content {
-				if part.Text != "" {
-					content = append(content, map[string]any{"type": "text", "text": part.Text})
+				cleaned := stripFabricatedToolJSON(part.Text)
+				if cleaned != "" {
+					content = append(content, map[string]any{"type": "text", "text": cleaned})
 				}
 			}
 		case "function_call":
@@ -3498,7 +3502,11 @@ func responsesToOpenAIResponse(resp responsesResponse) map[string]any {
 func toOpenAI(cfg config, in anthropicRequest) (openAIRequest, error) {
 	model := resolveModel(cfg, in.Model)
 	out := openAIRequest{Model: model, MaxTokens: in.MaxTokens, Temperature: in.Temperature, Stream: in.Stream, ReasoningEffort: requestReasoningEffort(cfg, in)}
-	if sys := contentToText(in.System); sys != "" {
+	sys := contentToText(in.System)
+	if len(in.Tools) > 0 {
+		sys = strings.TrimSpace(sys + "\n\n" + noFakeToolJSONGuard)
+	}
+	if sys != "" {
 		out.Messages = append(out.Messages, openAIMessage{Role: "system", Content: sys})
 	}
 	for _, msg := range in.Messages {
@@ -3835,7 +3843,7 @@ func toAnthropicResponse(resp openAIResponse, requestedModel string) map[string]
 		if s, ok := map[string]string{"tool_calls": "tool_use", "length": "max_tokens", "stop": "end_turn"}[choice.FinishReason]; ok {
 			stopReason = s
 		}
-		if text := contentToText(choice.Message.Content); text != "" {
+		if text := stripFabricatedToolJSON(contentToText(choice.Message.Content)); text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 		for _, tc := range choice.Message.ToolCalls {
@@ -3871,6 +3879,92 @@ func contentToText(v any) string {
 	default:
 		return fmt.Sprint(x)
 	}
+}
+
+// noFakeToolJSONGuard is appended to the upstream system prompt whenever the
+// request carries tool definitions. It prevents the upstream model (e.g. GPT
+// behind the proxy) from imitating tool-result JSON in its text output, which
+// has been observed to leak fabricated IDs and prices into customer replies.
+const noFakeToolJSONGuard = "OUTPUT FORMAT RULE (HARD): Never emit JSON objects in your text content that mimic tool messages. Do not write text containing JSON with the keys \"tool_call\", \"tool_response\", \"tool_result\", or \"tool_use\". To invoke a tool, use the function/tool-call API only — do not narrate or rehearse it as JSON text. When citing data from tool results, paraphrase the values in natural language; do not reconstruct or invent JSON blocks. Never invent identifiers, package_ids, prices, amounts, dates, or any factual value that is not present verbatim in a real tool result message you have already received in this conversation."
+
+// stripFabricatedToolJSON removes standalone JSON objects from text that contain
+// any of the keys "tool_call", "tool_response", "tool_result", "tool_use". These
+// are hallucinated tool-shaped blobs that the upstream model sometimes writes as
+// text instead of using the proper tool/function-call mechanism. Leaving them in
+// the assistant text leaks fabricated data to end users.
+func stripFabricatedToolJSON(text string) string {
+	if text == "" || !containsFakeToolMarker(text) {
+		return text
+	}
+	runes := []rune(text)
+	n := len(runes)
+	var out strings.Builder
+	out.Grow(len(text))
+	stripped := 0
+	i := 0
+	for i < n {
+		if runes[i] == '{' {
+			if end, ok := matchJSONBrace(runes, i); ok {
+				block := string(runes[i : end+1])
+				if containsFakeToolMarker(block) {
+					stripped++
+					i = end + 1
+					for i < n && (runes[i] == ' ' || runes[i] == '\t' || runes[i] == '\n' || runes[i] == '\r') {
+						i++
+					}
+					continue
+				}
+			}
+		}
+		out.WriteRune(runes[i])
+		i++
+	}
+	cleaned := strings.TrimSpace(out.String())
+	if stripped > 0 {
+		log.Printf("proxy: stripped %d fabricated tool-shaped JSON block(s) from upstream text output", stripped)
+	}
+	return cleaned
+}
+
+func containsFakeToolMarker(s string) bool {
+	return strings.Contains(s, `"tool_call"`) ||
+		strings.Contains(s, `"tool_response"`) ||
+		strings.Contains(s, `"tool_result"`) ||
+		strings.Contains(s, `"tool_use"`)
+}
+
+func matchJSONBrace(runes []rune, start int) (int, bool) {
+	depth := 0
+	inString := false
+	escape := false
+	for i := start; i < len(runes); i++ {
+		c := runes[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if inString {
+			switch c {
+			case '\\':
+				escape = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func newSSEScanner(r io.Reader) *bufio.Scanner {
