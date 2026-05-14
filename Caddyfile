@@ -1,0 +1,10 @@
+{
+	email hrashdan.22@gmail.com
+	http_port 80
+	https_port 443
+}
+
+ai-api1.cus.cx {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:4000
+}
