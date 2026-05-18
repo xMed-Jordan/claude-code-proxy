@@ -59,6 +59,12 @@ func runCLI(args []string) (bool, error) {
 		return true, installStartup()
 	case "uninstall-startup":
 		return true, uninstallStartup()
+	case "refresh-token":
+		return true, runRefreshCodexToken()
+	case "install-token-refresh":
+		return true, installTokenRefreshTimer()
+	case "uninstall-token-refresh":
+		return true, uninstallTokenRefreshTimer()
 	case "hook-worktree-create":
 		return true, runHookWorktreeCreate()
 	case "hook-worktree-remove":
@@ -90,7 +96,10 @@ func printCLIHelp() {
   build [--all]                  Build current or all platform binaries
   package-extension              Build the local MCPB/DXT browser package
   install-startup                Install optional per-user autostart
-  uninstall-startup              Remove optional per-user autostart`)
+  uninstall-startup              Remove optional per-user autostart
+  refresh-token                  Refresh Codex auth.json (no-op if still fresh)
+  install-token-refresh          Install systemd timer that refreshes auth.json every 6h (Linux root)
+  uninstall-token-refresh        Remove the auto-refresh systemd timer`)
 }
 
 func runServe() error {
@@ -100,6 +109,10 @@ func runServe() error {
 	}
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
+	// Auto-provision the Codex token refresh timer (Linux root only). First
+	// run after a binary upgrade silently installs the systemd timer so
+	// /root/.codex/auth.json keeps itself fresh without operator action.
+	ensureTokenRefreshTimer()
 	mux := newProxyMux(cfg)
 	server := &http.Server{Addr: net.JoinHostPort(cfg.Host, cfg.Port), Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
 	fmt.Printf("connect-ai-proxy listening on http://%s\n", server.Addr)
