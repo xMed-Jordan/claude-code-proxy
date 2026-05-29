@@ -872,60 +872,31 @@ install_browser_dependencies() {
   warn "Install the Antigravity Chrome extension in the browser profile before using browser MCP tools. Extension ID: eeijfnjmjelapkebgockoeaadonbchdd"
 }
 
-ensure_python_dependencies() {
-  log "Verifying Python package manager and sidecar dependencies."
-  if ! command_exists python3; then
-    package_install python3
-  fi
-
-  # Install python3-venv on Debian/Ubuntu systems for virtual environment support
-  if [[ "${PKG_MANAGER}" == "apt" ]]; then
-    if ! dpkg -s python3-venv >/dev/null 2>&1; then
-      log "Installing python3-venv for virtual environment support."
-      package_install python3-venv
-    fi
-  fi
-
-  # Ensure the install directory exists and is owned by INSTALL_USER before creating the venv
-  run_sudo mkdir -p "${INSTALL_DIR}"
-  run_sudo chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
-
-  # Create virtual environment if it doesn't exist
-  if [[ ! -d "${INSTALL_DIR}/.venv" ]]; then
-    log "Creating Python virtual environment in ${INSTALL_DIR}/.venv."
-    run_as_install_user python3 -m venv "${INSTALL_DIR}/.venv" || {
-      warn "Failed to create Python virtual environment. Falling back to system/user Python."
+ensure_antigravity_cli() {
+  log "Verifying Antigravity CLI installation."
+  
+  local home_dir="${INSTALL_HOME}"
+  local agy_bin="${home_dir}/.local/bin/agy"
+  
+  if ! run_as_install_user test -f "${agy_bin}"; then
+    log "Antigravity CLI (agy) not found at ${agy_bin}. Installing..."
+    run_as_install_user bash -c "curl -fsSL https://antigravity.google/cli/install.sh | bash" || {
+      warn "Failed to install Antigravity CLI automatically. Please install it manually from https://antigravity.google."
     }
-  fi
-
-  if [[ -d "${INSTALL_DIR}/.venv" ]]; then
-    log "Installing Python gateway dependencies in virtual environment..."
-    run_as_install_user "${INSTALL_DIR}/.venv/bin/pip" install --upgrade fastapi uvicorn pydantic || {
-      warn "Failed to install dependencies in virtual environment."
-    }
-    # Try to install google-antigravity but don't fail if private/unavailable
-    run_as_install_user "${INSTALL_DIR}/.venv/bin/pip" install --upgrade google-antigravity || true
   else
-    # Fallback: install pip and install packages globally/user-wide
-    if ! command_exists pip && ! command_exists pip3; then
-      local pip_pkg="python3-pip"
-      if [[ "${PKG_MANAGER}" == "apk" ]]; then
-        pip_pkg="py3-pip"
-      fi
-      log "Installing Python pip package: ${pip_pkg}."
-      package_install "${pip_pkg}"
-    fi
-    local pip_cmd="pip"
-    if command_exists pip3; then
-      pip_cmd="pip3"
-    fi
-    if command_exists "${pip_cmd}"; then
-      log "Installing Python gateway dependencies (fastapi, uvicorn, pydantic)..."
-      run_as_install_user python3 -m pip install --upgrade fastapi uvicorn pydantic || true
-      run_as_install_user python3 -m pip install --upgrade google-antigravity || true
-    else
-      warn "pip is still not available; Python dependencies will be auto-installed by Go proxy on first run."
-    fi
+    log "Antigravity CLI (agy) is already installed."
+  fi
+  
+  log "--------------------------------------------------------"
+  log "Please make sure you are logged into Antigravity CLI."
+  log "If this is a new installation or you are not authenticated,"
+  log "please run the following command in a separate terminal:"
+  log "  agy login"
+  log "or authenticate via the URL printed by agy."
+  log "Once authenticated, press [ENTER] to continue..."
+  log "--------------------------------------------------------"
+  if [[ "${DRY_RUN}" -ne 1 ]]; then
+    read -p "Press [ENTER] after logging into Antigravity..."
   fi
 }
 
@@ -1218,7 +1189,7 @@ install_all() {
   detect_os_and_package_manager
 	resolve_install_choices
 	install_base_dependencies
-	ensure_python_dependencies
+	ensure_antigravity_cli
 	ensure_node_runtime
 	ensure_claude_code_cli
 	ensure_go

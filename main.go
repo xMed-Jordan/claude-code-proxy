@@ -1529,6 +1529,10 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		applyCustomSessionToOpenAIRequest(r, &out)
 		if hasProviderRoute && route.Provider != "" {
+			if strings.ToLower(route.Provider) == "antigravity" {
+				callAntigravityCLI(ctx, cfg, out, in.Model, in.Stream, "anthropic", w, r)
+				return
+			}
 			traceLogID(traceID, "openai_compatible.prepared", summarizeOpenAIRequest(out))
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: firstNonEmpty(route.Provider, out.Model), Stream: in.Stream})
 			setRequestNote(r, requestNote(in.Model, out.Model, in.Stream, out.ReasoningEffort)+" provider="+route.Provider+" trace="+traceID)
@@ -1612,6 +1616,10 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		}
 		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: route.Provider, Stream: in.Stream})
+			if strings.ToLower(route.Provider) == "antigravity" {
+				callAntigravityCLI(r.Context(), cfg, in, in.Model, in.Stream, "openai", w, r)
+				return
+			}
 			proxyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
@@ -1687,6 +1695,10 @@ func handleResponses(cfg config) http.HandlerFunc {
 		in.Store = false
 		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: route.Provider, Stream: in.Stream})
+			if strings.ToLower(route.Provider) == "antigravity" {
+				callAntigravityCLI(r.Context(), cfg, responsesRequestToOpenAI(in), in.Model, in.Stream, "responses", w, r)
+				return
+			}
 			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
 			return
 		}
@@ -7500,6 +7512,472 @@ func resolveModel(cfg config, model string) string {
 		return mapped
 	}
 	return cleanModel(model)
+}
+
+func responsesRequestToOpenAI(in responsesRequest) openAIRequest {
+	out := openAIRequest{
+		Model:  in.Model,
+		Stream: in.Stream,
+	}
+	if in.Instructions != "" {
+		out.Messages = append(out.Messages, openAIMessage{
+			Role:    "system",
+			Content: in.Instructions,
+		})
+	}
+	for _, item := range in.Input {
+		if m, ok := item.(map[string]any); ok {
+			role := stringField(m, "role")
+			content := m["content"]
+			if role == "" {
+				role = stringField(m, "type")
+				if strings.HasPrefix(role, "input_") {
+					role = strings.TrimPrefix(role, "input_")
+				}
+				if role == "image" {
+					role = "user"
+					content = []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": stringField(m, "image_url")}}}
+				}
+			}
+			msg := openAIMessage{
+				Role:    role,
+				Content: content,
+			}
+			if role == "tool" {
+				msg.ToolCallID = stringField(m, "call_id")
+			}
+			out.Messages = append(out.Messages, msg)
+		}
+	}
+	return out
+}
+
+func findAgyPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		path := filepath.Join(home, ".local", "bin", "agy")
+		if runtime.GOOS == "windows" {
+			path = filepath.Join(home, "AppData", "Local", "Programs", "agy", "agy.exe")
+		}
+		if fileExists(path) {
+			return path
+		}
+	}
+	if fileExists("/root/.local/bin/agy") {
+		return "/root/.local/bin/agy"
+	}
+	if p, err := exec.LookPath("agy"); err == nil {
+		return p
+	}
+	return "agy"
+}
+
+func writeAntigravityCLIModel(cfg config, requestedModel, effort string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
+	
+	targetModel := "Gemini 3.1 Pro (High)"
+	resolved := strings.ToLower(resolveModel(cfg, requestedModel))
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	
+	isPro := strings.Contains(resolved, "pro") || strings.Contains(resolved, "opus") || strings.Contains(resolved, "sonnet")
+	if isPro {
+		if effort == "low" || effort == "minimal" {
+			targetModel = "Gemini 3.1 Pro (Low)"
+		} else {
+			targetModel = "Gemini 3.1 Pro (High)"
+		}
+	} else {
+		if effort == "low" || effort == "minimal" {
+			targetModel = "Gemini 3.5 Flash (Low)"
+		} else if effort == "high" || effort == "xhigh" || effort == "max" {
+			targetModel = "Gemini 3.5 Flash (High)"
+		} else {
+			targetModel = "Gemini 3.5 Flash (Medium)"
+		}
+	}
+	
+	var settings map[string]any
+	if fileExists(settingsPath) {
+		data, err := os.ReadFile(settingsPath)
+		if err == nil {
+			_ = json.Unmarshal(data, &settings)
+		}
+	}
+	if settings == nil {
+		settings = make(map[string]any)
+	}
+	settings["model"] = targetModel
+	settings["toolPermission"] = "always-proceed"
+	if _, ok := settings["colorScheme"]; !ok {
+		settings["colorScheme"] = "dark"
+	}
+	
+	updated, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	_ = os.MkdirAll(filepath.Dir(settingsPath), 0700)
+	return os.WriteFile(settingsPath, updated, 0600)
+}
+
+func extractBase64DataAndExt(part map[string]any) ([]byte, string, error) {
+	if imgUrl, ok := part["image_url"].(map[string]any); ok {
+		if urlStr, ok := imgUrl["url"].(string); ok {
+			return parseDataURL(urlStr)
+		}
+	}
+	if urlStr, ok := part["image_url"].(string); ok {
+		return parseDataURL(urlStr)
+	}
+	
+	if source, ok := part["source"].(map[string]any); ok {
+		if stringField(source, "type") == "base64" {
+			mediaType := stringField(source, "media_type")
+			dataStr := stringField(source, "data")
+			ext := ".jpg"
+			if strings.Contains(mediaType, "png") {
+				ext = ".png"
+			} else if strings.Contains(mediaType, "webp") {
+				ext = ".webp"
+			} else if strings.Contains(mediaType, "pdf") {
+				ext = ".pdf"
+			} else if strings.Contains(mediaType, "mp4") {
+				ext = ".mp4"
+			}
+			dec, err := base64.StdEncoding.DecodeString(dataStr)
+			return dec, ext, err
+		}
+	}
+	
+	if fileObj, ok := part["file"].(map[string]any); ok {
+		filename := stringField(fileObj, "filename")
+		ext := filepath.Ext(filename)
+		if ext == "" {
+			ext = ".pdf"
+		}
+		dataStr := stringField(fileObj, "file_data")
+		dec, err := base64.StdEncoding.DecodeString(dataStr)
+		return dec, ext, err
+	}
+	
+	return nil, "", fmt.Errorf("unsupported file block")
+}
+
+func parseDataURL(urlStr string) ([]byte, string, error) {
+	if !strings.HasPrefix(urlStr, "data:") {
+		return nil, "", fmt.Errorf("not a data URL")
+	}
+	comma := strings.Index(urlStr, ",")
+	if comma == -1 {
+		return nil, "", fmt.Errorf("invalid data URL")
+	}
+	header := urlStr[:comma]
+	dataStr := urlStr[comma+1:]
+	
+	ext := ".jpg"
+	if strings.Contains(header, "image/png") {
+		ext = ".png"
+	} else if strings.Contains(header, "image/webp") {
+		ext = ".webp"
+	} else if strings.Contains(header, "application/pdf") {
+		ext = ".pdf"
+	} else if strings.Contains(header, "video/mp4") {
+		ext = ".mp4"
+	}
+	
+	dec, err := base64.StdEncoding.DecodeString(dataStr)
+	return dec, ext, err
+}
+
+func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, requestedModel string, stream bool, format string, w http.ResponseWriter, r *http.Request) {
+	var tempFiles []string
+	defer func() {
+		for _, path := range tempFiles {
+			_ = os.Remove(path)
+		}
+	}()
+
+	var systemPrompt string
+	var transcriptBuilder strings.Builder
+	for _, msg := range in.Messages {
+		role := strings.ToLower(msg.Role)
+		if role == "system" {
+			systemPrompt = contentToText(msg.Content)
+			continue
+		}
+		var contentText string
+		if str, ok := msg.Content.(string); ok {
+			contentText = str
+		} else if parts, ok := msg.Content.([]any); ok {
+			var partsTexts []string
+			for _, p := range parts {
+				if m, ok := p.(map[string]any); ok {
+					pType := stringField(m, "type")
+					if pType == "text" {
+						partsTexts = append(partsTexts, stringField(m, "text"))
+					} else {
+						dec, ext, err := extractBase64DataAndExt(m)
+						if err == nil {
+							tempFile, err := os.CreateTemp("", "ccp_file_*" + ext)
+							if err == nil {
+								_, _ = tempFile.Write(dec)
+								_ = tempFile.Close()
+								tempFiles = append(tempFiles, tempFile.Name())
+								partsTexts = append(partsTexts, fmt.Sprintf(" [Attached file: %s] ", tempFile.Name()))
+							}
+						}
+					}
+				}
+			}
+			contentText = strings.Join(partsTexts, "")
+		} else {
+			contentText = contentToText(msg.Content)
+		}
+		
+		roleLabel := "User"
+		if role == "assistant" {
+			roleLabel = "Assistant"
+		}
+		transcriptBuilder.WriteString(roleLabel + ": " + contentText + "\n\n")
+	}
+
+	var finalPromptBuilder strings.Builder
+	if systemPrompt != "" {
+		finalPromptBuilder.WriteString("System instructions:\n" + systemPrompt + "\n\n")
+	}
+	finalPromptBuilder.WriteString("Below is the conversation transcript between a User and an Assistant. Please continue the conversation as the Assistant.\n\n")
+	finalPromptBuilder.WriteString(transcriptBuilder.String())
+	finalPromptBuilder.WriteString("Assistant:")
+	prompt := finalPromptBuilder.String()
+
+	inputTokens := estimateOpenAIChatRequestTokens(in)
+
+	if err := writeAntigravityCLIModel(cfg, requestedModel, in.ReasoningEffort); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to update settings: " + err.Error())
+		return
+	}
+
+	agyPath := findAgyPath()
+	cmd := exec.Command(agyPath, "--dangerously-skip-permissions", "-p", prompt)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to get stdout: " + err.Error())
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to start agy: " + err.Error())
+		return
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	readChan := make(chan readResult)
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stdoutPipe.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				readChan <- readResult{data: chunk}
+			}
+			if err != nil {
+				readChan <- readResult{err: err}
+				close(readChan)
+				return
+			}
+		}
+	}()
+
+	var completionText strings.Builder
+	hasReceivedData := false
+	silenceTimeout := 2500 * time.Millisecond
+	var silenceTimer *time.Timer
+
+	respID := "chatcmpl-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	modelLabel := firstNonEmpty(requestedModel, "Gemini 3.5 Flash")
+
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		if format == "anthropic" {
+			sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}
+
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+loop:
+	for {
+		var timeoutChan <-chan time.Time
+		if hasReceivedData {
+			if silenceTimer == nil {
+				silenceTimer = time.NewTimer(silenceTimeout)
+			} else {
+				silenceTimer.Reset(silenceTimeout)
+			}
+			timeoutChan = silenceTimer.C
+		}
+
+		select {
+		case res, ok := <-readChan:
+			if !ok {
+				break loop
+			}
+			if res.err != nil {
+				break loop
+			}
+			if len(res.data) > 0 {
+				hasReceivedData = true
+				textChunk := string(res.data)
+				completionText.WriteString(textChunk)
+				
+				if stream {
+					if format == "anthropic" {
+						sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": textChunk}})
+					} else {
+						chunkJSON, _ := json.Marshal(map[string]any{
+							"id":      respID,
+							"object":  "chat.completion.chunk",
+							"created": time.Now().Unix(),
+							"model":   modelLabel,
+							"choices": []any{
+								map[string]any{
+									"index":         0,
+									"delta":         map[string]any{"content": textChunk},
+									"finish_reason": nil,
+								},
+							},
+						})
+						fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+					}
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				}
+			}
+		case <-timeoutChan:
+			break loop
+		case <-ctx.Done():
+			break loop
+		}
+	}
+
+	outputTokens := estimateTextTokens(completionText.String())
+	updateRequestStat(r, func(stat *requestStat) {
+		stat.InputTokens = inputTokens
+		stat.OutputTokens = outputTokens
+		stat.StopReason = "stop"
+		stat.Upstream = "antigravity"
+	})
+
+	if stream {
+		if format == "anthropic" {
+			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+			sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
+			sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		} else {
+			chunkJSON, _ := json.Marshal(map[string]any{
+				"id":      respID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   modelLabel,
+				"choices": []any{
+					map[string]any{
+						"index":         0,
+						"delta":         map[string]any{},
+						"finish_reason": "stop",
+					},
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}
+	} else {
+		if format == "anthropic" {
+			resp := map[string]any{
+				"id":      "msg_" + respID,
+				"type":    "message",
+				"role":    "assistant",
+				"model":   modelLabel,
+				"content": []any{map[string]any{"type": "text", "text": completionText.String()}},
+				"stop_reason":   "end_turn",
+				"stop_sequence": nil,
+				"usage": map[string]any{
+					"input_tokens":  inputTokens,
+					"output_tokens": outputTokens,
+				},
+			}
+			writeJSON(w, http.StatusOK, resp)
+		} else if format == "responses" {
+			resp := map[string]any{
+				"id":     respID,
+				"object": "response",
+				"model":  modelLabel,
+				"choices": []any{
+					map[string]any{
+						"index": 0,
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": completionText.String(),
+						},
+						"finish_reason": "stop",
+					},
+				},
+				"usage": map[string]any{
+					"input_tokens":  inputTokens,
+					"output_tokens": outputTokens,
+					"total_tokens":  inputTokens + outputTokens,
+				},
+			}
+			writeJSON(w, http.StatusOK, resp)
+		} else {
+			resp := map[string]any{
+				"id":      respID,
+				"object":  "chat.completion",
+				"created": time.Now().Unix(),
+				"model":   modelLabel,
+				"choices": []any{
+					map[string]any{
+						"index": 0,
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": completionText.String(),
+						},
+						"finish_reason": "stop",
+					},
+				},
+				"usage": map[string]any{
+					"prompt_tokens":     inputTokens,
+					"completion_tokens": outputTokens,
+					"total_tokens":      inputTokens + outputTokens,
+				},
+			}
+			writeJSON(w, http.StatusOK, resp)
+		}
+	}
 }
 
 func requestUpstream(cfg config, r *http.Request, requestedModel string) string {
