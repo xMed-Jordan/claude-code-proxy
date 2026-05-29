@@ -1108,16 +1108,16 @@ func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
 func requireAuth(cfg config, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.ProxyKey != "" && cfg.ProxyKey != "YOUR_PROXY_TOKEN" {
-			if proxyRequestHasKey(r, cfg.ProxyKey) {
-				next(w, r)
-				return
-			}
 			if route, ok := lookupClientKeyRoute(cfg, r); ok {
 				if !clientKeySchemaAllowsPath(route.Schema, r.URL.Path) {
 					writeSchemaAuthError(w, r, route.Schema)
 					return
 				}
 				requestProviderKeys.Store(r, route)
+				next(w, r)
+				return
+			}
+			if proxyRequestHasKey(r, cfg.ProxyKey) {
 				next(w, r)
 				return
 			}
