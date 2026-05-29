@@ -909,6 +909,7 @@ assert_safe_install_dir() {
 build_proxy() {
   log "Building ${APP_NAME}."
   run mkdir -p "${REPO_DIR}/bin"
+  cd "${REPO_DIR}" || die "failed to enter ${REPO_DIR}"
   run env PATH="/usr/local/go/bin:${PATH}" go mod download
   run env PATH="/usr/local/go/bin:${PATH}" go build -o "${REPO_DIR}/bin/${APP_NAME}" .
 }
