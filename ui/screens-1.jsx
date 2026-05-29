@@ -403,7 +403,7 @@ const Configuration = ({ pushToast }) => {
           </div>
           <div className="ctl">
             <div className="seg">
-              {["codex", "openai"].map(opt => (
+              {["codex", "antigravity", "openai"].map(opt => (
                 <button key={opt} aria-pressed={cfg.UPSTREAM === opt} onClick={() => update("UPSTREAM", opt)}>
                   {opt}
                 </button>
@@ -413,6 +413,8 @@ const Configuration = ({ pushToast }) => {
               <Icon name="info" size={11}/>
               {cfg.UPSTREAM === "codex"
                 ? "Uses your Codex ChatGPT subscription via ~/.codex/auth.json."
+                : cfg.UPSTREAM === "antigravity"
+                ? "Uses Google Antigravity/Gemini API via your ANTIGRAVITY_API_KEY."
                 : "Uses a raw OpenAI API key. Codex-only models will be unavailable."}
             </div>
           </div>

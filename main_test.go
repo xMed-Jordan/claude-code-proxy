@@ -608,9 +608,9 @@ func TestOpenAINamespaceRoutesUseOpenAICompatibleUpstream(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/chat/completions":
-			_, _ = io.WriteString(w, `{"id":"chatcmpl_test","model":"gemini-3-flash-preview","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl_test","model":"custom-flash-preview","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
 		case "/responses":
-			_, _ = io.WriteString(w, `{"id":"resp_test","object":"response","status":"completed","model":"gemini-3-flash-preview","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+			_, _ = io.WriteString(w, `{"id":"resp_test","object":"response","status":"completed","model":"custom-flash-preview","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 		default:
 			t.Fatalf("unexpected upstream path %s", r.URL.Path)
 		}
@@ -621,18 +621,18 @@ func TestOpenAINamespaceRoutesUseOpenAICompatibleUpstream(t *testing.T) {
 		OpenAIAPIKey:  "sk-test",
 		OpenAIBaseURL: upstream.URL,
 		Upstream:      "openai",
-		Models:        map[string]string{"gemini-coder": "gemini-3-flash-preview"},
+		Models:        map[string]string{"custom-coder": "custom-flash-preview"},
 	}
 	handler := newProxyMux(cfg)
 
-	chatReq := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(`{"model":"gemini-coder","messages":[{"role":"user","content":"hi"}]}`))
+	chatReq := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(`{"model":"custom-coder","messages":[{"role":"user","content":"hi"}]}`))
 	chatRec := httptest.NewRecorder()
 	handler.ServeHTTP(chatRec, chatReq)
 	if chatRec.Code != http.StatusOK {
 		t.Fatalf("chat status = %d, want 200; body=%s", chatRec.Code, chatRec.Body.String())
 	}
 
-	respReq := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"gemini-coder","input":[{"role":"user","content":"hi"}]}`))
+	respReq := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"custom-coder","input":[{"role":"user","content":"hi"}]}`))
 	respRec := httptest.NewRecorder()
 	handler.ServeHTTP(respRec, respReq)
 	if respRec.Code != http.StatusOK {

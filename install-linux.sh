@@ -25,6 +25,8 @@ HTTPS_PORT="${DEFAULT_HTTPS_PORT}"
 INSTALL_KIND="ask"
 HTTPS_MODE="ask"
 BROWSER_TOOLS="ask"
+UPSTREAM_CHOICE="ask"
+GEMINI_API_KEY_CHOICE=""
 DOMAIN=""
 EMAIL=""
 PROXY_PUBLIC_URL=""
@@ -88,6 +90,8 @@ Options:
   --browser-tools        Install/configure Chrome or Chromium browser tools
   --no-browser-tools     Skip Chrome/Chromium and browser MCP setup
   --server               Use server-oriented defaults
+  --upstream UPSTREAM    Default upstream provider: codex, antigravity, or openai (default: ask)
+  --gemini-api-key KEY   Google Gemini/Antigravity API key to write to .env
   --local                Use local workstation defaults
   -h, --help             Show this help
 USAGE
@@ -112,6 +116,16 @@ parse_args() {
         shift
         [[ $# -gt 0 ]] || die "--install-dir needs a path"
         INSTALL_DIR="$1"
+        ;;
+      --upstream)
+        shift
+        [[ $# -gt 0 ]] || die "--upstream needs a provider"
+        UPSTREAM_CHOICE="$1"
+        ;;
+      --gemini-api-key)
+        shift
+        [[ $# -gt 0 ]] || die "--gemini-api-key needs a key"
+        GEMINI_API_KEY_CHOICE="$1"
         ;;
       --proxy-port)
         shift
@@ -715,6 +729,34 @@ resolve_install_choices() {
     fi
   fi
 
+  if [[ "${UPSTREAM_CHOICE}" == "ask" ]]; then
+    if prompt_yes_no "Set Google Antigravity (Gemini) as your default upstream? (If 'no', Codex/ChatGPT is used)" "no"; then
+      UPSTREAM_CHOICE="antigravity"
+    else
+      UPSTREAM_CHOICE="codex"
+    fi
+  fi
+
+  if [[ "${UPSTREAM_CHOICE}" == "antigravity" ]]; then
+    if [[ -z "${GEMINI_API_KEY_CHOICE}" ]]; then
+      local current_gemini_key=""
+      if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        current_gemini_key="$(get_env_value "${INSTALL_DIR}/.env" "GEMINI_API_KEY" || true)"
+      fi
+      GEMINI_API_KEY_CHOICE="$(prompt_value "Gemini/Antigravity API Key" "${current_gemini_key}")"
+    fi
+  else
+    if [[ -z "${GEMINI_API_KEY_CHOICE}" ]]; then
+      local current_gemini_key=""
+      if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        current_gemini_key="$(get_env_value "${INSTALL_DIR}/.env" "GEMINI_API_KEY" || true)"
+      fi
+      if [[ -n "${current_gemini_key}" ]] || prompt_yes_no "Configure a Gemini/Antigravity API Key for concurrent model routing?" "yes"; then
+        GEMINI_API_KEY_CHOICE="$(prompt_value "Gemini/Antigravity API Key (optional, press Enter to skip)" "${current_gemini_key}")"
+      fi
+    fi
+  fi
+
   if [[ "${HTTPS_MODE}" == "ask" ]]; then
     if prompt_yes_no "Do you need a static domain with HTTPS for this installation?" "no"; then
       HTTPS_MODE="yes"
@@ -803,6 +845,63 @@ install_browser_dependencies() {
   warn "Install the Antigravity Chrome extension in the browser profile before using browser MCP tools. Extension ID: eeijfnjmjelapkebgockoeaadonbchdd"
 }
 
+ensure_python_dependencies() {
+  log "Verifying Python package manager and sidecar dependencies."
+  if ! command_exists python3; then
+    package_install python3
+  fi
+
+  # Install python3-venv on Debian/Ubuntu systems for virtual environment support
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    if ! dpkg -s python3-venv >/dev/null 2>&1; then
+      log "Installing python3-venv for virtual environment support."
+      package_install python3-venv
+    fi
+  fi
+
+  # Ensure the install directory exists and is owned by INSTALL_USER before creating the venv
+  run_sudo mkdir -p "${INSTALL_DIR}"
+  run_sudo chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
+
+  # Create virtual environment if it doesn't exist
+  if [[ ! -d "${INSTALL_DIR}/.venv" ]]; then
+    log "Creating Python virtual environment in ${INSTALL_DIR}/.venv."
+    run_as_install_user python3 -m venv "${INSTALL_DIR}/.venv" || {
+      warn "Failed to create Python virtual environment. Falling back to system/user Python."
+    }
+  fi
+
+  if [[ -d "${INSTALL_DIR}/.venv" ]]; then
+    log "Installing Python gateway dependencies in virtual environment..."
+    run_as_install_user "${INSTALL_DIR}/.venv/bin/pip" install --upgrade fastapi uvicorn pydantic || {
+      warn "Failed to install dependencies in virtual environment."
+    }
+    # Try to install google-antigravity but don't fail if private/unavailable
+    run_as_install_user "${INSTALL_DIR}/.venv/bin/pip" install --upgrade google-antigravity || true
+  else
+    # Fallback: install pip and install packages globally/user-wide
+    if ! command_exists pip && ! command_exists pip3; then
+      local pip_pkg="python3-pip"
+      if [[ "${PKG_MANAGER}" == "apk" ]]; then
+        pip_pkg="py3-pip"
+      fi
+      log "Installing Python pip package: ${pip_pkg}."
+      package_install "${pip_pkg}"
+    fi
+    local pip_cmd="pip"
+    if command_exists pip3; then
+      pip_cmd="pip3"
+    fi
+    if command_exists "${pip_cmd}"; then
+      log "Installing Python gateway dependencies (fastapi, uvicorn, pydantic)..."
+      run_as_install_user python3 -m pip install --upgrade fastapi uvicorn pydantic || true
+      run_as_install_user python3 -m pip install --upgrade google-antigravity || true
+    else
+      warn "pip is still not available; Python dependencies will be auto-installed by Go proxy on first run."
+    fi
+  fi
+}
+
 assert_safe_install_dir() {
   case "${INSTALL_DIR}" in
     ""|"/"|"/opt"|"/usr"|"/usr/local"|"/home") die "unsafe install directory: ${INSTALL_DIR}" ;;
@@ -828,7 +927,7 @@ copy_proxy_files() {
   run mv -f "${binary_tmp}" "${INSTALL_DIR}/${APP_NAME}"
   run rm -rf "${INSTALL_DIR}/ui"
   run cp -R "${REPO_DIR}/ui" "${INSTALL_DIR}/ui"
-  for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh; do
+  for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh antigravity_gateway.py; do
     if [[ -f "${REPO_DIR}/${helper}" ]]; then
       run cp "${REPO_DIR}/${helper}" "${INSTALL_DIR}/${helper}"
     fi
@@ -836,6 +935,7 @@ copy_proxy_files() {
   if [[ -f "${REPO_DIR}/.env.example" ]]; then
     run cp "${REPO_DIR}/.env.example" "${INSTALL_DIR}/.env.example"
   fi
+  run_sudo chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
   run_sudo ln -sfn "${INSTALL_DIR}/${APP_NAME}" "/usr/local/bin/${APP_NAME}"
 }
 
@@ -910,6 +1010,13 @@ configure_env_file() {
   session_secret="$(get_env_value "${env_file}" "ADMIN_SESSION_SECRET" || true)"
   if [[ -z "${session_secret}" ]]; then
     set_env_value "${env_file}" "ADMIN_SESSION_SECRET" "$(random_secret)"
+  fi
+  if [[ "${UPSTREAM_CHOICE}" != "ask" && -n "${UPSTREAM_CHOICE}" ]]; then
+    set_env_value "${env_file}" "UPSTREAM" "${UPSTREAM_CHOICE}"
+  fi
+  if [[ -n "${GEMINI_API_KEY_CHOICE}" ]]; then
+    set_env_value "${env_file}" "GEMINI_API_KEY" "${GEMINI_API_KEY_CHOICE}"
+    set_env_value "${env_file}" "ANTIGRAVITY_API_KEY" "${GEMINI_API_KEY_CHOICE}"
   fi
   run_sudo chown "${INSTALL_USER}:${INSTALL_GROUP}" "${env_file}"
 }
@@ -1084,11 +1191,16 @@ install_all() {
   detect_os_and_package_manager
 	resolve_install_choices
 	install_base_dependencies
+	ensure_python_dependencies
 	ensure_node_runtime
 	ensure_claude_code_cli
 	ensure_go
-	ensure_codex_cli
-  ensure_codex_auth
+	if [[ "${UPSTREAM_CHOICE}" != "antigravity" ]]; then
+		ensure_codex_cli
+		ensure_codex_auth
+	else
+		log "Google Antigravity selected as default upstream; skipping Codex/ChatGPT setup."
+	fi
   install_browser_dependencies
   build_proxy
   copy_proxy_files

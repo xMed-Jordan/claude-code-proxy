@@ -212,6 +212,33 @@ When Claude Code launches a subagent with `isolation: "worktree"`, the proxy set
 
 Before applying settings, the proxy creates snapshots of the current Claude Code settings, Claude Code root MCP config, Claude Desktop MCP config, and user memory file. Existing snapshots are preserved so a reboot while proxy mode is active does not overwrite the original settings. Stopping the proxy restores the snapshots.
 
+## Model Selection & Available Models
+
+The proxy dynamically routes request payloads to the correct upstream backend (Codex/ChatGPT or Antigravity/Gemini) by inspecting the model name or configured model alias.
+
+### How to Select Models
+- **Route to Antigravity (Gemini)**: If the resolved model name contains `"antigravity"` or `"banana"`, the request is routed to the Google Antigravity sidecar.
+- **Route to Codex (ChatGPT)**: If the resolved model name contains `"codex"` or `"gpt-5"`, the request is routed to Codex.
+- **Global Default**: If the model name doesn't match these keywords, the request routes to the global default upstream specified by `UPSTREAM` in the `.env` file (which can be `codex`, `openai`, or `antigravity`).
+- **Model Aliases**: You can configure custom aliases in the local control panel at `http://127.0.0.1:4000/` or by updating the `PROXY_MODEL_ALIASES` variable in your `.env` file.
+
+### Available Upstreams & Models
+
+#### 1. Codex (ChatGPT Upstream)
+Supports standard Codex/ChatGPT models.
+
+#### 2. Google Antigravity (Gemini Upstream)
+Supports direct Gemini models (e.g., `gemini-2.5-flash`, `gemini-2.5-pro`).
+- **Nano Banana (Image Generation & Multimodal Editing)**:
+  - `nano-banana` &rarr; maps to `gemini-2.5-flash-image` (Nano Banana)
+  - `nano-banana-2` &rarr; maps to `gemini-3.1-flash-image-preview` (Nano Banana 2)
+  - `nano-banana-pro` &rarr; maps to `gemini-3-pro-image-preview` (Nano Banana Pro)
+- **Image Inputs**: Multimodal chat requests containing base64 images (in OpenAI's `image_url` / `input_image` or Anthropic's `image` format) are automatically translated to Gemini's native `inlineData` structure.
+- **Thinking / Reasoning Level**: Sets the Gemini reasoning depth (`thinkingLevel` or `thinkingBudget`) dynamically. The client can request the level via payload `reasoning_effort` or environment variables `CLAUDE_CODE_EFFORT_LEVEL`/`OPENAI_REASONING_EFFORT`:
+  - `low` / `minimal` &rarr; Maps to minimal reasoning budget.
+  - `medium` &rarr; Maps to medium reasoning budget.
+  - `high` / `xhigh` / `max` &rarr; Maps to maximum reasoning budget (dynamic thinking).
+
 ## Live Server + Local Browser Mode
 
 Use this split when a VPS hosts the AI proxy and your local workstation should provide only the visible browser tools:

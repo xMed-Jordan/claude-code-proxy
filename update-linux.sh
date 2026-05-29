@@ -278,12 +278,16 @@ current_install_args() {
   local current_port=""
   local current_public_url=""
   local browser_enabled=""
+  local current_upstream=""
+  local current_gemini_key=""
   current_port="$(get_env_value "${env_file}" "PROXY_PORT" || printf '%s' "${DEFAULT_PROXY_PORT}")"
   current_public_url="$(get_env_value "${env_file}" "PROXY_PUBLIC_URL" || true)"
   if [[ -z "${current_public_url}" ]]; then
     current_public_url="$(derive_public_url_from_caddy "${current_port}" || true)"
   fi
   browser_enabled="$(get_env_value "${env_file}" "ANTIGRAVITY_BROWSER_ENABLED" || printf '0')"
+  current_upstream="$(get_env_value "${env_file}" "UPSTREAM" || true)"
+  current_gemini_key="$(get_env_value "${env_file}" "GEMINI_API_KEY" || true)"
 
   printf '%s\0' "--server" "--no-https" "--no-public-http" "--install-dir" "${INSTALL_DIR}" "--proxy-port" "${current_port}"
   if [[ -n "${current_public_url}" ]]; then
@@ -293,6 +297,12 @@ current_install_args() {
     printf '%s\0' "--browser-tools"
   else
     printf '%s\0' "--no-browser-tools"
+  fi
+  if [[ -n "${current_upstream}" ]]; then
+    printf '%s\0' "--upstream" "${current_upstream}"
+  fi
+  if [[ -n "${current_gemini_key}" ]]; then
+    printf '%s\0' "--gemini-api-key" "${current_gemini_key}"
   fi
 }
 

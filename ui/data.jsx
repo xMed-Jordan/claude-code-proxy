@@ -43,6 +43,9 @@ const SAMPLE_MODELS = [
   { alias: "haiku",                        real: "gpt-5.4-mini",    status: "ok",     desc: "Fast Haiku alias. Claude Haiku 4.5 is 200k context.", default: false, context: "200k" },
   { alias: "claude-haiku-4-5",             real: "gpt-5.4-mini",    status: "ok",     desc: "Latest Haiku model alias.", default: false, context: "200k" },
   { alias: "gpt-5.3-codex",                real: "gpt-5.3-codex",   status: "ok",     desc: "Direct passthrough. Recommended for Claude Code.", default: false, recommended: true },
+  { alias: "antigravity-sonnet",           real: "antigravity-sonnet", status: "ok",    desc: "Google Antigravity Sonnet model alias.", default: false, context: "1m" },
+  { alias: "nano-banana-pro",              real: "nano-banana-pro", status: "ok",     desc: "Google Antigravity flagship image model.", default: false, context: "1m" },
+  { alias: "gemini-3.5-pro",               real: "gemini-3.5-pro",  status: "ok",     desc: "Direct pass-through to Gemini 3.5 Pro.", default: false, context: "1m" },
 ];
 
 const DEFAULT_CONFIG = {

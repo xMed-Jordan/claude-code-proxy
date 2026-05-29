@@ -113,6 +113,8 @@ func runServe() error {
 	// run after a binary upgrade silently installs the systemd timer so
 	// /root/.codex/auth.json keeps itself fresh without operator action.
 	ensureTokenRefreshTimer()
+	startAntigravityGateway(cfg)
+	defer stopAntigravityGateway()
 	mux := newProxyMux(cfg)
 	server := &http.Server{Addr: net.JoinHostPort(cfg.Host, cfg.Port), Handler: loggingMiddleware(mux), ReadHeaderTimeout: 15 * time.Second}
 	fmt.Printf("connect-ai-proxy listening on http://%s\n", server.Addr)
@@ -200,6 +202,7 @@ func runStop() error {
 	}
 	_ = os.Remove(pidPath)
 	_ = stopControlledAntigravityBrowser(false)
+	_ = stopAntigravityGatewayProcess(false)
 	return runClaudeSettingsSyncGo("restore")
 }
 
@@ -717,4 +720,119 @@ func gitCombinedOutput(repoRoot string, args ...string) ([]byte, error) {
 	full := append([]string{"-C", repoRoot}, args...)
 	cmd := exec.Command("git", full...)
 	return cmd.CombinedOutput()
+}
+
+var antigravityGatewayCmd *exec.Cmd
+
+func hasAntigravityRoute(cfg config) bool {
+	if strings.ToLower(cfg.Upstream) == "antigravity" {
+		return true
+	}
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	_ = migrateProxyDB(db)
+	var count int
+	err = db.QueryRow(`SELECT COUNT(*) FROM provider_keys WHERE LOWER(provider) = 'antigravity' AND enabled = 1`).Scan(&count)
+	if err == nil && count > 0 {
+		return true
+	}
+	err = db.QueryRow(`SELECT COUNT(*) FROM client_keys WHERE LOWER(provider) = 'antigravity' AND enabled = 1`).Scan(&count)
+	if err == nil && count > 0 {
+		return true
+	}
+	return false
+}
+
+func startAntigravityGateway(cfg config) {
+	if !hasAntigravityRoute(cfg) {
+		return
+	}
+	basePath := mustGetwd()
+	pidPath := filepath.Join(basePath, ".antigravity-gateway.pid")
+	if pid, err := readPIDFile(pidPath); err == nil && processExists(pid) {
+		fmt.Printf("Antigravity gateway already running with PID %d.\n", pid)
+		return
+	}
+	_ = os.Remove(pidPath)
+
+	pythonCmd := "python"
+	if _, err := exec.LookPath("python3"); err == nil {
+		pythonCmd = "python3"
+	} else if _, err := exec.LookPath("python"); err != nil {
+		fmt.Println("Warning: Python was not found. Antigravity SDK sidecar requires Python.")
+		return
+	}
+
+	venvPython := filepath.Join(basePath, ".venv", "bin", "python")
+	if runtime.GOOS == "windows" {
+		venvPython = filepath.Join(basePath, ".venv", "Scripts", "python.exe")
+	}
+	if fileExists(venvPython) {
+		pythonCmd = venvPython
+	}
+
+	gatewayScript := filepath.Join(basePath, "antigravity_gateway.py")
+	if !fileExists(gatewayScript) {
+		fmt.Println("Warning: antigravity_gateway.py script not found.")
+		return
+	}
+
+	port := "4005"
+	if envPort := os.Getenv("ANTIGRAVITY_GATEWAY_PORT"); envPort != "" {
+		port = envPort
+	}
+
+	antigravityGatewayCmd = exec.Command(pythonCmd, gatewayScript, "--port", port)
+	antigravityGatewayCmd.Dir = basePath
+	logFile, err := os.OpenFile(filepath.Join(basePath, ".proxy.antigravity.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err == nil {
+		antigravityGatewayCmd.Stdout = logFile
+		antigravityGatewayCmd.Stderr = logFile
+	}
+	configureBackgroundCommand(antigravityGatewayCmd)
+	fmt.Printf("Starting Antigravity SDK gateway on port %s...\n", port)
+	if err := antigravityGatewayCmd.Start(); err != nil {
+		fmt.Printf("Error starting Antigravity gateway: %v\n", err)
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return
+	}
+	_ = os.WriteFile(pidPath, []byte(strconv.Itoa(antigravityGatewayCmd.Process.Pid)), 0600)
+}
+
+func stopAntigravityGateway() {
+	if antigravityGatewayCmd != nil && antigravityGatewayCmd.Process != nil {
+		fmt.Printf("Stopping Antigravity gateway (PID %d)...\n", antigravityGatewayCmd.Process.Pid)
+		_ = terminateProcess(antigravityGatewayCmd.Process.Pid)
+		antigravityGatewayCmd = nil
+	}
+	basePath := mustGetwd()
+	pidPath := filepath.Join(basePath, ".antigravity-gateway.pid")
+	_ = os.Remove(pidPath)
+}
+
+func stopAntigravityGatewayProcess(verbose bool) error {
+	basePath := mustGetwd()
+	pidPath := filepath.Join(basePath, ".antigravity-gateway.pid")
+	pid, err := readPIDFile(pidPath)
+	if err != nil {
+		if verbose {
+			fmt.Println("No Antigravity gateway PID file found.")
+		}
+		return nil
+	}
+	if processExists(pid) {
+		if err := terminateProcess(pid); err != nil {
+			return err
+		}
+		if verbose {
+			fmt.Printf("Stopped Antigravity gateway (PID %d).\n", pid)
+		}
+	}
+	_ = os.Remove(pidPath)
+	return nil
 }

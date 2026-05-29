@@ -565,6 +565,16 @@ func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
 		"claude-3-7-sonnet-latest":  cleanModel(env("OPENAI_CLAUDE_SONNET_MODEL", env("OPENAI_CLAUDE_3_7_MODEL", "gpt-5.5"))),
 		"claude-3-5-haiku-latest":   cleanModel(env("OPENAI_CLAUDE_HAIKU_MODEL", env("OPENAI_CLAUDE_3_5_HAIKU_MODEL", "gpt-5.4-mini"))),
 		"claude-3-opus-20240229":    cleanModel(env("OPENAI_CLAUDE_OPUS_MODEL", "gpt-5.5")),
+		"antigravity-opus":          "antigravity-opus",
+		"antigravity-sonnet":        "antigravity-sonnet",
+		"antigravity-haiku":         "antigravity-haiku",
+		"nano-banana":               "nano-banana",
+		"nano-banana-2":             "nano-banana-2",
+		"nano-banana-pro":           "nano-banana-pro",
+		"gemini-2.5-flash":          "gemini-2.5-flash",
+		"gemini-2.5-pro":            "gemini-2.5-pro",
+		"gemini-3.5-flash":          "gemini-3.5-flash",
+		"gemini-3.5-pro":            "gemini-3.5-pro",
 	}
 }
 
@@ -1311,6 +1321,16 @@ func firstProviderCredential(cfg config, db *sql.DB, provider string) (providerC
 func effectiveOpenAIUpstream(cfg config, r *http.Request) providerCredential {
 	if r != nil {
 		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
+			pName := strings.ToLower(route.Provider)
+			if pName == "antigravity" {
+				if route.BaseURL == "" {
+					route.BaseURL = "http://127.0.0.1:4005/v1"
+				}
+				if route.APIKey == "" {
+					route.APIKey = "local"
+				}
+				return route
+			}
 			if route.APIKey != "" {
 				route.BaseURL = strings.TrimRight(firstNonEmpty(route.BaseURL, defaultProviderBaseURL(route.Provider)), "/")
 				return route
@@ -1330,6 +1350,9 @@ func effectiveOpenAIUpstream(cfg config, r *http.Request) providerCredential {
 				}
 			}
 		}
+	}
+	if cfg.Upstream == "antigravity" {
+		return providerCredential{Provider: "antigravity", Label: "Antigravity Sidecar", APIKey: "local", BaseURL: "http://127.0.0.1:4005/v1"}
 	}
 	return providerCredential{Provider: "openai", Label: "OpenAI from .env", APIKey: cfg.OpenAIAPIKey, BaseURL: strings.TrimRight(firstNonEmpty(cfg.OpenAIBaseURL, "https://api.openai.com/v1"), "/")}
 }
@@ -1470,13 +1493,6 @@ func handleMessages(cfg config) http.HandlerFunc {
 			"body_truncated":    len(rawBody) > traceBodyLimit,
 			"body_preview_json": truncateString(string(rawBody), traceBodyLimit),
 		})
-		route, hasProviderRoute := requestProviderRoute(r)
-		if cfg.Upstream == "openai" && !hasProviderRoute && (cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(cfg.OpenAIAPIKey, "sk-or-")) {
-			traceLogID(traceID, "anthropic.config_error", map[string]any{"message": "OPENAI_API_KEY is not configured"})
-			writeAnthropicError(w, http.StatusBadRequest, "OPENAI_API_KEY is not configured")
-			return
-		}
-
 		var in anthropicRequest
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&in); err != nil {
 			traceLogID(traceID, "anthropic.decode_error", map[string]any{"error": err.Error()})
@@ -1485,6 +1501,26 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		in.FastMode = requestUsesClaudeFastMode(r, in)
 		traceLogID(traceID, "anthropic.decoded", summarizeAnthropicRequest(in))
+
+		if _, ok := requestProviderRoute(r); !ok {
+			upstreamType := requestUpstream(cfg, r, in.Model)
+			if upstreamType == "antigravity" {
+				route := providerCredential{
+					Provider: "antigravity",
+					Label:    "Antigravity Dynamic",
+					APIKey:   "local",
+					BaseURL:  "http://127.0.0.1:4005/v1",
+				}
+				requestProviderKeys.Store(r, route)
+			}
+		}
+		route, hasProviderRoute := requestProviderRoute(r)
+
+		if cfg.Upstream == "openai" && !hasProviderRoute && (cfg.OpenAIAPIKey == "" || cfg.OpenAIAPIKey == "YOUR_OPENAI_API_KEY" || strings.HasPrefix(cfg.OpenAIAPIKey, "sk-or-")) {
+			traceLogID(traceID, "anthropic.config_error", map[string]any{"message": "OPENAI_API_KEY is not configured"})
+			writeAnthropicError(w, http.StatusBadRequest, "OPENAI_API_KEY is not configured")
+			return
+		}
 		out, err := toOpenAI(cfg, in)
 		if err != nil {
 			traceLogID(traceID, "anthropic.convert_error", map[string]any{"error": err.Error()})
@@ -1562,6 +1598,18 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			in.MaxTokens = in.MaxCompletionTokens
 		}
 		applyCustomSessionToOpenAIRequest(r, &in)
+		if _, ok := requestProviderRoute(r); !ok {
+			upstreamType := requestUpstream(cfg, r, in.Model)
+			if upstreamType == "antigravity" {
+				route := providerCredential{
+					Provider: "antigravity",
+					Label:    "Antigravity Dynamic",
+					APIKey:   "local",
+					BaseURL:  "http://127.0.0.1:4005/v1",
+				}
+				requestProviderKeys.Store(r, route)
+			}
+		}
 		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: route.Provider, Stream: in.Stream})
 			proxyOpenAIChat(r.Context(), cfg, in, w, r)
@@ -1614,6 +1662,18 @@ func handleResponses(cfg config) http.HandlerFunc {
 			return
 		}
 		in.Model = resolveModel(cfg, in.Model)
+		if _, ok := requestProviderRoute(r); !ok {
+			upstreamType := requestUpstream(cfg, r, in.Model)
+			if upstreamType == "antigravity" {
+				route := providerCredential{
+					Provider: "antigravity",
+					Label:    "Antigravity Dynamic",
+					APIKey:   "local",
+					BaseURL:  "http://127.0.0.1:4005/v1",
+				}
+				requestProviderKeys.Store(r, route)
+			}
+		}
 		if strings.TrimSpace(in.Instructions) == "" {
 			in.Instructions = "You are a helpful coding assistant."
 		}
@@ -7014,7 +7074,8 @@ func modelRows(cfg config) []map[string]any {
 		}
 		context := contextForAlias(cfg, alias)
 		contextWindow := contextWindowTokensForModelContext(cfg, context)
-		if strings.EqualFold(strings.TrimSpace(cfg.Upstream), "codex") {
+		modelUpstream := requestUpstream(cfg, nil, alias)
+		if strings.EqualFold(modelUpstream, "codex") {
 			context = "200k"
 		}
 		maxOutput, limitsSource := maxOutputTokensForModel(real)
@@ -7129,6 +7190,8 @@ func maxOutputTokensForModel(model string) (int, string) {
 	switch {
 	case model == "":
 		return 0, "unknown"
+	case strings.Contains(model, "antigravity") || strings.Contains(model, "banana") || strings.Contains(model, "gemini"):
+		return 8192, "built_in"
 	case strings.Contains(model, "gpt-5") || strings.Contains(model, "codex"):
 		return 128000, "built_in"
 	case strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4"):
@@ -7204,7 +7267,7 @@ func contextForAlias(cfg config, alias string) string {
 	if lower == "sonnet" || lower == "claude-sonnet-4-6" {
 		return contextFromModel(cfg.ClaudeDefaults["sonnet"])
 	}
-	if strings.Contains(lower, "[1m]") || lower == "gpt-5.3-codex" {
+	if strings.Contains(lower, "[1m]") || lower == "gpt-5.3-codex" || strings.Contains(lower, "antigravity") || strings.Contains(lower, "banana") || strings.Contains(lower, "gemini") {
 		return "1m"
 	}
 	return "200k"
@@ -7437,6 +7500,23 @@ func resolveModel(cfg config, model string) string {
 		return mapped
 	}
 	return cleanModel(model)
+}
+
+func requestUpstream(cfg config, r *http.Request, requestedModel string) string {
+	if r != nil {
+		if route, ok := requestProviderRoute(r); ok && route.Provider != "" {
+			return strings.ToLower(route.Provider)
+		}
+	}
+	resolved := resolveModel(cfg, requestedModel)
+	resolvedLower := strings.ToLower(resolved)
+	if strings.Contains(resolvedLower, "antigravity") || strings.Contains(resolvedLower, "banana") || strings.Contains(resolvedLower, "gemini") {
+		return "antigravity"
+	}
+	if strings.Contains(resolvedLower, "codex") || strings.Contains(resolvedLower, "gpt-5") {
+		return "codex"
+	}
+	return cfg.Upstream
 }
 
 func requestNote(alias, upstream string, stream bool, effort string) string {
