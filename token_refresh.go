@@ -292,6 +292,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=root
+WorkingDirectory=/opt/connect-ai-proxy
+Environment=HOME=/root
+Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%s refresh-token
 StandardOutput=journal
 StandardError=journal
