@@ -7832,7 +7832,8 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 	}
 
 	agyPath := findAgyPath()
-	cmd := exec.Command(agyPath, "--dangerously-skip-permissions", "-p", prompt)
+	cmd := exec.Command(agyPath, "--dangerously-skip-permissions", "-p", "-")
+	cmd.Stdin = strings.NewReader(prompt)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to get stdout: " + err.Error())
