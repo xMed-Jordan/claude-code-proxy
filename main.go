@@ -7582,20 +7582,36 @@ func writeAntigravityCLIModel(cfg config, requestedModel, effort string) error {
 	resolved := strings.ToLower(resolveModel(cfg, requestedModel))
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	
-	isPro := strings.Contains(resolved, "pro") || strings.Contains(resolved, "opus") || strings.Contains(resolved, "sonnet")
-	if isPro {
-		if effort == "low" || effort == "minimal" {
-			targetModel = "Gemini 3.1 Pro (Low)"
-		} else {
-			targetModel = "Gemini 3.1 Pro (High)"
-		}
+	isOpus := strings.Contains(resolved, "opus")
+	isSonnet := strings.Contains(resolved, "sonnet")
+	isHaiku := strings.Contains(resolved, "haiku") || strings.Contains(resolved, "flash")
+	
+	envOpus := getenv("ANTIGRAVITY_OPUS_MODEL", "")
+	envSonnet := getenv("ANTIGRAVITY_SONNET_MODEL", "")
+	envHaiku := getenv("ANTIGRAVITY_HAIKU_MODEL", "")
+	
+	if isOpus && envOpus != "" {
+		targetModel = envOpus
+	} else if isSonnet && envSonnet != "" {
+		targetModel = envSonnet
+	} else if isHaiku && envHaiku != "" {
+		targetModel = envHaiku
 	} else {
-		if effort == "low" || effort == "minimal" {
-			targetModel = "Gemini 3.5 Flash (Low)"
-		} else if effort == "high" || effort == "xhigh" || effort == "max" {
-			targetModel = "Gemini 3.5 Flash (High)"
+		isPro := strings.Contains(resolved, "pro") || isOpus || isSonnet
+		if isPro {
+			if effort == "low" || effort == "minimal" {
+				targetModel = "Gemini 3.1 Pro (Low)"
+			} else {
+				targetModel = "Gemini 3.1 Pro (High)"
+			}
 		} else {
-			targetModel = "Gemini 3.5 Flash (Medium)"
+			if effort == "low" || effort == "minimal" {
+				targetModel = "Gemini 3.5 Flash (Low)"
+			} else if effort == "high" || effort == "xhigh" || effort == "max" {
+				targetModel = "Gemini 3.5 Flash (High)"
+			} else {
+				targetModel = "Gemini 3.5 Flash (Medium)"
+			}
 		}
 	}
 	
@@ -7709,6 +7725,22 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 			systemPrompt = contentToText(msg.Content)
 			continue
 		}
+		
+		if role == "tool" {
+			contentText := contentToText(msg.Content)
+			transcriptBuilder.WriteString("Tool Result:\n" + contentText + "\n\n")
+			continue
+		}
+		
+		if role == "assistant" && len(msg.ToolCalls) > 0 {
+			var tcTexts []string
+			for _, tc := range msg.ToolCalls {
+				tcTexts = append(tcTexts, fmt.Sprintf("%s %s", tc.Function.Name, tc.Function.Arguments))
+			}
+			transcriptBuilder.WriteString("Assistant (Tool Call): " + strings.Join(tcTexts, ", ") + "\n\n")
+			continue
+		}
+		
 		var contentText string
 		if str, ok := msg.Content.(string); ok {
 			contentText = str
@@ -7719,6 +7751,13 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 					pType := stringField(m, "type")
 					if pType == "text" {
 						partsTexts = append(partsTexts, stringField(m, "text"))
+					} else if pType == "tool_use" {
+						name := stringField(m, "name")
+						inputBytes, _ := json.Marshal(m["input"])
+						partsTexts = append(partsTexts, fmt.Sprintf("Assistant (Tool Call): %s %s", name, string(inputBytes)))
+					} else if pType == "tool_result" {
+						contentStr := contentToText(m["content"])
+						partsTexts = append(partsTexts, fmt.Sprintf("Tool Result:\n%s", contentStr))
 					} else {
 						dec, ext, err := extractBase64DataAndExt(m)
 						if err == nil {
@@ -7742,13 +7781,44 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 		if role == "assistant" {
 			roleLabel = "Assistant"
 		}
-		transcriptBuilder.WriteString(roleLabel + ": " + contentText + "\n\n")
+		
+		if strings.Contains(contentText, "Assistant (Tool Call):") || strings.Contains(contentText, "Tool Result:") {
+			transcriptBuilder.WriteString(contentText + "\n\n")
+		} else {
+			transcriptBuilder.WriteString(roleLabel + ": " + contentText + "\n\n")
+		}
 	}
 
 	var finalPromptBuilder strings.Builder
 	if systemPrompt != "" {
 		finalPromptBuilder.WriteString("System instructions:\n" + systemPrompt + "\n\n")
 	}
+	
+	if len(in.Tools) > 0 {
+		finalPromptBuilder.WriteString("AVAILABLE TOOLS:\n")
+		for _, t := range in.Tools {
+			finalPromptBuilder.WriteString(fmt.Sprintf("- Name: %s\n", t.Function.Name))
+			if t.Function.Description != "" {
+				finalPromptBuilder.WriteString(fmt.Sprintf("  Description: %s\n", t.Function.Description))
+			}
+			if t.Function.Parameters != nil {
+				paramBytes, _ := json.Marshal(t.Function.Parameters)
+				finalPromptBuilder.WriteString(fmt.Sprintf("  Parameters: %s\n", string(paramBytes)))
+			}
+		}
+		finalPromptBuilder.WriteString("\n")
+	}
+	
+	finalPromptBuilder.WriteString("OUTPUT FORMAT RULES (CRITICAL):\n")
+	finalPromptBuilder.WriteString("You must respond in one of two formats:\n\n")
+	finalPromptBuilder.WriteString("Format A (If you want to run a tool):\n")
+	finalPromptBuilder.WriteString("Output a single line starting with \"TOOL_USE:\" followed by a JSON block specifying the tool name and arguments. Example:\n")
+	finalPromptBuilder.WriteString("TOOL_USE: {\"name\": \"PowerShell\", \"input\": {\"command\": \"git status\"}}\n")
+	finalPromptBuilder.WriteString("Do NOT output any other text (no explanations, no conversation) if you are calling a tool. Just output the single TOOL_USE line and stop.\n\n")
+	finalPromptBuilder.WriteString("Format B (If you do not need to use a tool and are ready to respond to the user):\n")
+	finalPromptBuilder.WriteString("Output a single line starting with \"FINAL_ANSWER:\" followed by your text response. Example:\n")
+	finalPromptBuilder.WriteString("FINAL_ANSWER: I have successfully completed the audit.\n\n")
+	
 	finalPromptBuilder.WriteString("Below is the conversation transcript between a User and an Assistant. Please continue the conversation as the Assistant.\n\n")
 	finalPromptBuilder.WriteString(transcriptBuilder.String())
 	finalPromptBuilder.WriteString("Assistant:")
@@ -7797,6 +7867,7 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 	}()
 
 	var completionText strings.Builder
+	var outputBuffer strings.Builder
 	hasReceivedData := false
 	silenceTimeout := 2500 * time.Millisecond
 	var silenceTimer *time.Timer
@@ -7804,20 +7875,15 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 	respID := "chatcmpl-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	modelLabel := firstNonEmpty(requestedModel, "Gemini 3.5 Flash")
 
+	prefixChecked := false
+	isToolCall := false
+
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
-		}
-
-		if format == "anthropic" {
-			sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
-			sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
-			}
 		}
 	}
 
@@ -7850,30 +7916,106 @@ loop:
 			}
 			if len(res.data) > 0 {
 				hasReceivedData = true
-				textChunk := string(res.data)
-				completionText.WriteString(textChunk)
+				outputBuffer.Write(res.data)
 				
-				if stream {
-					if format == "anthropic" {
-						sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": textChunk}})
-					} else {
-						chunkJSON, _ := json.Marshal(map[string]any{
-							"id":      respID,
-							"object":  "chat.completion.chunk",
-							"created": time.Now().Unix(),
-							"model":   modelLabel,
-							"choices": []any{
-								map[string]any{
-									"index":         0,
-									"delta":         map[string]any{"content": textChunk},
-									"finish_reason": nil,
-								},
-							},
-						})
-						fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+				if !prefixChecked {
+					bufStr := outputBuffer.String()
+					if strings.Contains(bufStr, "\n") || len(bufStr) >= 25 {
+						prefixChecked = true
+						trimmedBuf := strings.TrimSpace(bufStr)
+						if strings.HasPrefix(trimmedBuf, "TOOL_USE:") {
+							isToolCall = true
+							completionText.WriteString(bufStr)
+						} else if strings.HasPrefix(trimmedBuf, "FINAL_ANSWER:") {
+							remaining := strings.TrimPrefix(trimmedBuf, "FINAL_ANSWER:")
+							completionText.WriteString(remaining)
+							if stream {
+								if format == "anthropic" {
+									sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+									sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+								}
+								if remaining != "" {
+									if format == "anthropic" {
+										sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": remaining}})
+									} else {
+										chunkJSON, _ := json.Marshal(map[string]any{
+											"id":      respID,
+											"object":  "chat.completion.chunk",
+											"created": time.Now().Unix(),
+											"model":   modelLabel,
+											"choices": []any{
+												map[string]any{
+													"index":         0,
+													"delta":         map[string]any{"content": remaining},
+													"finish_reason": nil,
+												},
+											},
+										})
+										fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+									}
+									if flusher, ok := w.(http.Flusher); ok {
+										flusher.Flush()
+									}
+								}
+							}
+						} else {
+							completionText.WriteString(bufStr)
+							if stream {
+								if format == "anthropic" {
+									sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+									sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+								}
+								if bufStr != "" {
+									if format == "anthropic" {
+										sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": bufStr}})
+									} else {
+										chunkJSON, _ := json.Marshal(map[string]any{
+											"id":      respID,
+											"object":  "chat.completion.chunk",
+											"created": time.Now().Unix(),
+											"model":   modelLabel,
+											"choices": []any{
+												map[string]any{
+													"index":         0,
+													"delta":         map[string]any{"content": bufStr},
+													"finish_reason": nil,
+												},
+											},
+										})
+										fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+									}
+									if flusher, ok := w.(http.Flusher); ok {
+										flusher.Flush()
+									}
+								}
+							}
+						}
 					}
-					if flusher, ok := w.(http.Flusher); ok {
-						flusher.Flush()
+				} else {
+					textChunk := string(res.data)
+					completionText.WriteString(textChunk)
+					if stream && !isToolCall {
+						if format == "anthropic" {
+							sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": textChunk}})
+						} else {
+							chunkJSON, _ := json.Marshal(map[string]any{
+								"id":      respID,
+								"object":  "chat.completion.chunk",
+								"created": time.Now().Unix(),
+								"model":   modelLabel,
+								"choices": []any{
+									map[string]any{
+										"index":         0,
+										"delta":         map[string]any{"content": textChunk},
+										"finish_reason": nil,
+									},
+								},
+							})
+							fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+						}
+						if flusher, ok := w.(http.Flusher); ok {
+							flusher.Flush()
+						}
 					}
 				}
 			}
@@ -7884,98 +8026,275 @@ loop:
 		}
 	}
 
-	outputTokens := estimateTextTokens(completionText.String())
+	if !prefixChecked {
+		bufStr := outputBuffer.String()
+		trimmedBuf := strings.TrimSpace(bufStr)
+		if strings.HasPrefix(trimmedBuf, "TOOL_USE:") {
+			isToolCall = true
+			completionText.WriteString(bufStr)
+		} else {
+			remaining := strings.TrimPrefix(trimmedBuf, "FINAL_ANSWER:")
+			completionText.WriteString(remaining)
+		}
+	}
+
+	rawText := completionText.String()
+	var parsedToolCall *struct {
+		Name  string         `json:"name"`
+		Input map[string]any `json:"input"`
+	}
+
+	if isToolCall {
+		cleanJSON := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rawText), "TOOL_USE:"))
+		var tc struct {
+			Name  string         `json:"name"`
+			Input map[string]any `json:"input"`
+		}
+		if err := json.Unmarshal([]byte(cleanJSON), &tc); err == nil && tc.Name != "" {
+			parsedToolCall = &tc
+		}
+	}
+
+	outputTokens := estimateTextTokens(rawText)
+	stopReason := "stop"
+	if parsedToolCall != nil {
+		stopReason = "tool_use"
+	}
 	updateRequestStat(r, func(stat *requestStat) {
 		stat.InputTokens = inputTokens
 		stat.OutputTokens = outputTokens
-		stat.StopReason = "stop"
+		stat.StopReason = stopReason
 		stat.Upstream = "antigravity"
 	})
 
 	if stream {
-		if format == "anthropic" {
-			sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-			sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
-			sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
-			fmt.Fprint(w, "data: [DONE]\n\n")
-		} else {
-			chunkJSON, _ := json.Marshal(map[string]any{
-				"id":      respID,
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   modelLabel,
-				"choices": []any{
-					map[string]any{
-						"index":         0,
-						"delta":         map[string]any{},
-						"finish_reason": "stop",
+		if parsedToolCall != nil {
+			if format == "anthropic" {
+				sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+				sendEvent(w, "content_block_start", map[string]any{
+					"type": "content_block_start",
+					"index": 0,
+					"content_block": map[string]any{
+						"type": "tool_use",
+						"id": "toolu_" + respID,
+						"name": parsedToolCall.Name,
+						"input": parsedToolCall.Input,
 					},
-				},
-			})
-			fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
-			fmt.Fprint(w, "data: [DONE]\n\n")
+				})
+				sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+				sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
+				sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			} else {
+				inputBytes, _ := json.Marshal(parsedToolCall.Input)
+				chunkJSON, _ := json.Marshal(map[string]any{
+					"id":      respID,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index":         0,
+							"delta":         map[string]any{
+								"tool_calls": []any{
+									map[string]any{
+										"id": "call_" + respID,
+										"type": "function",
+										"function": map[string]any{
+											"name": parsedToolCall.Name,
+											"arguments": string(inputBytes),
+										},
+									},
+								},
+							},
+							"finish_reason": "tool_calls",
+						},
+					},
+				})
+				fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}
+		} else {
+			if format == "anthropic" {
+				if !prefixChecked {
+					sendEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_" + respID, "type": "message", "role": "assistant", "content": []any{}, "model": modelLabel, "stop_reason": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+					sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+				}
+				sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+				sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
+				sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			} else {
+				chunkJSON, _ := json.Marshal(map[string]any{
+					"id":      respID,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index":         0,
+							"delta":         map[string]any{},
+							"finish_reason": "stop",
+						},
+					},
+				})
+				fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}
 		}
 	} else {
-		if format == "anthropic" {
-			resp := map[string]any{
-				"id":      "msg_" + respID,
-				"type":    "message",
-				"role":    "assistant",
-				"model":   modelLabel,
-				"content": []any{map[string]any{"type": "text", "text": completionText.String()}},
-				"stop_reason":   "end_turn",
-				"stop_sequence": nil,
-				"usage": map[string]any{
-					"input_tokens":  inputTokens,
-					"output_tokens": outputTokens,
-				},
-			}
-			writeJSON(w, http.StatusOK, resp)
-		} else if format == "responses" {
-			resp := map[string]any{
-				"id":     respID,
-				"object": "response",
-				"model":  modelLabel,
-				"choices": []any{
-					map[string]any{
-						"index": 0,
-						"message": map[string]any{
-							"role":    "assistant",
-							"content": completionText.String(),
+		if parsedToolCall != nil {
+			if format == "anthropic" {
+				resp := map[string]any{
+					"id":      "msg_" + respID,
+					"type":    "message",
+					"role":    "assistant",
+					"model":   modelLabel,
+					"content": []any{
+						map[string]any{
+							"type": "tool_use",
+							"id": "toolu_" + respID,
+							"name": parsedToolCall.Name,
+							"input": parsedToolCall.Input,
 						},
-						"finish_reason": "stop",
 					},
-				},
-				"usage": map[string]any{
-					"input_tokens":  inputTokens,
-					"output_tokens": outputTokens,
-					"total_tokens":  inputTokens + outputTokens,
-				},
+					"stop_reason":   "tool_use",
+					"stop_sequence": nil,
+					"usage": map[string]any{
+						"input_tokens":  inputTokens,
+						"output_tokens": outputTokens,
+					},
+				}
+				writeJSON(w, http.StatusOK, resp)
+			} else if format == "responses" {
+				resp := map[string]any{
+					"id":     respID,
+					"object": "response",
+					"model":  modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index": 0,
+							"message": map[string]any{
+								"role":    "assistant",
+								"content": nil,
+								"tool_calls": []any{
+									map[string]any{
+										"id": "call_" + respID,
+										"type": "function",
+										"function": map[string]any{
+											"name": parsedToolCall.Name,
+											"arguments": parsedToolCall.Input,
+										},
+									},
+								},
+							},
+							"finish_reason": "tool_calls",
+						},
+					},
+					"usage": map[string]any{
+						"input_tokens":  inputTokens,
+						"output_tokens": outputTokens,
+						"total_tokens":  inputTokens + outputTokens,
+					},
+				}
+				writeJSON(w, http.StatusOK, resp)
+			} else {
+				inputBytes, _ := json.Marshal(parsedToolCall.Input)
+				resp := map[string]any{
+					"id":      respID,
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index": 0,
+							"message": map[string]any{
+								"role":    "assistant",
+								"content": nil,
+								"tool_calls": []any{
+									map[string]any{
+										"id": "call_" + respID,
+										"type": "function",
+										"function": map[string]any{
+											"name": parsedToolCall.Name,
+											"arguments": string(inputBytes),
+										},
+									},
+								},
+							},
+							"finish_reason": "tool_calls",
+						},
+					},
+					"usage": map[string]any{
+						"prompt_tokens":     inputTokens,
+						"completion_tokens": outputTokens,
+						"total_tokens":      inputTokens + outputTokens,
+					},
+				}
+				writeJSON(w, http.StatusOK, resp)
 			}
-			writeJSON(w, http.StatusOK, resp)
 		} else {
-			resp := map[string]any{
-				"id":      respID,
-				"object":  "chat.completion",
-				"created": time.Now().Unix(),
-				"model":   modelLabel,
-				"choices": []any{
-					map[string]any{
-						"index": 0,
-						"message": map[string]any{
-							"role":    "assistant",
-							"content": completionText.String(),
-						},
-						"finish_reason": "stop",
+			if format == "anthropic" {
+				resp := map[string]any{
+					"id":      "msg_" + respID,
+					"type":    "message",
+					"role":    "assistant",
+					"model":   modelLabel,
+					"content": []any{map[string]any{"type": "text", "text": rawText}},
+					"stop_reason":   "end_turn",
+					"stop_sequence": nil,
+					"usage": map[string]any{
+						"input_tokens":  inputTokens,
+						"output_tokens": outputTokens,
 					},
-				},
-				"usage": map[string]any{
-					"prompt_tokens":     inputTokens,
-					"completion_tokens": outputTokens,
-					"total_tokens":      inputTokens + outputTokens,
-				},
+				}
+				writeJSON(w, http.StatusOK, resp)
+			} else if format == "responses" {
+				resp := map[string]any{
+					"id":     respID,
+					"object": "response",
+					"model":  modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index": 0,
+							"message": map[string]any{
+								"role":    "assistant",
+								"content": rawText,
+							},
+							"finish_reason": "stop",
+						},
+					},
+					"usage": map[string]any{
+						"input_tokens":  inputTokens,
+						"output_tokens": outputTokens,
+						"total_tokens":  inputTokens + outputTokens,
+					},
+				}
+				writeJSON(w, http.StatusOK, resp)
+			} else {
+				resp := map[string]any{
+					"id":      respID,
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   modelLabel,
+					"choices": []any{
+						map[string]any{
+							"index": 0,
+							"message": map[string]any{
+								"role":    "assistant",
+								"content": rawText,
+							},
+							"finish_reason": "stop",
+						},
+					},
+					"usage": map[string]any{
+						"prompt_tokens":     inputTokens,
+						"completion_tokens": outputTokens,
+						"total_tokens":      inputTokens + outputTokens,
+					},
+				}
+				writeJSON(w, http.StatusOK, resp)
 			}
-			writeJSON(w, http.StatusOK, resp)
 		}
 	}
 }
