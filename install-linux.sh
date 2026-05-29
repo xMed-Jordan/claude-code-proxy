@@ -273,7 +273,7 @@ prompt_yes_no() {
 prompt_value() {
   local question="$1"
   local default_value="$2"
-  local required="$3"
+  local required="${3:-}"
   local answer=""
   if [[ ! -t 0 ]]; then
     answer="${default_value}"
