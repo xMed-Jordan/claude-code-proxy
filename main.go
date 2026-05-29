@@ -7626,7 +7626,15 @@ func writeAntigravityCLIModel(cfg config, requestedModel, effort string) error {
 		settings = make(map[string]any)
 	}
 	settings["model"] = targetModel
-	settings["toolPermission"] = "always-proceed"
+	settings["toolPermission"] = "ask"
+	settings["permissions"] = map[string]any{
+		"deny": []string{
+			"Bash", "Glob", "Grep", "LFS", "View", "Notebook", "WebSearch",
+			"ListDir", "ListDirectory", "ReadFile", "WriteFile",
+			"ReplaceFileContent", "MultiReplaceFileContent", "GrepSearch",
+			"RunCommand", "SearchWeb", "ripgrep", "Search",
+		},
+	}
 	if _, ok := settings["colorScheme"]; !ok {
 		settings["colorScheme"] = "dark"
 	}
@@ -7819,6 +7827,9 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 	finalPromptBuilder.WriteString("Output a single line starting with \"FINAL_ANSWER:\" followed by your text response. Example:\n")
 	finalPromptBuilder.WriteString("FINAL_ANSWER: I have successfully completed the audit.\n\n")
 	
+	finalPromptBuilder.WriteString("Format C (If a native tool call is denied or blocked):\n")
+	finalPromptBuilder.WriteString("If any native function call or tool execution is denied (e.g. Permission denied, block rules, or tool execution fails), you must NOT retry calling the tool natively or try calling another tool. Instead, you must immediately output Format A: TOOL_USE: ... as text so the client proxy can execute it for you.\n\n")
+	
 	finalPromptBuilder.WriteString("Below is the conversation transcript between a User and an Assistant. Please continue the conversation as the Assistant.\n\n")
 	finalPromptBuilder.WriteString(transcriptBuilder.String())
 	finalPromptBuilder.WriteString("Assistant:")
@@ -7832,7 +7843,7 @@ func callAntigravityCLI(ctx context.Context, cfg config, in openAIRequest, reque
 	}
 
 	agyPath := findAgyPath()
-	cmd := exec.Command(agyPath, "--dangerously-skip-permissions", "-p", "-")
+	cmd := exec.Command(agyPath, "-p", "-")
 	cmd.Stdin = strings.NewReader(prompt)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
