@@ -399,12 +399,39 @@ package_available() {
 }
 
 install_base_dependencies() {
-	local packages=(curl ca-certificates tar gzip git nodejs npm python3)
-  if [[ "${EUID}" -eq 0 ]]; then
+  local packages=()
+  local pkg=""
+  for pkg in curl tar gzip git python3; do
+    if ! command_exists "${pkg}"; then
+      packages+=("${pkg}")
+    fi
+  done
+
+  local has_cacerts=0
+  if [[ -d /etc/ssl/certs ]] || [[ -d /etc/pki/tls/certs ]]; then
+    has_cacerts=1
+  fi
+  if [[ "${has_cacerts}" -eq 0 ]]; then
+    packages+=(ca-certificates)
+  fi
+
+  if ! command_exists node; then
+    packages+=(nodejs)
+  fi
+  if ! command_exists npm; then
+    packages+=(npm)
+  fi
+  if [[ "${EUID}" -eq 0 ]] && ! command_exists sudo; then
     packages+=(sudo)
   fi
-  log "Installing base dependencies if missing."
-	package_install "${packages[@]}"
+
+  if [[ ${#packages[@]} -eq 0 ]]; then
+    log "All base dependencies are already installed."
+    return 0
+  fi
+
+  log "Installing base dependencies if missing: ${packages[*]}"
+  package_install "${packages[@]}"
 }
 
 node_major_version() {
