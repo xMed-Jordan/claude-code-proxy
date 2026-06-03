@@ -183,10 +183,17 @@ update_system_packages() {
     return
   fi
   log "Updating OS packages through ${PKG_MANAGER}."
+  # Best-effort: a broken or held host package (e.g. the apt nodejs/npm conflict
+  # seen on this host) must never abort the proxy update. Tolerate a failed OS
+  # upgrade with a warning and keep going so the proxy still gets rebuilt.
+  run_system_package_upgrade || warn "OS package upgrade failed; continuing with the proxy update."
+}
+
+run_system_package_upgrade() {
   case "${PKG_MANAGER}" in
     apt)
-      run_sudo apt-get update
-      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+      run_sudo apt-get update &&
+      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold &&
       run_sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
       ;;
     dnf)
@@ -196,14 +203,14 @@ update_system_packages() {
       run_sudo yum update -y
       ;;
     zypper)
-      run_sudo zypper --non-interactive refresh
+      run_sudo zypper --non-interactive refresh &&
       run_sudo zypper --non-interactive update
       ;;
     pacman)
       run_sudo pacman -Syu --noconfirm
       ;;
     apk)
-      run_sudo apk update
+      run_sudo apk update &&
       run_sudo apk upgrade
       ;;
     *)
@@ -328,13 +335,13 @@ reinstall_proxy_from_current_checkout() {
     install_args+=("${item}")
   done < <(current_install_args)
 
-  if command_exists systemctl; then
-    SERVICE_STOPPED_FOR_UPDATE=1
-    run_sudo systemctl stop "${SERVICE_NAME}" || true
-  fi
+  # Do NOT stop the service before rebuilding. install-linux.sh replaces the
+  # binary atomically (temp file + mv) and performs a single `systemctl restart`
+  # at the very end, so the proxy keeps serving during the build and is never
+  # left stopped if an earlier step (apt/go/npm/build) fails. Stopping it up
+  # front is exactly what left the live service dead after a failed update.
   log "Rebuilding and reinstalling ${APP_NAME} from the updated checkout."
   run bash "${HELPER_DIR}/install-linux.sh" install "${install_args[@]}"
-  SERVICE_STOPPED_FOR_UPDATE=0
 }
 
 reload_caddy_if_present() {

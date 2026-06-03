@@ -1036,6 +1036,10 @@ write_systemd_service() {
     tmp="$(mktemp)"
     cat > "${tmp}" <<SERVICE
 [Unit]
+# Never give up restarting: StartLimitIntervalSec=0 disables systemd's start-rate
+# limiter, so a crash loop or a botched self-update can never leave the proxy
+# permanently dead waiting for a human to restart it by hand.
+StartLimitIntervalSec=0
 Description=Connect AI Proxy
 After=network-online.target
 Wants=network-online.target
@@ -1050,7 +1054,8 @@ ExecStartPre=/usr/local/bin/${APP_NAME} sync apply
 ExecStart=/usr/local/bin/${APP_NAME} serve
 ExecReload=/usr/local/bin/${APP_NAME} sync apply
 ExecStopPost=/usr/local/bin/${APP_NAME} sync restore
-Restart=on-failure
+# Restart=always (not on-failure) so a clean exit/SIGTERM also triggers recovery.
+Restart=always
 RestartSec=3
 
 [Install]
