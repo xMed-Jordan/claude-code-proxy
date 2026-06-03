@@ -90,8 +90,7 @@ Options:
   --browser-tools        Install/configure Chrome or Chromium browser tools
   --no-browser-tools     Skip Chrome/Chromium and browser MCP setup
   --server               Use server-oriented defaults
-  --upstream UPSTREAM    Default upstream provider: codex, antigravity, or openai (default: ask)
-  --gemini-api-key KEY   Google Gemini/Antigravity API key to write to .env
+  --upstream UPSTREAM    Default upstream provider: codex or openai (default: codex)
   --local                Use local workstation defaults
   -h, --help             Show this help
 USAGE
@@ -757,31 +756,7 @@ resolve_install_choices() {
   fi
 
   if [[ "${UPSTREAM_CHOICE}" == "ask" ]]; then
-    if prompt_yes_no "Set Google Antigravity (Gemini) as your default upstream? (If 'no', Codex/ChatGPT is used)" "no"; then
-      UPSTREAM_CHOICE="antigravity"
-    else
-      UPSTREAM_CHOICE="codex"
-    fi
-  fi
-
-  if [[ "${UPSTREAM_CHOICE}" == "antigravity" ]]; then
-    if [[ -z "${GEMINI_API_KEY_CHOICE}" ]]; then
-      local current_gemini_key=""
-      if [[ -f "${INSTALL_DIR}/.env" ]]; then
-        current_gemini_key="$(get_env_value "${INSTALL_DIR}/.env" "GEMINI_API_KEY" || true)"
-      fi
-      GEMINI_API_KEY_CHOICE="$(prompt_value "Gemini/Antigravity API Key" "${current_gemini_key}")"
-    fi
-  else
-    if [[ -z "${GEMINI_API_KEY_CHOICE}" ]]; then
-      local current_gemini_key=""
-      if [[ -f "${INSTALL_DIR}/.env" ]]; then
-        current_gemini_key="$(get_env_value "${INSTALL_DIR}/.env" "GEMINI_API_KEY" || true)"
-      fi
-      if [[ -n "${current_gemini_key}" ]] || prompt_yes_no "Configure a Gemini/Antigravity API Key for concurrent model routing?" "yes"; then
-        GEMINI_API_KEY_CHOICE="$(prompt_value "Gemini/Antigravity API Key (optional, press Enter to skip)" "${current_gemini_key}")"
-      fi
-    fi
+    UPSTREAM_CHOICE="codex"
   fi
 
   if [[ "${HTTPS_MODE}" == "ask" ]]; then
@@ -872,34 +847,6 @@ install_browser_dependencies() {
   warn "Install the Antigravity Chrome extension in the browser profile before using browser MCP tools. Extension ID: eeijfnjmjelapkebgockoeaadonbchdd"
 }
 
-ensure_antigravity_cli() {
-  log "Verifying Antigravity CLI installation."
-  
-  local home_dir="${INSTALL_HOME}"
-  local agy_bin="${home_dir}/.local/bin/agy"
-  
-  if ! run_as_install_user test -f "${agy_bin}"; then
-    log "Antigravity CLI (agy) not found at ${agy_bin}. Installing..."
-    run_as_install_user bash -c "curl -fsSL https://antigravity.google/cli/install.sh | bash" || {
-      warn "Failed to install Antigravity CLI automatically. Please install it manually from https://antigravity.google."
-    }
-  else
-    log "Antigravity CLI (agy) is already installed."
-  fi
-  
-  log "--------------------------------------------------------"
-  log "Please make sure you are logged into Antigravity CLI."
-  log "If this is a new installation or you are not authenticated,"
-  log "please run the following command in a separate terminal:"
-  log "  agy login"
-  log "or authenticate via the URL printed by agy."
-  log "Once authenticated, press [ENTER] to continue..."
-  log "--------------------------------------------------------"
-  if [[ "${DRY_RUN}" -ne 1 ]]; then
-    read -p "Press [ENTER] after logging into Antigravity..."
-  fi
-}
-
 assert_safe_install_dir() {
   case "${INSTALL_DIR}" in
     ""|"/"|"/opt"|"/usr"|"/usr/local"|"/home") die "unsafe install directory: ${INSTALL_DIR}" ;;
@@ -926,7 +873,7 @@ copy_proxy_files() {
   run mv -f "${binary_tmp}" "${INSTALL_DIR}/${APP_NAME}"
   run rm -rf "${INSTALL_DIR}/ui"
   run cp -R "${REPO_DIR}/ui" "${INSTALL_DIR}/ui"
-  for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh antigravity_gateway.py; do
+  for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh; do
     if [[ -f "${REPO_DIR}/${helper}" ]]; then
       run cp "${REPO_DIR}/${helper}" "${INSTALL_DIR}/${helper}"
     fi
@@ -1195,15 +1142,12 @@ install_all() {
   detect_os_and_package_manager
 	resolve_install_choices
 	install_base_dependencies
-	ensure_antigravity_cli
 	ensure_node_runtime
 	ensure_claude_code_cli
 	ensure_go
-	if [[ "${UPSTREAM_CHOICE}" != "antigravity" ]]; then
+	if [[ "${UPSTREAM_CHOICE}" != "openai" ]]; then
 		ensure_codex_cli
 		ensure_codex_auth
-	else
-		log "Google Antigravity selected as default upstream; skipping Codex/ChatGPT setup."
 	fi
   install_browser_dependencies
   build_proxy
