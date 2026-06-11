@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Connect AI Proxy — Control Panel</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234F46E5'/%3E%3Cpath d='M18 7l-8 11h6l-2 7 8-11h-6l2-7z' fill='%23fff'/%3E%3C/svg%3E"/>
+  <script>
+    // No-flash theme bootstrap: must run before any CSS loads.
+    (function () {
+      var theme = null;
+      try { theme = localStorage.getItem("ccp.theme"); } catch (e) {}
+      if (theme !== "light" && theme !== "dark") {
+        theme = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/ui/base.css"/>
+  <link rel="stylesheet" href="/ui/screens-monitor.css"/>
+  <link rel="stylesheet" href="/ui/screens-config.css"/>
+  <link rel="stylesheet" href="/ui/screens-tools.css"/>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="/ui/vendor/react.development.js"></script>
+  <script src="/ui/vendor/react-dom.development.js"></script>
+  <script src="/ui/vendor/babel.min.js"></script>
+
+  <script type="text/babel" src="/ui/icons.jsx"></script>
+  <script type="text/babel" src="/ui/lib.jsx"></script>
+  <script type="text/babel" src="/ui/components.jsx"></script>
+  <script type="text/babel" src="/ui/screens-monitor.jsx"></script>
+  <script type="text/babel" src="/ui/screens-config.jsx"></script>
+  <script type="text/babel" src="/ui/screens-tools.jsx"></script>
+  <script type="text/babel" src="/ui/app.jsx"></script>
+</body>
+</html>

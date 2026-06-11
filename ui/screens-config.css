@@ -1,0 +1,241 @@
+/* screens-config.css — Worker B: Configuration + Models + ApiKeys
+   All selectors prefixed .cfg- / .models- / .keys-
+   Reuses base.css tokens + primitives; no inline hex. */
+
+/* ── SCREEN: Configuration ── */
+
+.cfg-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.cfg-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  justify-content: flex-end;
+  padding: var(--sp-3) 0;
+}
+
+/* Two-column label / control grid */
+.cfg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.cfg-row {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: var(--sp-4);
+  align-items: start;
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+.cfg-row:last-child {
+  border-bottom: none;
+}
+
+.cfg-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 7px;
+}
+
+.cfg-label-name {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.cfg-label-env {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.02em;
+}
+
+.cfg-ctl {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.cfg-ctl-narrow .input {
+  max-width: 160px;
+}
+
+.cfg-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  margin: 0;
+  line-height: 1.4;
+}
+.cfg-hint-error {
+  color: var(--danger);
+}
+.cfg-hint-success {
+  color: var(--success);
+}
+
+.cfg-alias-input {
+  width: 100%;
+}
+
+.cfg-alias-arrow {
+  text-align: center;
+  font-size: var(--fs-md);
+  padding: 0 var(--sp-1);
+  white-space: nowrap;
+}
+
+@media (max-width: 800px) {
+  .cfg-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-2);
+  }
+  .cfg-label {
+    padding-top: 0;
+  }
+}
+
+/* ── SCREEN: Models ── */
+
+.models-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.models-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.models-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 0 var(--sp-2);
+}
+
+.models-search-input {
+  border: none !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  width: 200px;
+  padding: var(--sp-1) 0;
+  height: 32px;
+}
+
+.models-search-input:focus {
+  outline: none;
+  box-shadow: none !important;
+}
+
+.models-inline-input {
+  width: 100%;
+  min-width: 120px;
+  height: 30px;
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.models-alias-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.models-badges {
+  display: flex;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+.models-arrow {
+  text-align: center;
+  white-space: nowrap;
+  font-size: var(--fs-md);
+  padding: 0 var(--sp-2);
+  color: var(--text-3);
+}
+
+.models-context-select {
+  min-width: 0;
+  width: 90px;
+}
+
+.models-forward-select {
+  min-width: 0;
+  width: 104px;
+}
+
+.models-notes-col {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.models-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  justify-content: flex-end;
+}
+
+.models-info-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.models-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* ── SCREEN: API Keys ── */
+
+.keys-url-value {
+  display: block;
+  font-size: 11.5px;
+  max-width: 100%;
+}
+
+.keys-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.keys-renew-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-sm);
+}
+
+.keys-renew-banner .btn {
+  margin-left: auto;
+}
+
+.keys-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}

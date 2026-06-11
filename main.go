@@ -85,6 +85,7 @@ type config struct {
 	Models             map[string]string
 	ModelContexts      map[string]string
 	ModelCustom        map[string]bool
+	ModelForward       map[string]string
 	ClaudeDefaults     map[string]string
 	ReasoningEffort    string
 	AdminUsername      string
@@ -93,9 +94,10 @@ type config struct {
 }
 
 type modelAliasConfig struct {
-	Alias   string `json:"alias"`
-	Real    string `json:"real"`
-	Context string `json:"context,omitempty"`
+	Alias     string `json:"alias"`
+	Real      string `json:"real"`
+	Context   string `json:"context,omitempty"`
+	ForwardTo string `json:"forward_to,omitempty"`
 }
 
 type codexAuthFile struct {
@@ -397,29 +399,29 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/openai/v1/responses", requireAuth(cfg, requireProxyEnabled(handleResponses(cfg))))
 	mux.HandleFunc("/openai/v1/files", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
 	mux.HandleFunc("/openai/v1/files/", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
-	mux.HandleFunc("/ui/api/auth/status", handleUIAuthStatus(cfg))
-	mux.HandleFunc("/ui/api/auth/setup", handleUIAuthSetup(cfg))
-	mux.HandleFunc("/ui/api/auth/login", handleUIAuthLogin(cfg))
-	mux.HandleFunc("/ui/api/auth/logout", handleUIAuthLogout(cfg))
-	mux.HandleFunc("/ui/api/status", requireAdmin(cfg, handleUIStatus(cfg)))
-	mux.HandleFunc("/ui/api/config", requireAdmin(cfg, handleUIConfig(cfg)))
-	mux.HandleFunc("/ui/api/models", requireAdmin(cfg, handleUIModels(cfg)))
-	mux.HandleFunc("/ui/api/keys", requireAdmin(cfg, handleUIKeys(cfg)))
-	mux.HandleFunc("/ui/api/keys/provider", requireAdmin(cfg, handleUIProviderKeys(cfg)))
-	mux.HandleFunc("/ui/api/keys/client", requireAdmin(cfg, handleUIClientKeys(cfg)))
-	mux.HandleFunc("/ui/api/keys/toggle", requireAdmin(cfg, handleUIKeyToggle(cfg)))
-	mux.HandleFunc("/ui/api/validate", requireAdmin(cfg, handleUIValidate(cfg)))
-	mux.HandleFunc("/ui/api/test", requireAdmin(cfg, handleUITest(cfg)))
-	mux.HandleFunc("/ui/api/logs", requireAdmin(cfg, handleUILogs))
-	mux.HandleFunc("/ui/api/antigravity", requireAdmin(cfg, handleUIAntigravityStatus))
-	mux.HandleFunc("/ui/api/antigravity/probe", requireAdmin(cfg, handleUIAntigravityProbe))
-	mux.HandleFunc("/ui/api/update/status", requireAdmin(cfg, handleUIUpdateStatus(cfg)))
-	mux.HandleFunc("/ui/api/update/check", requireAdmin(cfg, handleUIUpdateCheck(cfg)))
-	mux.HandleFunc("/ui/api/update/start", requireAdmin(cfg, handleUIUpdateStart(cfg)))
-	mux.HandleFunc("/ui/api/update/settings", requireAdmin(cfg, handleUIUpdateSettings(cfg)))
-	mux.HandleFunc("/ui/api/proxy/stop", requireAdmin(cfg, handleUIStop))
-	mux.HandleFunc("/ui/api/proxy/start", requireAdmin(cfg, handleUIStart))
-	mux.HandleFunc("/ui/api/proxy/restart", requireAdmin(cfg, handleUIRestart(cfg)))
+	mux.HandleFunc("/ui/api/auth/status", noStore(handleUIAuthStatus(cfg)))
+	mux.HandleFunc("/ui/api/auth/setup", noStore(handleUIAuthSetup(cfg)))
+	mux.HandleFunc("/ui/api/auth/login", noStore(handleUIAuthLogin(cfg)))
+	mux.HandleFunc("/ui/api/auth/logout", noStore(handleUIAuthLogout(cfg)))
+	mux.HandleFunc("/ui/api/status", noStore(requireAdmin(cfg, handleUIStatus(cfg))))
+	mux.HandleFunc("/ui/api/config", noStore(requireAdmin(cfg, handleUIConfig(cfg))))
+	mux.HandleFunc("/ui/api/models", noStore(requireAdmin(cfg, handleUIModels(cfg))))
+	mux.HandleFunc("/ui/api/keys", noStore(requireAdmin(cfg, handleUIKeys(cfg))))
+	mux.HandleFunc("/ui/api/keys/provider", noStore(requireAdmin(cfg, handleUIProviderKeys(cfg))))
+	mux.HandleFunc("/ui/api/keys/client", noStore(requireAdmin(cfg, handleUIClientKeys(cfg))))
+	mux.HandleFunc("/ui/api/keys/toggle", noStore(requireAdmin(cfg, handleUIKeyToggle(cfg))))
+	mux.HandleFunc("/ui/api/validate", noStore(requireAdmin(cfg, handleUIValidate(cfg))))
+	mux.HandleFunc("/ui/api/test", noStore(requireAdmin(cfg, handleUITest(cfg))))
+	mux.HandleFunc("/ui/api/logs", noStore(requireAdmin(cfg, handleUILogs)))
+	mux.HandleFunc("/ui/api/antigravity", noStore(requireAdmin(cfg, handleUIAntigravityStatus)))
+	mux.HandleFunc("/ui/api/antigravity/probe", noStore(requireAdmin(cfg, handleUIAntigravityProbe)))
+	mux.HandleFunc("/ui/api/update/status", noStore(requireAdmin(cfg, handleUIUpdateStatus(cfg))))
+	mux.HandleFunc("/ui/api/update/check", noStore(requireAdmin(cfg, handleUIUpdateCheck(cfg))))
+	mux.HandleFunc("/ui/api/update/start", noStore(requireAdmin(cfg, handleUIUpdateStart(cfg))))
+	mux.HandleFunc("/ui/api/update/settings", noStore(requireAdmin(cfg, handleUIUpdateSettings(cfg))))
+	mux.HandleFunc("/ui/api/proxy/stop", noStore(requireAdmin(cfg, handleUIStop)))
+	mux.HandleFunc("/ui/api/proxy/start", noStore(requireAdmin(cfg, handleUIStart)))
+	mux.HandleFunc("/ui/api/proxy/restart", noStore(requireAdmin(cfg, handleUIRestart(cfg))))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_running": proxyEnabled.Load()})
 	})
@@ -445,7 +447,7 @@ func loadConfig() config {
 	}
 	env := processEnvValue
 	claudeDefaults := claudeDefaultsFromValues(env)
-	models, modelContexts, modelCustom := modelAliasesFromValues(env)
+	models, modelContexts, modelCustom, modelForward := modelAliasesFromValues(env)
 	return config{
 		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:      baseURL,
@@ -463,6 +465,7 @@ func loadConfig() config {
 		Models:             models,
 		ModelContexts:      modelContexts,
 		ModelCustom:        modelCustom,
+		ModelForward:       modelForward,
 		AdminUsername:      strings.TrimSpace(getenv("ADMIN_USERNAME", "")),
 		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
 		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
@@ -578,10 +581,11 @@ func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
 	}
 }
 
-func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]string, map[string]bool) {
+func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]string, map[string]bool, map[string]string) {
 	models := defaultModelAliasesFromValues(env)
 	contexts := map[string]string{}
 	custom := map[string]bool{}
+	forwards := map[string]string{}
 	for _, row := range parseModelAliasConfigs(env("PROXY_MODEL_ALIASES", "")) {
 		alias := strings.TrimSpace(row.Alias)
 		real := cleanModel(strings.TrimSpace(row.Real))
@@ -591,13 +595,39 @@ func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]str
 		models[alias] = real
 		contexts[alias] = normalizeModelContext(row.Context)
 		custom[alias] = true
+		forwards[alias] = normalizeForwardTarget(row.ForwardTo)
 	}
 	for alias := range parseDisabledModelAliases(env("PROXY_MODEL_ALIASES_DISABLED", "")) {
 		delete(models, alias)
 		delete(contexts, alias)
 		delete(custom, alias)
+		delete(forwards, alias)
 	}
-	return models, contexts, custom
+	return models, contexts, custom, forwards
+}
+
+// knownForwardTargets is the set of backends a model alias may forward to.
+// Only "codex" routes today; "agy", "claude" and "opencode" are reserved and
+// take effect once their backends are wired (see requestUpstream).
+var knownForwardTargets = map[string]bool{"codex": true, "agy": true, "claude": true, "opencode": true}
+
+func normalizeForwardTarget(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if knownForwardTargets[s] {
+		return s
+	}
+	return "codex"
+}
+
+// forwardForAlias returns the configured forward target for an alias, defaulting
+// to "codex". Callers must hold modelConfigMu (read lock) as it reads cfg.ModelForward.
+func forwardForAlias(cfg config, alias string) string {
+	if cfg.ModelForward != nil {
+		if v, ok := cfg.ModelForward[alias]; ok && v != "" {
+			return normalizeForwardTarget(v)
+		}
+	}
+	return "codex"
 }
 
 func parseModelAliasConfigs(raw string) []modelAliasConfig {
@@ -908,6 +938,15 @@ func requireAdmin(cfg config, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// noStore marks a control-panel API response as uncacheable so browsers never
+// serve a stale auth/status payload after the session changes.
+func noStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
+}
+
 func handleUIAuthStatus(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg = adminRuntimeConfig(cfg)
@@ -934,6 +973,7 @@ func handleUIAuthSetup(cfg config) http.HandlerFunc {
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
+			Remember bool   `json:"remember"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -965,7 +1005,7 @@ func handleUIAuthSetup(cfg config) http.HandlerFunc {
 		cfg.AdminUsername = username
 		cfg.AdminPasswordHash = hash
 		cfg.AdminSessionSecret = secret
-		setAdminSessionCookie(w, cfg, username)
+		setAdminSessionCookie(w, cfg, username, body.Remember)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Admin login configured."})
 	}
 }
@@ -984,6 +1024,7 @@ func handleUIAuthLogin(cfg config) http.HandlerFunc {
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
+			Remember bool   `json:"remember"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -993,7 +1034,7 @@ func handleUIAuthLogin(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid username or password"})
 			return
 		}
-		setAdminSessionCookie(w, cfg, cfg.AdminUsername)
+		setAdminSessionCookie(w, cfg, cfg.AdminUsername, body.Remember)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -1005,15 +1046,24 @@ func handleUIAuthLogout(_ config) http.HandlerFunc {
 	}
 }
 
-func setAdminSessionCookie(w http.ResponseWriter, cfg config, username string) {
-	exp := time.Now().Add(24 * time.Hour).Unix()
+const (
+	adminSessionTTL         = 24 * time.Hour
+	adminSessionRememberTTL = 365 * 24 * time.Hour
+)
+
+func setAdminSessionCookie(w http.ResponseWriter, cfg config, username string, remember bool) {
+	ttl := adminSessionTTL
+	if remember {
+		ttl = adminSessionRememberTTL
+	}
+	exp := time.Now().Add(ttl).Unix()
 	payload := fmt.Sprintf("%s|%d", username, exp)
 	sig := adminSessionSignature(cfg, payload)
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + sig,
 		Path:     "/",
-		MaxAge:   24 * 60 * 60,
+		MaxAge:   int(ttl / time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -4246,7 +4296,7 @@ func apiDocRoutes() []apiDocRoute {
 			Group: "Admin auth", OperationID: "loginAdmin", Method: http.MethodPost, Path: "/ui/api/auth/login", Summary: "Log in to the admin UI", Auth: apiDocAuthPublic,
 			Description:   "Sets the local admin session cookie when the credentials are valid.",
 			RequestSchema: "UIAuthCredentialsRequest", ResponseSchema: "OKResponse",
-			RequestExample:  map[string]any{"username": "{{adminUsername}}", "password": "{{adminPassword}}"},
+			RequestExample:  map[string]any{"username": "{{adminUsername}}", "password": "{{adminPassword}}", "remember": true},
 			ResponseExample: map[string]any{"ok": true},
 		},
 		{
@@ -4792,7 +4842,7 @@ func openAPISchemas() map[string]any {
 		"ResponsesResponse":            schemaOpenObject(map[string]any{"id": schemaString("Response id."), "object": schemaString("response"), "model": schemaString("Model id."), "output": schemaArray(anyMap), "usage": anyMap}),
 		"ProviderPassThroughResponse":  map[string]any{"type": "object", "additionalProperties": true, "description": "Provider-shaped OpenAI-compatible response."},
 		"UIAuthStatusResponse":         schemaObject(map[string]any{"configured": schemaBoolean("Admin auth is configured."), "authenticated": schemaBoolean("Current request has a valid admin cookie."), "username": schemaString("Configured admin username.")}, "configured", "authenticated", "username"),
-		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password.")}, "username", "password"),
+		"UIAuthCredentialsRequest":     schemaObject(map[string]any{"username": schemaString("Admin username."), "password": schemaString("Admin password."), "remember": schemaBoolean("Keep the session signed in for a year instead of 24 hours.")}, "username", "password"),
 		"UIStatusResponse":             schemaOpenObject(map[string]any{"running": schemaBoolean("Proxy endpoints are running."), "proxy_running": schemaBoolean("Proxy endpoints are running."), "pid": schemaInteger("Process id."), "uptime_seconds": schemaInteger("Process uptime."), "version": schemaString("Installed proxy version."), "update": anyMap, "local_url": schemaString("Local control panel URL."), "public_url": schemaString("Public reverse-proxy URL when configured."), "display_url": schemaString("Preferred URL for the control panel to show."), "anthropic_url": schemaString("Anthropic-compatible base URL."), "openai_url": schemaString("OpenAI-compatible base URL."), "host": schemaString("Local bind host."), "port": schemaString("Local port."), "bind_url": schemaString("Local bind address."), "upstream": schemaString("Configured upstream."), "codex_auth": anyMap, "codex_sessions": anyMap, "claude_settings": anyMap, "antigravity": anyMap, "dashboard": anyMap, "models": schemaArray(anyMap), "last_request": anyMap, "claude_version": schemaString("Claude CLI version."), "proxy_key": schemaString("Current proxy key."), "proxy_key_masked": schemaString("Masked proxy key.")}),
 		"UIUpdateStatusResponse":       schemaOpenObject(map[string]any{"current_version": schemaString("Installed proxy version."), "latest_version": schemaString("Latest version from GitHub."), "update_available": schemaBoolean("A newer version is available."), "auto_update": schemaBoolean("Automatic app updates are enabled."), "full_system_update": schemaBoolean("Manual dashboard updates may run the full system updater."), "state": schemaString("idle, queued, running, succeeded, or failed."), "phase": schemaString("Current update phase."), "message": schemaString("Human-readable update status."), "running": schemaBoolean("An update is currently active."), "updated_at": schemaString("Last status update time."), "started_at": schemaString("Update start time."), "finished_at": schemaString("Update finish time."), "repo_dir": schemaString("Repository directory used by the updater."), "branch": schemaString("Git branch used by the updater."), "version_url": schemaString("VERSION URL checked for newer releases."), "status_file": schemaString("Machine-readable status file path."), "latest": anyMap}),
 		"UIUpdateStartResponse":        schemaOpenObject(map[string]any{"ok": schemaBoolean("Whether the update was queued."), "message": schemaString("Human-readable status."), "update": anyMap}),
@@ -5276,16 +5326,47 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// uiSPARoutes is the allowlist of client-side routes the SPA owns. Each one
+// (with or without a single trailing slash) serves the SPA HTML so deep links
+// and reloads work. Anything else under "/" is a 404.
+var uiSPARoutes = map[string]bool{
+	"/":          true,
+	"/dashboard": true,
+	"/config":    true,
+	"/models":    true,
+	"/keys":      true,
+	"/test":      true,
+	"/logs":      true,
+	"/updates":   true,
+	"/browser":   true,
+	"/setup":     true,
+}
+
+// uiIndexFile returns the SPA entry point: the new ui/index.html when present,
+// otherwise the legacy filename (deploy-order safety so an out-of-sync rollout
+// still serves a panel).
+func uiIndexFile(uiDir string) string {
+	index := filepath.Join(uiDir, "index.html")
+	if _, err := os.Stat(index); err == nil {
+		return index
+	}
+	return filepath.Join(uiDir, "Connect AI Proxy Control Panel.html")
+}
+
 func handleUI(w http.ResponseWriter, r *http.Request) {
 	uiDir := filepath.Join(".", "ui")
-	if r.URL.Path == "/" {
-		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeFile(w, r, filepath.Join(uiDir, "Connect AI Proxy Control Panel.html"))
-		return
-	}
 	if strings.HasPrefix(r.URL.Path, "/ui/") {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.StripPrefix("/ui/", http.FileServer(http.Dir(uiDir))).ServeHTTP(w, r)
+		return
+	}
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	if path == "" {
+		path = "/"
+	}
+	if uiSPARoutes[path] {
+		w.Header().Set("Cache-Control", "no-cache")
+		http.ServeFile(w, r, uiIndexFile(uiDir))
 		return
 	}
 	http.NotFound(w, r)
@@ -6953,8 +7034,13 @@ func saveModelAliasesToEnvMap(vals map[string]string, submitted []modelAliasConf
 	for _, row := range rows {
 		baseReal, isBase := baseModels[row.Alias]
 		baseContext := contextForAlias(baseCfg, row.Alias)
-		if !isBase || baseReal != row.Real || row.Context != baseContext {
-			overrides = append(overrides, row)
+		forwardCustom := row.ForwardTo != "" && row.ForwardTo != "codex"
+		if !isBase || baseReal != row.Real || row.Context != baseContext || forwardCustom {
+			out := row
+			if !forwardCustom {
+				out.ForwardTo = "" // keep .env tidy: omitempty drops default codex
+			}
+			overrides = append(overrides, out)
 		}
 	}
 	sort.Slice(overrides, func(i, j int) bool { return overrides[i].Alias < overrides[j].Alias })
@@ -6976,11 +7062,13 @@ func saveModelAliasesToEnvMap(vals map[string]string, submitted []modelAliasConf
 		Models:         map[string]string{},
 		ModelContexts:  map[string]string{},
 		ModelCustom:    map[string]bool{},
+		ModelForward:   map[string]string{},
 		ClaudeDefaults: claudeDefaults,
 	}
 	for _, row := range rows {
 		next.Models[row.Alias] = row.Real
 		next.ModelContexts[row.Alias] = row.Context
+		next.ModelForward[row.Alias] = normalizeForwardTarget(row.ForwardTo)
 		if _, isBase := baseModels[row.Alias]; !isBase || !isAdvertisedModel(row.Alias) {
 			next.ModelCustom[row.Alias] = true
 		}
@@ -7008,7 +7096,7 @@ func normalizeSubmittedModelAliases(submitted []modelAliasConfig) ([]modelAliasC
 			return nil, fmt.Errorf("alias %q is duplicated", alias)
 		}
 		seen[key] = true
-		rows = append(rows, modelAliasConfig{Alias: alias, Real: real, Context: normalizeModelContext(row.Context)})
+		rows = append(rows, modelAliasConfig{Alias: alias, Real: real, Context: normalizeModelContext(row.Context), ForwardTo: normalizeForwardTarget(row.ForwardTo)})
 	}
 	return rows, nil
 }
@@ -7029,6 +7117,7 @@ func replaceRuntimeModelConfig(cfg config, next config) {
 	replaceStringMap(cfg.Models, next.Models)
 	replaceStringMap(cfg.ModelContexts, next.ModelContexts)
 	replaceBoolMap(cfg.ModelCustom, next.ModelCustom)
+	replaceStringMap(cfg.ModelForward, next.ModelForward)
 	replaceStringMap(cfg.ClaudeDefaults, next.ClaudeDefaults)
 }
 
@@ -7098,6 +7187,7 @@ func modelRows(cfg config) []map[string]any {
 			"limits_source":         limitsSource,
 			"default":               isDefaultModelAlias(alias),
 			"recommended":           isRecommendedModelAlias(alias),
+			"forward_to":            forwardForAlias(cfg, alias),
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -7540,7 +7630,6 @@ func responsesRequestToOpenAI(in responsesRequest) openAIRequest {
 	return out
 }
 
-
 func extractBase64DataAndExt(part map[string]any) ([]byte, string, error) {
 	if imgUrl, ok := part["image_url"].(map[string]any); ok {
 		if urlStr, ok := imgUrl["url"].(string); ok {
@@ -7550,7 +7639,7 @@ func extractBase64DataAndExt(part map[string]any) ([]byte, string, error) {
 	if urlStr, ok := part["image_url"].(string); ok {
 		return parseDataURL(urlStr)
 	}
-	
+
 	if source, ok := part["source"].(map[string]any); ok {
 		if stringField(source, "type") == "base64" {
 			mediaType := stringField(source, "media_type")
@@ -7569,7 +7658,7 @@ func extractBase64DataAndExt(part map[string]any) ([]byte, string, error) {
 			return dec, ext, err
 		}
 	}
-	
+
 	if fileObj, ok := part["file"].(map[string]any); ok {
 		filename := stringField(fileObj, "filename")
 		ext := filepath.Ext(filename)
@@ -7580,7 +7669,7 @@ func extractBase64DataAndExt(part map[string]any) ([]byte, string, error) {
 		dec, err := base64.StdEncoding.DecodeString(dataStr)
 		return dec, ext, err
 	}
-	
+
 	return nil, "", fmt.Errorf("unsupported file block")
 }
 
@@ -7594,7 +7683,7 @@ func parseDataURL(urlStr string) ([]byte, string, error) {
 	}
 	header := urlStr[:comma]
 	dataStr := urlStr[comma+1:]
-	
+
 	ext := ".jpg"
 	if strings.Contains(header, "image/png") {
 		ext = ".png"
@@ -7605,11 +7694,10 @@ func parseDataURL(urlStr string) ([]byte, string, error) {
 	} else if strings.Contains(header, "video/mp4") {
 		ext = ".mp4"
 	}
-	
+
 	dec, err := base64.StdEncoding.DecodeString(dataStr)
 	return dec, ext, err
 }
-
 
 func requestUpstream(cfg config, r *http.Request, requestedModel string) string {
 	// Gemini/Antigravity support has been removed. This proxy only talks to the

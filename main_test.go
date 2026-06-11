@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPublicBaseURLNormalization(t *testing.T) {
@@ -805,6 +808,70 @@ func TestNormalizeSubmittedModelAliasesRejectsDuplicates(t *testing.T) {
 	}
 }
 
+func TestModelForwardToPersistAndDefault(t *testing.T) {
+	t.Setenv("PROXY_MODEL_ALIASES", "")
+	t.Setenv("PROXY_MODEL_ALIASES_DISABLED", "")
+	vals := map[string]string{}
+	next, err := saveModelAliasesToEnvMap(vals, []modelAliasConfig{
+		{Alias: "agy-model", Real: "gpt-5.4", Context: "200k", ForwardTo: "agy"},
+		{Alias: "plain-model", Real: "gpt-5.4-mini", Context: "200k"},
+		{Alias: "weird-model", Real: "gpt-5.5", Context: "200k", ForwardTo: "xyz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Runtime config carries the forward target, defaulting/normalizing to codex.
+	if next.ModelForward["agy-model"] != "agy" {
+		t.Fatalf("agy-model forward = %q, want agy", next.ModelForward["agy-model"])
+	}
+	if next.ModelForward["plain-model"] != "codex" {
+		t.Fatalf("plain-model forward = %q, want codex (default)", next.ModelForward["plain-model"])
+	}
+	if next.ModelForward["weird-model"] != "codex" {
+		t.Fatalf("weird-model forward = %q, want codex (invalid normalized)", next.ModelForward["weird-model"])
+	}
+
+	// Persisted JSON keeps forward_to only for non-codex targets (omitempty + blanked default).
+	var overrides []modelAliasConfig
+	if err := json.Unmarshal([]byte(vals["PROXY_MODEL_ALIASES"]), &overrides); err != nil {
+		t.Fatalf("override JSON invalid: %v", err)
+	}
+	byAlias := map[string]modelAliasConfig{}
+	for _, o := range overrides {
+		byAlias[o.Alias] = o
+	}
+	if byAlias["agy-model"].ForwardTo != "agy" {
+		t.Fatalf("persisted agy-model forward_to = %q, want agy", byAlias["agy-model"].ForwardTo)
+	}
+	if byAlias["plain-model"].ForwardTo != "" {
+		t.Fatalf("default codex row should omit forward_to, got %q", byAlias["plain-model"].ForwardTo)
+	}
+
+	// modelRows surfaces forward_to (default codex) for the admin UI.
+	got := map[string]any{}
+	for _, r := range modelRows(next) {
+		got[fmt.Sprint(r["alias"])] = r["forward_to"]
+	}
+	if got["agy-model"] != "agy" {
+		t.Fatalf("modelRows agy-model forward_to = %v, want agy", got["agy-model"])
+	}
+	if got["plain-model"] != "codex" {
+		t.Fatalf("modelRows plain-model forward_to = %v, want codex", got["plain-model"])
+	}
+
+	// A round-trip through the env loader restores the forward targets.
+	env := func(key, def string) string {
+		if v, ok := vals[key]; ok {
+			return v
+		}
+		return def
+	}
+	if _, _, _, forwards := modelAliasesFromValues(env); forwards["agy-model"] != "agy" {
+		t.Fatalf("loader agy-model forward = %q, want agy", forwards["agy-model"])
+	}
+}
+
 func stringSliceContains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -1314,6 +1381,213 @@ func TestEnsureClaudeIsolationHooksAddsSubagentStop(t *testing.T) {
 	}
 	if _, ok := hooks["SubagentStop"]; !ok {
 		t.Fatal("SubagentStop hook was not configured")
+	}
+}
+
+// sessionCookieExp decodes the username|exp payload from an admin session
+// cookie value and returns the exp as a Unix timestamp.
+func sessionCookieExp(t *testing.T, value string) int64 {
+	t.Helper()
+	parts := strings.SplitN(value, ".", 2)
+	if len(parts) != 2 {
+		t.Fatalf("cookie value %q is not payload.sig", value)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode cookie payload: %v", err)
+	}
+	fields := strings.Split(string(raw), "|")
+	if len(fields) != 2 {
+		t.Fatalf("cookie payload %q is not username|exp", string(raw))
+	}
+	exp, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse cookie exp %q: %v", fields[1], err)
+	}
+	return exp
+}
+
+func TestSetAdminSessionCookieRememberExpiry(t *testing.T) {
+	cfg := config{AdminUsername: "admin", AdminSessionSecret: "test-secret"}
+	const tolerance = 2 * 60 // seconds
+
+	cases := []struct {
+		name       string
+		remember   bool
+		wantMaxAge int
+		ttl        time.Duration
+	}{
+		{"default", false, int(adminSessionTTL / time.Second), adminSessionTTL},
+		{"remember", true, int(adminSessionRememberTTL / time.Second), adminSessionRememberTTL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			before := time.Now()
+			setAdminSessionCookie(rec, cfg, "admin", tc.remember)
+			after := time.Now()
+
+			res := rec.Result()
+			cookies := res.Cookies()
+			if len(cookies) != 1 {
+				t.Fatalf("expected 1 cookie, got %d", len(cookies))
+			}
+			ck := cookies[0]
+			if ck.Name != adminSessionCookieName {
+				t.Fatalf("cookie name = %q, want %q", ck.Name, adminSessionCookieName)
+			}
+			if ck.MaxAge != tc.wantMaxAge {
+				t.Fatalf("MaxAge = %d, want %d", ck.MaxAge, tc.wantMaxAge)
+			}
+
+			gotExp := sessionCookieExp(t, ck.Value)
+			wantExpLo := before.Add(tc.ttl).Unix() - tolerance
+			wantExpHi := after.Add(tc.ttl).Unix() + tolerance
+			if gotExp < wantExpLo || gotExp > wantExpHi {
+				t.Fatalf("payload exp = %d, want within [%d,%d]", gotExp, wantExpLo, wantExpHi)
+			}
+
+			// Cookie must round-trip through adminSessionValid.
+			req := httptest.NewRequest(http.MethodGet, "/ui/api/status", nil)
+			req.AddCookie(ck)
+			if !adminSessionValid(cfg, req) {
+				t.Fatalf("adminSessionValid rejected freshly issued cookie (remember=%v)", tc.remember)
+			}
+		})
+	}
+}
+
+func TestLoginRememberFieldControlsSessionLength(t *testing.T) {
+	// Isolate from any ambient admin env so the runtime config is fully ours.
+	t.Setenv("ADMIN_USERNAME", "")
+	t.Setenv("ADMIN_PASSWORD_HASH", "")
+	t.Setenv("ADMIN_SESSION_SECRET", "")
+
+	hash, err := hashAdminPassword("supersecret")
+	if err != nil {
+		t.Fatalf("hashAdminPassword: %v", err)
+	}
+	cfg := config{AdminUsername: "admin", AdminPasswordHash: hash, AdminSessionSecret: "test-secret"}
+	handler := handleUIAuthLogin(cfg)
+
+	cases := []struct {
+		name       string
+		body       string
+		wantMaxAge int
+	}{
+		{"without remember", `{"username":"admin","password":"supersecret"}`, int(adminSessionTTL / time.Second)},
+		{"with remember", `{"username":"admin","password":"supersecret","remember":true}`, int(adminSessionRememberTTL / time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ui/api/auth/login", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			handler(rec, req)
+
+			res := rec.Result()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("login status = %d, want 200; body=%s", res.StatusCode, rec.Body.String())
+			}
+			cookies := res.Cookies()
+			if len(cookies) != 1 {
+				t.Fatalf("expected 1 session cookie, got %d", len(cookies))
+			}
+			if cookies[0].MaxAge != tc.wantMaxAge {
+				t.Fatalf("MaxAge = %d, want %d", cookies[0].MaxAge, tc.wantMaxAge)
+			}
+		})
+	}
+}
+
+func TestUISlugRoutesServeSPA(t *testing.T) {
+	dir := t.TempDir()
+	uiDir := filepath.Join(dir, "ui")
+	if err := os.MkdirAll(uiDir, 0o755); err != nil {
+		t.Fatalf("mkdir ui: %v", err)
+	}
+	const marker = "<!--SPA-INDEX-MARKER-->"
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte(marker), 0o644); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+	t.Chdir(dir)
+
+	allowed := []string{
+		"/", "/dashboard", "/config", "/models", "/keys",
+		"/test", "/logs", "/updates", "/browser", "/setup",
+		"/dashboard/", // one trailing slash tolerated
+	}
+	for _, path := range allowed {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handleUI(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", path, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), marker) {
+			t.Fatalf("GET %s did not serve SPA index (marker missing)", path)
+		}
+	}
+
+	for _, path := range []string{"/nope", "/dashboard/extra", "/api"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handleUI(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want 404", path, rec.Code)
+		}
+	}
+
+	// /health must not be shadowed by the SPA catch-all: it stays a JSON route.
+	cfg := config{Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	mux := newProxyMux(cfg)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /health status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("GET /health content-type = %q, want JSON", ct)
+	}
+	if strings.Contains(rec.Body.String(), marker) {
+		t.Fatalf("GET /health was shadowed by the SPA index")
+	}
+}
+
+func TestUIIndexFallsBackToLegacyFilename(t *testing.T) {
+	dir := t.TempDir()
+	uiDir := filepath.Join(dir, "ui")
+	if err := os.MkdirAll(uiDir, 0o755); err != nil {
+		t.Fatalf("mkdir ui: %v", err)
+	}
+	const marker = "<!--LEGACY-PANEL-MARKER-->"
+	if err := os.WriteFile(filepath.Join(uiDir, "Connect AI Proxy Control Panel.html"), []byte(marker), 0o644); err != nil {
+		t.Fatalf("write legacy panel: %v", err)
+	}
+	t.Chdir(dir)
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	rec := httptest.NewRecorder()
+	handleUI(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), marker) {
+		t.Fatalf("GET /dashboard did not fall back to the legacy panel filename")
+	}
+}
+
+func TestUIAPIResponsesSetNoStore(t *testing.T) {
+	cfg := config{Models: map[string]string{"sonnet[1m]": "gpt-5.5"}}
+	mux := newProxyMux(cfg)
+
+	for _, path := range []string{"/ui/api/auth/status", "/ui/api/status"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("GET %s Cache-Control = %q, want %q", path, got, "no-store")
+		}
 	}
 }
 
