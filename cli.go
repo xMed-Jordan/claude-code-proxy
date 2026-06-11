@@ -133,9 +133,10 @@ func runStart() error {
 	if err := ensureCurrentBinaryBuilt(); err != nil {
 		return err
 	}
-	if err := runClaudeSettingsSyncGo("apply"); err != nil {
-		return err
-	}
+	// NOTE: starting the proxy no longer rewrites ~/.claude/settings.json.
+	// The interface (control panel) and the proxy server are decoupled — apply
+	// Claude Code settings manually from the dashboard "Apply to Claude Code"
+	// button (POST /ui/api/settings/apply) or `connect-ai-proxy sync apply`.
 	if envFlag("ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", false) {
 		if err := startAntigravityBrowser(false, false); err != nil {
 			fmt.Printf("Antigravity browser prelaunch skipped: %v\n", err)
@@ -200,7 +201,9 @@ func runStop() error {
 	}
 	_ = os.Remove(pidPath)
 	_ = stopControlledAntigravityBrowser(false)
-	return runClaudeSettingsSyncGo("restore")
+	// Stopping the proxy no longer restores ~/.claude/settings.json — settings
+	// are managed manually (dashboard button or `connect-ai-proxy sync restore`).
+	return nil
 }
 
 func runRestart() error {

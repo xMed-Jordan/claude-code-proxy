@@ -9,7 +9,7 @@
     Icon, api, useLive, fmtUptime, fmtCount, fmtPct, fmtMs, timeAgo,
     PageHeader, Card, StatCard, Button, IconButton, Badge, Tabs, Switch,
     Input, CopyButton, SecretField, KeyValue, Sparkline, AreaChart,
-    Skeleton, Spinner, EmptyState,
+    Skeleton, Spinner, EmptyState, useToast, Modal,
   } = window;
 
   const cx = (...p) => p.filter(Boolean).join(" ");
@@ -19,7 +19,7 @@
   /* ════════════════════════════════════════════════════════════════
      DASHBOARD
      ════════════════════════════════════════════════════════════════ */
-  function Dashboard({ liveStatus, statusStale, onAction, navigate }) {
+  function Dashboard({ liveStatus, statusStale, onAction, navigate, pushToast }) {
     const [chartTab, setChartTab] = useState("requests");
 
     // On-demand validation (GET /ui/api/validate) — same contract as old code.
@@ -33,6 +33,33 @@
         .finally(() => setValidating(false));
     }, []);
     useEffect(() => { runValidation(); }, [runValidation]);
+
+    // Manual "Apply to Claude Code" — start/stop scripts no longer auto-sync settings.
+    const toast = useToast();
+    const ccNotify = useCallback((msg, tone) => {
+      if (toast) { tone === "error" ? toast.error(msg) : tone === "success" ? toast.success(msg) : toast.info(msg); }
+      else if (pushToast) pushToast(msg, tone || "info");
+    }, [toast, pushToast]);
+    const [ccApplied, setCcApplied] = useState(null); // null = unknown
+    const [ccBusy, setCcBusy] = useState(false);
+    const [ccConfirm, setCcConfirm] = useState(false);
+    const refreshCc = useCallback(() => {
+      api.get("/ui/api/settings/apply").then((r) => setCcApplied(!!r.applied)).catch(() => {});
+    }, []);
+    useEffect(() => { refreshCc(); }, [refreshCc]);
+    const applyCc = useCallback(async () => {
+      setCcBusy(true);
+      try {
+        const r = await api.post("/ui/api/settings/apply");
+        setCcApplied(true);
+        setCcConfirm(false);
+        ccNotify((r && r.message) || "Applied proxy settings to Claude Code", "success");
+      } catch (e) {
+        ccNotify("Apply failed: " + (e.message || e), "error");
+      } finally {
+        setCcBusy(false);
+      }
+    }, [ccNotify]);
 
     const loading = !liveStatus;
     const running = !!(liveStatus && liveStatus.proxy_running);
@@ -319,6 +346,40 @@
             )}
           </Card>
         </div>
+
+        {/* Claude Code integration (manual settings apply) */}
+        <Card
+          title="Claude Code integration"
+          description="Point this machine's Claude Code at the proxy. Applied manually — starting or stopping the proxy no longer changes your settings."
+          actions={
+            <Badge tone={ccApplied == null ? "neutral" : ccApplied ? "success" : "warning"}>
+              {ccApplied == null ? "—" : ccApplied ? "Applied" : "Not applied"}
+            </Badge>
+          }
+        >
+          <div className="dash-cc-row">
+            <div className="dash-cc-text">
+              Writes <span className="mono">ANTHROPIC_BASE_URL</span>, the auth token and model defaults into{" "}
+              <span className="mono">~/.claude/settings.json</span>. This session keeps working; restart Claude Code to pick up the change.
+            </div>
+            <Button variant="primary" icon="bolt" loading={ccBusy} onClick={() => setCcConfirm(true)}>
+              Apply to Claude Code
+            </Button>
+          </div>
+        </Card>
+
+        <Modal
+          open={ccConfirm}
+          onClose={() => { if (!ccBusy) setCcConfirm(false); }}
+          title="Apply settings to Claude Code?"
+          description="This rewrites ~/.claude/settings.json so Claude Code routes through this proxy. New Claude Code sessions use it after a restart; the proxy server itself is unaffected."
+          footer={
+            <div className="dash-cc-modal-footer">
+              <Button variant="ghost" onClick={() => setCcConfirm(false)} disabled={ccBusy}>Cancel</Button>
+              <Button variant="primary" icon="bolt" loading={ccBusy} onClick={applyCc}>Apply</Button>
+            </div>
+          }
+        />
 
         {/* Validation + Status breakdown */}
         <div className="grid-2">

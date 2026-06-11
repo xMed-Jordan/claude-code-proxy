@@ -419,6 +419,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/update/check", noStore(requireAdmin(cfg, handleUIUpdateCheck(cfg))))
 	mux.HandleFunc("/ui/api/update/start", noStore(requireAdmin(cfg, handleUIUpdateStart(cfg))))
 	mux.HandleFunc("/ui/api/update/settings", noStore(requireAdmin(cfg, handleUIUpdateSettings(cfg))))
+	mux.HandleFunc("/ui/api/settings/apply", noStore(requireAdmin(cfg, handleUISettingsApply(cfg))))
 	mux.HandleFunc("/ui/api/proxy/stop", noStore(requireAdmin(cfg, handleUIStop)))
 	mux.HandleFunc("/ui/api/proxy/start", noStore(requireAdmin(cfg, handleUIStart)))
 	mux.HandleFunc("/ui/api/proxy/restart", noStore(requireAdmin(cfg, handleUIRestart(cfg))))
@@ -6449,6 +6450,49 @@ func handleUIModels(cfg config) http.HandlerFunc {
 			syncProcessEnvKeys(current, "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED")
 			replaceRuntimeModelConfig(cfg, next)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Model aliases saved and active for new requests.", "models": modelRows(cfg)})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		}
+	}
+}
+
+// claudeSettingsApplied reports whether ~/.claude/settings.json currently points
+// Claude Code at this proxy (ANTHROPIC_BASE_URL == this proxy's /anthropic URL).
+func claudeSettingsApplied(cfg config) bool {
+	settings, err := readJSONMap(defaultClaudeSettingsPath())
+	if err != nil {
+		return false
+	}
+	env, ok := settings["env"].(map[string]any)
+	if !ok {
+		return false
+	}
+	base, _ := env["ANTHROPIC_BASE_URL"].(string)
+	return strings.EqualFold(strings.TrimSpace(base), "http://127.0.0.1:"+cfg.Port+"/anthropic")
+}
+
+// handleUISettingsApply lets the admin manually write proxy settings into Claude
+// Code's settings.json. The start/stop scripts no longer do this automatically,
+// so the control panel (interface) and the proxy server stay decoupled.
+func handleUISettingsApply(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, map[string]any{
+				"applied":       claudeSettingsApplied(cfg),
+				"settings_path": defaultClaudeSettingsPath(),
+			})
+		case http.MethodPost:
+			if err := applyProxySettingsGo(); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":            true,
+				"applied":       true,
+				"settings_path": defaultClaudeSettingsPath(),
+				"message":       "Applied proxy settings to Claude Code. Restart Claude Code to pick them up.",
+			})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}

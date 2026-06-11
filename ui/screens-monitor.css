@@ -359,3 +359,23 @@
   .logs-toolbar-top { flex-wrap: wrap; row-gap: var(--sp-2); }
   .dash-endpoint-label { width: 64px; }
 }
+
+/* Claude Code integration card */
+.dash-cc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+.dash-cc-text {
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  max-width: 64ch;
+}
+.dash-cc-modal-footer {
+  display: flex;
+  gap: var(--sp-3);
+  justify-content: flex-end;
+}
