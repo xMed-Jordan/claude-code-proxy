@@ -62,6 +62,7 @@
     logout: <><path d="M6.5 2H4a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2.5"/><path d="M10.5 11.5L14 8l-3.5-3.5M14 8H6"/></>,
     palette: <><path d="M8 2a6 6 0 0 0 0 12c.9 0 1.5-.6 1.5-1.3 0-.6-.5-1-.5-1.7 0-.7.6-1.2 1.4-1.2H12a2 2 0 0 0 2-2.3A6 6 0 0 0 8 2z"/><circle cx="5" cy="6.4" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="4.8" r=".9" fill="currentColor" stroke="none"/><circle cx="11" cy="6.4" r=".9" fill="currentColor" stroke="none"/><circle cx="4.8" cy="9.5" r=".9" fill="currentColor" stroke="none"/></>,
     send: <><path d="M14 2L7.5 8.5M14 2L9.5 14l-2-5.5L2 6.5 14 2z"/></>,
+    image: <><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.6" cy="6" r="1.2"/><path d="M3 11.5l3.2-3 2.3 2.2 2.3-2.4L14 11"/></>,
   };
 
   // Dash-case + semantic aliases (both spellings always work).

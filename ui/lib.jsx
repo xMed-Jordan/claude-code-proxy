@@ -179,6 +179,7 @@
     { id: "config",    path: "/config",    title: "Configuration",      icon: "config",    group: "Manage",       component: "Configuration" },
     { id: "models",    path: "/models",    title: "Models",             icon: "models",    group: "Manage",       component: "Models" },
     { id: "virustotal",path: "/virustotal",title: "VirusTotal",         icon: "shield",    group: "Manage",       component: "VirusTotal" },
+    { id: "images",    path: "/images",    title: "Images",             icon: "image",     group: "Manage",       component: "ImageStudio" },
     { id: "keys",      path: "/keys",      title: "API Keys",           icon: "key",       group: "Manage",       component: "ApiKeys" },
     { id: "test",      path: "/test",      title: "Test Request",       icon: "test",      group: "Operate",      component: "TestRequest" },
     { id: "logs",      path: "/logs",      title: "Logs",               icon: "logs",      group: "Operate",      component: "Logs" },

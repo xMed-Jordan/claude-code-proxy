@@ -10,6 +10,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -2207,5 +2210,136 @@ func TestParseAgyConcurrencyAndTimeout(t *testing.T) {
 	}
 	if parseAgyTimeout("45") != 45*time.Second {
 		t.Fatal("timeout 45 not honored")
+	}
+}
+
+func TestParseImageSize(t *testing.T) {
+	cases := []struct {
+		in     string
+		w, h   int
+		wantOK bool
+	}{
+		{"", 1024, 1024, true},
+		{"auto", 1024, 1024, true},
+		{"1k", 1024, 1024, true},
+		{"512", 512, 512, true},
+		{"half", 512, 512, true},
+		{"hd", 1280, 720, true},
+		{"1080p", 1920, 1080, true},
+		{"2k", 2560, 1440, true},
+		{"4k", 3840, 2160, true},
+		{"1280x720", 1280, 720, true},
+		{"800x600", 800, 600, true},
+		{"800X600", 800, 600, true},
+		{"800*600", 800, 600, true},
+		{"800×600", 800, 600, true},
+		{"5000x5000", 0, 0, false}, // over the per-side cap
+		{"8x8", 0, 0, false},       // under the per-side min
+		{"banana", 0, 0, false},
+	}
+	for _, c := range cases {
+		sz, err := parseImageSize(c.in)
+		if !c.wantOK {
+			if err == nil {
+				t.Errorf("parseImageSize(%q) expected error, got %dx%d", c.in, sz.W, sz.H)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseImageSize(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if sz.W != c.w || sz.H != c.h {
+			t.Errorf("parseImageSize(%q) = %dx%d, want %dx%d", c.in, sz.W, sz.H, c.w, c.h)
+		}
+	}
+}
+
+func TestAgyImageModelForRequest(t *testing.T) {
+	cfg := config{
+		AgyImageModel: "Gemini 3.5 Flash (Low)",
+		Models:        map[string]string{"my-img": "Gemini 3.1 Pro (High)", "my-codex": "gpt-5.5"},
+	}
+	// A genuine Antigravity display name passes through verbatim.
+	if got := agyImageModelForRequest(cfg, "Gemini 3.1 Pro (Low)"); got != "Gemini 3.1 Pro (Low)" {
+		t.Errorf("display-name passthrough = %q", got)
+	}
+	// Empty → the configured default image model.
+	if got := agyImageModelForRequest(cfg, ""); got != "Gemini 3.5 Flash (Low)" {
+		t.Errorf("empty → default = %q", got)
+	}
+	// An alias resolving to an Antigravity model is used.
+	if got := agyImageModelForRequest(cfg, "my-img"); got != "Gemini 3.1 Pro (High)" {
+		t.Errorf("alias resolve = %q", got)
+	}
+	// A codex/gpt alias must NOT be forwarded to agy as an image model → default.
+	if got := agyImageModelForRequest(cfg, "my-codex"); got != "Gemini 3.5 Flash (Low)" {
+		t.Errorf("codex alias fallback = %q", got)
+	}
+}
+
+func TestValidGeneratedImageName(t *testing.T) {
+	good := []string{"abcdef01.png", "0123456789abcdef0123456789abcdef.jpg", "ab12cd34.jpeg", "deadbeef.webp", "cafebabe.gif", "00112233.bmp"}
+	for _, n := range good {
+		if !validGeneratedImageName(n) {
+			t.Errorf("expected %q to be valid", n)
+		}
+	}
+	bad := []string{"../etc/passwd", "abc.png", "ABCDEF01.png", "abcdef01.exe", "abcdef01.png/x", "foo bar.png", "abcdef01", "g123abcd.png", "abcdef01.svg"}
+	for _, n := range bad {
+		if validGeneratedImageName(n) {
+			t.Errorf("expected %q to be invalid", n)
+		}
+	}
+}
+
+func TestCollectGeneratedImages(t *testing.T) {
+	scratch := t.TempDir()
+	root := t.TempDir()
+
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for x := 0; x < 4; x++ {
+		for y := 0; y < 4; y++ {
+			img.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "image-1.png"), buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A non-image file must be ignored, not collected.
+	if err := os.WriteFile(filepath.Join(scratch, "notes.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	imgs, err := collectGeneratedImages(scratch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imgs) != 1 {
+		t.Fatalf("expected 1 image, got %d", len(imgs))
+	}
+	g := imgs[0]
+	if g.Ext != ".png" || g.ContentType != "image/png" {
+		t.Errorf("ext/type = %q/%q, want .png/image/png", g.Ext, g.ContentType)
+	}
+	if g.Width != 4 || g.Height != 4 {
+		t.Errorf("dims = %dx%d, want 4x4", g.Width, g.Height)
+	}
+	if !validGeneratedImageName(g.File) {
+		t.Errorf("served name %q does not match the minted pattern", g.File)
+	}
+	fi, err := os.Stat(g.Path)
+	if err != nil {
+		t.Fatalf("served file missing: %v", err)
+	}
+	if fi.Mode().Perm()&0o111 != 0 {
+		t.Errorf("served file is executable: %v", fi.Mode())
+	}
+	if filepath.Dir(g.Path) != root {
+		t.Errorf("served file not in root: %q", g.Path)
 	}
 }

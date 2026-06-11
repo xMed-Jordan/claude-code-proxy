@@ -103,6 +103,10 @@ type config struct {
 	AgyMediaMaxTotal  int64         // max total bytes materialized per request
 	AgyMediaAllowURLs bool          // allow downloading media from remote URLs
 	AgyMediaRetention time.Duration // keep materialized files this long for reuse
+	AgyImage          bool          // enable the agy image-generation endpoint
+	AgyImageDir       string        // served root for generated images ("" → temp)
+	AgyImageModel     string        // default Antigravity model for image generation
+	AgyImageRetention time.Duration // keep generated images this long for reuse
 	// VirusTotal malware scanning for media attachments (keys editable at runtime).
 	VirusTotalEnabled    bool
 	VirusTotalKeys       string        // newline/comma-separated API keys (load-balanced)
@@ -423,6 +427,9 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/openai/v1/responses", requireAuth(cfg, requireProxyEnabled(handleResponses(cfg))))
 	mux.HandleFunc("/openai/v1/files", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
 	mux.HandleFunc("/openai/v1/files/", requireAuth(cfg, requireProxyEnabled(handleOpenAIFiles(cfg))))
+	mux.HandleFunc("/v1/images/generations", requireAuth(cfg, requireProxyEnabled(handleImageGenerations(cfg))))
+	mux.HandleFunc("/openai/v1/images/generations", requireAuth(cfg, requireProxyEnabled(handleImageGenerations(cfg))))
+	mux.HandleFunc("/media/generated/", handleGeneratedImage(cfg))
 	mux.HandleFunc("/ui/api/auth/status", noStore(handleUIAuthStatus(cfg)))
 	mux.HandleFunc("/ui/api/auth/setup", noStore(handleUIAuthSetup(cfg)))
 	mux.HandleFunc("/ui/api/auth/login", noStore(handleUIAuthLogin(cfg)))
@@ -432,6 +439,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/config", noStore(requireAdmin(cfg, handleUIConfig(cfg))))
 	mux.HandleFunc("/ui/api/models", noStore(requireAdmin(cfg, handleUIModels(cfg))))
 	mux.HandleFunc("/ui/api/virustotal", noStore(requireAdmin(cfg, handleUIVirusTotal(cfg))))
+	mux.HandleFunc("/ui/api/images/generate", noStore(requireAdmin(cfg, handleUIImageGenerate(cfg))))
 	mux.HandleFunc("/ui/api/keys", noStore(requireAdmin(cfg, handleUIKeys(cfg))))
 	mux.HandleFunc("/ui/api/keys/provider", noStore(requireAdmin(cfg, handleUIProviderKeys(cfg))))
 	mux.HandleFunc("/ui/api/keys/client", noStore(requireAdmin(cfg, handleUIClientKeys(cfg))))
@@ -508,6 +516,10 @@ func loadConfig() config {
 		AgyMediaMaxTotal:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
 		AgyMediaAllowURLs: envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
 		AgyMediaRetention: parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
+		AgyImage:          envFlag("PROXY_AGY_IMAGE", true),
+		AgyImageDir:       strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
+		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.5 Flash (Low)")),
+		AgyImageRetention: parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
 
 		VirusTotalEnabled:    envFlag("PROXY_VIRUSTOTAL_ENABLED", true),
 		VirusTotalKeys:       strings.TrimSpace(getenv("PROXY_VIRUSTOTAL_KEYS", "")),
@@ -5808,6 +5820,7 @@ var uiSPARoutes = map[string]bool{
 	"/config":     true,
 	"/models":     true,
 	"/virustotal": true,
+	"/images":     true,
 	"/keys":       true,
 	"/test":       true,
 	"/logs":       true,
@@ -6982,6 +6995,176 @@ func handleUIVirusTotal(cfg config) http.HandlerFunc {
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}
+	}
+}
+
+// imageGenRequest is the OpenAI-compatible images/generations request body.
+type imageGenRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model,omitempty"`
+	N              int    `json:"n,omitempty"`
+	Size           string `json:"size,omitempty"`
+	ResponseFormat string `json:"response_format,omitempty"`
+	User           string `json:"user,omitempty"`
+}
+
+// handleImageGenerations serves POST /v1/images/generations (OpenAI-compatible).
+// Image generation always routes through the local agy (Antigravity) CLI: agy
+// writes the file(s) to a scratch dir and we return a link (or base64) to each.
+func handleImageGenerations(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !cfg.AgyImage {
+			writeOpenAIError(w, http.StatusNotFound, "image generation is disabled (set PROXY_AGY_IMAGE=1)")
+			return
+		}
+		var in imageGenRequest
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if strings.TrimSpace(in.Prompt) == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "prompt is required")
+			return
+		}
+		sz, err := parseImageSize(in.Size)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		n := in.N
+		if n <= 0 {
+			n = 1
+		}
+		model := agyImageModelForRequest(cfg, in.Model)
+		setRequestStat(r, requestStat{Model: firstNonEmpty(in.Model, model), Upstream: "agy", Stream: false})
+		setRequestNote(r, "image_gen model="+model+" size="+sz.Label+" n="+strconv.Itoa(n))
+		imgs, err := agyGenerateImages(r.Context(), cfg, in.Prompt, model, n, sz)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "agy image error: "+err.Error())
+			return
+		}
+		b64 := strings.EqualFold(strings.TrimSpace(in.ResponseFormat), "b64_json")
+		data := make([]map[string]any, 0, len(imgs))
+		for _, img := range imgs {
+			item := map[string]any{}
+			if b64 {
+				raw, rerr := os.ReadFile(img.Path)
+				if rerr != nil {
+					continue
+				}
+				item["b64_json"] = base64.StdEncoding.EncodeToString(raw)
+			} else {
+				item["url"] = generatedImageURL(cfg, r, img.File)
+			}
+			if img.Width > 0 {
+				item["width"], item["height"] = img.Width, img.Height
+			}
+			data = append(data, item)
+		}
+		updateRequestStat(r, func(stat *requestStat) { stat.StopReason = "stop" })
+		writeJSON(w, http.StatusOK, map[string]any{
+			"created": time.Now().Unix(),
+			"model":   model,
+			"data":    data,
+		})
+	}
+}
+
+// handleGeneratedImage serves GET /media/generated/<token>.<ext> — an
+// unauthenticated capability URL (the token is an unguessable 128-bit value and
+// the file is retention-limited). Only files in the generated-image root whose
+// names match the minted pattern are served, so there is no path traversal.
+func handleGeneratedImage(cfg config) http.HandlerFunc {
+	root := agyImageRoot(cfg)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/media/generated/")
+		if !validGeneratedImageName(name) {
+			http.NotFound(w, r)
+			return
+		}
+		full := filepath.Join(root, name)
+		if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") || strings.ContainsRune(rel, os.PathSeparator) {
+			http.NotFound(w, r)
+			return
+		}
+		fi, err := os.Stat(full)
+		if err != nil || fi.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+		ct, _ := sniffImage(full)
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+		http.ServeFile(w, r, full)
+	}
+}
+
+// handleUIImageGenerate is the admin-authed control-panel wrapper around image
+// generation: same engine, richer payload (dims, bytes) for the Images page.
+func handleUIImageGenerate(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !cfg.AgyImage {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Image generation is disabled (set PROXY_AGY_IMAGE=1)."})
+			return
+		}
+		var body struct {
+			Prompt string `json:"prompt"`
+			Model  string `json:"model"`
+			Size   string `json:"size"`
+			N      int    `json:"n"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+		if strings.TrimSpace(body.Prompt) == "" {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Enter a prompt."})
+			return
+		}
+		sz, err := parseImageSize(body.Size)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		n := body.N
+		if n <= 0 {
+			n = 1
+		}
+		model := agyImageModelForRequest(cfg, body.Model)
+		imgs, err := agyGenerateImages(r.Context(), cfg, body.Prompt, model, n, sz)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "model": model})
+			return
+		}
+		out := make([]map[string]any, 0, len(imgs))
+		for _, img := range imgs {
+			out = append(out, map[string]any{
+				"url":          generatedImageURL(cfg, r, img.File),
+				"width":        img.Width,
+				"height":       img.Height,
+				"bytes":        img.Bytes,
+				"content_type": img.ContentType,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "model": model, "size": sz.Label, "images": out,
+		})
 	}
 }
 
