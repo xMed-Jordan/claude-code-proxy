@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -869,6 +870,124 @@ func TestModelForwardToPersistAndDefault(t *testing.T) {
 	}
 	if _, _, _, forwards := modelAliasesFromValues(env); forwards["agy-model"] != "agy" {
 		t.Fatalf("loader agy-model forward = %q, want agy", forwards["agy-model"])
+	}
+}
+
+func TestAnalyticsPeriodBounds(t *testing.T) {
+	now := time.Date(2026, 6, 11, 15, 30, 0, 0, time.UTC) // Thursday
+	hour := int64(3600_000)
+	day := 24 * hour
+
+	s, e, b := analyticsRange("today", 0, 0, now)
+	if s != time.Date(2026, 6, 11, 0, 0, 0, 0, time.UTC).UnixMilli() {
+		t.Fatalf("today start = %d", s)
+	}
+	if e != now.UnixMilli() {
+		t.Fatalf("today end = %d, want now", e)
+	}
+	if b != hour {
+		t.Fatalf("today bucket = %d, want hourly", b)
+	}
+	if _, _, by := analyticsRange("last_year", 0, 0, now); by != 30*day {
+		t.Fatalf("last_year bucket = %d, want 30d", by)
+	}
+	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	to := time.Date(2026, 6, 11, 0, 0, 0, 0, time.UTC).UnixMilli()
+	cs, ce, cb := analyticsRange("custom", from, to, now)
+	if cs != from || ce != to {
+		t.Fatalf("custom bounds = %d,%d want %d,%d", cs, ce, from, to)
+	}
+	if cb != day {
+		t.Fatalf("custom 10d bucket = %d, want daily", cb)
+	}
+}
+
+func TestMetricsMigrate(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrateMetricsDB(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO request_metrics (at_unix_ms) VALUES (1)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM request_metrics`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("count = %d err=%v", n, err)
+	}
+}
+
+func TestAnalyticsAggregation(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateMetricsDB(db); err != nil {
+		t.Fatal(err)
+	}
+	prev := metricsDB
+	metricsDB = db
+	defer func() { metricsDB = prev; db.Close() }()
+
+	day := int64(24) * 3600_000
+	from := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC).UnixMilli()
+	to := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC).UnixMilli() // 2 days -> daily buckets
+	ins := func(at int64, status, dur, in, out, isErr int) {
+		if _, err := db.Exec(`INSERT INTO request_metrics (at_unix_ms,status,duration_ms,input_tokens,output_tokens,is_error) VALUES (?,?,?,?,?,?)`,
+			at, status, dur, in, out, isErr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ins(from+1000, 200, 100, 10, 5, 0)
+	ins(from+2000, 500, 300, 20, 0, 1)
+	ins(from+day+1000, 200, 200, 7, 3, 0)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/ui/api/analytics?period=custom&from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(to, 10), nil)
+	rec := httptest.NewRecorder()
+	handleUIAnalytics(config{})(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		BucketMS int64 `json:"bucket_ms"`
+		Buckets  []struct {
+			Requests     int   `json:"requests"`
+			AvgLatencyMs int64 `json:"avg_latency_ms"`
+			TokensIn     int   `json:"tokens_in"`
+			Errors       int   `json:"errors"`
+		} `json:"buckets"`
+		Totals struct {
+			Requests  int     `json:"requests"`
+			TokensIn  int     `json:"tokens_in"`
+			TokensOut int     `json:"tokens_out"`
+			Errors    int     `json:"errors"`
+			ErrorRate float64 `json:"error_rate"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if resp.BucketMS != day {
+		t.Fatalf("bucket_ms = %d, want %d (daily)", resp.BucketMS, day)
+	}
+	if len(resp.Buckets) != 2 {
+		t.Fatalf("buckets = %d, want 2", len(resp.Buckets))
+	}
+	if resp.Buckets[0].Requests != 2 || resp.Buckets[1].Requests != 1 {
+		t.Fatalf("bucket reqs = %d,%d want 2,1", resp.Buckets[0].Requests, resp.Buckets[1].Requests)
+	}
+	if resp.Buckets[0].AvgLatencyMs != 200 { // (100+300)/2
+		t.Fatalf("day0 avg latency = %d, want 200", resp.Buckets[0].AvgLatencyMs)
+	}
+	if resp.Totals.Requests != 3 || resp.Totals.TokensIn != 37 || resp.Totals.TokensOut != 8 || resp.Totals.Errors != 1 {
+		t.Fatalf("totals = %+v", resp.Totals)
+	}
+	if resp.Totals.ErrorRate < 33.0 || resp.Totals.ErrorRate > 33.4 { // 1/3
+		t.Fatalf("error_rate = %v, want ~33.3", resp.Totals.ErrorRate)
 	}
 }
 

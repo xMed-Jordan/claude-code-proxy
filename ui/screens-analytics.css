@@ -1,0 +1,123 @@
+/* screens-analytics.css — Analytics screen (.an- prefix). Tokens from base.css. */
+
+.an-periodbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.an-periodbar .tabs { flex: 1 1 auto; flex-wrap: wrap; }
+
+/* ── Dual-month range calendar ── */
+.an-cal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: rgba(8, 10, 16, 0.55);
+  backdrop-filter: blur(2px);
+  animation: an-fade 120ms var(--ease, ease);
+}
+@keyframes an-fade { from { opacity: 0; } to { opacity: 1; } }
+
+.an-cal {
+  width: min(640px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.an-cal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+.an-cal-title { font-size: var(--fs-base); font-weight: 600; color: var(--text); }
+
+.an-cal-months {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-5);
+  padding: var(--sp-4);
+}
+@media (max-width: 560px) {
+  .an-cal-months { grid-template-columns: 1fr; }
+}
+
+.an-month-name {
+  text-align: center;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: var(--sp-2);
+}
+.an-dow,
+.an-days {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+.an-dow span {
+  text-align: center;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  padding-bottom: 4px;
+}
+
+.an-day {
+  aspect-ratio: 1 / 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background 120ms var(--ease, ease), color 120ms var(--ease, ease);
+}
+.an-day:hover:not(.disabled):not(.empty) { background: var(--surface-3); }
+.an-day.empty { cursor: default; }
+.an-day.disabled { color: var(--text-3); opacity: 0.45; cursor: not-allowed; }
+.an-day.in-range { background: var(--accent-soft); border-radius: 0; color: var(--accent-fg); }
+.an-day.sel {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.an-day.sel:hover { background: var(--accent); }
+
+.an-cal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.an-cal-range {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+.an-cal-pill {
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+}
+.an-cal-pill.set { color: var(--text); border-color: var(--border-strong); }
+.an-cal-actions { display: flex; gap: var(--sp-2); }

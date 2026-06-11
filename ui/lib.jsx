@@ -175,6 +175,7 @@
      ──────────────────────────────────────────── */
   const ROUTES = [
     { id: "dashboard", path: "/dashboard", title: "Dashboard",          icon: "dashboard", group: "Overview",     component: "Dashboard" },
+    { id: "analytics", path: "/analytics", title: "Analytics",          icon: "activity",  group: "Overview",     component: "Analytics" },
     { id: "config",    path: "/config",    title: "Configuration",      icon: "config",    group: "Manage",       component: "Configuration" },
     { id: "models",    path: "/models",    title: "Models",             icon: "models",    group: "Manage",       component: "Models" },
     { id: "keys",      path: "/keys",      title: "API Keys",           icon: "key",       group: "Manage",       component: "ApiKeys" },

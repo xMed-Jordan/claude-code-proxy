@@ -404,6 +404,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/auth/login", noStore(handleUIAuthLogin(cfg)))
 	mux.HandleFunc("/ui/api/auth/logout", noStore(handleUIAuthLogout(cfg)))
 	mux.HandleFunc("/ui/api/status", noStore(requireAdmin(cfg, handleUIStatus(cfg))))
+	mux.HandleFunc("/ui/api/analytics", noStore(requireAdmin(cfg, handleUIAnalytics(cfg))))
 	mux.HandleFunc("/ui/api/config", noStore(requireAdmin(cfg, handleUIConfig(cfg))))
 	mux.HandleFunc("/ui/api/models", noStore(requireAdmin(cfg, handleUIModels(cfg))))
 	mux.HandleFunc("/ui/api/keys", noStore(requireAdmin(cfg, handleUIKeys(cfg))))
@@ -5039,7 +5040,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		}
 		now := time.Now()
 		stat := takeRequestStat(r)
-		appendUILog(uiLogRow{
+		row := uiLogRow{
 			AtUnixMS:     now.UnixMilli(),
 			TS:           now.Format("15:04:05.000"),
 			Level:        level,
@@ -5055,7 +5056,22 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			InputTokens:  stat.InputTokens,
 			OutputTokens: stat.OutputTokens,
 			StopReason:   stat.StopReason,
-		})
+		}
+		appendUILog(row)
+		if isDashboardTraffic(row) {
+			recordMetric(requestMetric{
+				AtUnixMS:     row.AtUnixMS,
+				Status:       row.Status,
+				DurMS:        row.DurMS,
+				Model:        row.Model,
+				Upstream:     row.Upstream,
+				InputTokens:  row.InputTokens,
+				OutputTokens: row.OutputTokens,
+				Stream:       row.Stream,
+				IsError:      row.Status >= 400,
+				Surface:      surfaceFromPath(row.Path),
+			})
+		}
 		requestProviderKeys.Delete(r)
 	})
 }
@@ -5066,6 +5082,353 @@ func appendUILog(row uiLogRow) {
 	logRows = append(logRows, row)
 	if len(logRows) > 300 {
 		logRows = logRows[len(logRows)-300:]
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Request-metrics persistence (Analytics)
+//
+// One row per LLM request is recorded into a SEPARATE WAL SQLite db (a sibling
+// of .proxy.db) so the Analytics page can aggregate usage / latency / tokens /
+// errors over long periods. Writes are queued and flushed by a single
+// background goroutine; the request path never blocks and never fails because
+// of metrics. If the db can't be opened, metrics are simply disabled.
+// ───────────────────────────────────────────────────────────────────────────
+
+type requestMetric struct {
+	AtUnixMS     int64
+	Status       int
+	DurMS        int64
+	Model        string
+	Upstream     string
+	InputTokens  int
+	OutputTokens int
+	Stream       bool
+	IsError      bool
+	Surface      string // "anthropic" | "openai"
+}
+
+var (
+	metricsDB *sql.DB
+	metricsCh chan requestMetric
+)
+
+const metricsRetentionDays = 400
+
+func metricsDBPath(cfg config) string {
+	base := strings.TrimSpace(cfg.DBPath)
+	if base == "" {
+		base = ".proxy.db"
+	}
+	if strings.HasSuffix(strings.ToLower(base), ".db") {
+		return base[:len(base)-3] + ".metrics.db"
+	}
+	return base + ".metrics.db"
+}
+
+// initMetricsDB opens the persistent metrics db (WAL), migrates it, and starts
+// the async writer + hourly pruner. Best-effort: on any error metrics stay
+// disabled (metricsDB == nil) and the proxy runs unaffected.
+func initMetricsDB(cfg config) {
+	db, err := sql.Open("sqlite", metricsDBPath(cfg))
+	if err != nil {
+		fmt.Printf("metrics: open failed (analytics disabled): %v\n", err)
+		return
+	}
+	db.SetMaxOpenConns(4)
+	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000", "PRAGMA synchronous=NORMAL"} {
+		if _, err := db.Exec(pragma); err != nil {
+			fmt.Printf("metrics: pragma %q failed: %v\n", pragma, err)
+		}
+	}
+	if err := migrateMetricsDB(db); err != nil {
+		fmt.Printf("metrics: migrate failed (analytics disabled): %v\n", err)
+		_ = db.Close()
+		return
+	}
+	metricsDB = db
+	metricsCh = make(chan requestMetric, 2000)
+	go metricsWriter()
+	go metricsPruner()
+}
+
+func migrateMetricsDB(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS request_metrics (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			at_unix_ms INTEGER NOT NULL,
+			status INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			model TEXT NOT NULL DEFAULT '',
+			upstream TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			stream INTEGER NOT NULL DEFAULT 0,
+			is_error INTEGER NOT NULL DEFAULT 0,
+			surface TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_metrics_at ON request_metrics(at_unix_ms)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordMetric queues a metric for async persistence. Non-blocking: drops the
+// row (rather than stalling the request) if the buffer is full.
+func recordMetric(m requestMetric) {
+	if metricsCh == nil {
+		return
+	}
+	select {
+	case metricsCh <- m:
+	default:
+		// buffer full — drop rather than block the request path
+	}
+}
+
+func metricsWriter() {
+	const flushEvery = 50
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	batch := make([]requestMetric, 0, flushEvery)
+	flush := func() {
+		if len(batch) == 0 || metricsDB == nil {
+			batch = batch[:0]
+			return
+		}
+		tx, err := metricsDB.Begin()
+		if err != nil {
+			batch = batch[:0]
+			return
+		}
+		stmt, err := tx.Prepare(`INSERT INTO request_metrics
+			(at_unix_ms,status,duration_ms,model,upstream,input_tokens,output_tokens,stream,is_error,surface)
+			VALUES (?,?,?,?,?,?,?,?,?,?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			batch = batch[:0]
+			return
+		}
+		for _, m := range batch {
+			_, _ = stmt.Exec(m.AtUnixMS, m.Status, m.DurMS, m.Model, m.Upstream, m.InputTokens, m.OutputTokens, boolToInt(m.Stream), boolToInt(m.IsError), m.Surface)
+		}
+		_ = stmt.Close()
+		_ = tx.Commit()
+		batch = batch[:0]
+	}
+	for {
+		select {
+		case m := <-metricsCh:
+			batch = append(batch, m)
+			if len(batch) >= flushEvery {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func metricsPruner() {
+	timer := time.NewTimer(time.Minute)
+	defer timer.Stop()
+	for {
+		<-timer.C
+		if metricsDB != nil {
+			cutoff := time.Now().Add(-metricsRetentionDays * 24 * time.Hour).UnixMilli()
+			_, _ = metricsDB.Exec(`DELETE FROM request_metrics WHERE at_unix_ms < ?`, cutoff)
+		}
+		timer.Reset(time.Hour)
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func surfaceFromPath(path string) string {
+	if strings.HasPrefix(path, "/anthropic/") {
+		return "anthropic"
+	}
+	if strings.HasPrefix(path, "/openai/") {
+		return "openai"
+	}
+	return ""
+}
+
+// ─── Analytics aggregation ───
+
+type analyticsBucket struct {
+	T            int64 `json:"t"`
+	Requests     int   `json:"requests"`
+	AvgLatencyMs int64 `json:"avg_latency_ms"`
+	TokensIn     int   `json:"tokens_in"`
+	TokensOut    int   `json:"tokens_out"`
+	Errors       int   `json:"errors"`
+}
+
+func parseInt64(s string) int64 {
+	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	return n
+}
+
+// analyticsBucketMS picks a bucket size from the total span so charts stay
+// readable (~13–45 bars): hourly / daily / weekly / 30-day.
+func analyticsBucketMS(span int64) int64 {
+	const h = int64(3600_000)
+	const d = 24 * h
+	switch {
+	case span <= 36*h:
+		return h
+	case span <= 45*d:
+		return d
+	case span <= 200*d:
+		return 7 * d
+	default:
+		return 30 * d
+	}
+}
+
+// analyticsRange resolves a named period (or a custom from/to) into [start,end)
+// unix-ms (server-local time) plus the bucket size.
+func analyticsRange(period string, fromMS, toMS int64, now time.Time) (start, end, bucketMS int64) {
+	loc := now.Location()
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	end = now.UnixMilli()
+	switch period {
+	case "today":
+		start = midnight.UnixMilli()
+	case "this_week":
+		wd := (int(midnight.Weekday()) + 6) % 7 // Monday = 0
+		start = midnight.AddDate(0, 0, -wd).UnixMilli()
+	case "this_month":
+		start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc).UnixMilli()
+	case "last_month":
+		firstThis := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+		start = firstThis.AddDate(0, -1, 0).UnixMilli()
+		end = firstThis.UnixMilli()
+	case "last_30_days":
+		start = midnight.AddDate(0, 0, -29).UnixMilli()
+	case "last_6_months":
+		start = midnight.AddDate(0, -6, 0).UnixMilli()
+	case "last_year":
+		start = midnight.AddDate(-1, 0, 0).UnixMilli()
+	case "custom":
+		start, end = fromMS, toMS
+		if end <= start {
+			end = start + 1
+		}
+	default:
+		start = midnight.UnixMilli()
+	}
+	bucketMS = analyticsBucketMS(end - start)
+	return start, end, bucketMS
+}
+
+func handleUIAnalytics(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		q := r.URL.Query()
+		period := strings.TrimSpace(q.Get("period"))
+		if period == "" {
+			period = "today"
+		}
+		start, end, bucketMS := analyticsRange(period, parseInt64(q.Get("from")), parseInt64(q.Get("to")), time.Now())
+
+		emptyTotals := map[string]any{"requests": 0, "avg_latency_ms": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "errors": 0, "error_rate": 0.0}
+		resp := map[string]any{
+			"period":    period,
+			"from":      start,
+			"to":        end,
+			"bucket_ms": bucketMS,
+			"buckets":   []analyticsBucket{},
+			"totals":    emptyTotals,
+			"available": metricsDB != nil,
+		}
+		if metricsDB == nil || bucketMS <= 0 || end <= start {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+
+		nBuckets := int((end - start + bucketMS - 1) / bucketMS)
+		if nBuckets < 1 {
+			nBuckets = 1
+		}
+		if nBuckets > 2000 {
+			nBuckets = 2000
+		}
+		buckets := make([]analyticsBucket, nBuckets)
+		for i := range buckets {
+			buckets[i].T = start + int64(i)*bucketMS
+		}
+
+		rows, err := metricsDB.Query(
+			`SELECT (at_unix_ms - ?) / ? AS b,
+			        COUNT(*), COALESCE(SUM(duration_ms),0),
+			        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+			        COALESCE(SUM(is_error),0)
+			 FROM request_metrics
+			 WHERE at_unix_ms >= ? AND at_unix_ms < ?
+			 GROUP BY b ORDER BY b`,
+			start, bucketMS, start, end)
+		if err != nil {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		defer rows.Close()
+
+		var totReq, totIn, totOut, totErr int
+		var totDur int64
+		for rows.Next() {
+			var b, durSum int64
+			var cnt, inTok, outTok, errCnt int
+			if err := rows.Scan(&b, &cnt, &durSum, &inTok, &outTok, &errCnt); err != nil {
+				continue
+			}
+			if b >= 0 && int(b) < nBuckets {
+				bk := &buckets[b]
+				bk.Requests = cnt
+				bk.TokensIn = inTok
+				bk.TokensOut = outTok
+				bk.Errors = errCnt
+				if cnt > 0 {
+					bk.AvgLatencyMs = durSum / int64(cnt)
+				}
+			}
+			totReq += cnt
+			totIn += inTok
+			totOut += outTok
+			totErr += errCnt
+			totDur += durSum
+		}
+
+		avgLat := int64(0)
+		errRate := 0.0
+		if totReq > 0 {
+			avgLat = totDur / int64(totReq)
+			errRate = float64(int(float64(totErr)/float64(totReq)*1000+0.5)) / 10 // 1 decimal %
+		}
+		resp["buckets"] = buckets
+		resp["totals"] = map[string]any{
+			"requests":       totReq,
+			"avg_latency_ms": avgLat,
+			"tokens_in":      totIn,
+			"tokens_out":     totOut,
+			"tokens_total":   totIn + totOut,
+			"errors":         totErr,
+			"error_rate":     errRate,
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -5333,6 +5696,7 @@ func clientIP(r *http.Request) string {
 var uiSPARoutes = map[string]bool{
 	"/":          true,
 	"/dashboard": true,
+	"/analytics": true,
 	"/config":    true,
 	"/models":    true,
 	"/keys":      true,

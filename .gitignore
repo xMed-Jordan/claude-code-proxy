@@ -19,6 +19,7 @@
 .proxy.trace.log.old
 .proxy.sessions.json
 .proxy.db*
+.proxy.metrics.db*
 .antigravity-browser.pid
 .antigravity-browser-state.json
 .antigravity-browser-profile/
