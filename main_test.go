@@ -1860,13 +1860,19 @@ func TestAgyModelFor(t *testing.T) {
 	if got := agyModelFor(config{AgyModel: "gemini-x", Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "gemini-x" {
 		t.Fatalf("override → %q, want gemini-x", got)
 	}
-	// codex/gpt-style upstream names are dropped (agy would reject them).
+	// A bare codex id left on an agy alias is dropped (agy would reject it).
 	if got := agyModelFor(config{Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "" {
-		t.Fatalf("gpt upstream → %q, want empty", got)
+		t.Fatalf("bare gpt id → %q, want empty", got)
 	}
-	// A gemini-looking upstream name is forwarded.
-	if got := agyModelFor(config{Models: map[string]string{"m": "gemini-3-pro"}}, "m"); got != "gemini-3-pro" {
-		t.Fatalf("gemini upstream → %q, want gemini-3-pro", got)
+	if got := agyModelFor(config{Models: map[string]string{"m": "o4-mini"}}, "m"); got != "" {
+		t.Fatalf("bare o-series id → %q, want empty", got)
+	}
+	// Antigravity display names (always contain a space) are forwarded verbatim —
+	// including "GPT-OSS 120B (Medium)", which must NOT be dropped by the gpt guard.
+	for _, name := range []string{"Gemini 3.1 Pro (High)", "Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"} {
+		if got := agyModelFor(config{Models: map[string]string{"m": name}}, "m"); got != name {
+			t.Fatalf("antigravity model %q → %q, want verbatim", name, got)
+		}
 	}
 }
 

@@ -30,9 +30,23 @@
     "o4-mini",
   ];
 
+  // Antigravity models served by the agy CLI (from `agy models`). Used as the
+  // upstream-model options when a row's "Forwarded to" = Agy. agy accepts these
+  // display names verbatim via --model. First entry is the default on switch.
+  const AGY_MODEL_OPTIONS = [
+    "Gemini 3.1 Pro (High)",
+    "Gemini 3.1 Pro (Low)",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.5 Flash (Low)",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
+  ];
+
   function modelStatusFor(real) {
     if (!real) return "unsupported";
-    return CODEX_MODEL_OPTIONS.includes(real) ? "available" : "untested";
+    return (CODEX_MODEL_OPTIONS.includes(real) || AGY_MODEL_OPTIONS.includes(real)) ? "available" : "untested";
   }
 
   // Where each alias forwards to. Codex and Agy route today (Agy is text-only:
@@ -541,7 +555,12 @@
       setModels(rows => rows.map(row => {
         if (row.id !== id) return row;
         const next = { ...row, [key]: val };
-        if (key === "real") next.status = modelStatusFor(val.trim());
+        // Switching a row to Agy: if its upstream model isn't an Antigravity
+        // model yet, prefill a sensible default so it routes to a real agy model.
+        if (key === "forward_to" && val === "agy" && !AGY_MODEL_OPTIONS.includes((next.real || "").trim())) {
+          next.real = AGY_MODEL_OPTIONS[0];
+        }
+        if (key === "real" || key === "forward_to") next.status = modelStatusFor((next.real || "").trim());
         return next;
       }));
       setDirty(true);
@@ -648,6 +667,9 @@
             <datalist id="models-codex-options">
               {CODEX_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
             </datalist>
+            <datalist id="models-agy-options">
+              {AGY_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
+            </datalist>
             {filtered.length === 0 ? (
               <EmptyState
                 icon="models"
@@ -693,10 +715,10 @@
                           <td>
                             <input
                               className={cx("input models-inline-input mono", invalid && !m.real.trim() && "invalid")}
-                              list="models-codex-options"
+                              list={m.forward_to === "agy" ? "models-agy-options" : "models-codex-options"}
                               value={m.real}
                               onChange={e => updateModel(m.id, "real", e.target.value)}
-                              placeholder="gpt-5.5"
+                              placeholder={m.forward_to === "agy" ? "Gemini 3.1 Pro (High)" : "gpt-5.5"}
                             />
                           </td>
                           <td>

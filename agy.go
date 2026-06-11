@@ -220,15 +220,21 @@ func agyModelFor(cfg config, alias string) string {
 		return m
 	}
 	real := strings.TrimSpace(resolveModel(cfg, alias))
-	low := strings.ToLower(real)
-	switch {
-	case real == "",
-		strings.HasPrefix(low, "gpt"),
-		strings.HasPrefix(low, "o1"),
-		strings.HasPrefix(low, "o3"),
-		strings.HasPrefix(low, "o4"),
-		strings.HasPrefix(low, "codex"):
+	if real == "" {
 		return ""
+	}
+	// Antigravity model names (from `agy models`) always contain a space, e.g.
+	// "Gemini 3.1 Pro (High)", "Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"
+	// — forward those verbatim (agy accepts the display name). A bare, space-free
+	// gpt-*/o*/codex token is a Codex id left on an agy alias by mistake; drop it
+	// so agy falls back to its own configured default instead of erroring.
+	if !strings.Contains(real, " ") {
+		low := strings.ToLower(real)
+		if strings.HasPrefix(low, "gpt") || strings.HasPrefix(low, "o1") ||
+			strings.HasPrefix(low, "o3") || strings.HasPrefix(low, "o4") ||
+			strings.HasPrefix(low, "codex") {
+			return ""
+		}
 	}
 	return real
 }
