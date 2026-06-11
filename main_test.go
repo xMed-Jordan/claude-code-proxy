@@ -2343,3 +2343,25 @@ func TestCollectGeneratedImages(t *testing.T) {
 		t.Errorf("served file not in root: %q", g.Path)
 	}
 }
+
+func TestClientKeySchemaAllowsImagePath(t *testing.T) {
+	// The bare /v1/images/ path counts as openai for openai/both keys, not anthropic.
+	for _, schema := range []string{"openai", "both", ""} {
+		if !clientKeySchemaAllowsPath(schema, "/v1/images/generations") {
+			t.Errorf("schema %q should allow /v1/images/generations", schema)
+		}
+	}
+	if clientKeySchemaAllowsPath("anthropic", "/v1/images/generations") {
+		t.Error("anthropic-only key should NOT allow the openai-style image path")
+	}
+	if !clientKeySchemaAllowsPath("openai", "/openai/v1/images/generations") {
+		t.Error("openai key should allow /openai/v1/images/generations")
+	}
+	// Regression: existing schema rules unchanged.
+	if !clientKeySchemaAllowsPath("anthropic", "/anthropic/v1/messages") {
+		t.Error("anthropic key should allow /anthropic/")
+	}
+	if clientKeySchemaAllowsPath("openai", "/anthropic/v1/messages") {
+		t.Error("openai key should NOT allow /anthropic/")
+	}
+}

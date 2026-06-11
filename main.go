@@ -1285,13 +1285,17 @@ func writeSchemaAuthError(w http.ResponseWriter, r *http.Request, schema string)
 }
 
 func clientKeySchemaAllowsPath(schema, path string) bool {
+	// The bare /v1/images/generations alias is an OpenAI-style endpoint, so it
+	// counts as the openai schema even though it isn't under /openai/.
+	openaiPath := strings.HasPrefix(path, "/openai/") || strings.HasPrefix(path, "/v1/images/")
+	anthropicPath := strings.HasPrefix(path, "/anthropic/")
 	switch normalizeClientSchema(schema) {
 	case "anthropic":
-		return strings.HasPrefix(path, "/anthropic/")
+		return anthropicPath
 	case "openai":
-		return strings.HasPrefix(path, "/openai/")
+		return openaiPath
 	default:
-		return strings.HasPrefix(path, "/anthropic/") || strings.HasPrefix(path, "/openai/")
+		return anthropicPath || openaiPath
 	}
 }
 
