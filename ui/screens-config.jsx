@@ -1231,9 +1231,137 @@
   }
 
   /* ─────────────────────────────────────────────────────────────────
+     VIRUSTOTAL
+  ───────────────────────────────────────────────────────────────── */
+  function VirusTotal({ pushToast }) {
+    const toast = useToast();
+    const notify = useCallback((msg, tone) => {
+      if (toast) { tone === "error" ? toast.error(msg) : tone === "success" ? toast.success(msg) : toast.info(msg); }
+      else if (pushToast) pushToast(msg, tone || "info");
+    }, [toast, pushToast]);
+
+    const [enabled, setEnabled] = useState(true);
+    const [keysText, setKeysText] = useState("");
+    const [statuses, setStatuses] = useState([]);
+    const [meta, setMeta] = useState({ threshold: 1, upload: true, fail_closed: false });
+    const [loading, setLoading] = useState(true);
+    const [saving, setSaving] = useState(false);
+    const [dirty, setDirty] = useState(false);
+
+    const load = useCallback(() => {
+      setLoading(true);
+      api.get("/ui/api/virustotal").then(res => {
+        setEnabled(!!res.enabled);
+        setKeysText(res.keys_raw || "");
+        setStatuses(res.statuses || []);
+        setMeta({ threshold: res.threshold, upload: res.upload, fail_closed: res.fail_closed });
+        setDirty(false);
+      }).catch(e => notify("Failed to load VirusTotal settings: " + (e.message || e), "error"))
+        .finally(() => setLoading(false));
+    }, [notify]);
+    useEffect(() => { load(); }, []);
+
+    const keyCount = keysText.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean).length;
+
+    const save = useCallback(async () => {
+      setSaving(true);
+      try {
+        const res = await api.post("/ui/api/virustotal", { enabled, keys: keysText });
+        setStatuses(res.statuses || []);
+        setDirty(false);
+        notify(res.message || "VirusTotal settings saved", "success");
+      } catch (e) {
+        notify("Save failed: " + (e.message || e), "error");
+      } finally { setSaving(false); }
+    }, [enabled, keysText, notify]);
+
+    if (loading) {
+      return (
+        <div className="screen">
+          <PageHeader title="VirusTotal" description="Scan media attachments for malware before agy opens them." />
+          <Skeleton height={120} />
+          <Skeleton height={180} />
+        </div>
+      );
+    }
+
+    return (
+      <div className="screen">
+        <PageHeader
+          title="VirusTotal"
+          description="Scan media attachments for malware before agy opens them."
+          actions={
+            <div className="models-header-actions">
+              {dirty && <Badge tone="warning">Unsaved</Badge>}
+              <Button size="sm" variant="ghost" icon="refresh" onClick={load} disabled={loading}>Refresh</Button>
+              <Button size="sm" variant="primary" icon={saving ? undefined : "check"} loading={saving} disabled={saving} onClick={save}>Save</Button>
+            </div>
+          }
+        />
+
+        <Card title="Scanning">
+          <div className="cfg-row">
+            <div className="cfg-label">
+              <span className="cfg-label-name">Enable scanning</span>
+              <span className="cfg-label-env mono">PROXY_VIRUSTOTAL_ENABLED</span>
+            </div>
+            <div className="cfg-ctl">
+              <Switch checked={enabled} onChange={v => { setEnabled(v); setDirty(true); }} />
+              <p className="cfg-hint">
+                Every attached file is checked against VirusTotal before agy reads it. A file flagged
+                malicious is deleted and the request is rejected — agy is never run on it. Verdicts are
+                cached locally by file hash, so re-uploading the same file skips VirusTotal.
+              </p>
+            </div>
+          </div>
+        </Card>
+
+        <Card
+          title="API keys"
+          description="One key per line. Keys are load-balanced round-robin; a key that errors (rate limit / auth) is parked for 1 hour and skipped, then resumes automatically."
+        >
+          <Textarea
+            rows={6}
+            className="mono"
+            value={keysText}
+            placeholder={"key1\nkey2\nkey3"}
+            onChange={e => { setKeysText(e.target.value); setDirty(true); }}
+          />
+          <p className="cfg-hint">
+            {keyCount} key{keyCount === 1 ? "" : "s"} configured · reject threshold {meta.threshold} engine{meta.threshold === 1 ? "" : "s"}
+            {meta.fail_closed ? " · fail-closed (reject when unavailable)" : ""}.
+          </p>
+        </Card>
+
+        <Card title="Key status" flush>
+          {statuses.length === 0 ? (
+            <EmptyState icon="shield" title="No keys yet" description="Add one or more VirusTotal API keys above and Save." compact />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead><tr><th>Key</th><th>Status</th><th>Available again</th></tr></thead>
+                <tbody>
+                  {statuses.map((s, i) => (
+                    <tr key={i}>
+                      <td className="mono">{s.masked}</td>
+                      <td><Badge tone={s.status === "active" ? "success" : "warning"}>{s.status === "active" ? "Active" : "Cooling down"}</Badge></td>
+                      <td className="muted">{s.cooling_until ? new Date(s.cooling_until).toLocaleString() : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </div>
+    );
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
      Exports
   ───────────────────────────────────────────────────────────────── */
   window.Configuration = Configuration;
   window.Models = Models;
+  window.VirusTotal = VirusTotal;
   window.ApiKeys = ApiKeys;
 })();

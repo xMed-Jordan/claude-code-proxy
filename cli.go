@@ -107,8 +107,10 @@ func runServe() error {
 	if err := initProxyDB(cfg); err != nil {
 		return fmt.Errorf("proxy database init failed: %w", err)
 	}
-	initMetricsDB(cfg) // best-effort: Analytics persistence (separate WAL db)
-	initAgy(cfg)       // size the agy (Antigravity) subprocess concurrency cap
+	initMetricsDB(cfg)    // best-effort: Analytics persistence (separate WAL db)
+	initAgy(cfg)          // size the agy (Antigravity) subprocess concurrency cap
+	initVT(cfg)           // seed VirusTotal runtime keys/enabled from config
+	startMediaReaper(cfg) // reap retained media scratch older than the window
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
 	// Auto-provision the Codex token refresh timer (Linux root only). First

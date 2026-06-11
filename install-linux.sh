@@ -433,6 +433,31 @@ install_base_dependencies() {
   package_install "${packages[@]}"
 }
 
+install_media_dependencies() {
+  # Tools agy uses to read rich media (images, audio, video, PDF, Office docs)
+  # and to extract archives. Best-effort: a missing optional package must never
+  # abort the install — the Agy media feature simply degrades.
+  local packages=()
+  command_exists ffmpeg || packages+=(ffmpeg)                       # ffmpeg + ffprobe (audio/video)
+  command_exists pip3 || command_exists pip || packages+=(python3-pip)
+  command_exists 7z || command_exists 7za || packages+=(p7zip-full) # 7z / zip
+  command_exists unar || packages+=(unar)                           # rar (apt: unar)
+  if [[ ${#packages[@]} -gt 0 ]]; then
+    log "Installing media dependencies (best-effort): ${packages[*]}"
+    package_install "${packages[@]}" || log "WARNING: some media packages failed to install; Agy media may be limited."
+  fi
+  # Python libraries agy shells out to for documents (installed for root, which
+  # is what agy runs as). PEP 668 needs --break-system-packages on modern apt.
+  local pipbin=""
+  if command_exists pip3; then pipbin="pip3"; elif command_exists pip; then pipbin="pip"; fi
+  if [[ -n "${pipbin}" ]]; then
+    log "Installing python document libraries (best-effort)."
+    run_sudo "${pipbin}" install --break-system-packages --upgrade pymupdf python-docx openpyxl pillow python-pptx \
+      || run_sudo "${pipbin}" install --upgrade pymupdf python-docx openpyxl pillow python-pptx \
+      || log "WARNING: python media libraries failed to install; PDF/Office reading may be limited."
+  fi
+}
+
 node_major_version() {
 	if ! command_exists node; then
 		return 1
@@ -1159,6 +1184,7 @@ install_all() {
   detect_os_and_package_manager
 	resolve_install_choices
 	install_base_dependencies
+	install_media_dependencies
 	ensure_node_runtime
 	ensure_claude_code_cli
 	ensure_go

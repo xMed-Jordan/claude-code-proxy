@@ -63,6 +63,69 @@ func parseAgyTimeout(s string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// parseByteSize accepts plain bytes or a K/M/G(B) suffix (e.g. "500MB", "1GB").
+func parseByteSize(s string, def int64) int64 {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if s == "" {
+		return def
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "G"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "G")
+	case strings.HasSuffix(s, "MB"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "M"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "M")
+	case strings.HasSuffix(s, "KB"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "K"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "K")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n * mult
+}
+
+// agyMediaPrep materializes any attached media into content-addressed dirs
+// (retained for reuse) and augments the prompt with the file paths. Returns the
+// (possibly augmented) prompt, the content dirs to hand agy via --add-dir (nil
+// when no media), and an error. Files are NOT deleted here — they persist for
+// follow-up questions and are reaped after the retention window.
+func agyMediaPrep(ctx context.Context, cfg config, basePrompt string, parts []mediaPart) (string, []string, error) {
+	if !cfg.AgyMedia || len(parts) == 0 {
+		return basePrompt, nil, nil
+	}
+	root := agyMediaRoot(cfg)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return basePrompt, nil, err
+	}
+	items, addDirs, err := materializeMedia(ctx, cfg, root, parts)
+	if err != nil {
+		return basePrompt, nil, err
+	}
+	if len(items) == 0 {
+		return basePrompt, nil, nil
+	}
+	return buildMediaPrompt(items, basePrompt), addDirs, nil
+}
+
+// agyModelForRequest resolves the model, defaulting media requests with no
+// explicit Antigravity model to cfg.AgyMediaModel ("Gemini 3.5 Flash (Low)").
+func agyModelForRequest(cfg config, alias string, hasMedia bool) string {
+	m := agyModelFor(cfg, alias)
+	if m == "" && hasMedia {
+		return strings.TrimSpace(cfg.AgyMediaModel)
+	}
+	return m
+}
+
 // agyAcquire blocks for a concurrency slot, honoring ctx cancellation/timeout so
 // a queued request can give up cleanly instead of piling up. Returns nil (and
 // "acquired") on success, or ctx.Err() if the caller was cancelled while waiting.
@@ -157,22 +220,34 @@ func agyBinPath(cfg config) string {
 // result. It acquires a concurrency slot (ctx-aware), bounds the run with
 // cfg.AgyTimeout, points agyj at the configured agy CLI, and parses stdout even
 // on a non-zero exit (agyj still prints structured JSON on agy errors).
-func runAgyj(ctx context.Context, cfg config, prompt, model string) (agyResult, error) {
+func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []string) (agyResult, error) {
 	if err := agyAcquire(ctx); err != nil {
 		return agyResult{}, fmt.Errorf("agy queue wait cancelled: %w", err)
 	}
 	defer agyRelease()
 
+	media := len(addDirs) > 0
 	timeout := cfg.AgyTimeout
+	if media {
+		timeout = cfg.AgyMediaTimeout // media analysis (transcode/parse) is heavier
+	}
 	if timeout <= 0 {
 		timeout = 180 * time.Second
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := make([]string, 0, 4)
+	args := make([]string, 0, 6+2*len(addDirs))
 	if m := strings.TrimSpace(model); m != "" {
 		args = append(args, "--model", m)
+	}
+	if media {
+		// Scope agy to exactly this request's files and let it read them without
+		// an interactive permission prompt (which would hang print mode).
+		for _, d := range addDirs {
+			args = append(args, "--add-dir", d)
+		}
+		args = append(args, "--dangerously-skip-permissions")
 	}
 	args = append(args, "-p", prompt)
 
@@ -364,7 +439,12 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := runAgyj(ctx, cfg, flattenAnthropicToPrompt(in), agyModelFor(cfg, in.Model))
+	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenAnthropicToPrompt(in), collectAnthropicMedia(in))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "agy media error: "+err.Error())
+		return
+	}
+	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
 		return
@@ -400,7 +480,12 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := runAgyj(ctx, cfg, flattenOpenAIChatToPrompt(in), agyModelFor(cfg, in.Model))
+	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenOpenAIChatToPrompt(in), collectOpenAIChatMedia(in))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "agy media error: "+err.Error())
+		return
+	}
+	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
 		return
@@ -443,7 +528,12 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := runAgyj(ctx, cfg, flattenResponsesToPrompt(in), agyModelFor(cfg, in.Model))
+	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenResponsesToPrompt(in), collectResponsesMedia(in))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "agy media error: "+err.Error())
+		return
+	}
+	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
 		return

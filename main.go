@@ -71,33 +71,48 @@ type updateLatestCache struct {
 }
 
 type config struct {
-	OpenAIAPIKey       string
-	OpenAIBaseURL      string
-	Upstream           string
-	CodexBaseURL       string
-	CodexAuthFile      string
-	CodexSessionFile   string
-	DBPath             string
-	ProxyKey           string
-	Host               string
-	Port               string
-	PublicURL          string
-	Models             map[string]string
-	ModelContexts      map[string]string
-	ModelCustom        map[string]bool
-	ModelForward       map[string]string
-	ModelDefault       map[string]bool // alias → is the default choice (overrides the built-in seed)
-	ModelRecommended   map[string]bool // alias → is the recommended choice
-	ClaudeDefaults     map[string]string
-	ReasoningEffort    string
-	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
-	AgyCLI             string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
-	AgyModel           string        // optional global model override forwarded to agy ("" → agy's own default)
-	AgyConcurrency     int           // max simultaneous agyj subprocesses
-	AgyTimeout         time.Duration // per-call agy execution timeout
-	AdminUsername      string
-	AdminPasswordHash  string
-	AdminSessionSecret string
+	OpenAIAPIKey      string
+	OpenAIBaseURL     string
+	Upstream          string
+	CodexBaseURL      string
+	CodexAuthFile     string
+	CodexSessionFile  string
+	DBPath            string
+	ProxyKey          string
+	Host              string
+	Port              string
+	PublicURL         string
+	Models            map[string]string
+	ModelContexts     map[string]string
+	ModelCustom       map[string]bool
+	ModelForward      map[string]string
+	ModelDefault      map[string]bool // alias → is the default choice (overrides the built-in seed)
+	ModelRecommended  map[string]bool // alias → is the recommended choice
+	ClaudeDefaults    map[string]string
+	ReasoningEffort   string
+	AgyBin            string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
+	AgyCLI            string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
+	AgyModel          string        // optional global model override forwarded to agy ("" → agy's own default)
+	AgyConcurrency    int           // max simultaneous agyj subprocesses
+	AgyTimeout        time.Duration // per-call agy execution timeout
+	AgyMedia          bool          // enable media attachments for agy requests
+	AgyMediaDir       string        // scratch root for materialized media ("" → temp)
+	AgyMediaModel     string        // default Antigravity model for media requests
+	AgyMediaTimeout   time.Duration // per-call timeout for media (heavier) requests
+	AgyMediaMaxBytes  int64         // max bytes per attached/extracted file
+	AgyMediaMaxTotal  int64         // max total bytes materialized per request
+	AgyMediaAllowURLs bool          // allow downloading media from remote URLs
+	AgyMediaRetention time.Duration // keep materialized files this long for reuse
+	// VirusTotal malware scanning for media attachments (keys editable at runtime).
+	VirusTotalEnabled    bool
+	VirusTotalKeys       string        // newline/comma-separated API keys (load-balanced)
+	VirusTotalThreshold  int           // reject when >= this many engines flag the file
+	VirusTotalUpload     bool          // upload files unknown to VT (else hash-only)
+	VirusTotalMaxWait    time.Duration // bound on upload+analysis polling
+	VirusTotalFailClosed bool          // reject when scanning is unavailable
+	AdminUsername        string
+	AdminPasswordHash    string
+	AdminSessionSecret   string
 }
 
 type modelAliasConfig struct {
@@ -416,6 +431,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/ui/api/analytics", noStore(requireAdmin(cfg, handleUIAnalytics(cfg))))
 	mux.HandleFunc("/ui/api/config", noStore(requireAdmin(cfg, handleUIConfig(cfg))))
 	mux.HandleFunc("/ui/api/models", noStore(requireAdmin(cfg, handleUIModels(cfg))))
+	mux.HandleFunc("/ui/api/virustotal", noStore(requireAdmin(cfg, handleUIVirusTotal(cfg))))
 	mux.HandleFunc("/ui/api/keys", noStore(requireAdmin(cfg, handleUIKeys(cfg))))
 	mux.HandleFunc("/ui/api/keys/provider", noStore(requireAdmin(cfg, handleUIProviderKeys(cfg))))
 	mux.HandleFunc("/ui/api/keys/client", noStore(requireAdmin(cfg, handleUIClientKeys(cfg))))
@@ -460,30 +476,46 @@ func loadConfig() config {
 	claudeDefaults := claudeDefaultsFromValues(env)
 	models, modelContexts, modelCustom, modelForward, modelDefault, modelRecommended := modelAliasesFromValues(env)
 	return config{
-		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:      baseURL,
-		Upstream:           strings.ToLower(getenv("UPSTREAM", "codex")),
-		CodexBaseURL:       strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
-		CodexAuthFile:      codexAuthFile,
-		CodexSessionFile:   getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
-		DBPath:             getenv("PROXY_DB_PATH", ".proxy.db"),
-		ProxyKey:           getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
-		Host:               host,
-		Port:               port,
-		PublicURL:          publicURL,
-		ReasoningEffort:    normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
-		ClaudeDefaults:     claudeDefaults,
-		Models:             models,
-		ModelContexts:      modelContexts,
-		ModelCustom:        modelCustom,
-		ModelForward:       modelForward,
-		ModelDefault:       modelDefault,
-		ModelRecommended:   modelRecommended,
-		AgyBin:             strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
-		AgyCLI:             strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
-		AgyModel:           strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
-		AgyConcurrency:     parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
-		AgyTimeout:         parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
+		OpenAIAPIKey:      os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:     baseURL,
+		Upstream:          strings.ToLower(getenv("UPSTREAM", "codex")),
+		CodexBaseURL:      strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
+		CodexAuthFile:     codexAuthFile,
+		CodexSessionFile:  getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
+		DBPath:            getenv("PROXY_DB_PATH", ".proxy.db"),
+		ProxyKey:          getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
+		Host:              host,
+		Port:              port,
+		PublicURL:         publicURL,
+		ReasoningEffort:   normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
+		ClaudeDefaults:    claudeDefaults,
+		Models:            models,
+		ModelContexts:     modelContexts,
+		ModelCustom:       modelCustom,
+		ModelForward:      modelForward,
+		ModelDefault:      modelDefault,
+		ModelRecommended:  modelRecommended,
+		AgyBin:            strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
+		AgyCLI:            strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
+		AgyModel:          strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
+		AgyConcurrency:    parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
+		AgyTimeout:        parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
+		AgyMedia:          envFlag("PROXY_AGY_MEDIA", true),
+		AgyMediaDir:       strings.TrimSpace(getenv("PROXY_AGY_MEDIA_DIR", "")),
+		AgyMediaModel:     strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.5 Flash (Low)")),
+		AgyMediaTimeout:   parseAgyTimeout(getenv("PROXY_AGY_MEDIA_TIMEOUT", "300")),
+		AgyMediaMaxBytes:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_BYTES", "1GB"), 1<<30),
+		AgyMediaMaxTotal:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
+		AgyMediaAllowURLs: envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
+		AgyMediaRetention: parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
+
+		VirusTotalEnabled:    envFlag("PROXY_VIRUSTOTAL_ENABLED", true),
+		VirusTotalKeys:       strings.TrimSpace(getenv("PROXY_VIRUSTOTAL_KEYS", "")),
+		VirusTotalThreshold:  parseIntDefault(getenv("PROXY_VIRUSTOTAL_THRESHOLD", "1"), 1),
+		VirusTotalUpload:     envFlag("PROXY_VIRUSTOTAL_UPLOAD", true),
+		VirusTotalMaxWait:    parseAgyTimeout(getenv("PROXY_VIRUSTOTAL_MAX_WAIT", "90")),
+		VirusTotalFailClosed: envFlag("PROXY_VIRUSTOTAL_FAIL_CLOSED", false),
+
 		AdminUsername:      strings.TrimSpace(getenv("ADMIN_USERNAME", "")),
 		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
 		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
@@ -5231,6 +5263,14 @@ func migrateMetricsDB(db *sql.DB) error {
 			surface TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_metrics_at ON request_metrics(at_unix_ms)`,
+		// Local cache of malware-scan verdicts (keyed by file SHA-256, with the
+		// MD5 stored alongside) so a re-uploaded known file skips VirusTotal.
+		`CREATE TABLE IF NOT EXISTS file_scan_cache (
+			sha256 TEXT PRIMARY KEY,
+			md5 TEXT NOT NULL DEFAULT '',
+			malicious_engines INTEGER NOT NULL DEFAULT 0,
+			scanned_at_ms INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -5762,17 +5802,18 @@ func clientIP(r *http.Request) string {
 // (with or without a single trailing slash) serves the SPA HTML so deep links
 // and reloads work. Anything else under "/" is a 404.
 var uiSPARoutes = map[string]bool{
-	"/":          true,
-	"/dashboard": true,
-	"/analytics": true,
-	"/config":    true,
-	"/models":    true,
-	"/keys":      true,
-	"/test":      true,
-	"/logs":      true,
-	"/updates":   true,
-	"/browser":   true,
-	"/setup":     true,
+	"/":           true,
+	"/dashboard":  true,
+	"/analytics":  true,
+	"/config":     true,
+	"/models":     true,
+	"/virustotal": true,
+	"/keys":       true,
+	"/test":       true,
+	"/logs":       true,
+	"/updates":    true,
+	"/browser":    true,
+	"/setup":      true,
 }
 
 // uiIndexFile returns the SPA entry point: the new ui/index.html when present,
@@ -6882,6 +6923,62 @@ func handleUIModels(cfg config) http.HandlerFunc {
 			syncProcessEnvKeys(current, "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED")
 			replaceRuntimeModelConfig(cfg, next)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Model aliases saved and active for new requests.", "models": modelRows(cfg)})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		}
+	}
+}
+
+// handleUIVirusTotal manages the VirusTotal API key pool used to scan media
+// attachments. Keys are load-balanced round-robin with a 1h cooldown on errors;
+// edits take effect immediately (no restart) and persist to .env.
+func handleUIVirusTotal(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			raw, enabled := getVTRuntime()
+			keys := parseVTKeys(raw)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"enabled":     enabled,
+				"keys_raw":    strings.Join(keys, "\n"),
+				"count":       len(keys),
+				"statuses":    vtKeyStatuses(keys),
+				"threshold":   vtThreshold(cfg),
+				"upload":      cfg.VirusTotalUpload,
+				"fail_closed": cfg.VirusTotalFailClosed,
+			})
+		case http.MethodPost:
+			var body struct {
+				Enabled bool   `json:"enabled"`
+				Keys    string `json:"keys"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+				return
+			}
+			keys := parseVTKeys(body.Keys)
+			joined := strings.Join(keys, "\n")
+			current := readEnvMap()
+			if joined == "" {
+				delete(current, "PROXY_VIRUSTOTAL_KEYS")
+			} else {
+				current["PROXY_VIRUSTOTAL_KEYS"] = joined
+			}
+			if body.Enabled {
+				current["PROXY_VIRUSTOTAL_ENABLED"] = "1"
+			} else {
+				current["PROXY_VIRUSTOTAL_ENABLED"] = "0"
+			}
+			if err := writeEnvMap(current); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			syncProcessEnvKeys(current, "PROXY_VIRUSTOTAL_KEYS", "PROXY_VIRUSTOTAL_ENABLED")
+			setVTRuntime(joined, body.Enabled)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "message": "VirusTotal settings saved.",
+				"enabled": body.Enabled, "count": len(keys), "statuses": vtKeyStatuses(keys),
+			})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1975,6 +1979,216 @@ func TestAgyResponseShape(t *testing.T) {
 	}
 	if out["stop_reason"] != "end_turn" {
 		t.Fatalf("stop_reason = %v", out["stop_reason"])
+	}
+}
+
+func TestMediaExtFor(t *testing.T) {
+	cases := []struct{ mt, fn, want string }{
+		{"", "report.PDF", ".pdf"},
+		{"audio/mp4", "", ".m4a"},
+		{"application/zip", "", ".zip"},
+		{"image/png", "pic", ".png"},
+		{"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "", ".docx"},
+		{"audio/mpeg", "", ".mp3"},
+		{"", "clip.M4A", ".m4a"},
+	}
+	for _, c := range cases {
+		if got := mediaExtFor(c.mt, c.fn); got != c.want {
+			t.Fatalf("mediaExtFor(%q,%q) = %q, want %q", c.mt, c.fn, got, c.want)
+		}
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	cases := map[string]int64{"": 99, "1GB": 1 << 30, "500MB": 500 << 20, "16": 16, "2g": 2 << 30, "junk": 99}
+	for in, want := range cases {
+		if got := parseByteSize(in, 99); got != want {
+			t.Fatalf("parseByteSize(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+func TestIsBlockedIP(t *testing.T) {
+	for _, s := range []string{"127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.169.254", "100.64.0.1", "::1", "fc00::1"} {
+		if !isBlockedIP(net.ParseIP(s)) {
+			t.Fatalf("%s should be blocked", s)
+		}
+	}
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"} {
+		if isBlockedIP(net.ParseIP(s)) {
+			t.Fatalf("%s should be allowed", s)
+		}
+	}
+}
+
+func TestOpenMediaURLBlocksInternal(t *testing.T) {
+	for _, u := range []string{"http://127.0.0.1/x", "http://169.254.169.254/latest/meta-data", "http://10.0.0.5/x", "ftp://example.com/x"} {
+		if _, err := openMediaURL(context.Background(), u, 1<<20); err == nil {
+			t.Fatalf("expected block/reject for %s", u)
+		}
+	}
+}
+
+func TestCollectAnthropicMedia(t *testing.T) {
+	in := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "hi"},
+		map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "QUFB"}},
+		map[string]any{"type": "document", "md5": "abc123", "source": map[string]any{"type": "url", "url": "https://example.com/y.pdf"}},
+	}}}}
+	parts := collectAnthropicMedia(in)
+	if len(parts) != 2 {
+		t.Fatalf("got %d parts, want 2", len(parts))
+	}
+	if parts[0].B64 != "QUFB" || parts[0].MediaType != "image/png" {
+		t.Fatalf("image part = %+v", parts[0])
+	}
+	if parts[1].URL != "https://example.com/y.pdf" || parts[1].MD5 != "abc123" {
+		t.Fatalf("doc part = %+v", parts[1])
+	}
+}
+
+func TestMaterializeMediaBase64AndPerms(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config{AgyMedia: true, AgyMediaMaxBytes: 1 << 20, AgyMediaMaxTotal: 4 << 20}
+	raw := []byte("hello-media-bytes")
+	sum := md5.Sum(raw)
+	parts := []mediaPart{{B64: base64.StdEncoding.EncodeToString(raw), MediaType: "image/png", Filename: "x.png", MD5: hex.EncodeToString(sum[:])}}
+	items, addDirs, err := materializeMedia(context.Background(), cfg, dir, parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Kind != "image" {
+		t.Fatalf("items = %+v", items)
+	}
+	if len(addDirs) != 1 {
+		t.Fatalf("addDirs = %+v", addDirs)
+	}
+	if _, e := os.Stat(filepath.Join(addDirs[0], "_map.md")); e != nil {
+		t.Fatalf("expected _map.md manifest in content dir: %v", e)
+	}
+	info, err := os.Stat(items[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&0o111 != 0 {
+		t.Fatalf("materialized file is executable: %v", info.Mode())
+	}
+	got, _ := os.ReadFile(items[0].Path)
+	if string(got) != "hello-media-bytes" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestMaterializeMediaMD5Mismatch(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config{AgyMedia: true}
+	parts := []mediaPart{{B64: base64.StdEncoding.EncodeToString([]byte("abc")), Filename: "x.bin", MD5: "deadbeef"}}
+	if _, _, err := materializeMedia(context.Background(), cfg, dir, parts); err == nil || !strings.Contains(err.Error(), "md5 mismatch") {
+		t.Fatalf("expected md5 mismatch error, got %v", err)
+	}
+}
+
+func TestMaterializeMediaPerFileCap(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config{AgyMedia: true, AgyMediaMaxBytes: 4, AgyMediaMaxTotal: 100}
+	parts := []mediaPart{{B64: base64.StdEncoding.EncodeToString([]byte("way too big to fit")), Filename: "x.bin"}}
+	if _, _, err := materializeMedia(context.Background(), cfg, dir, parts); err == nil {
+		t.Fatal("expected per-file cap error")
+	}
+}
+
+func TestMaterializeMediaReuse(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config{AgyMedia: true, AgyMediaMaxBytes: 1 << 20, AgyMediaMaxTotal: 4 << 20}
+	parts := []mediaPart{{B64: base64.StdEncoding.EncodeToString([]byte("reuse-me-bytes")), MediaType: "text/plain", Filename: "a.txt"}}
+	i1, _, err := materializeMedia(context.Background(), cfg, dir, parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i2, _, err := materializeMedia(context.Background(), cfg, dir, parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i1[0].Path != i2[0].Path {
+		t.Fatalf("content-addressed reuse failed: %q vs %q", i1[0].Path, i2[0].Path)
+	}
+}
+
+func TestExtractArchiveZipSlip(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "a.zip")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, _ := zw.Create("../escape.txt")
+	w.Write([]byte("evil"))
+	zw.Close()
+	if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "out")
+	os.MkdirAll(dest, 0o755)
+	var total int64
+	if err := extractArchive(zipPath, dest, &total, 1<<20); err == nil {
+		t.Fatal("expected zip-slip rejection")
+	}
+	if _, e := os.Stat(filepath.Join(dir, "escape.txt")); e == nil {
+		t.Fatal("zip-slip wrote a file outside the destination")
+	}
+}
+
+func TestExtractArchiveZipNormal(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "a.zip")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, _ := zw.Create("sub/inside.txt")
+	w.Write([]byte("ok-content"))
+	zw.Close()
+	os.WriteFile(zipPath, buf.Bytes(), 0o644)
+	dest := filepath.Join(dir, "out")
+	os.MkdirAll(dest, 0o755)
+	var total int64
+	if err := extractArchive(zipPath, dest, &total, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "sub", "inside.txt"))
+	if err != nil || string(got) != "ok-content" {
+		t.Fatalf("extracted content = %q, err=%v", got, err)
+	}
+}
+
+func TestVTKeysParseRotationCooldown(t *testing.T) {
+	if keys := parseVTKeys("a, b\nc;d a"); len(keys) != 4 {
+		t.Fatalf("parseVTKeys = %v, want 4 unique", keys)
+	}
+	vtMu.Lock()
+	vtCooldown = map[string]time.Time{}
+	vtRotation = 0
+	vtMu.Unlock()
+	keys := []string{"k1", "k2", "k3"}
+	var got []string
+	for i := 0; i < 3; i++ {
+		k, _ := vtPickKey(keys)
+		got = append(got, k)
+	}
+	if got[0] != "k1" || got[1] != "k2" || got[2] != "k3" {
+		t.Fatalf("round-robin = %v", got)
+	}
+	vtParkKey("k1")
+	if k, ok := vtPickKey(keys); !ok || k == "k1" {
+		t.Fatalf("parked key k1 was returned: %q (ok=%v)", k, ok)
+	}
+}
+
+func TestVTVerdictMalicious(t *testing.T) {
+	if !(vtVerdict{Stats: vtStats{Malicious: 1}}).isMalicious(1) {
+		t.Fatal("1 engine should be malicious at threshold 1")
+	}
+	if (vtVerdict{Stats: vtStats{Malicious: 0}}).isMalicious(1) {
+		t.Fatal("0 engines should be clean")
+	}
+	if (vtVerdict{Stats: vtStats{Malicious: 2}}).isMalicious(3) {
+		t.Fatal("2 < threshold 3 should be clean")
 	}
 }
 
