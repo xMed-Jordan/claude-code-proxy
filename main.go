@@ -86,6 +86,8 @@ type config struct {
 	ModelContexts      map[string]string
 	ModelCustom        map[string]bool
 	ModelForward       map[string]string
+	ModelDefault       map[string]bool // alias → is the default choice (overrides the built-in seed)
+	ModelRecommended   map[string]bool // alias → is the recommended choice
 	ClaudeDefaults     map[string]string
 	ReasoningEffort    string
 	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
@@ -99,10 +101,12 @@ type config struct {
 }
 
 type modelAliasConfig struct {
-	Alias     string `json:"alias"`
-	Real      string `json:"real"`
-	Context   string `json:"context,omitempty"`
-	ForwardTo string `json:"forward_to,omitempty"`
+	Alias       string `json:"alias"`
+	Real        string `json:"real"`
+	Context     string `json:"context,omitempty"`
+	ForwardTo   string `json:"forward_to,omitempty"`
+	Default     bool   `json:"default,omitempty"`
+	Recommended bool   `json:"recommended,omitempty"`
 }
 
 type codexAuthFile struct {
@@ -454,7 +458,7 @@ func loadConfig() config {
 	}
 	env := processEnvValue
 	claudeDefaults := claudeDefaultsFromValues(env)
-	models, modelContexts, modelCustom, modelForward := modelAliasesFromValues(env)
+	models, modelContexts, modelCustom, modelForward, modelDefault, modelRecommended := modelAliasesFromValues(env)
 	return config{
 		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:      baseURL,
@@ -473,6 +477,8 @@ func loadConfig() config {
 		ModelContexts:      modelContexts,
 		ModelCustom:        modelCustom,
 		ModelForward:       modelForward,
+		ModelDefault:       modelDefault,
+		ModelRecommended:   modelRecommended,
 		AgyBin:             strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
 		AgyCLI:             strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
 		AgyModel:           strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
@@ -593,11 +599,13 @@ func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
 	}
 }
 
-func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]string, map[string]bool, map[string]string) {
+func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]string, map[string]bool, map[string]string, map[string]bool, map[string]bool) {
 	models := defaultModelAliasesFromValues(env)
 	contexts := map[string]string{}
 	custom := map[string]bool{}
 	forwards := map[string]string{}
+	defaults := map[string]bool{}
+	recommended := map[string]bool{}
 	for _, row := range parseModelAliasConfigs(env("PROXY_MODEL_ALIASES", "")) {
 		alias := strings.TrimSpace(row.Alias)
 		real := cleanModel(strings.TrimSpace(row.Real))
@@ -608,14 +616,20 @@ func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]str
 		contexts[alias] = normalizeModelContext(row.Context)
 		custom[alias] = true
 		forwards[alias] = normalizeForwardTarget(row.ForwardTo)
+		// Presence of an override row makes the flags explicit (so unsetting a
+		// built-in default/recommended persists). Absence → built-in seed.
+		defaults[alias] = row.Default
+		recommended[alias] = row.Recommended
 	}
 	for alias := range parseDisabledModelAliases(env("PROXY_MODEL_ALIASES_DISABLED", "")) {
 		delete(models, alias)
 		delete(contexts, alias)
 		delete(custom, alias)
 		delete(forwards, alias)
+		delete(defaults, alias)
+		delete(recommended, alias)
 	}
-	return models, contexts, custom, forwards
+	return models, contexts, custom, forwards, defaults, recommended
 }
 
 // knownForwardTargets is the set of backends a model alias may forward to.
@@ -640,6 +654,28 @@ func forwardForAlias(cfg config, alias string) string {
 		}
 	}
 	return "codex"
+}
+
+// defaultForAlias / recommendedForAlias report whether an alias is the default /
+// recommended choice. An explicit stored flag (set via the Models page) wins;
+// absent that, the built-in seed (sonnet / gpt-5.3-codex) applies so a fresh
+// install keeps its out-of-box choices until the user customizes them.
+func defaultForAlias(cfg config, alias string) bool {
+	if cfg.ModelDefault != nil {
+		if v, ok := cfg.ModelDefault[alias]; ok {
+			return v
+		}
+	}
+	return isDefaultModelAlias(alias)
+}
+
+func recommendedForAlias(cfg config, alias string) bool {
+	if cfg.ModelRecommended != nil {
+		if v, ok := cfg.ModelRecommended[alias]; ok {
+			return v
+		}
+	}
+	return isRecommendedModelAlias(alias)
 }
 
 func parseModelAliasConfigs(raw string) []modelAliasConfig {
@@ -5207,6 +5243,11 @@ func migrateMetricsDB(db *sql.DB) error {
 // recordMetric queues a metric for async persistence. Non-blocking: drops the
 // row (rather than stalling the request) if the buffer is full.
 func recordMetric(m requestMetric) {
+	// A successful proxied request verifies the alias (reflected as Available on
+	// the Models page). Done regardless of the metrics channel state.
+	if !m.IsError && m.Status >= 200 && m.Status < 400 {
+		markModelAliasVerified(m.Model)
+	}
 	if metricsCh == nil {
 		return
 	}
@@ -7470,7 +7511,10 @@ func saveModelAliasesToEnvMap(vals map[string]string, submitted []modelAliasConf
 		baseReal, isBase := baseModels[row.Alias]
 		baseContext := contextForAlias(baseCfg, row.Alias)
 		forwardCustom := row.ForwardTo != "" && row.ForwardTo != "codex"
-		if !isBase || baseReal != row.Real || row.Context != baseContext || forwardCustom {
+		// A flag differing from its built-in seed must persist (e.g. unsetting the
+		// default on "sonnet" or marking a new default), even if real/context match.
+		flagCustom := row.Default != isDefaultModelAlias(row.Alias) || row.Recommended != isRecommendedModelAlias(row.Alias)
+		if !isBase || baseReal != row.Real || row.Context != baseContext || forwardCustom || flagCustom {
 			out := row
 			if !forwardCustom {
 				out.ForwardTo = "" // keep .env tidy: omitempty drops default codex
@@ -7494,16 +7538,20 @@ func saveModelAliasesToEnvMap(vals map[string]string, submitted []modelAliasConf
 	}
 
 	next := config{
-		Models:         map[string]string{},
-		ModelContexts:  map[string]string{},
-		ModelCustom:    map[string]bool{},
-		ModelForward:   map[string]string{},
-		ClaudeDefaults: claudeDefaults,
+		Models:           map[string]string{},
+		ModelContexts:    map[string]string{},
+		ModelCustom:      map[string]bool{},
+		ModelForward:     map[string]string{},
+		ModelDefault:     map[string]bool{},
+		ModelRecommended: map[string]bool{},
+		ClaudeDefaults:   claudeDefaults,
 	}
 	for _, row := range rows {
 		next.Models[row.Alias] = row.Real
 		next.ModelContexts[row.Alias] = row.Context
 		next.ModelForward[row.Alias] = normalizeForwardTarget(row.ForwardTo)
+		next.ModelDefault[row.Alias] = row.Default
+		next.ModelRecommended[row.Alias] = row.Recommended
 		if _, isBase := baseModels[row.Alias]; !isBase || !isAdvertisedModel(row.Alias) {
 			next.ModelCustom[row.Alias] = true
 		}
@@ -7531,7 +7579,7 @@ func normalizeSubmittedModelAliases(submitted []modelAliasConfig) ([]modelAliasC
 			return nil, fmt.Errorf("alias %q is duplicated", alias)
 		}
 		seen[key] = true
-		rows = append(rows, modelAliasConfig{Alias: alias, Real: real, Context: normalizeModelContext(row.Context), ForwardTo: normalizeForwardTarget(row.ForwardTo)})
+		rows = append(rows, modelAliasConfig{Alias: alias, Real: real, Context: normalizeModelContext(row.Context), ForwardTo: normalizeForwardTarget(row.ForwardTo), Default: row.Default, Recommended: row.Recommended})
 	}
 	return rows, nil
 }
@@ -7553,6 +7601,8 @@ func replaceRuntimeModelConfig(cfg config, next config) {
 	replaceStringMap(cfg.ModelContexts, next.ModelContexts)
 	replaceBoolMap(cfg.ModelCustom, next.ModelCustom)
 	replaceStringMap(cfg.ModelForward, next.ModelForward)
+	replaceBoolMap(cfg.ModelDefault, next.ModelDefault)
+	replaceBoolMap(cfg.ModelRecommended, next.ModelRecommended)
 	replaceStringMap(cfg.ClaudeDefaults, next.ClaudeDefaults)
 }
 
@@ -7613,15 +7663,15 @@ func modelRows(cfg config) []map[string]any {
 		rows = append(rows, map[string]any{
 			"alias":                 alias,
 			"real":                  real,
-			"status":                modelStatus(real),
+			"status":                modelStatusForRow(cfg, alias, real),
 			"context":               context,
 			"context_window_tokens": contextWindow,
 			"max_input_tokens":      maxInput,
 			"max_output_tokens":     maxOutput,
 			"limits_known":          maxOutput > 0,
 			"limits_source":         limitsSource,
-			"default":               isDefaultModelAlias(alias),
-			"recommended":           isRecommendedModelAlias(alias),
+			"default":               defaultForAlias(cfg, alias),
+			"recommended":           recommendedForAlias(cfg, alias),
 			"forward_to":            forwardForAlias(cfg, alias),
 		})
 	}
@@ -7668,6 +7718,57 @@ func modelStatus(real string) string {
 		return "untested"
 	}
 	return "unsupported"
+}
+
+// antigravityModels is the catalog the agy CLI accepts (from `agy models`),
+// lowercased. Used so an Agy-forwarded alias shows "Available" rather than
+// "Untested" for a recognized Antigravity model.
+var antigravityModels = map[string]bool{
+	"gemini 3.1 pro (high)":        true,
+	"gemini 3.1 pro (low)":         true,
+	"gemini 3.5 flash (high)":      true,
+	"gemini 3.5 flash (medium)":    true,
+	"gemini 3.5 flash (low)":       true,
+	"claude sonnet 4.6 (thinking)": true,
+	"claude opus 4.6 (thinking)":   true,
+	"gpt-oss 120b (medium)":        true,
+}
+
+// modelVerified tracks aliases that have served at least one successful request
+// this process lifetime, so "I tested it and it works" is reflected as Available.
+// In-memory only — resets on restart and re-verifies on the next success.
+var modelVerified sync.Map // alias → true
+
+func markModelAliasVerified(alias string) {
+	alias = strings.TrimSpace(alias)
+	if alias != "" {
+		modelVerified.Store(alias, true)
+	}
+}
+
+func modelAliasVerified(alias string) bool {
+	_, ok := modelVerified.Load(strings.TrimSpace(alias))
+	return ok
+}
+
+// modelStatusForRow computes the Models-page status with awareness of the
+// forward target and real usage: a verified alias is Available; an Agy alias is
+// Available when its model is a known Antigravity model; otherwise the codex
+// heuristic applies.
+func modelStatusForRow(cfg config, alias, real string) string {
+	if strings.TrimSpace(real) == "" {
+		return "unsupported"
+	}
+	if modelAliasVerified(alias) {
+		return "ok"
+	}
+	if forwardForAlias(cfg, alias) == "agy" {
+		if antigravityModels[strings.ToLower(strings.TrimSpace(real))] {
+			return "ok"
+		}
+		return "untested"
+	}
+	return modelStatus(real)
 }
 
 func isDefaultModelAlias(alias string) bool {

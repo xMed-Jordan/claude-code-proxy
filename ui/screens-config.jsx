@@ -116,7 +116,6 @@
 
     const [cfg, setCfg] = useState(DEFAULT_CFG);
     const [secrets, setSecrets] = useState({});
-    const [aliases, setAliases] = useState([]);
     const [dirty, setDirty] = useState(false);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -129,11 +128,6 @@
       api.get("/ui/api/config").then(res => {
         setCfg(c => ({ ...c, ...(res.config || {}) }));
         setSecrets(res.secrets || {});
-        setAliases((res.aliases || []).map((a, i) => ({
-          from: a.from || a.alias || "",
-          to: a.to || a.real || "",
-          context: a.context || "200k",
-        })));
         setDirty(false);
       }).catch(e => notify("Failed to load config: " + (e.message || e), "error"))
         .finally(() => setLoading(false));
@@ -141,21 +135,6 @@
 
     const update = useCallback((k, v) => {
       setCfg(c => ({ ...c, [k]: v }));
-      setDirty(true);
-    }, []);
-
-    const updateAlias = useCallback((i, k, v) => {
-      setAliases(a => a.map((row, idx) => idx === i ? { ...row, [k]: v } : row));
-      setDirty(true);
-    }, []);
-
-    const removeAlias = useCallback((i) => {
-      setAliases(a => a.filter((_, idx) => idx !== i));
-      setDirty(true);
-    }, []);
-
-    const addAlias = useCallback(() => {
-      setAliases(a => [...a, { from: "", to: "", context: "200k" }]);
       setDirty(true);
     }, []);
 
@@ -169,7 +148,6 @@
       try {
         const res = await api.post("/ui/api/config", {
           config: cfg,
-          aliases: aliases.map(a => ({ from: a.from, to: a.to, context: a.context })),
         });
         setDirty(false);
         notify(res.message || "Configuration saved — restart proxy to apply", "success");
@@ -178,11 +156,10 @@
       } finally {
         setSaving(false);
       }
-    }, [canSave, cfg, aliases, notify]);
+    }, [canSave, cfg, notify]);
 
     const reset = useCallback(() => {
       setCfg(DEFAULT_CFG);
-      setAliases([]);
       setDirty(true);
     }, []);
 
@@ -380,88 +357,15 @@
           </div>
         </Card>
 
-        {/* Model aliases */}
-        <Card
-          title="Model aliases"
-          description="Rewrite Anthropic model names to Codex upstream models at request time."
-          actions={
-            <Button size="sm" variant="secondary" icon="plus" onClick={addAlias}>
-              Add alias
-            </Button>
-          }
-          flush
-        >
-          {aliases.length === 0 ? (
-            <EmptyState
-              icon="models"
-              title="No aliases configured"
-              description="Add an alias to map Anthropic model names to Codex upstream models."
-              compact
-            />
-          ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Public alias (Claude Code)</th>
-                  <th></th>
-                  <th>Codex model</th>
-                  <th>Context</th>
-                  <th style={{ width: 44 }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {aliases.map((a, i) => {
-                  const aliasInvalid = !a.from.trim();
-                  const modelInvalid = !a.to.trim();
-                  return (
-                    <tr key={i} className={aliasInvalid || modelInvalid ? "tr-danger" : ""}>
-                      <td>
-                        <Input
-                          className="cfg-alias-input"
-                          value={a.from}
-                          onChange={e => updateAlias(i, "from", e.target.value)}
-                          placeholder="claude-sonnet-4-5"
-                          invalid={aliasInvalid}
-                        />
-                      </td>
-                      <td className="cfg-alias-arrow subtle">→</td>
-                      <td>
-                        <input
-                          className={cx("input", modelInvalid && "invalid", "cfg-alias-input")}
-                          list="cfg-model-options"
-                          value={a.to}
-                          onChange={e => updateAlias(i, "to", e.target.value)}
-                          placeholder="gpt-5.5"
-                        />
-                        <datalist id="cfg-model-options">
-                          {CODEX_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
-                        </datalist>
-                      </td>
-                      <td>
-                        <Select
-                          value={a.context || "200k"}
-                          onChange={e => updateAlias(i, "context", e.target.value)}
-                          options={[
-                            { value: "200k", label: "200k" },
-                            { value: "1m", label: "1M tokens" },
-                          ]}
-                        />
-                      </td>
-                      <td>
-                        <IconButton
-                          icon="trash"
-                          label="Remove alias"
-                          size={13}
-                          onClick={() => removeAlias(i)}
-                        />
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </Card>
+        {/* Model aliases are managed on the dedicated Models page (single source). */}
+        <div className="alert" data-tone="info" style={{ marginTop: "var(--sp-4)" }}>
+          <Icon name="info" size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>
+            <strong>Model aliases moved.</strong> Manage what each public model maps to —
+            upstream model, context, forwarded-to backend, default and recommended — on the{" "}
+            <a href="/models" className="cfg-inline-link">Models</a> page.
+          </span>
+        </div>
 
         <div className="cfg-footer-actions">
           {dirty && <Badge tone={!portValid || !urlValid ? "danger" : "warning"}>Unsaved changes</Badge>}
@@ -566,6 +470,18 @@
       setDirty(true);
     }, []);
 
+    // default / recommended are single-choice: turning one on clears the others.
+    const toggleFlag = useCallback((id, key) => {
+      setModels(rows => {
+        const turningOn = !rows.find(r => r.id === id)?.[key];
+        return rows.map(row => {
+          if (row.id === id) return { ...row, [key]: turningOn };
+          return turningOn && row[key] ? { ...row, [key]: false } : row;
+        });
+      });
+      setDirty(true);
+    }, []);
+
     const addAlias = useCallback(() => {
       const id = "new-" + Date.now();
       setModels(rows => [...rows, normalizeModelDraft({ id, alias: "", real: CODEX_MODEL_OPTIONS[0], context: "200k" }, rows.length)]);
@@ -591,7 +507,7 @@
       setSaving(true);
       try {
         const res = await api.post("/ui/api/models", {
-          models: models.map(m => ({ alias: m.alias.trim(), real: m.real.trim(), context: m.context, forward_to: m.forward_to })),
+          models: models.map(m => ({ alias: m.alias.trim(), real: m.real.trim(), context: m.context, forward_to: m.forward_to, default: !!m.default, recommended: !!m.recommended })),
         });
         setModels((res.models || []).map((m, i) => normalizeModelDraft(m, i)));
         setDirty(false);
@@ -602,6 +518,71 @@
         setSaving(false);
       }
     }, [canSave, models, invalidIds, notify]);
+
+    // ── Import / Export ──────────────────────────────────────────────
+    const fileInputRef = useRef(null);
+
+    const exportModels = useCallback(() => {
+      const payload = {
+        version: 1,
+        exported_at: new Date().toISOString(),
+        models: models.map(m => ({
+          alias: m.alias.trim(),
+          real: m.real.trim(),
+          context: m.context,
+          forward_to: m.forward_to,
+          default: !!m.default,
+          recommended: !!m.recommended,
+        })),
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "connect-ai-proxy-models.json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      notify("Exported " + payload.models.length + " model" + (payload.models.length === 1 ? "" : "s"), "success");
+    }, [models, notify]);
+
+    const importModels = useCallback((file) => {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(String(reader.result));
+          const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.models) ? parsed.models : null);
+          if (!list) throw new Error("expected a JSON array or an object with a \"models\" array");
+          const rows = list.map((m, i) => normalizeModelDraft({
+            id: "imp-" + Date.now() + "-" + i,
+            alias: m.alias || m.from || "",
+            real: m.real || m.to || "",
+            context: m.context || "200k",
+            forward_to: m.forward_to,
+            default: !!m.default,
+            recommended: !!m.recommended,
+          }, i));
+          if (rows.length === 0) throw new Error("no models found in file");
+          setModels(rows);
+          setFilter("all");
+          setQuery("");
+          setDirty(true);
+          notify("Imported " + rows.length + " model" + (rows.length === 1 ? "" : "s") + " — review and Save", "success");
+        } catch (e) {
+          notify("Import failed: " + (e.message || e), "error");
+        }
+      };
+      reader.onerror = () => notify("Could not read file", "error");
+      reader.readAsText(file);
+    }, [notify]);
+
+    const onImportFile = useCallback((e) => {
+      const file = e.target.files && e.target.files[0];
+      importModels(file);
+      e.target.value = ""; // allow re-importing the same file
+    }, [importModels]);
 
     const filterTabs = [
       { id: "all", label: "All", badge: counts.all },
@@ -622,8 +603,21 @@
                   {invalidIds.size ? "Fix " + invalidIds.size + " row" + (invalidIds.size > 1 ? "s" : "") : "Unsaved"}
                 </Badge>
               )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                style={{ display: "none" }}
+                onChange={onImportFile}
+              />
               <Button size="sm" variant="ghost" icon="refresh" onClick={load} disabled={loading}>
                 Refresh
+              </Button>
+              <Button size="sm" variant="ghost" icon="upload" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+                Import
+              </Button>
+              <Button size="sm" variant="ghost" icon="download" onClick={exportModels} disabled={!models.length}>
+                Export
               </Button>
               <Button size="sm" variant="secondary" icon="plus" onClick={addAlias}>
                 Add alias
@@ -705,9 +699,25 @@
                                 onChange={e => updateModel(m.id, "alias", e.target.value)}
                                 placeholder="claude-sonnet-4-5"
                               />
-                              <div className="models-badges">
-                                {m.default && <Badge tone="info">default</Badge>}
-                                {m.recommended && <Badge tone="success">recommended</Badge>}
+                              <div className="models-flags">
+                                <button
+                                  type="button"
+                                  className={cx("models-flag", m.default && "on")}
+                                  data-flag="default"
+                                  onClick={() => toggleFlag(m.id, "default")}
+                                  title="Mark this alias as the default choice"
+                                >
+                                  {m.default ? "★ default" : "☆ default"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className={cx("models-flag", m.recommended && "on")}
+                                  data-flag="recommended"
+                                  onClick={() => toggleFlag(m.id, "recommended")}
+                                  title="Mark this alias as the recommended choice"
+                                >
+                                  {m.recommended ? "★ recommended" : "☆ recommended"}
+                                </button>
                               </div>
                             </div>
                           </td>

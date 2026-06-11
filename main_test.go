@@ -868,8 +868,87 @@ func TestModelForwardToPersistAndDefault(t *testing.T) {
 		}
 		return def
 	}
-	if _, _, _, forwards := modelAliasesFromValues(env); forwards["agy-model"] != "agy" {
+	if _, _, _, forwards, _, _ := modelAliasesFromValues(env); forwards["agy-model"] != "agy" {
 		t.Fatalf("loader agy-model forward = %q, want agy", forwards["agy-model"])
+	}
+}
+
+func TestModelDefaultRecommendedPersist(t *testing.T) {
+	t.Setenv("PROXY_MODEL_ALIASES", "")
+	t.Setenv("PROXY_MODEL_ALIASES_DISABLED", "")
+	vals := map[string]string{}
+	// "sonnet" is a built-in default; unset it and make "opus" the default +
+	// recommended. The unset of a built-in flag must persist.
+	next, err := saveModelAliasesToEnvMap(vals, []modelAliasConfig{
+		{Alias: "opus", Real: "gpt-5.5", Context: "1m", Default: true, Recommended: true},
+		{Alias: "sonnet", Real: "gpt-5.5", Context: "200k", Default: false},
+		{Alias: "haiku", Real: "gpt-5.4-mini", Context: "200k"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.ModelDefault["opus"] || !next.ModelRecommended["opus"] {
+		t.Fatalf("opus flags not set: default=%v recommended=%v", next.ModelDefault["opus"], next.ModelRecommended["opus"])
+	}
+	rows := map[string]map[string]any{}
+	for _, r := range modelRows(next) {
+		rows[fmt.Sprint(r["alias"])] = r
+	}
+	if rows["opus"]["default"] != true || rows["opus"]["recommended"] != true {
+		t.Fatalf("opus row flags = %v / %v", rows["opus"]["default"], rows["opus"]["recommended"])
+	}
+	// sonnet's built-in default is now explicitly off, and it must round-trip.
+	if rows["sonnet"]["default"] != false {
+		t.Fatalf("sonnet default = %v, want false", rows["sonnet"]["default"])
+	}
+	var overrides []modelAliasConfig
+	if err := json.Unmarshal([]byte(vals["PROXY_MODEL_ALIASES"]), &overrides); err != nil {
+		t.Fatalf("override JSON invalid: %v", err)
+	}
+	byAlias := map[string]modelAliasConfig{}
+	for _, o := range overrides {
+		byAlias[o.Alias] = o
+	}
+	if !byAlias["opus"].Default || !byAlias["opus"].Recommended {
+		t.Fatalf("persisted opus flags lost: %+v", byAlias["opus"])
+	}
+	if _, ok := byAlias["sonnet"]; !ok {
+		t.Fatal("sonnet must be persisted as an override (built-in default unset)")
+	}
+	// Reload from the persisted env and confirm the flags survive.
+	env := func(key, def string) string {
+		if v, ok := vals[key]; ok {
+			return v
+		}
+		return def
+	}
+	_, _, _, _, defaults, recommended := modelAliasesFromValues(env)
+	if !defaults["opus"] || defaults["sonnet"] {
+		t.Fatalf("reloaded defaults wrong: opus=%v sonnet=%v", defaults["opus"], defaults["sonnet"])
+	}
+	if !recommended["opus"] {
+		t.Fatalf("reloaded opus recommended = %v, want true", recommended["opus"])
+	}
+}
+
+func TestModelStatusForRow(t *testing.T) {
+	cfg := config{
+		Models:       map[string]string{"st-agy1": "Gemini 3.1 Pro (High)", "st-agy2": "totally-unknown", "st-c1": "gpt-5.5"},
+		ModelForward: map[string]string{"st-agy1": "agy", "st-agy2": "agy"},
+	}
+	if got := modelStatusForRow(cfg, "st-agy1", "Gemini 3.1 Pro (High)"); got != "ok" {
+		t.Fatalf("known Antigravity model status = %q, want ok", got)
+	}
+	if got := modelStatusForRow(cfg, "st-agy2", "totally-unknown"); got != "untested" {
+		t.Fatalf("unknown agy model status = %q, want untested", got)
+	}
+	if got := modelStatusForRow(cfg, "st-x", ""); got != "unsupported" {
+		t.Fatalf("empty real status = %q, want unsupported", got)
+	}
+	// A successful request verifies the alias → Available even if otherwise untested.
+	markModelAliasVerified("st-agy2")
+	if got := modelStatusForRow(cfg, "st-agy2", "totally-unknown"); got != "ok" {
+		t.Fatalf("verified alias status = %q, want ok", got)
 	}
 }
 
