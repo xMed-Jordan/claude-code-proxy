@@ -328,13 +328,60 @@ func agyRoleLabel(role string) string {
 	}
 }
 
+// contentToTextNoMedia renders content as text for the agy flattening path but
+// DROPS media blocks (image/document/audio/video/file) instead of
+// json-marshalling them. Media is handed to agy out-of-band via --add-dir, so
+// inlining a block's base64 here both wastes agy's context and — because the
+// flattened prompt is passed as the agyj `-p` CLI argument — overflows the OS
+// ARG_MAX limit on real-sized media, surfacing as
+// "fork/exec agyj: argument list too long". (The shared contentToText, used by
+// the upstream-request converters, is intentionally left unchanged.)
+func contentToTextNoMedia(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			if m, ok := item.(map[string]any); ok {
+				if m["type"] == "text" {
+					parts = append(parts, fmt.Sprint(m["text"]))
+
+					continue
+				}
+				if _, isMedia := mediaPartFromBlock(m); isMedia {
+					continue // handled via --add-dir; never inline base64 as text
+				}
+			}
+			if s := contentToTextNoMedia(item); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		if text, ok := x["text"]; ok {
+			return fmt.Sprint(text)
+		}
+		if _, isMedia := mediaPartFromBlock(x); isMedia {
+			return ""
+		}
+		b, _ := json.Marshal(x)
+		return string(b)
+	default:
+		return fmt.Sprint(x)
+	}
+}
+
 // flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
 // A lone user turn with no system prompt is sent raw; otherwise a role-tagged
-// transcript is built. Tool/image blocks are dropped (agy is text-only).
+// transcript is built. Media blocks are dropped here (handled via --add-dir);
+// agy reads attachments from the scratch dir, not from the prompt text.
 func flattenAnthropicToPrompt(in anthropicRequest) string {
-	sys := strings.TrimSpace(contentToText(in.System))
+	sys := strings.TrimSpace(contentToTextNoMedia(in.System))
 	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
-		return strings.TrimSpace(contentToText(in.Messages[0].Content))
+		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
 	var b strings.Builder
 	if sys != "" {
@@ -342,7 +389,7 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 		b.WriteString("\n\n")
 	}
 	for _, msg := range in.Messages {
-		text := strings.TrimSpace(contentToText(msg.Content))
+		text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
 		if text == "" {
 			continue
 		}
@@ -358,11 +405,11 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 func flattenOpenAIChatToPrompt(in openAIRequest) string {
 	// Fast path: a single user message with no system context.
 	if len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
-		return strings.TrimSpace(contentToText(in.Messages[0].Content))
+		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
 	var b strings.Builder
 	for _, msg := range in.Messages {
-		text := strings.TrimSpace(contentToText(msg.Content))
+		text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
 		if text == "" {
 			continue
 		}
@@ -386,14 +433,14 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 	for _, raw := range in.Input {
 		m, ok := raw.(map[string]any)
 		if !ok {
-			if s := strings.TrimSpace(contentToText(raw)); s != "" {
+			if s := strings.TrimSpace(contentToTextNoMedia(raw)); s != "" {
 				b.WriteString(s)
 				b.WriteString("\n\n")
 			}
 			continue
 		}
 		role, _ := m["role"].(string)
-		text := strings.TrimSpace(contentToText(m["content"]))
+		text := strings.TrimSpace(contentToTextNoMedia(m["content"]))
 		if text == "" {
 			if o, ok := m["output"].(string); ok {
 				text = strings.TrimSpace(o)

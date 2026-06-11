@@ -1273,6 +1273,33 @@ func TestAnthropicMediaBlocksConvertToOpenAICompatibleParts(t *testing.T) {
 	}
 }
 
+func TestFlattenAnthropicDropsMediaBase64(t *testing.T) {
+	// Regression: media block base64 must NOT land in the agy prompt. It is
+	// handed to agy via --add-dir; inlining it into the -p CLI argument
+	// overflowed ARG_MAX for real-sized media ("fork/exec agyj: argument list
+	// too long"). A 600-byte test image slipped under the limit and hid this.
+	bigB64 := strings.Repeat("A", 300_000) // ~300 KB, like a real photo/voice
+	in := anthropicRequest{
+		Messages: []anthropicMessage{{Role: "user", Content: []any{
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": bigB64}},
+			map[string]any{"type": "document", "source": map[string]any{"type": "base64", "media_type": "audio/ogg", "data": bigB64}},
+			map[string]any{"type": "text", "text": "Transcribe the audio and describe the image."},
+		}}},
+	}
+
+	prompt := flattenAnthropicToPrompt(in)
+
+	if strings.Contains(prompt, bigB64) {
+		t.Fatalf("agy prompt must not contain media base64 (prompt len=%d)", len(prompt))
+	}
+	if !strings.Contains(prompt, "Transcribe the audio and describe the image.") {
+		t.Fatalf("agy prompt lost the user text: %q", prompt)
+	}
+	if len(prompt) > 2000 {
+		t.Fatalf("agy prompt unexpectedly large (%d bytes) — media likely leaked", len(prompt))
+	}
+}
+
 func TestOpenAIFileContentConvertsToResponsesInputFile(t *testing.T) {
 	content := []any{
 		map[string]any{"type": "text", "text": "Summarize this file."},
