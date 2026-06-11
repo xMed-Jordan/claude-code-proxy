@@ -88,6 +88,11 @@ type config struct {
 	ModelForward       map[string]string
 	ClaudeDefaults     map[string]string
 	ReasoningEffort    string
+	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
+	AgyCLI             string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
+	AgyModel           string        // optional global model override forwarded to agy ("" → agy's own default)
+	AgyConcurrency     int           // max simultaneous agyj subprocesses
+	AgyTimeout         time.Duration // per-call agy execution timeout
 	AdminUsername      string
 	AdminPasswordHash  string
 	AdminSessionSecret string
@@ -468,6 +473,11 @@ func loadConfig() config {
 		ModelContexts:      modelContexts,
 		ModelCustom:        modelCustom,
 		ModelForward:       modelForward,
+		AgyBin:             strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
+		AgyCLI:             strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
+		AgyModel:           strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
+		AgyConcurrency:     parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
+		AgyTimeout:         parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
 		AdminUsername:      strings.TrimSpace(getenv("ADMIN_USERNAME", "")),
 		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
 		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
@@ -1554,6 +1564,13 @@ func handleMessages(cfg config) http.HandlerFunc {
 		in.FastMode = requestUsesClaudeFastMode(r, in)
 		traceLogID(traceID, "anthropic.decoded", summarizeAnthropicRequest(in))
 
+		// Forwarded-to = Agy: serve this alias from the local agy (Antigravity)
+		// CLI via the agyj subprocess instead of the codex/openai HTTP path.
+		if forwardForAlias(cfg, in.Model) == "agy" {
+			serveAgyAnthropic(ctx, cfg, in, w, r)
+			return
+		}
+
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
 			if upstreamType == "antigravity" {
@@ -1650,6 +1667,10 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			in.MaxTokens = in.MaxCompletionTokens
 		}
 		applyCustomSessionToOpenAIRequest(r, &in)
+		if forwardForAlias(cfg, in.Model) == "agy" {
+			serveAgyOpenAIChat(r.Context(), cfg, in, w, r)
+			return
+		}
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
 			if upstreamType == "antigravity" {
@@ -1711,6 +1732,12 @@ func handleResponses(cfg config) http.HandlerFunc {
 		var in responsesRequest
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		// Forwarded-to = Agy is keyed on the public alias, so route before
+		// resolveModel rewrites in.Model to the upstream model name.
+		if forwardForAlias(cfg, in.Model) == "agy" {
+			serveAgyResponses(r.Context(), cfg, in, w, r)
 			return
 		}
 		in.Model = resolveModel(cfg, in.Model)

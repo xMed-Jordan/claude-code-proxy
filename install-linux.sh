@@ -859,6 +859,15 @@ build_proxy() {
   cd "${REPO_DIR}" || die "failed to enter ${REPO_DIR}"
   run env PATH="/usr/local/go/bin:${PATH}" go mod download
   run env PATH="/usr/local/go/bin:${PATH}" go build -o "${REPO_DIR}/bin/${APP_NAME}" .
+  # agyj is a separate nested module (the "agy" upstream wrapper) — `go build .`
+  # above skips it, so build it explicitly next to the proxy binary.
+  if [[ -f "${REPO_DIR}/agyj/go.mod" ]]; then
+    log "Building agyj (agy upstream wrapper)."
+    ( cd "${REPO_DIR}/agyj" \
+      && run env PATH="/usr/local/go/bin:${PATH}" go mod download \
+      && run env PATH="/usr/local/go/bin:${PATH}" go build -o "${REPO_DIR}/bin/agyj" . ) \
+      || log "WARNING: agyj build failed; the Agy upstream will be unavailable."
+  fi
 }
 
 copy_proxy_files() {
@@ -871,6 +880,14 @@ copy_proxy_files() {
   run cp "${REPO_DIR}/bin/${APP_NAME}" "${binary_tmp}"
   run chmod 0755 "${binary_tmp}"
   run mv -f "${binary_tmp}" "${INSTALL_DIR}/${APP_NAME}"
+  # Ship agyj alongside the proxy binary; the proxy resolves it as a sibling of
+  # its own executable (PROXY_AGY_BIN overrides). Atomic swap to avoid a torn file.
+  if [[ -f "${REPO_DIR}/bin/agyj" ]]; then
+    local agyj_tmp="${INSTALL_DIR}/.agyj.new.$$"
+    run cp "${REPO_DIR}/bin/agyj" "${agyj_tmp}"
+    run chmod 0755 "${agyj_tmp}"
+    run mv -f "${agyj_tmp}" "${INSTALL_DIR}/agyj"
+  fi
   run rm -rf "${INSTALL_DIR}/ui"
   run cp -R "${REPO_DIR}/ui" "${INSTALL_DIR}/ui"
   for helper in VERSION update-linux.sh reinstall-linux.sh uninstall-linux.sh install-linux.sh; do

@@ -1755,3 +1755,158 @@ func TestCodexRequestsOmitTemperature(t *testing.T) {
 		t.Fatalf("temperature still set after retry: %#v", retry.request.Temperature)
 	}
 }
+
+func TestParseAgyjOutput(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		raw := []byte(`{"ok":true,"session_id":"abc","response":"hello from agy","model":"gemini-3-pro","duration_ms":5804,"exit_code":0}`)
+		res, err := parseAgyjOutput(raw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !res.Ok || res.Response != "hello from agy" || res.Model != "gemini-3-pro" {
+			t.Fatalf("parsed = %#v", res)
+		}
+		if res.DurationMs != 5804 {
+			t.Fatalf("duration = %d", res.DurationMs)
+		}
+	})
+	t.Run("agy error stays a valid parse", func(t *testing.T) {
+		raw := []byte(`{"ok":false,"error":"agy timed out after 600 seconds","exit_code":1}`)
+		res, err := parseAgyjOutput(raw)
+		if err != nil {
+			t.Fatalf("ok=false must not be a parse error: %v", err)
+		}
+		if res.Ok {
+			t.Fatal("expected Ok=false")
+		}
+		if res.Error != "agy timed out after 600 seconds" {
+			t.Fatalf("error = %q", res.Error)
+		}
+	})
+	t.Run("ok false without message gets a default", func(t *testing.T) {
+		res, err := parseAgyjOutput([]byte(`{"ok":false}`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res.Error == "" {
+			t.Fatal("expected a default error message")
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		if _, err := parseAgyjOutput([]byte("   ")); err == nil {
+			t.Fatal("expected error for empty output")
+		}
+	})
+	t.Run("not json", func(t *testing.T) {
+		if _, err := parseAgyjOutput([]byte("agy: command not found")); err == nil {
+			t.Fatal("expected error for non-JSON output")
+		}
+	})
+}
+
+func TestFlattenAnthropicToPrompt(t *testing.T) {
+	// Single user turn, no system → raw prompt (no role tags).
+	single := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "What is 2+2?"}}}
+	if got := flattenAnthropicToPrompt(single); got != "What is 2+2?" {
+		t.Fatalf("single-turn prompt = %q", got)
+	}
+
+	// System + multi-turn → ordered, role-tagged transcript; tool blocks dropped.
+	multi := anthropicRequest{
+		System: "You are terse.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "Hi"},
+			{Role: "assistant", Content: "Hello."},
+			{Role: "user", Content: []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "ignored"},
+				map[string]any{"type": "text", "text": "And now?"},
+			}},
+		},
+	}
+	got := flattenAnthropicToPrompt(multi)
+	for _, want := range []string{"You are terse.", "User: Hi", "Assistant: Hello.", "User:", "And now?"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("prompt missing %q; got:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, "User: Hi") > strings.Index(got, "Assistant: Hello.") {
+		t.Fatalf("turns out of order:\n%s", got)
+	}
+}
+
+func TestForwardForAliasRouting(t *testing.T) {
+	cfg := config{
+		Upstream:     "codex",
+		ModelForward: map[string]string{"agy-model": "agy", "claude-model": "claude", "plain": "codex"},
+	}
+	if got := forwardForAlias(cfg, "agy-model"); got != "agy" {
+		t.Fatalf("agy-model → %q, want agy", got)
+	}
+	// Reserved-but-unwired targets and unknown aliases still resolve to codex,
+	// so only an explicit "agy" diverts off the codex/openai path.
+	if got := forwardForAlias(cfg, "claude-model"); got != "claude" {
+		t.Fatalf("claude-model → %q, want claude (stored, but routing treats non-agy as codex)", got)
+	}
+	if got := forwardForAlias(cfg, "plain"); got != "codex" {
+		t.Fatalf("plain → %q, want codex", got)
+	}
+	if got := forwardForAlias(cfg, "unknown"); got != "codex" {
+		t.Fatalf("unknown → %q, want codex default", got)
+	}
+}
+
+func TestAgyModelFor(t *testing.T) {
+	// Global override wins.
+	if got := agyModelFor(config{AgyModel: "gemini-x", Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "gemini-x" {
+		t.Fatalf("override → %q, want gemini-x", got)
+	}
+	// codex/gpt-style upstream names are dropped (agy would reject them).
+	if got := agyModelFor(config{Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "" {
+		t.Fatalf("gpt upstream → %q, want empty", got)
+	}
+	// A gemini-looking upstream name is forwarded.
+	if got := agyModelFor(config{Models: map[string]string{"m": "gemini-3-pro"}}, "m"); got != "gemini-3-pro" {
+		t.Fatalf("gemini upstream → %q, want gemini-3-pro", got)
+	}
+}
+
+func TestAgyResponseShape(t *testing.T) {
+	resp := agyToResponsesResponse("the answer", "agy-model", 12)
+	out := toAnthropicResponsesResponse(resp, "agy-model")
+	if out["type"] != "message" || out["role"] != "assistant" {
+		t.Fatalf("bad envelope: %#v", out)
+	}
+	content, ok := out["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %#v", out["content"])
+	}
+	block := content[0].(map[string]any)
+	if block["type"] != "text" || block["text"] != "the answer" {
+		t.Fatalf("text block = %#v", block)
+	}
+	usage := out["usage"].(map[string]any)
+	if usage["input_tokens"] != 12 {
+		t.Fatalf("input_tokens = %v, want 12", usage["input_tokens"])
+	}
+	if out["stop_reason"] != "end_turn" {
+		t.Fatalf("stop_reason = %v", out["stop_reason"])
+	}
+}
+
+func TestParseAgyConcurrencyAndTimeout(t *testing.T) {
+	if parseAgyConcurrency("") != 2 || parseAgyConcurrency("0") != 2 || parseAgyConcurrency("x") != 2 {
+		t.Fatal("bad/empty concurrency should default to 2")
+	}
+	if parseAgyConcurrency("3") != 3 {
+		t.Fatal("concurrency 3 not honored")
+	}
+	if parseAgyConcurrency("999") != 16 {
+		t.Fatal("concurrency should clamp to 16")
+	}
+	if parseAgyTimeout("") != 180*time.Second || parseAgyTimeout("0") != 180*time.Second {
+		t.Fatal("bad/empty timeout should default to 180s")
+	}
+	if parseAgyTimeout("45") != 45*time.Second {
+		t.Fatal("timeout 45 not honored")
+	}
+}

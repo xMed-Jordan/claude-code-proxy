@@ -108,6 +108,7 @@ func runServe() error {
 		return fmt.Errorf("proxy database init failed: %w", err)
 	}
 	initMetricsDB(cfg) // best-effort: Analytics persistence (separate WAL db)
+	initAgy(cfg)       // size the agy (Antigravity) subprocess concurrency cap
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
 	// Auto-provision the Codex token refresh timer (Linux root only). First

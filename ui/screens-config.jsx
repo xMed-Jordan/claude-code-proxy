@@ -35,8 +35,8 @@
     return CODEX_MODEL_OPTIONS.includes(real) ? "available" : "untested";
   }
 
-  // Where each alias forwards to. Only Codex routes today; Agy and Claude are
-  // reserved targets that activate once their backends are wired. Alphabetical.
+  // Where each alias forwards to. Codex and Agy route today (Agy is text-only:
+  // no tool calls). Claude is reserved until its backend is wired. Alphabetical.
   const FORWARD_OPTIONS = [
     { value: "agy", label: "Agy" },
     { value: "claude", label: "Claude" },
@@ -758,8 +758,10 @@
             <span className="mono">claude-sonnet-4-5</span>. This proxy rewrites the{" "}
             <span className="mono">model</span> field and forwards it to the upstream model. Context
             window size is advertised per alias. <strong>Forwarded to</strong> selects the backend:{" "}
-            <span className="mono">Codex</span> is active today; <span className="mono">Agy</span> and{" "}
-            <span className="mono">Claude</span> are reserved and take effect once their backends are enabled.
+            <span className="mono">Codex</span> and <span className="mono">Agy</span> route today —{" "}
+            <span className="mono">Agy</span> (Google Antigravity) is text-only, so it serves plain
+            completions but can't drive Claude Code's tool loop. <span className="mono">Claude</span> is
+            reserved and takes effect once its backend is enabled.
           </span>
         </div>
 
