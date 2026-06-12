@@ -479,6 +479,32 @@ func agyNote(alias string, stream bool) string {
 	return "alias=" + alias + " upstream=agy stream=" + strconv.FormatBool(stream)
 }
 
+// agyResolve produces the agy response for a request. If the attachments are
+// audio/video only and Groq STT is configured, it transcribes them directly
+// (fast, ~1s) and returns the transcript — agy itself can't hear audio. Otherwise
+// it materializes media and runs agy on the flattened prompt as usual. A non-nil
+// error means the caller should surface it so the client's fallback (e.g. Vertex)
+// can take over.
+func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, modelAlias string) (agyResult, error) {
+	if transcript, ok, err := agyAudioTranscript(ctx, cfg, parts); err != nil {
+		return agyResult{}, fmt.Errorf("transcription error: %w", err)
+	} else if ok {
+		return agyResult{Ok: true, Response: transcript}, nil
+	}
+	prompt, addDirs, err := agyMediaPrep(ctx, cfg, basePrompt, parts)
+	if err != nil {
+		return agyResult{}, fmt.Errorf("media error: %w", err)
+	}
+	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, modelAlias, len(addDirs) > 0), addDirs)
+	if err != nil {
+		return agyResult{}, fmt.Errorf("backend error: %w", err)
+	}
+	if !res.Ok {
+		return agyResult{}, fmt.Errorf("backend error: %s", res.Error)
+	}
+	return res, nil
+}
+
 // serveAgyAnthropic handles /anthropic/v1/messages for an agy-backed alias.
 func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w http.ResponseWriter, r *http.Request) {
 	inputTokens := estimateAnthropicRequestTokens(in)
@@ -486,18 +512,9 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenAnthropicToPrompt(in), collectAnthropicMedia(in))
+	res, err := agyResolve(ctx, cfg, collectAnthropicMedia(in), flattenAnthropicToPrompt(in), in.Model)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "agy media error: "+err.Error())
-		return
-	}
-	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
-		return
-	}
-	if !res.Ok {
-		writeAnthropicError(w, http.StatusBadGateway, "agy backend error: "+res.Error)
+		writeAnthropicError(w, http.StatusBadGateway, "agy "+err.Error())
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
@@ -527,18 +544,9 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenOpenAIChatToPrompt(in), collectOpenAIChatMedia(in))
+	res, err := agyResolve(ctx, cfg, collectOpenAIChatMedia(in), flattenOpenAIChatToPrompt(in), in.Model)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "agy media error: "+err.Error())
-		return
-	}
-	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
-		return
-	}
-	if !res.Ok {
-		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+res.Error)
+		writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
@@ -575,18 +583,9 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	prompt, addDirs, err := agyMediaPrep(ctx, cfg, flattenResponsesToPrompt(in), collectResponsesMedia(in))
+	res, err := agyResolve(ctx, cfg, collectResponsesMedia(in), flattenResponsesToPrompt(in), in.Model)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "agy media error: "+err.Error())
-		return
-	}
-	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, in.Model, len(addDirs) > 0), addDirs)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+err.Error())
-		return
-	}
-	if !res.Ok {
-		writeOpenAIError(w, http.StatusBadGateway, "agy backend error: "+res.Error)
+		writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)

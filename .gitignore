@@ -32,6 +32,8 @@ Claude Code Screenshots/
 bin/
 dist/
 *.exe
+connect-ai-proxy-linux
+connect-ai-proxy
 
 # OS/editor noise
 .DS_Store

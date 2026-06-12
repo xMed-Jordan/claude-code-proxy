@@ -107,6 +107,15 @@ type config struct {
 	AgyImageDir       string        // served root for generated images ("" → temp)
 	AgyImageModel     string        // default Antigravity model for image generation
 	AgyImageRetention time.Duration // keep generated images this long for reuse
+	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
+	// has no native audio understanding; rather than let it improvise (slow, fragile),
+	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
+	// handing anything to agy. Disabled when GroqAPIKey is empty.
+	GroqAPIKey      string        // PROXY_GROQ_API_KEY ("" → STT disabled, audio falls through)
+	GroqSTTModel    string        // Groq transcription model (default whisper-large-v3)
+	GroqSTTLanguage string        // ISO-639-1 hint, e.g. "ar" ("" → auto-detect)
+	GroqSTTPrompt   string        // optional context prompt to bias vocabulary (domain terms)
+	GroqSTTTimeout  time.Duration // per-clip transcription timeout
 	// VirusTotal malware scanning for media attachments (keys editable at runtime).
 	VirusTotalEnabled    bool
 	VirusTotalKeys       string        // newline/comma-separated API keys (load-balanced)
@@ -520,6 +529,11 @@ func loadConfig() config {
 		AgyImageDir:       strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
 		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.5 Flash (Low)")),
 		AgyImageRetention: parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
+		GroqAPIKey:        strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),
+		GroqSTTModel:      strings.TrimSpace(getenv("PROXY_GROQ_STT_MODEL", "whisper-large-v3")),
+		GroqSTTLanguage:   strings.TrimSpace(getenv("PROXY_GROQ_STT_LANGUAGE", "ar")),
+		GroqSTTPrompt:     strings.TrimSpace(getenv("PROXY_GROQ_STT_PROMPT", "")),
+		GroqSTTTimeout:    parseAgyTimeout(getenv("PROXY_GROQ_STT_TIMEOUT", "90")),
 
 		VirusTotalEnabled:    envFlag("PROXY_VIRUSTOTAL_ENABLED", true),
 		VirusTotalKeys:       strings.TrimSpace(getenv("PROXY_VIRUSTOTAL_KEYS", "")),
