@@ -88,7 +88,7 @@ const Dashboard = ({ proxyState, onAction, liveStatus, statusError }) => {
   const runValidation = () => api.get("/ui/api/validate").then(res => {
     setValidation((res.steps || []).map(s => ({
       name: s.name,
-      expect: `${s.status || 0} ${s.ok ? "OK" : "FAILED"}`,
+      expect: s.skipped ? "skipped" : `${s.status || 0} ${s.ok ? "OK" : "FAILED"}`,
       tone: s.ok ? "ok" : "err",
       ms: s.duration_ms || 0,
     })));

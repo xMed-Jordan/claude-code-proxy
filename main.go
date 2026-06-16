@@ -7621,14 +7621,43 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 		steps := []map[string]any{}
 		base := "http://127.0.0.1:" + cfg.Port
 		headers := map[string]string{"x-api-key": cfg.ProxyKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
-		modelAlias := "sonnet[1m]"
+
+		// Upstream-agnostic checks (computed locally — no backend call).
 		steps = append(steps, validateHTTP(http.MethodGet, base+"/anthropic/v1/models", headers, nil, "GET /anthropic/v1/models"))
-		body := []byte(`{"model":"sonnet[1m]","messages":[{"role":"user","content":"Quick count test"}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages/count_tokens", headers, body, "POST /anthropic/v1/messages/count_tokens"))
-		body = []byte(`{"model":"sonnet[1m]","max_tokens":32,"messages":[{"role":"user","content":"Say hello in one sentence."}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers, body, "POST /anthropic/v1/messages"))
-		body = []byte(`{"model":"sonnet[1m]","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Say streaming hello."}]}`)
-		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers, body, "POST /anthropic/v1/messages (stream)"))
+		steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages/count_tokens", headers,
+			[]byte(`{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"count"}]}`), "POST /anthropic/v1/messages/count_tokens"))
+
+		// One round-trip (non-stream + stream) per ENABLED upstream, each with a
+		// cheap representative model. Disabled upstreams are listed but skipped.
+		targets := []struct {
+			label    string
+			disabled bool
+			model    string
+		}{
+			{"codex", codexIsDisabled(), "gpt-5.4-mini"},
+			{"claude", claudeIsDisabled(), validationClaudeModel(cfg)},
+			{"agy", agyIsDisabled(), validationAgyModel(cfg)},
+		}
+		used := []string{}
+		for _, t := range targets {
+			ns := "POST /anthropic/v1/messages [" + t.label + "]"
+			st := ns + " (stream)"
+			switch {
+			case t.disabled:
+				reason := t.label + " upstream is disabled — skipped"
+				steps = append(steps, skippedValidationStep(ns, reason), skippedValidationStep(st, reason))
+			case t.model == "":
+				reason := "no model routed to " + t.label + " is configured — skipped"
+				steps = append(steps, skippedValidationStep(ns, reason), skippedValidationStep(st, reason))
+			default:
+				used = append(used, t.label+"="+t.model)
+				steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers,
+					[]byte(`{"model":"`+t.model+`","max_tokens":24,"messages":[{"role":"user","content":"Say hello in one sentence."}]}`), ns))
+				steps = append(steps, validateHTTP(http.MethodPost, base+"/anthropic/v1/messages", headers,
+					[]byte(`{"model":"`+t.model+`","max_tokens":24,"stream":true,"messages":[{"role":"user","content":"Say streaming hello."}]}`), st))
+			}
+		}
+
 		ok := true
 		for _, step := range steps {
 			if step["ok"] != true {
@@ -7639,8 +7668,8 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 		summary := map[string]any{
 			"ok":             ok,
 			"ran_at":         time.Now().Format("15:04:05"),
-			"model":          modelAlias,
-			"upstream_model": resolveModel(cfg, modelAlias),
+			"model":          firstNonEmpty(strings.Join(used, " · "), "none (all upstreams disabled)"),
+			"upstream_model": "",
 			"steps":          steps,
 			"duration_total": validationDurationTotal(steps),
 		}
@@ -7649,6 +7678,50 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 		validationMu.Unlock()
 		writeJSON(w, http.StatusOK, summary)
 	}
+}
+
+// validationClaudeModel returns a registered alias that routes to the claude
+// upstream (preferring a haiku-tier model), or "" if none is configured.
+func validationClaudeModel(cfg config) string {
+	return firstAliasForwardingTo(cfg, "claude", []string{"haiku"})
+}
+
+// validationAgyModel returns a registered alias that routes to the agy upstream
+// (preferring the cheapest Flash/Low model), or "" if none is configured.
+func validationAgyModel(cfg config) string {
+	return firstAliasForwardingTo(cfg, "agy", []string{"flash", "low", "medium"})
+}
+
+// firstAliasForwardingTo finds a model alias whose forward target is `target`,
+// preferring aliases whose name or upstream model contains one of `prefer`.
+func firstAliasForwardingTo(cfg config, target string, prefer []string) string {
+	keys := make([]string, 0, len(cfg.Models))
+	for k := range cfg.Models {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, p := range prefer {
+		for _, k := range keys {
+			if forwardForAlias(cfg, k) != target {
+				continue
+			}
+			if strings.Contains(strings.ToLower(k), p) || strings.Contains(strings.ToLower(resolveModel(cfg, k)), p) {
+				return k
+			}
+		}
+	}
+	for _, k := range keys {
+		if forwardForAlias(cfg, k) == target {
+			return k
+		}
+	}
+	return ""
+}
+
+// skippedValidationStep is a non-failing step shown when a check is intentionally
+// not run (e.g. its upstream is disabled).
+func skippedValidationStep(name, reason string) map[string]any {
+	return map[string]any{"name": name, "ok": true, "status": "skipped", "duration_ms": int64(0), "message": reason, "skipped": true}
 }
 
 func validationDurationTotal(steps []map[string]any) int64 {
