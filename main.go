@@ -123,6 +123,13 @@ type config struct {
 	ClaudeSystemPrompt string        // optional system-prompt override ("" → CLI default identity)
 	ClaudeSafeMode     bool          // pass --safe-mode (disable ambient CLAUDE.md/skills/plugins, keep auth)
 	ClaudeExtraArgs    string        // optional extra flags appended to every `claude` invocation
+	// Claude Code tool loop (opt-in). When enabled, a claude request that carries
+	// a `connect_tools` catalog + X-Connect-Callback-* headers runs the agentic
+	// tool loop in the CLI via an MCP gateway that bridges tool calls back to
+	// Connect. Default OFF → claude stays chat-only and codex is untouched.
+	ClaudeToolsEnabled bool          // PROXY_CLAUDE_TOOLS_ENABLED (master switch)
+	ClaudeToolMaxTurns int           // PROXY_CLAUDE_TOOL_MAX_TURNS (CLI --max-turns for tool loops)
+	ClaudeToolTimeout  time.Duration // PROXY_CLAUDE_TOOL_TIMEOUT (longer than chat; loops do many round-trips)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -172,6 +179,10 @@ type anthropicRequest struct {
 	Speed        string                 `json:"speed,omitempty"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 	FastMode     bool                   `json:"-"`
+	// ConnectTools is a non-standard catalog of caller tools (Connect's agent
+	// tools) used only by the claude tool loop. Codex never sets it, so it is
+	// inert for every other path. Shape: [{name, description, input_schema}].
+	ConnectTools json.RawMessage `json:"connect_tools,omitempty"`
 }
 
 type anthropicOutputConfig struct {
@@ -555,6 +566,9 @@ func loadConfig() config {
 		ClaudeSystemPrompt: strings.TrimSpace(getenv("PROXY_CLAUDE_SYSTEM_PROMPT", "")),
 		ClaudeSafeMode:     envFlag("PROXY_CLAUDE_SAFE_MODE", false),
 		ClaudeExtraArgs:    strings.TrimSpace(getenv("PROXY_CLAUDE_EXTRA_ARGS", "")),
+		ClaudeToolsEnabled: envFlag("PROXY_CLAUDE_TOOLS_ENABLED", false),
+		ClaudeToolMaxTurns: parseClaudeToolMaxTurns(getenv("PROXY_CLAUDE_TOOL_MAX_TURNS", "20")),
+		ClaudeToolTimeout:  parseAgyTimeout(getenv("PROXY_CLAUDE_TOOL_TIMEOUT", "600")),
 
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
 		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),

@@ -38,6 +38,10 @@ func runCLI(args []string) (bool, error) {
 		return true, runRestart()
 	case "launch-claude":
 		return true, runLaunchClaude(args[1:])
+	case "claude-mcp-gateway":
+		// Internal: stdio MCP server spawned by the Claude Code CLI for the
+		// claude tool loop. Bridges tool calls back to Connect (see mcpgateway.go).
+		return true, runClaudeMCPGateway()
 	case "sync":
 		if len(args) < 2 {
 			return true, fmt.Errorf("usage: %s sync apply|restore|browser-apply|browser-restore", os.Args[0])

@@ -496,6 +496,16 @@ func serveClaudeAnthropic(ctx context.Context, cfg config, in anthropicRequest, 
 	setRequestNote(r, claudeNote(in.Model, in.Stream))
 
 	claudeModel := claudeModelFor(cfg, in.Model)
+
+	// Tool loop: when the request carries a Connect tool catalog + callback
+	// headers and PROXY_CLAUDE_TOOLS_ENABLED is on, run the agentic loop inside
+	// the CLI via the MCP gateway (which bridges tool calls back to Connect).
+	// Otherwise fall through to the chat-only path below (unchanged).
+	if spec := claudeToolSpecFromRequest(cfg, in.ConnectTools, r); spec != nil {
+		serveClaudeAnthropicTools(ctx, cfg, in, model, claudeModel, spec, inputTokens, w, r)
+		return
+	}
+
 	stdin, mediaIn, _ := claudeBuildInput(flattenAnthropicToPrompt(in), collectAnthropicMedia(in))
 
 	if in.Stream {
@@ -731,6 +741,286 @@ func serveClaudeResponsesStream(ctx context.Context, cfg config, model, stdin st
 		"type":     "response.completed",
 		"response": responsesToOpenAIResponse(resp),
 	})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Tool loop (caller-defined tools via the MCP gateway).
+//
+// When Connect's autonomous agent delegates its tool loop to the proxy, the
+// claude request carries a `connect_tools` catalog + X-Connect-Callback-*
+// headers. We run `claude -p` with a per-request MCP gateway (this binary in
+// claude-mcp-gateway mode); the CLI runs the agentic loop and calls our single
+// umbrella tool, which bridges each call back to Connect. The proxy returns
+// only the model's final text. Gated by PROXY_CLAUDE_TOOLS_ENABLED. Codex never
+// sets connect_tools, so none of this affects it.
+// ----------------------------------------------------------------------------
+
+// connectToolDef is one caller tool in the inbound `connect_tools` catalog.
+type connectToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// claudeToolSpec is the per-request tool context extracted from the inbound body + headers.
+type claudeToolSpec struct {
+	CallbackURL   string
+	CallbackToken string
+	Conversation  string
+	Agent         string
+	Tools         []connectToolDef
+}
+
+func parseClaudeToolMaxTurns(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 1 {
+		return 20
+	}
+	if n > 60 {
+		n = 60
+	}
+	return n
+}
+
+func claudeToolMaxTurns(cfg config) int {
+	if cfg.ClaudeToolMaxTurns > 0 {
+		return cfg.ClaudeToolMaxTurns
+	}
+	return 20
+}
+
+func claudeToolTimeout(cfg config) time.Duration {
+	if cfg.ClaudeToolTimeout > 0 {
+		return cfg.ClaudeToolTimeout
+	}
+	return 600 * time.Second
+}
+
+// claudeToolSpecFromRequest returns a tool spec when tool mode is active for
+// this request (master switch on + a non-empty catalog + callback url/token),
+// else nil (→ chat-only path).
+func claudeToolSpecFromRequest(cfg config, connectTools json.RawMessage, r *http.Request) *claudeToolSpec {
+	if !cfg.ClaudeToolsEnabled || r == nil {
+		return nil
+	}
+	if len(bytes.TrimSpace(connectTools)) == 0 {
+		return nil
+	}
+	url := strings.TrimSpace(r.Header.Get("X-Connect-Callback-Url"))
+	token := strings.TrimSpace(r.Header.Get("X-Connect-Callback-Token"))
+	if url == "" || token == "" {
+		return nil
+	}
+	var tools []connectToolDef
+	if json.Unmarshal(connectTools, &tools) != nil || len(tools) == 0 {
+		return nil
+	}
+	return &claudeToolSpec{
+		CallbackURL:   url,
+		CallbackToken: token,
+		Conversation:  strings.TrimSpace(r.Header.Get("X-Connect-Conversation")),
+		Agent:         strings.TrimSpace(r.Header.Get("X-Connect-Agent")),
+		Tools:         tools,
+	}
+}
+
+// claudeToolArgs builds the `claude` args for a tool-capable run. Unlike the
+// chat-only claudeArgs it does NOT pass --tools "" (that would disable the MCP
+// tool too); instead it allow-lists exactly the umbrella tool and raises
+// --max-turns so the loop can run. --strict-mcp-config ensures ONLY our gateway
+// is loaded (no ambient project/user MCP servers).
+func claudeToolArgs(cfg config, model, mcpConfigPath string) []string {
+	args := []string{"-p", "--output-format", "json"}
+	if m := strings.TrimSpace(model); m != "" {
+		args = append(args, "--model", m)
+	}
+	args = append(args,
+		"--strict-mcp-config",
+		"--mcp-config", mcpConfigPath,
+		"--allowedTools", "mcp__connect__"+mcpGatewayToolName,
+		"--max-turns", strconv.Itoa(claudeToolMaxTurns(cfg)),
+		"--no-session-persistence",
+	)
+	if cfg.ClaudeSafeMode {
+		args = append(args, "--safe-mode")
+	}
+	return args
+}
+
+// claudeToolSystemPrompt renders the standing instructions + the tool catalog
+// (as data) injected via --append-system-prompt.
+func claudeToolSystemPrompt(spec *claudeToolSpec) string {
+	var b strings.Builder
+	b.WriteString("You have access to a set of Connect business tools. Run them ONLY through the single tool `connect_execute_tool`, by passing {\"tool_name\":\"<name>\",\"arguments\":{...}}. Use only the tools listed below; do not invent names. Call one tool at a time and read its result before the next call. \"arguments\" must match the named tool's input_schema. A result of {\"success\":false,\"error\":...} means the tool failed — adapt or tell the user, do not blindly retry. These tools act on real customer data and bookings; only call a tool when the request requires it. When you have gathered enough information, reply to the user in plain text with NO further tool calls — that plain-text reply is your final answer.\n\nAvailable tools:\n")
+	for _, t := range spec.Tools {
+		if strings.TrimSpace(t.Name) == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(t.Name)
+		if d := strings.TrimSpace(t.Description); d != "" {
+			b.WriteString(": ")
+			b.WriteString(d)
+		}
+		b.WriteString("\n")
+		if len(bytes.TrimSpace(t.InputSchema)) > 0 {
+			var compact bytes.Buffer
+			if json.Compact(&compact, t.InputSchema) == nil {
+				b.WriteString("  input_schema: ")
+				b.Write(compact.Bytes())
+				b.WriteString("\n")
+			}
+		}
+	}
+	return b.String()
+}
+
+// writeClaudeMCPConfig writes a per-request mcp-config that points the CLI at
+// this binary in gateway mode, passing the callback context via the server's
+// `env` block (verified to propagate to the spawned MCP server). Returns the
+// path + a cleanup func.
+func writeClaudeMCPConfig(cfg config, spec *claudeToolSpec) (string, func(), error) {
+	self, err := os.Executable()
+	if err != nil || strings.TrimSpace(self) == "" {
+		self = currentProxyBinaryPath()
+	}
+	names := make([]string, 0, len(spec.Tools))
+	for _, t := range spec.Tools {
+		if n := strings.TrimSpace(t.Name); n != "" {
+			names = append(names, n)
+		}
+	}
+	allowedJSON, _ := json.Marshal(names)
+	conf := map[string]any{
+		"mcpServers": map[string]any{
+			"connect": map[string]any{
+				"command": self,
+				"args":    []string{"claude-mcp-gateway"},
+				"env": map[string]string{
+					"CONNECT_CALLBACK_URL":   spec.CallbackURL,
+					"CONNECT_CALLBACK_TOKEN": spec.CallbackToken,
+					"CONNECT_CONVERSATION":   spec.Conversation,
+					"CONNECT_AGENT":          spec.Agent,
+					"CONNECT_ALLOWED_TOOLS":  string(allowedJSON),
+					"DISABLE_AUTOUPDATER":    "1",
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(conf, "", "  ")
+	f, err := os.CreateTemp(claudeHome(cfg), "mcp-*.json")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("mcp config: %w", err)
+	}
+	path := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", func() {}, err
+	}
+	f.Close()
+	return path, func() { os.Remove(path) }, nil
+}
+
+// runClaudeTools runs one tool-capable, non-streaming claude invocation: the CLI
+// runs the agentic loop (calling the MCP gateway), and we parse the final result.
+func runClaudeTools(ctx context.Context, cfg config, prompt string, spec *claudeToolSpec, model string) (claudeResult, error) {
+	if err := claudeAcquire(ctx); err != nil {
+		return claudeResult{}, fmt.Errorf("queue wait cancelled: %w", err)
+	}
+	defer claudeRelease()
+
+	mcpPath, cleanup, err := writeClaudeMCPConfig(cfg, spec)
+	if err != nil {
+		return claudeResult{}, err
+	}
+	defer cleanup()
+
+	cctx, cancel := context.WithTimeout(ctx, claudeToolTimeout(cfg))
+	defer cancel()
+
+	args := claudeToolArgs(cfg, model, mcpPath)
+	if catalog := claudeToolSystemPrompt(spec); strings.TrimSpace(catalog) != "" {
+		args = append(args, "--append-system-prompt", catalog)
+	}
+	if extra := strings.Fields(cfg.ClaudeExtraArgs); len(extra) > 0 {
+		args = append(args, extra...)
+	}
+
+	cmd := exec.CommandContext(cctx, claudeBinPath(cfg), args...)
+	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Env = claudeChildEnv(cfg)
+	cmd.Dir = claudeHome(cfg)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	if cctx.Err() == context.DeadlineExceeded {
+		return claudeResult{}, fmt.Errorf("timed out after %ds", int(claudeToolTimeout(cfg)/time.Second))
+	}
+	if ctx.Err() != nil {
+		return claudeResult{}, ctx.Err()
+	}
+	out := bytes.TrimSpace(stdout.Bytes())
+	if len(out) == 0 {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" && runErr != nil {
+			detail = runErr.Error()
+		}
+		if detail == "" {
+			detail = "no output"
+		}
+		return claudeResult{}, fmt.Errorf("produced no output: %s", truncateString(detail, 300))
+	}
+	return parseClaudeJSON(out)
+}
+
+// serveClaudeAnthropicTools handles a tool-capable /anthropic/v1/messages turn.
+// The loop runs non-streamed (so only the final answer is returned — no leaked
+// intermediate "I'll call X" chatter); a stream:true request gets the final text
+// synthesized as a single-block SSE.
+func serveClaudeAnthropicTools(ctx context.Context, cfg config, in anthropicRequest, model, claudeModel string, spec *claudeToolSpec, inputTokens int, w http.ResponseWriter, r *http.Request) {
+	setRequestNote(r, claudeNote(in.Model, in.Stream)+" tools="+strconv.Itoa(len(spec.Tools)))
+
+	res, err := runClaudeTools(ctx, cfg, flattenAnthropicToPrompt(in), spec, claudeModel)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "claude "+err.Error())
+		return
+	}
+	if !res.Ok {
+		writeAnthropicError(w, http.StatusBadGateway, "claude "+res.Error)
+		return
+	}
+	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+	updateRequestStat(r, func(stat *requestStat) {
+		stat.OutputTokens = resp.Usage.OutputTokens
+		stat.StopReason = "end_turn"
+	})
+
+	if !in.Stream {
+		writeJSON(w, http.StatusOK, toAnthropicResponsesResponse(resp, model))
+		return
+	}
+
+	// stream:true → emit the (already complete) final text as one SSE text block.
+	flusher, _ := w.(http.Flusher)
+	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	sendAnthropicMessageStart(w, messageID, model, inputTokens, 0)
+	sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+	if res.Response != "" {
+		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": res.Response}})
+	}
+	sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	sendAnthropicMessageDeltaStop(w, "end_turn", resp.Usage.OutputTokens)
+	sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
