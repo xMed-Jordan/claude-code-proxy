@@ -85,7 +85,7 @@ const Dashboard = ({ proxyState, onAction, liveStatus, statusError }) => {
   const isUp = proxyState !== "stopped";
   const [validation, setValidation] = useState(VALIDATION_STEPS);
   const [validationMeta, setValidationMeta] = useState(null);
-  const runValidation = () => api.get("/ui/api/validate").then(res => {
+  const runValidation = () => api.get("/ui/api/validate", { timeoutMs: 60000 }).then(res => {
     setValidation((res.steps || []).map(s => ({
       name: s.name,
       expect: s.skipped ? "skipped" : `${s.status || 0} ${s.ok ? "OK" : "FAILED"}`,

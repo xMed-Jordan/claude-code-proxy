@@ -7866,7 +7866,7 @@ func validateHTTP(method, url string, headers map[string]string, body []byte, na
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return map[string]any{"name": name, "ok": false, "status": 0, "duration_ms": time.Since(start).Milliseconds(), "message": err.Error()}

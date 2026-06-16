@@ -27,9 +27,11 @@
     const [validating, setValidating] = useState(false);
     const runValidation = useCallback(() => {
       setValidating(true);
-      api.get("/ui/api/validate")
+      // Per-upstream round-trips can take ~15-20s (agy is a subprocess), so allow
+      // well beyond the 10s default; surface failures instead of silently blanking.
+      api.get("/ui/api/validate", { timeoutMs: 60000 })
         .then((res) => setValidation(res || null))
-        .catch(() => {})
+        .catch((e) => { if (pushToast) pushToast("Validation failed: " + (e.message || e), "error"); })
         .finally(() => setValidating(false));
     }, []);
     useEffect(() => { runValidation(); }, [runValidation]);
