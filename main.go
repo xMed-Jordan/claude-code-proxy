@@ -550,7 +550,7 @@ func loadConfig() config {
 		ClaudeOAuthToken:   strings.TrimSpace(getenv("PROXY_CLAUDE_OAUTH_TOKEN", "")),
 		ClaudeWorkDir:      strings.TrimSpace(getenv("PROXY_CLAUDE_WORKDIR", "")),
 		ClaudeSystemPrompt: strings.TrimSpace(getenv("PROXY_CLAUDE_SYSTEM_PROMPT", "")),
-		ClaudeSafeMode:     envFlag("PROXY_CLAUDE_SAFE_MODE", true),
+		ClaudeSafeMode:     envFlag("PROXY_CLAUDE_SAFE_MODE", false),
 		ClaudeExtraArgs:    strings.TrimSpace(getenv("PROXY_CLAUDE_EXTRA_ARGS", "")),
 
 		GroqAPIKey:      strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),

@@ -2074,6 +2074,49 @@ func TestClaudeArgs(t *testing.T) {
 	}
 }
 
+func TestClaudeChildEnv(t *testing.T) {
+	// Defense regardless of mode: proxy-pointing vars are stripped and the CLI's
+	// self-updater is disabled, so a backend run can never loop or self-upgrade.
+	os.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:4000/anthropic")
+	os.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-local-loop")
+	os.Setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+	defer func() {
+		os.Unsetenv("ANTHROPIC_BASE_URL")
+		os.Unsetenv("ANTHROPIC_AUTH_TOKEN")
+		os.Unsetenv("ANTHROPIC_API_KEY")
+	}()
+
+	// No token: inherited HOME kept, but the loop-inducing vars are gone.
+	noTok := strings.Join(claudeChildEnv(config{}), "\n")
+	for _, banned := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN=", "ANTHROPIC_API_KEY="} {
+		if strings.Contains(noTok, banned) {
+			t.Fatalf("env must strip %q; got:\n%s", banned, noTok)
+		}
+	}
+	if !strings.Contains(noTok, "DISABLE_AUTOUPDATER=1") {
+		t.Fatalf("env must set DISABLE_AUTOUPDATER=1")
+	}
+	if strings.Contains(noTok, "CLAUDE_CODE_OAUTH_TOKEN=") {
+		t.Fatalf("no token configured → must not set CLAUDE_CODE_OAUTH_TOKEN")
+	}
+
+	// With a token: HOME is isolated and the token is injected.
+	withTok := claudeChildEnv(config{ClaudeOAuthToken: "sk-ant-oat-xyz", ClaudeWorkDir: t.TempDir()})
+	joined := strings.Join(withTok, "\n")
+	if !strings.Contains(joined, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-xyz") {
+		t.Fatalf("token must be injected; got:\n%s", joined)
+	}
+	homeCount := 0
+	for _, kv := range withTok {
+		if strings.HasPrefix(kv, "HOME=") {
+			homeCount++
+		}
+	}
+	if homeCount != 1 {
+		t.Fatalf("expected exactly one HOME= (isolated), got %d", homeCount)
+	}
+}
+
 func TestParseClaudeJSON(t *testing.T) {
 	ok, err := parseClaudeJSON([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"x"}`))
 	if err != nil || !ok.Ok || ok.Response != "the answer" {

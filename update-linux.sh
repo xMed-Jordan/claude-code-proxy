@@ -340,11 +340,19 @@ update_global_clis() {
   if command_exists codex; then
     pkgs+=("${CODEX_NPM_PACKAGE}@latest")
   fi
+  # Claude Code is PINNED by default: only refresh it when PROXY_CLAUDE_AUTO_UPDATE=1
+  # in .env, so an unvetted CLI version can't silently change backend behavior.
+  local claude_auto=""
+  claude_auto="$(get_env_value "${INSTALL_DIR}/.env" "PROXY_CLAUDE_AUTO_UPDATE" || true)"
   if command_exists claude; then
-    pkgs+=("${CLAUDE_CODE_NPM_PACKAGE}@latest")
+    if [[ "${claude_auto}" == "1" ]]; then
+      pkgs+=("${CLAUDE_CODE_NPM_PACKAGE}@latest")
+    else
+      log "Claude Code CLI present but pinned (set PROXY_CLAUDE_AUTO_UPDATE=1 to update); skipping."
+    fi
   fi
   if [[ "${#pkgs[@]}" -eq 0 ]]; then
-    log "No Codex/Claude Code CLI present; skipping npm CLI update."
+    log "No global CLI to update; skipping npm CLI update."
     return
   fi
   log "Updating installed global CLIs with npm: ${pkgs[*]}"

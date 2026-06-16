@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -77,23 +78,52 @@ func claudeBinPath(cfg config) string {
 	return "claude"
 }
 
-// claudeWorkDir is where the child runs. A neutral dir (temp by default) keeps a
-// stray project CLAUDE.md out of the prompt; --safe-mode also suppresses that.
-func claudeWorkDir(cfg config) string {
-	if d := strings.TrimSpace(cfg.ClaudeWorkDir); d != "" {
-		return d
+// claudeHome is the directory used as the child's working dir (always) and as
+// its HOME when isolating. A neutral dir keeps a stray project CLAUDE.md out of
+// the prompt. Created on demand.
+func claudeHome(cfg config) string {
+	d := strings.TrimSpace(cfg.ClaudeWorkDir)
+	if d == "" {
+		d = filepath.Join(os.TempDir(), "connect-ai-proxy-claude")
 	}
-	return os.TempDir()
+	_ = os.MkdirAll(d, 0o700)
+	return d
 }
 
-// claudeChildEnv injects the subscription OAuth token (so the CLI authenticates
-// without keychain access) on top of the proxy's own environment.
+// claudeChildEnv builds the environment for the child `claude`. It always:
+//   - strips ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY so the
+//     backend CLI can never be pointed back at this proxy (an infinite loop), and
+//   - sets DISABLE_AUTOUPDATER=1 so a backend run never silently self-updates the
+//     CLI to an unvetted version.
+//
+// When an OAuth token is configured it ISOLATES the child's HOME to a clean dir
+// (so the operator's ~/.claude/settings.json — which the proxy may rewrite to
+// point Claude Code at itself — is not read) and authenticates with that token.
+// With no token, the inherited HOME (and its subscription login) is used; the
+// operator must ensure that HOME's settings do not point back at the proxy
+// (see PROXY_CLAUDE_SETTINGS_SYNC).
 func claudeChildEnv(cfg config) []string {
-	env := os.Environ()
-	if tok := strings.TrimSpace(cfg.ClaudeOAuthToken); tok != "" {
-		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+tok)
+	tok := strings.TrimSpace(cfg.ClaudeOAuthToken)
+	isolate := tok != ""
+	base := os.Environ()
+	out := make([]string, 0, len(base)+4)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "ANTHROPIC_BASE_URL=") ||
+			strings.HasPrefix(kv, "ANTHROPIC_AUTH_TOKEN=") ||
+			strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
+			continue
+		}
+		if isolate && (strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "USERPROFILE=")) {
+			continue
+		}
+		out = append(out, kv)
 	}
-	return env
+	out = append(out, "DISABLE_AUTOUPDATER=1")
+	if isolate {
+		home := claudeHome(cfg)
+		out = append(out, "HOME="+home, "USERPROFILE="+home, "CLAUDE_CODE_OAUTH_TOKEN="+tok)
+	}
+	return out
 }
 
 // claudeModelFor decides which model to pass to `claude --model`. A global
@@ -240,7 +270,7 @@ func runClaude(ctx context.Context, cfg config, prompt, model string) (claudeRes
 	cmd := exec.CommandContext(cctx, claudeBinPath(cfg), claudeArgs(cfg, model, false)...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = claudeChildEnv(cfg)
-	cmd.Dir = claudeWorkDir(cfg)
+	cmd.Dir = claudeHome(cfg)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -282,7 +312,7 @@ func runClaudeStream(ctx context.Context, cfg config, prompt, model string, onTe
 	cmd := exec.CommandContext(cctx, claudeBinPath(cfg), claudeArgs(cfg, model, true)...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = claudeChildEnv(cfg)
-	cmd.Dir = claudeWorkDir(cfg)
+	cmd.Dir = claudeHome(cfg)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

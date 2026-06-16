@@ -53,6 +53,14 @@ func runClaudeSettingsSyncGo(action string) error {
 }
 
 func applyProxySettingsGo() error {
+	proxyEnv := readEnvMap()
+	if v := strings.ToLower(strings.TrimSpace(proxyEnv["PROXY_CLAUDE_SETTINGS_SYNC"])); v == "0" || v == "false" || v == "no" || v == "off" {
+		// Auto-configuration of Claude Code settings is disabled (e.g. on a backend
+		// server where a claude-backed upstream must NOT have its ANTHROPIC_BASE_URL
+		// pointed at this proxy — that would loop). Do nothing; ExecStopPost
+		// `sync restore` still reverts any settings a previous apply wrote.
+		return nil
+	}
 	settingsPath := defaultClaudeSettingsPath()
 	settingsDir := filepath.Dir(settingsPath)
 	if err := ensureSnapshot(settingsPath, filepath.Join(mustGetwd(), claudeSettingsSnapshotPath), filepath.Join(mustGetwd(), claudeSettingsSnapshotMetaPath), "settings_path", "{}"); err != nil {
@@ -61,7 +69,6 @@ func applyProxySettingsGo() error {
 	if err := clearGatewayModelsCacheGo(); err != nil {
 		return err
 	}
-	proxyEnv := readEnvMap()
 	port := strings.TrimSpace(proxyEnv["PROXY_PORT"])
 	if port == "" {
 		port = "4000"
