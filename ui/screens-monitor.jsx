@@ -402,7 +402,7 @@
                 compact
                 icon="shield"
                 title="No validation run yet"
-                description="Run the checks to confirm Claude Code can reach Codex."
+                description="Run the checks to confirm each enabled upstream is reachable."
                 action={<Button variant="primary" size="sm" icon="shield" loading={validating} onClick={runValidation}>Run validation</Button>}
               />
             ) : (
@@ -420,8 +420,8 @@
                       <tr key={i} className={s.ok ? undefined : "tr-danger"}>
                         <td className="mono dash-check-name">{s.name}</td>
                         <td>
-                          <Badge tone={s.ok ? "success" : "danger"}>
-                            {num(s.status) || (s.ok ? 200 : 0)} {s.ok ? "OK" : "FAIL"}
+                          <Badge tone={s.skipped ? "neutral" : (s.ok ? "success" : "danger")}>
+                            {s.skipped ? "skipped" : `${num(s.status) || (s.ok ? 200 : 0)} ${s.ok ? "OK" : "FAIL"}`}
                           </Badge>
                         </td>
                         <td className="mono tnum dash-col-right">{fmtMs(num(s.duration_ms))}</td>

@@ -1737,7 +1737,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 		// CLI via the agyj subprocess instead of the codex/openai HTTP path.
 		if forwardForAlias(cfg, in.Model) == "agy" {
 			if agyIsDisabled() {
-				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
+				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyAnthropic(ctx, cfg, in, w, r)
@@ -1747,7 +1747,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 		// (`claude -p`) backed by a Claude subscription, instead of codex/openai.
 		if forwardForAlias(cfg, in.Model) == "claude" {
 			if claudeIsDisabled() {
-				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
+				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeAnthropic(ctx, cfg, in, w, r)
@@ -1793,7 +1793,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 		}
 		if cfg.Upstream == "codex" {
 			if codexIsDisabled() {
-				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
+				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("codex"))
 				return
 			}
 			responsesReq := toResponses(cfg, in)
@@ -1856,7 +1856,7 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		applyCustomSessionToOpenAIRequest(r, &in)
 		if forwardForAlias(cfg, in.Model) == "agy" {
 			if agyIsDisabled() {
-				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyOpenAIChat(r.Context(), cfg, in, w, r)
@@ -1864,7 +1864,7 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
 			if claudeIsDisabled() {
-				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeOpenAIChat(r.Context(), cfg, in, w, r)
@@ -1893,7 +1893,7 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			return
 		}
 		if codexIsDisabled() {
-			writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
+			writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("codex"))
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
@@ -1941,7 +1941,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 		// resolveModel rewrites in.Model to the upstream model name.
 		if forwardForAlias(cfg, in.Model) == "agy" {
 			if agyIsDisabled() {
-				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyResponses(r.Context(), cfg, in, w, r)
@@ -1949,7 +1949,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
 			if claudeIsDisabled() {
-				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeResponses(r.Context(), cfg, in, w, r)
@@ -1990,7 +1990,7 @@ func handleResponses(cfg config) http.HandlerFunc {
 			return
 		}
 		if codexIsDisabled() {
-			writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
+			writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("codex"))
 			return
 		}
 		if decision := codexTokenLimitDecision(estimateCodexRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
