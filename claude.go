@@ -261,6 +261,22 @@ func claudeStreamTextDelta(line []byte) string {
 // surfaces a transient error. With Connect's fallback disabled the proxy is the
 // last line, so this is set high — the real limit is the wall-clock budget
 // (claudeTotalTimeout), which keeps the proxy answering within Connect's window.
+// parseClaudeConcurrency parses PROXY_CLAUDE_CONCURRENCY: how many `claude`
+// subprocesses run in parallel (a global semaphore; the rest queue). Default 2;
+// capped at 64. Size to BOTH the CPU cores (each run is a Node process + its
+// MCP gateway child) AND the subscription's rate-limit headroom — too high
+// overloads the subscription (overloaded/429) even with spare CPU.
+func parseClaudeConcurrency(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 1 {
+		return 2
+	}
+	if n > 64 {
+		n = 64
+	}
+	return n
+}
+
 func claudeRetries(cfg config) int {
 	if cfg.ClaudeRetries < 0 {
 		return 0

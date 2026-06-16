@@ -561,7 +561,7 @@ func loadConfig() config {
 
 		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
 		ClaudeModel:        strings.TrimSpace(getenv("PROXY_CLAUDE_MODEL", "")),
-		ClaudeConcurrency:  parseAgyConcurrency(getenv("PROXY_CLAUDE_CONCURRENCY", "2")),
+		ClaudeConcurrency:  parseClaudeConcurrency(getenv("PROXY_CLAUDE_CONCURRENCY", "2")),
 		ClaudeTimeout:      parseAgyTimeout(getenv("PROXY_CLAUDE_TIMEOUT", "180")),
 		ClaudeOAuthToken:   strings.TrimSpace(getenv("PROXY_CLAUDE_OAUTH_TOKEN", "")),
 		ClaudeWorkDir:      strings.TrimSpace(getenv("PROXY_CLAUDE_WORKDIR", "")),
