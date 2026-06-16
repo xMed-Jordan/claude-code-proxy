@@ -306,7 +306,7 @@
                 </div>
               );
             })}
-            <p className="cfg-hint">Disabling a service takes effect after a proxy restart.</p>
+            <p className="cfg-hint">Enabling/disabling a service applies immediately on Save — no restart needed.</p>
           </div>
         </Card>
 

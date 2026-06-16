@@ -734,6 +734,46 @@ func normalizeForwardTarget(s string) string {
 	return "codex"
 }
 
+// Live upstream kill switches. Seeded from config at startup (applyUpstreamSwitches)
+// and refreshed whenever the control panel saves settings, so toggling a service
+// on/off takes effect immediately — no proxy restart required.
+var (
+	upstreamOffCodex  atomic.Bool
+	upstreamOffClaude atomic.Bool
+	upstreamOffAgy    atomic.Bool
+)
+
+func applyUpstreamSwitches(cfg config) {
+	upstreamOffCodex.Store(cfg.CodexDisabled)
+	upstreamOffClaude.Store(cfg.ClaudeDisabled)
+	upstreamOffAgy.Store(cfg.AgyDisabled)
+}
+
+// applyUpstreamSwitchesFromEnvMap refreshes the live switches from a freshly
+// saved .env map (called after the control panel writes config).
+func applyUpstreamSwitchesFromEnvMap(m map[string]string) {
+	off := func(k string) bool {
+		switch strings.ToLower(strings.TrimSpace(m[k])) {
+		case "0", "false", "no", "off":
+			return true
+		}
+		return false
+	}
+	upstreamOffCodex.Store(off("PROXY_CODEX_ENABLED"))
+	upstreamOffClaude.Store(off("PROXY_CLAUDE_ENABLED"))
+	upstreamOffAgy.Store(off("PROXY_AGY_ENABLED"))
+}
+
+func codexIsDisabled() bool  { return upstreamOffCodex.Load() }
+func claudeIsDisabled() bool { return upstreamOffClaude.Load() }
+func agyIsDisabled() bool    { return upstreamOffAgy.Load() }
+
+// upstreamDisabledMsg is the client-facing error when a request is routed to an
+// upstream that has been switched off in the proxy's configuration.
+func upstreamDisabledMsg(name string) string {
+	return "the '" + name + "' upstream is disabled on this proxy — enable it in the control panel (Configuration → Upstream services), or use a model routed to another upstream"
+}
+
 // forwardForAlias returns the configured forward target for an alias, defaulting
 // to "codex". Callers must hold modelConfigMu (read lock) as it reads cfg.ModelForward.
 func forwardForAlias(cfg config, alias string) string {
@@ -1696,8 +1736,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 		// Forwarded-to = Agy: serve this alias from the local agy (Antigravity)
 		// CLI via the agyj subprocess instead of the codex/openai HTTP path.
 		if forwardForAlias(cfg, in.Model) == "agy" {
-			if cfg.AgyDisabled {
-				writeAnthropicError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+			if agyIsDisabled() {
+				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyAnthropic(ctx, cfg, in, w, r)
@@ -1706,8 +1746,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 		// Forwarded-to = Claude: serve this alias from the local Claude Code CLI
 		// (`claude -p`) backed by a Claude subscription, instead of codex/openai.
 		if forwardForAlias(cfg, in.Model) == "claude" {
-			if cfg.ClaudeDisabled {
-				writeAnthropicError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+			if claudeIsDisabled() {
+				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeAnthropic(ctx, cfg, in, w, r)
@@ -1752,8 +1792,8 @@ func handleMessages(cfg config) http.HandlerFunc {
 			return
 		}
 		if cfg.Upstream == "codex" {
-			if cfg.CodexDisabled {
-				writeAnthropicError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
+			if codexIsDisabled() {
+				writeAnthropicError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
 				return
 			}
 			responsesReq := toResponses(cfg, in)
@@ -1815,16 +1855,16 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		}
 		applyCustomSessionToOpenAIRequest(r, &in)
 		if forwardForAlias(cfg, in.Model) == "agy" {
-			if cfg.AgyDisabled {
-				writeOpenAIError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+			if agyIsDisabled() {
+				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
-			if cfg.ClaudeDisabled {
-				writeOpenAIError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+			if claudeIsDisabled() {
+				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeOpenAIChat(r.Context(), cfg, in, w, r)
@@ -1852,8 +1892,8 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			proxyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
-		if cfg.CodexDisabled {
-			writeOpenAIError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
+		if codexIsDisabled() {
+			writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
@@ -1900,16 +1940,16 @@ func handleResponses(cfg config) http.HandlerFunc {
 		// Forwarded-to = Agy is keyed on the public alias, so route before
 		// resolveModel rewrites in.Model to the upstream model name.
 		if forwardForAlias(cfg, in.Model) == "agy" {
-			if cfg.AgyDisabled {
-				writeOpenAIError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+			if agyIsDisabled() {
+				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("agy"))
 				return
 			}
 			serveAgyResponses(r.Context(), cfg, in, w, r)
 			return
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
-			if cfg.ClaudeDisabled {
-				writeOpenAIError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+			if claudeIsDisabled() {
+				writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("claude"))
 				return
 			}
 			serveClaudeResponses(r.Context(), cfg, in, w, r)
@@ -1949,8 +1989,8 @@ func handleResponses(cfg config) http.HandlerFunc {
 			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
 			return
 		}
-		if cfg.CodexDisabled {
-			writeOpenAIError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
+		if codexIsDisabled() {
+			writeOpenAIError(w, http.StatusServiceUnavailable, upstreamDisabledMsg("codex"))
 			return
 		}
 		if decision := codexTokenLimitDecision(estimateCodexRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
@@ -7002,7 +7042,10 @@ func handleUIConfig(cfg config) http.HandlerFunc {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Configuration saved. Restart proxy to apply changes."})
+			// Upstream enable/disable switches apply live (no restart); other
+			// process-level settings still require a restart.
+			applyUpstreamSwitchesFromEnvMap(current)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Configuration saved. Upstream enable/disable applies immediately; other settings apply on restart."})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}
