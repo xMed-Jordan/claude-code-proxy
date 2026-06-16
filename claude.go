@@ -297,10 +297,12 @@ func runClaude(ctx context.Context, cfg config, prompt, model string) (claudeRes
 	return parseClaudeJSON(out)
 }
 
-// runClaudeStream execs `claude` in stream-json mode and invokes onText for each
-// incremental text_delta. It returns the distilled result (Response = full text)
-// once the process exits. onText may be nil.
-func runClaudeStream(ctx context.Context, cfg config, prompt, model string, onText func(string)) (claudeResult, error) {
+// runClaudeStream execs `claude` with stream-json output and invokes onText for
+// each incremental text_delta. stdin is a plain prompt, or — when mediaIn — a
+// stream-json user message (so images/PDFs reach the model); mediaIn adds
+// --input-format stream-json. It returns the distilled result (Response = full
+// text) once the process exits. onText may be nil (used for non-stream media).
+func runClaudeStream(ctx context.Context, cfg config, stdin string, mediaIn bool, model string, onText func(string)) (claudeResult, error) {
 	if err := claudeAcquire(ctx); err != nil {
 		return claudeResult{}, fmt.Errorf("queue wait cancelled: %w", err)
 	}
@@ -309,8 +311,12 @@ func runClaudeStream(ctx context.Context, cfg config, prompt, model string, onTe
 	cctx, cancel := context.WithTimeout(ctx, claudeTimeout(cfg))
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, claudeBinPath(cfg), claudeArgs(cfg, model, true)...)
-	cmd.Stdin = strings.NewReader(prompt)
+	args := claudeArgs(cfg, model, true)
+	if mediaIn {
+		args = append(args, "--input-format", "stream-json")
+	}
+	cmd := exec.CommandContext(cctx, claudeBinPath(cfg), args...)
+	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Env = claudeChildEnv(cfg)
 	cmd.Dir = claudeHome(cfg)
 
@@ -402,6 +408,86 @@ func claudeNote(alias string, stream bool) string {
 	return "alias=" + alias + " upstream=claude stream=" + strconv.FormatBool(stream)
 }
 
+// claudeMaxInlineMediaBytes caps total base64 media inlined into one stream-json
+// message. `claude -p` reads stdin (capped ~10MB), so keep headroom for the JSON
+// envelope + text.
+const claudeMaxInlineMediaBytes = 7 << 20
+
+// claudeMediaBlocks converts collected media parts into Anthropic image/document
+// content blocks (base64 or url source), keeping only images and PDFs within the
+// byte budget. Audio/video/other and oversized parts are dropped (count returned)
+// — Claude can't ingest those natively (use codex/agy, or agy's Groq transcription).
+func claudeMediaBlocks(parts []mediaPart, budget int) ([]any, int) {
+	var blocks []any
+	dropped, used := 0, 0
+	for _, p := range parts {
+		mt := strings.ToLower(strings.TrimSpace(p.MediaType))
+		if i := strings.Index(mt, ";"); i >= 0 {
+			mt = strings.TrimSpace(mt[:i])
+		}
+		ext := strings.ToLower(filepath.Ext(p.Filename))
+		isImage := strings.HasPrefix(mt, "image/") || (mt == "" && (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp" || ext == ".bmp"))
+		isPDF := mt == "application/pdf" || (mt == "" && ext == ".pdf")
+		if !isImage && !isPDF {
+			dropped++
+			continue
+		}
+		kind := "image"
+		if isPDF {
+			kind = "document"
+		}
+		switch {
+		case p.B64 != "":
+			if used+len(p.B64) > budget {
+				dropped++
+				continue
+			}
+			used += len(p.B64)
+			srcMT := mt
+			if srcMT == "" {
+				srcMT = "image/png"
+				if isPDF {
+					srcMT = "application/pdf"
+				}
+			}
+			blocks = append(blocks, map[string]any{"type": kind, "source": map[string]any{"type": "base64", "media_type": srcMT, "data": p.B64}})
+		case p.URL != "":
+			blocks = append(blocks, map[string]any{"type": kind, "source": map[string]any{"type": "url", "url": p.URL}})
+		default:
+			dropped++
+		}
+	}
+	return blocks, dropped
+}
+
+// claudeBuildInput returns the stdin payload for `claude`. With usable image/PDF
+// media it returns a stream-json user message (text + media blocks) and
+// mediaIn=true; otherwise the plain flattened prompt and false. dropped counts
+// media that could not be forwarded.
+func claudeBuildInput(prompt string, parts []mediaPart) (string, bool, int) {
+	blocks, dropped := claudeMediaBlocks(parts, claudeMaxInlineMediaBytes)
+	if len(blocks) == 0 {
+		return prompt, false, dropped
+	}
+	content := make([]any, 0, len(blocks)+1)
+	if strings.TrimSpace(prompt) != "" {
+		content = append(content, map[string]any{"type": "text", "text": prompt})
+	}
+	content = append(content, blocks...)
+	msg := map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": content}}
+	b, _ := json.Marshal(msg)
+	return string(b) + "\n", true, dropped
+}
+
+// runClaudeUnified runs a non-streaming request: the stream-json media path when
+// mediaIn (media requires stream-json output), else the plain JSON path.
+func runClaudeUnified(ctx context.Context, cfg config, stdin string, mediaIn bool, model string) (claudeResult, error) {
+	if mediaIn {
+		return runClaudeStream(ctx, cfg, stdin, true, model, nil)
+	}
+	return runClaude(ctx, cfg, stdin, model)
+}
+
 // serveClaudeAnthropic handles /anthropic/v1/messages for a claude-backed alias.
 func serveClaudeAnthropic(ctx context.Context, cfg config, in anthropicRequest, w http.ResponseWriter, r *http.Request) {
 	inputTokens := estimateAnthropicRequestTokens(in)
@@ -409,14 +495,14 @@ func serveClaudeAnthropic(ctx context.Context, cfg config, in anthropicRequest, 
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "claude", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, claudeNote(in.Model, in.Stream))
 
-	prompt := flattenAnthropicToPrompt(in)
 	claudeModel := claudeModelFor(cfg, in.Model)
+	stdin, mediaIn, _ := claudeBuildInput(flattenAnthropicToPrompt(in), collectAnthropicMedia(in))
 
 	if in.Stream {
-		serveClaudeAnthropicStream(ctx, cfg, model, prompt, claudeModel, inputTokens, w, r)
+		serveClaudeAnthropicStream(ctx, cfg, model, stdin, mediaIn, claudeModel, inputTokens, w, r)
 		return
 	}
-	res, err := runClaude(ctx, cfg, prompt, claudeModel)
+	res, err := runClaudeUnified(ctx, cfg, stdin, mediaIn, claudeModel)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "claude "+err.Error())
 		return
@@ -433,7 +519,7 @@ func serveClaudeAnthropic(ctx context.Context, cfg config, in anthropicRequest, 
 	writeJSON(w, http.StatusOK, toAnthropicResponsesResponse(resp, model))
 }
 
-func serveClaudeAnthropicStream(ctx context.Context, cfg config, model, prompt, claudeModel string, inputTokens int, w http.ResponseWriter, r *http.Request) {
+func serveClaudeAnthropicStream(ctx context.Context, cfg config, model, stdin string, mediaIn bool, claudeModel string, inputTokens int, w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	started := false
@@ -450,7 +536,7 @@ func serveClaudeAnthropicStream(ctx context.Context, cfg config, model, prompt, 
 			flusher.Flush()
 		}
 	}
-	res, err := runClaudeStream(ctx, cfg, prompt, claudeModel, func(text string) {
+	res, err := runClaudeStream(ctx, cfg, stdin, mediaIn, claudeModel, func(text string) {
 		start()
 		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
 		if flusher != nil {
@@ -489,14 +575,14 @@ func serveClaudeOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w 
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "claude", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, claudeNote(in.Model, in.Stream))
 
-	prompt := flattenOpenAIChatToPrompt(in)
 	claudeModel := claudeModelFor(cfg, in.Model)
+	stdin, mediaIn, _ := claudeBuildInput(flattenOpenAIChatToPrompt(in), collectOpenAIChatMedia(in))
 
 	if in.Stream {
-		serveClaudeOpenAIChatStream(ctx, cfg, model, prompt, claudeModel, w, r)
+		serveClaudeOpenAIChatStream(ctx, cfg, model, stdin, mediaIn, claudeModel, w, r)
 		return
 	}
-	res, err := runClaude(ctx, cfg, prompt, claudeModel)
+	res, err := runClaudeUnified(ctx, cfg, stdin, mediaIn, claudeModel)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "claude "+err.Error())
 		return
@@ -513,7 +599,7 @@ func serveClaudeOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w 
 	writeJSON(w, http.StatusOK, responsesToOpenAIChat(resp, model))
 }
 
-func serveClaudeOpenAIChatStream(ctx context.Context, cfg config, model, prompt, claudeModel string, w http.ResponseWriter, r *http.Request) {
+func serveClaudeOpenAIChatStream(ctx context.Context, cfg config, model, stdin string, mediaIn bool, claudeModel string, w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	id := "chatcmpl_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	created := time.Now().Unix()
@@ -530,7 +616,7 @@ func serveClaudeOpenAIChatStream(ctx context.Context, cfg config, model, prompt,
 			flusher.Flush()
 		}
 	}
-	res, err := runClaudeStream(ctx, cfg, prompt, claudeModel, func(text string) {
+	res, err := runClaudeStream(ctx, cfg, stdin, mediaIn, claudeModel, func(text string) {
 		start()
 		sendOpenAIChatChunk(w, id, created, model, map[string]any{"content": text}, nil)
 		if flusher != nil {
@@ -568,14 +654,14 @@ func serveClaudeResponses(ctx context.Context, cfg config, in responsesRequest, 
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "claude", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, claudeNote(in.Model, in.Stream))
 
-	prompt := flattenResponsesToPrompt(in)
 	claudeModel := claudeModelFor(cfg, in.Model)
+	stdin, mediaIn, _ := claudeBuildInput(flattenResponsesToPrompt(in), collectResponsesMedia(in))
 
 	if in.Stream {
-		serveClaudeResponsesStream(ctx, cfg, model, prompt, claudeModel, inputTokens, w, r)
+		serveClaudeResponsesStream(ctx, cfg, model, stdin, mediaIn, claudeModel, inputTokens, w, r)
 		return
 	}
-	res, err := runClaude(ctx, cfg, prompt, claudeModel)
+	res, err := runClaudeUnified(ctx, cfg, stdin, mediaIn, claudeModel)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "claude "+err.Error())
 		return
@@ -592,7 +678,7 @@ func serveClaudeResponses(ctx context.Context, cfg config, in responsesRequest, 
 	writeJSON(w, http.StatusOK, responsesToOpenAIResponse(resp))
 }
 
-func serveClaudeResponsesStream(ctx context.Context, cfg config, model, prompt, claudeModel string, inputTokens int, w http.ResponseWriter, r *http.Request) {
+func serveClaudeResponsesStream(ctx context.Context, cfg config, model, stdin string, mediaIn bool, claudeModel string, inputTokens int, w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	respID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	started := false
@@ -611,7 +697,7 @@ func serveClaudeResponsesStream(ctx context.Context, cfg config, model, prompt, 
 			flusher.Flush()
 		}
 	}
-	res, err := runClaudeStream(ctx, cfg, prompt, claudeModel, func(text string) {
+	res, err := runClaudeStream(ctx, cfg, stdin, mediaIn, claudeModel, func(text string) {
 		start()
 		sendEvent(w, "response.output_text.delta", map[string]any{
 			"type":          "response.output_text.delta",

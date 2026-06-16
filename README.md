@@ -241,7 +241,7 @@ Supports direct Gemini models (e.g., `gemini-2.5-flash`, `gemini-2.5-pro`).
   - `high` / `xhigh` / `max` &rarr; Maps to maximum reasoning budget (dynamic thinking).
 
 #### 3. Claude (Anthropic subscription Upstream)
-Set a model alias's "Forwarded to" to `Claude` to serve it from the local Claude Code CLI (`claude -p`) backed by a Claude Max/Pro subscription, instead of Codex/OpenAI. Authenticate once with `claude setup-token` and set `PROXY_CLAUDE_OAUTH_TOKEN` (the installer offers to do this). Chat-only: built-in tools are disabled and the run is single-turn and stateless, so caller-defined tools are not honored (the CLI uses its own). Responses stream token-by-token. See the `PROXY_CLAUDE_*` variables in `.env.example`.
+Set a model alias's "Forwarded to" to `Claude` to serve it from the local Claude Code CLI (`claude -p`) backed by a Claude Max/Pro subscription, instead of Codex/OpenAI. Authenticate once with `claude setup-token` and set `PROXY_CLAUDE_OAUTH_TOKEN` (the installer offers to do this). Chat-only: built-in tools are disabled and the run is single-turn and stateless, so caller-defined tools are not honored (the CLI uses its own). Responses stream token-by-token. **Images and PDFs** in a request are forwarded to the model natively (inline via stream-json); audio/video are dropped (use agy for those). See the `PROXY_CLAUDE_*` variables in `.env.example`.
 
 ## Live Server + Local Browser Mode
 

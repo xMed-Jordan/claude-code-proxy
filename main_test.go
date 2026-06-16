@@ -2117,6 +2117,38 @@ func TestClaudeChildEnv(t *testing.T) {
 	}
 }
 
+func TestClaudeBuildInput(t *testing.T) {
+	// No media → plain prompt, mediaIn=false (the text fast path).
+	stdin, mediaIn, _ := claudeBuildInput("hello", nil)
+	if mediaIn || stdin != "hello" {
+		t.Fatalf("no media: mediaIn=%v stdin=%q", mediaIn, stdin)
+	}
+	// Image (base64) → stream-json user message carrying an image block + text.
+	s, mediaIn, dropped := claudeBuildInput("look", []mediaPart{{B64: "QUJD", MediaType: "image/png", Filename: "a.png"}})
+	if !mediaIn || dropped != 0 {
+		t.Fatalf("image: mediaIn=%v dropped=%d", mediaIn, dropped)
+	}
+	for _, want := range []string{`"type":"user"`, `"type":"image"`, `"media_type":"image/png"`, `"data":"QUJD"`, `"text":"look"`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("stream-json missing %q in %s", want, s)
+		}
+	}
+	// PDF → document block; audio is dropped (Claude can't ingest it natively).
+	s2, mediaIn2, dropped2 := claudeBuildInput("", []mediaPart{
+		{B64: "JVBE", MediaType: "application/pdf", Filename: "d.pdf"},
+		{B64: "AAAA", MediaType: "audio/mpeg", Filename: "a.mp3"},
+	})
+	if !mediaIn2 || dropped2 != 1 || !strings.Contains(s2, `"type":"document"`) {
+		t.Fatalf("pdf+audio: mediaIn=%v dropped=%d s=%s", mediaIn2, dropped2, s2)
+	}
+	// Oversized base64 is dropped rather than overflowing stdin.
+	big := strings.Repeat("A", claudeMaxInlineMediaBytes+10)
+	_, mediaIn3, dropped3 := claudeBuildInput("hi", []mediaPart{{B64: big, MediaType: "image/png", Filename: "big.png"}})
+	if mediaIn3 || dropped3 != 1 {
+		t.Fatalf("oversized: mediaIn=%v dropped=%d (want false,1)", mediaIn3, dropped3)
+	}
+}
+
 func TestParseClaudeJSON(t *testing.T) {
 	ok, err := parseClaudeJSON([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"x"}`))
 	if err != nil || !ok.Ok || ok.Response != "the answer" {
