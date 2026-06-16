@@ -255,11 +255,12 @@ func claudeStreamTextDelta(line []byte) string {
 	return ""
 }
 
-// claudeRetries is the number of OUTER retries (re-running the CLI) on a
+// claudeRetries is the max number of OUTER retries (re-running the CLI) on a
 // transient failure. The CLI already retries individual API calls internally
 // (Claude-Code style); this is a coarser layer for when it exhausts those and
-// surfaces a transient error. Bounded low because each outer retry re-runs the
-// whole turn (a tool loop can be costly) — unlike the cheap per-API-call retry.
+// surfaces a transient error. With Connect's fallback disabled the proxy is the
+// last line, so this is set high — the real limit is the wall-clock budget
+// (claudeTotalTimeout), which keeps the proxy answering within Connect's window.
 func claudeRetries(cfg config) int {
 	if cfg.ClaudeRetries < 0 {
 		return 0
@@ -267,15 +268,18 @@ func claudeRetries(cfg config) int {
 	return cfg.ClaudeRetries
 }
 
-// parseClaudeRetries parses PROXY_CLAUDE_RETRIES: default 3, floor 0 (set 0 to
-// disable outer retries), capped at 10 to bound cost/latency of re-running.
+// parseClaudeRetries parses PROXY_CLAUDE_RETRIES: default 20, floor 0 (set 0 to
+// disable outer retries). With Connect's fallback turned off the proxy is the
+// last line, so it should keep retrying claude until the wall-clock budget
+// (claudeTotalTimeout) runs out — the count is set high enough that the time
+// budget, not the count, is the real limit. Capped at 50 as a runaway guard.
 func parseClaudeRetries(s string) int {
 	n, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || n < 0 {
-		return 3
+		return 20
 	}
-	if n > 10 {
-		n = 10
+	if n > 50 {
+		n = 50
 	}
 	return n
 }
