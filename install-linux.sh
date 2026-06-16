@@ -1198,7 +1198,13 @@ configure_caddy() {
 
 ${DOMAIN} {
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:${PROXY_PORT}
+	reverse_proxy 127.0.0.1:${PROXY_PORT} {
+		# Ride through brief upstream gaps (proxy restart/deploy) instead of a
+		# hard 502 — when Connect runs without a fallback a momentary gap must
+		# not reach customers. Verified: a full proxy restart yields 0x 502.
+		lb_try_duration 15s
+		lb_try_interval 250ms
+	}
 }
 CADDY
     run_sudo mkdir -p /etc/caddy
