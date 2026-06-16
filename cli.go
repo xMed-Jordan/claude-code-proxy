@@ -109,6 +109,7 @@ func runServe() error {
 	}
 	initMetricsDB(cfg)    // best-effort: Analytics persistence (separate WAL db)
 	initAgy(cfg)          // size the agy (Antigravity) subprocess concurrency cap
+	initClaude(cfg)       // size the Claude Code CLI subprocess concurrency cap
 	initVT(cfg)           // seed VirusTotal runtime keys/enabled from config
 	startMediaReaper(cfg) // reap retained media scratch older than the window
 	startImageReaper(cfg) // reap generated images older than the retention window

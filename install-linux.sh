@@ -25,6 +25,7 @@ HTTPS_PORT="${DEFAULT_HTTPS_PORT}"
 INSTALL_KIND="ask"
 HTTPS_MODE="ask"
 BROWSER_TOOLS="ask"
+CLAUDE_CODE_CHOICE="ask"
 UPSTREAM_CHOICE="ask"
 GEMINI_API_KEY_CHOICE=""
 DOMAIN=""
@@ -61,7 +62,7 @@ usage() {
 Usage: ./install-linux.sh [action] [options]
 
 Actions:
-  install       Install dependencies, Claude Code, Codex, build ${APP_NAME}, and configure systemd
+  install       Install dependencies, Codex, optional Claude Code, build ${APP_NAME}, and configure systemd
   start         Start ${SERVICE_NAME}
   stop          Stop ${SERVICE_NAME}
   reload        Reload ${SERVICE_NAME}
@@ -89,6 +90,8 @@ Options:
   --no-public-http       Keep the Go proxy local-only when HTTPS is not configured
   --browser-tools        Install/configure Chrome or Chromium browser tools
   --no-browser-tools     Skip Chrome/Chromium and browser MCP setup
+  --claude-code          Install Claude Code CLI and enable the 'claude' upstream
+  --no-claude-code       Skip Claude Code CLI (no 'claude' upstream)
   --server               Use server-oriented defaults
   --upstream UPSTREAM    Default upstream provider: codex or openai (default: codex)
   --local                Use local workstation defaults
@@ -164,6 +167,8 @@ parse_args() {
       --no-public-http) EXPOSE_HTTP="no" ;;
       --browser-tools) BROWSER_TOOLS="yes" ;;
       --no-browser-tools) BROWSER_TOOLS="no" ;;
+      --claude-code) CLAUDE_CODE_CHOICE="yes" ;;
+      --no-claude-code) CLAUDE_CODE_CHOICE="no" ;;
       --server) INSTALL_KIND="server" ;;
       --local) INSTALL_KIND="local" ;;
       -h|--help)
@@ -755,6 +760,46 @@ ensure_codex_auth() {
   log "Codex auth verified."
 }
 
+# claude_logged_in reports whether the Claude Code CLI has working auth (a
+# subscription login or an injected OAuth token). `claude auth status` exits 0
+# when logged in, 1 otherwise.
+claude_logged_in() {
+  run_as_install_user claude auth status >/dev/null 2>&1
+}
+
+# ensure_claude_auth makes sure the Claude Code CLI can authenticate. If a token
+# is already present (env or prior login) it returns. Otherwise it runs
+# `claude setup-token` as the install user — which prints a long-lived OAuth
+# token (requires a Claude subscription) — captures it, and stores it in
+# CLAUDE_OAUTH_TOKEN_CAPTURED for configure_env_file to persist.
+CLAUDE_OAUTH_TOKEN_CAPTURED=""
+ensure_claude_auth() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "Would verify Claude Code auth and run 'claude setup-token' if needed."
+    return
+  fi
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || claude_logged_in; then
+    log "Claude Code auth is available."
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    warn "Claude Code is not authenticated and this session is non-interactive."
+    warn "Run 'claude setup-token' as ${INSTALL_USER} and set PROXY_CLAUDE_OAUTH_TOKEN in ${INSTALL_DIR}/.env."
+    return
+  fi
+  log "Generating a long-lived Claude Code token (requires a Claude subscription)."
+  log "Complete the browser/device sign-in if prompted; the token is printed below."
+  local token=""
+  token="$(run_as_install_user claude setup-token 2>/dev/null | grep -Eo 'sk-ant-oat[0-9A-Za-z_-]+' | tail -n 1 || true)"
+  if [[ -n "${token}" ]]; then
+    CLAUDE_OAUTH_TOKEN_CAPTURED="${token}"
+    log "Captured a Claude Code OAuth token; it will be written to .env."
+  else
+    warn "Could not capture a token from 'claude setup-token'."
+    warn "Set PROXY_CLAUDE_OAUTH_TOKEN in ${INSTALL_DIR}/.env manually, or run 'claude auth login' as ${INSTALL_USER}."
+  fi
+}
+
 resolve_install_choices() {
   validate_port "${PROXY_PORT}" "proxy port"
   validate_port "${HTTP_PORT}" "HTTP port"
@@ -777,6 +822,24 @@ resolve_install_choices() {
       BROWSER_TOOLS="yes"
     else
       BROWSER_TOOLS="no"
+    fi
+  fi
+
+  if [[ "${CLAUDE_CODE_CHOICE}" == "ask" ]]; then
+    # Default to "yes" only if Claude Code is already installed, so a re-run /
+    # non-interactive update preserves the prior choice and a fresh box opts out.
+    local claude_default="no"
+    if command_exists claude; then
+      claude_default="yes"
+    fi
+    if [[ -t 0 ]]; then
+      if prompt_yes_no "Install Claude Code CLI and use a Claude subscription as a 'claude' upstream?" "${claude_default}"; then
+        CLAUDE_CODE_CHOICE="yes"
+      else
+        CLAUDE_CODE_CHOICE="no"
+      fi
+    else
+      CLAUDE_CODE_CHOICE="${claude_default}"
     fi
   fi
 
@@ -1002,6 +1065,20 @@ configure_env_file() {
   if [[ "${UPSTREAM_CHOICE}" != "ask" && -n "${UPSTREAM_CHOICE}" ]]; then
     set_env_value "${env_file}" "UPSTREAM" "${UPSTREAM_CHOICE}"
   fi
+  if [[ "${CLAUDE_CODE_CHOICE}" == "yes" ]]; then
+    set_env_value "${env_file}" "PROXY_CLAUDE_ENABLED" "1"
+    local claude_bin=""
+    claude_bin="$(command -v claude 2>/dev/null || true)"
+    [[ -n "${claude_bin}" ]] && set_env_value "${env_file}" "PROXY_CLAUDE_BIN" "${claude_bin}"
+    if [[ -n "${CLAUDE_OAUTH_TOKEN_CAPTURED}" ]]; then
+      set_env_value "${env_file}" "PROXY_CLAUDE_OAUTH_TOKEN" "${CLAUDE_OAUTH_TOKEN_CAPTURED}"
+    fi
+    # Neutral working dir so a stray project CLAUDE.md never leaks into prompts.
+    set_env_value "${env_file}" "PROXY_CLAUDE_WORKDIR" "${INSTALL_DIR}/.claude-workdir"
+    run install -d -m 0700 -o "${INSTALL_USER}" -g "${INSTALL_GROUP}" "${INSTALL_DIR}/.claude-workdir" 2>/dev/null || run mkdir -p "${INSTALL_DIR}/.claude-workdir"
+  elif [[ "${CLAUDE_CODE_CHOICE}" == "no" ]]; then
+    set_env_value "${env_file}" "PROXY_CLAUDE_ENABLED" "0"
+  fi
   if [[ -n "${GEMINI_API_KEY_CHOICE}" ]]; then
     set_env_value "${env_file}" "GEMINI_API_KEY" "${GEMINI_API_KEY_CHOICE}"
     set_env_value "${env_file}" "ANTIGRAVITY_API_KEY" "${GEMINI_API_KEY_CHOICE}"
@@ -1186,7 +1263,10 @@ install_all() {
 	install_base_dependencies
 	install_media_dependencies
 	ensure_node_runtime
-	ensure_claude_code_cli
+	if [[ "${CLAUDE_CODE_CHOICE}" == "yes" ]]; then
+		ensure_claude_code_cli
+		ensure_claude_auth
+	fi
 	ensure_go
 	if [[ "${UPSTREAM_CHOICE}" != "openai" ]]; then
 		ensure_codex_cli

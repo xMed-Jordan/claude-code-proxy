@@ -44,13 +44,25 @@
     "GPT-OSS 120B (Medium)",
   ];
 
+  // Models the Claude Code CLI accepts via --model when a row's "Forwarded to"
+  // = Claude: short aliases or full claude-* ids. First entry is the default on
+  // switch. The "[1m]" alias suffix (if any) is stripped server-side.
+  const CLAUDE_MODEL_OPTIONS = [
+    "sonnet",
+    "opus",
+    "haiku",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+  ];
+
   function modelStatusFor(real) {
     if (!real) return "unsupported";
-    return (CODEX_MODEL_OPTIONS.includes(real) || AGY_MODEL_OPTIONS.includes(real)) ? "available" : "untested";
+    return (CODEX_MODEL_OPTIONS.includes(real) || AGY_MODEL_OPTIONS.includes(real) || CLAUDE_MODEL_OPTIONS.includes(real)) ? "available" : "untested";
   }
 
-  // Where each alias forwards to. Codex and Agy route today (Agy is text-only:
-  // no tool calls). Claude is reserved until its backend is wired. Alphabetical.
+  // Where each alias forwards to. Codex, Agy and Claude route today (Agy and
+  // Claude are text-only: no caller tool calls). Alphabetical.
   const FORWARD_OPTIONS = [
     { value: "agy", label: "Agy" },
     { value: "claude", label: "Claude" },
@@ -464,6 +476,11 @@
         if (key === "forward_to" && val === "agy" && !AGY_MODEL_OPTIONS.includes((next.real || "").trim())) {
           next.real = AGY_MODEL_OPTIONS[0];
         }
+        // Switching a row to Claude: if its upstream model isn't a known Claude
+        // name, prefill a sensible default so the CLI gets a valid --model.
+        if (key === "forward_to" && val === "claude" && !CLAUDE_MODEL_OPTIONS.includes((next.real || "").trim())) {
+          next.real = CLAUDE_MODEL_OPTIONS[0];
+        }
         if (key === "real" || key === "forward_to") next.status = modelStatusFor((next.real || "").trim());
         return next;
       }));
@@ -664,6 +681,9 @@
             <datalist id="models-agy-options">
               {AGY_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
             </datalist>
+            <datalist id="models-claude-options">
+              {CLAUDE_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
+            </datalist>
             {filtered.length === 0 ? (
               <EmptyState
                 icon="models"
@@ -725,7 +745,7 @@
                           <td>
                             <input
                               className={cx("input models-inline-input mono", invalid && !m.real.trim() && "invalid")}
-                              list={m.forward_to === "agy" ? "models-agy-options" : "models-codex-options"}
+                              list={m.forward_to === "agy" ? "models-agy-options" : m.forward_to === "claude" ? "models-claude-options" : "models-codex-options"}
                               value={m.real}
                               onChange={e => updateModel(m.id, "real", e.target.value)}
                               placeholder={m.forward_to === "agy" ? "Gemini 3.1 Pro (High)" : "gpt-5.5"}

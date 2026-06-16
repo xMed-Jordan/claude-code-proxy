@@ -87,7 +87,7 @@ To preview the work without changing the system:
 ./install-linux.sh --dry-run
 ```
 
-The installer supports `apt`, `dnf`, `yum`, `zypper`, `pacman`, and `apk`. It checks `sudo`, installs missing base packages, verifies Node.js 18+ with npm, installs Claude Code with `npm i -g @anthropic-ai/claude-code` when `claude` is missing, installs or updates Go from the official Go release metadata, installs Codex with `npm i -g @openai/codex`, and pauses for Codex sign-in if `~/.codex/auth.json` is not ready.
+The installer supports `apt`, `dnf`, `yum`, `zypper`, `pacman`, and `apk`. It checks `sudo`, installs missing base packages, verifies Node.js 18+ with npm, optionally installs Claude Code with `npm i -g @anthropic-ai/claude-code` (it asks first; choosing yes also runs `claude setup-token` to enable the `claude` upstream), installs or updates Go from the official Go release metadata, installs Codex with `npm i -g @openai/codex`, and pauses for Codex sign-in if `~/.codex/auth.json` is not ready.
 
 During install it asks whether this is a local workstation or a server. Server installs skip Chrome/Antigravity browser tools by default. Browser tools are only installed/configured if you approve them; if skipped, the installer sets `ANTIGRAVITY_BROWSER_ENABLED=0` so Claude Code browser MCP setup is not injected.
 
@@ -130,7 +130,7 @@ chmod +x install-linux.sh reinstall-linux.sh uninstall-linux.sh update-linux.sh
 ./uninstall-linux.sh --clean
 ```
 
-- `update-linux.sh` updates OS packages, pulls the latest code from `https://github.com/xMed-Jordan/claude-code-proxy.git`, updates Go from official Go metadata, updates the Codex and Claude Code npm CLIs, rebuilds, reinstalls, and restarts the service. It preserves the installed public URL when `/opt/connect-ai-proxy/.env` or Caddy already points at the proxy.
+- `update-linux.sh` updates OS packages, pulls the latest code from `https://github.com/xMed-Jordan/claude-code-proxy.git`, updates Go from official Go metadata, refreshes whichever of the Codex and Claude Code npm CLIs are already installed (it never adds one you skipped), rebuilds, reinstalls, and restarts the service. It preserves the installed public URL when `/opt/connect-ai-proxy/.env` or Caddy already points at the proxy.
 - `reinstall-linux.sh` stops the service, restores synced Claude settings if possible, removes the service, symlink, and install directory, then runs a fresh install. It keeps Codex auth by default so a reinstall does not force a new device login unless `--remove-codex-auth` is passed.
 - `uninstall-linux.sh --app-only` removes only the app service, symlink, and install directory. `--clean` also checks Caddy, Go, Node/npm, Codex/Claude CLI packages, and browser packages; it skips anything that appears to be used by another process, systemd unit, or project on the server.
 
@@ -221,6 +221,7 @@ The proxy dynamically routes request payloads to the correct upstream backend (C
 - **Route to Codex (ChatGPT)**: If the resolved model name contains `"codex"` or `"gpt-5"`, the request is routed to Codex.
 - **Global Default**: If the model name doesn't match these keywords, the request routes to the global default upstream specified by `UPSTREAM` in the `.env` file (which can be `codex`, `openai`, or `antigravity`).
 - **Model Aliases**: You can configure custom aliases in the local control panel at `http://127.0.0.1:4000/` or by updating the `PROXY_MODEL_ALIASES` variable in your `.env` file.
+- **Per-alias "Forwarded to"**: A model alias can be routed to a non-default backend via its `forward_to` setting (Models page or `PROXY_MODEL_ALIASES`): `agy` serves it from the local Antigravity CLI, and `claude` serves it from the local Claude Code CLI backed by a Claude subscription.
 
 ### Available Upstreams & Models
 
@@ -238,6 +239,9 @@ Supports direct Gemini models (e.g., `gemini-2.5-flash`, `gemini-2.5-pro`).
   - `low` / `minimal` &rarr; Maps to minimal reasoning budget.
   - `medium` &rarr; Maps to medium reasoning budget.
   - `high` / `xhigh` / `max` &rarr; Maps to maximum reasoning budget (dynamic thinking).
+
+#### 3. Claude (Anthropic subscription Upstream)
+Set a model alias's "Forwarded to" to `Claude` to serve it from the local Claude Code CLI (`claude -p`) backed by a Claude Max/Pro subscription, instead of Codex/OpenAI. Authenticate once with `claude setup-token` and set `PROXY_CLAUDE_OAUTH_TOKEN` (the installer offers to do this). Chat-only: built-in tools are disabled and the run is single-turn and stateless, so caller-defined tools are not honored (the CLI uses its own). Responses stream token-by-token. See the `PROXY_CLAUDE_*` variables in `.env.example`.
 
 ## Live Server + Local Browser Mode
 

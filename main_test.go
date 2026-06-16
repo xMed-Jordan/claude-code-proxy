@@ -1955,10 +1955,10 @@ func TestForwardForAliasRouting(t *testing.T) {
 	if got := forwardForAlias(cfg, "agy-model"); got != "agy" {
 		t.Fatalf("agy-model → %q, want agy", got)
 	}
-	// Reserved-but-unwired targets and unknown aliases still resolve to codex,
-	// so only an explicit "agy" diverts off the codex/openai path.
+	// "agy" and "claude" both divert off the codex/openai path; unknown aliases
+	// still resolve to the codex default.
 	if got := forwardForAlias(cfg, "claude-model"); got != "claude" {
-		t.Fatalf("claude-model → %q, want claude (stored, but routing treats non-agy as codex)", got)
+		t.Fatalf("claude-model → %q, want claude", got)
 	}
 	if got := forwardForAlias(cfg, "plain"); got != "codex" {
 		t.Fatalf("plain → %q, want codex", got)
@@ -2009,6 +2009,106 @@ func TestAgyResponseShape(t *testing.T) {
 	}
 	if out["stop_reason"] != "end_turn" {
 		t.Fatalf("stop_reason = %v", out["stop_reason"])
+	}
+}
+
+func TestClaudeModelFor(t *testing.T) {
+	// Global override wins.
+	if got := claudeModelFor(config{ClaudeModel: "opus", Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "opus" {
+		t.Fatalf("override → %q, want opus", got)
+	}
+	// Short aliases and claude-* ids are forwarded verbatim.
+	for in, want := range map[string]string{"sonnet": "sonnet", "opus": "opus", "haiku": "haiku", "fable": "fable", "claude-opus-4-8": "claude-opus-4-8"} {
+		if got := claudeModelFor(config{Models: map[string]string{"m": in}}, "m"); got != want {
+			t.Fatalf("claude model %q → %q, want %q", in, got, want)
+		}
+	}
+	// A trailing context marker is stripped (it is the proxy's alias suffix).
+	if got := claudeModelFor(config{Models: map[string]string{"m": "claude-sonnet-4-6[1m]"}}, "m"); got != "claude-sonnet-4-6" {
+		t.Fatalf("bracket strip → %q, want claude-sonnet-4-6", got)
+	}
+	// A non-Claude id left on a claude alias is dropped so the CLI uses its default.
+	for _, in := range []string{"gpt-5.5", "o4-mini", "Gemini 3.1 Pro (High)"} {
+		if got := claudeModelFor(config{Models: map[string]string{"m": in}}, "m"); got != "" {
+			t.Fatalf("non-claude model %q → %q, want empty", in, got)
+		}
+	}
+}
+
+func TestClaudeArgs(t *testing.T) {
+	args := claudeArgs(config{ClaudeSafeMode: true}, "opus", false)
+	joined := strings.Join(args, " ")
+	// Non-stream: json output, model, tools disabled, single turn, no --bare.
+	for _, want := range []string{"-p", "--output-format json", "--model opus", "--max-turns 1", "--strict-mcp-config", "--no-session-persistence", "--safe-mode"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q; got: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "--bare") {
+		t.Fatalf("must NOT use --bare (incompatible with OAuth): %s", joined)
+	}
+	// --tools is followed by an empty string (disable all built-in tools).
+	toolsAt := -1
+	for i, a := range args {
+		if a == "--tools" {
+			toolsAt = i
+			break
+		}
+	}
+	if toolsAt < 0 || toolsAt+1 >= len(args) || args[toolsAt+1] != "" {
+		t.Fatalf("expected `--tools \"\"`; got: %v", args)
+	}
+	// Streaming adds the stream-json + verbose + partial-messages flags.
+	s := strings.Join(claudeArgs(config{}, "", true), " ")
+	for _, want := range []string{"--output-format stream-json", "--verbose", "--include-partial-messages"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("stream args missing %q; got: %s", want, s)
+		}
+	}
+	// No --model when the resolved model is empty; safe-mode off → no flag.
+	if strings.Contains(s, "--model") {
+		t.Fatalf("unexpected --model for empty model: %s", s)
+	}
+	if strings.Contains(s, "--safe-mode") {
+		t.Fatalf("unexpected --safe-mode when disabled: %s", s)
+	}
+}
+
+func TestParseClaudeJSON(t *testing.T) {
+	ok, err := parseClaudeJSON([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"x"}`))
+	if err != nil || !ok.Ok || ok.Response != "the answer" {
+		t.Fatalf("success parse = %#v err=%v", ok, err)
+	}
+	bad, err := parseClaudeJSON([]byte(`{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}`))
+	if err != nil {
+		t.Fatalf("error result should parse cleanly: %v", err)
+	}
+	if bad.Ok || bad.Error == "" {
+		t.Fatalf("error result should be !Ok with a message: %#v", bad)
+	}
+	if _, err := parseClaudeJSON([]byte("   ")); err == nil {
+		t.Fatalf("empty output should error")
+	}
+	if _, err := parseClaudeJSON([]byte("not json")); err == nil {
+		t.Fatalf("non-JSON should error")
+	}
+}
+
+func TestClaudeStreamTextDelta(t *testing.T) {
+	delta := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}`
+	if got := claudeStreamTextDelta([]byte(delta)); got != "Hello" {
+		t.Fatalf("text_delta → %q, want Hello", got)
+	}
+	// Non-text events and other line types yield no text.
+	for _, line := range []string{
+		`{"type":"system","subtype":"init","model":"opus"}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}}`,
+		`{"type":"result","subtype":"success","result":"done"}`,
+		`not json`,
+	} {
+		if got := claudeStreamTextDelta([]byte(line)); got != "" {
+			t.Fatalf("line %q → %q, want empty", line, got)
+		}
 	}
 }
 

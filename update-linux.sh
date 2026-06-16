@@ -287,6 +287,7 @@ current_install_args() {
   local browser_enabled=""
   local current_upstream=""
   local current_gemini_key=""
+  local claude_enabled=""
   current_port="$(get_env_value "${env_file}" "PROXY_PORT" || printf '%s' "${DEFAULT_PROXY_PORT}")"
   current_public_url="$(get_env_value "${env_file}" "PROXY_PUBLIC_URL" || true)"
   if [[ -z "${current_public_url}" ]]; then
@@ -295,6 +296,7 @@ current_install_args() {
   browser_enabled="$(get_env_value "${env_file}" "ANTIGRAVITY_BROWSER_ENABLED" || printf '0')"
   current_upstream="$(get_env_value "${env_file}" "UPSTREAM" || true)"
   current_gemini_key="$(get_env_value "${env_file}" "GEMINI_API_KEY" || true)"
+  claude_enabled="$(get_env_value "${env_file}" "PROXY_CLAUDE_ENABLED" || true)"
 
   printf '%s\0' "--server" "--no-https" "--no-public-http" "--install-dir" "${INSTALL_DIR}" "--proxy-port" "${current_port}"
   if [[ -n "${current_public_url}" ]]; then
@@ -304,6 +306,13 @@ current_install_args() {
     printf '%s\0' "--browser-tools"
   else
     printf '%s\0' "--no-browser-tools"
+  fi
+  # Preserve the install-time Claude Code choice so the non-interactive reinstall
+  # never re-prompts and never installs/removes it against the operator's choice.
+  if [[ "${claude_enabled}" == "1" ]]; then
+    printf '%s\0' "--claude-code"
+  else
+    printf '%s\0' "--no-claude-code"
   fi
   if [[ -n "${current_upstream}" ]]; then
     printf '%s\0' "--upstream" "${current_upstream}"
@@ -325,8 +334,21 @@ update_go_runtime() {
 
 update_global_clis() {
   ensure_node_runtime
-  log "Updating Codex and Claude Code CLIs with npm."
-  run_sudo npm i -g "${CODEX_NPM_PACKAGE}@latest" "${CLAUDE_CODE_NPM_PACKAGE}@latest"
+  # Refresh each CLI only if it is already installed — never silently add a CLI
+  # the operator chose not to install (e.g. Claude Code was declined at setup).
+  local pkgs=()
+  if command_exists codex; then
+    pkgs+=("${CODEX_NPM_PACKAGE}@latest")
+  fi
+  if command_exists claude; then
+    pkgs+=("${CLAUDE_CODE_NPM_PACKAGE}@latest")
+  fi
+  if [[ "${#pkgs[@]}" -eq 0 ]]; then
+    log "No Codex/Claude Code CLI present; skipping npm CLI update."
+    return
+  fi
+  log "Updating installed global CLIs with npm: ${pkgs[*]}"
+  run_sudo npm i -g "${pkgs[@]}"
 }
 
 reinstall_proxy_from_current_checkout() {

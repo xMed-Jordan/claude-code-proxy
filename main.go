@@ -107,6 +107,19 @@ type config struct {
 	AgyImageDir       string        // served root for generated images ("" → temp)
 	AgyImageModel     string        // default Antigravity model for image generation
 	AgyImageRetention time.Duration // keep generated images this long for reuse
+	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
+	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
+	// Claude subscription (long-lived OAuth token from `claude setup-token`).
+	// Chat-only, stateless, tools disabled. See claude.go.
+	ClaudeBin          string        // path to the `claude` CLI ("" → "claude" on PATH)
+	ClaudeModel        string        // optional global model override ("" → alias Real, if a Claude name)
+	ClaudeConcurrency  int           // max simultaneous claude subprocesses
+	ClaudeTimeout      time.Duration // per-call claude execution timeout
+	ClaudeOAuthToken   string        // long-lived OAuth token, injected as CLAUDE_CODE_OAUTH_TOKEN
+	ClaudeWorkDir      string        // working dir for the child ("" → temp; keeps ambient CLAUDE.md out)
+	ClaudeSystemPrompt string        // optional system-prompt override ("" → CLI default identity)
+	ClaudeSafeMode     bool          // pass --safe-mode (disable ambient CLAUDE.md/skills/plugins, keep auth)
+	ClaudeExtraArgs    string        // optional extra flags appended to every `claude` invocation
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -529,11 +542,22 @@ func loadConfig() config {
 		AgyImageDir:       strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
 		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.5 Flash (Low)")),
 		AgyImageRetention: parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
-		GroqAPIKey:        strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),
-		GroqSTTModel:      strings.TrimSpace(getenv("PROXY_GROQ_STT_MODEL", "whisper-large-v3")),
-		GroqSTTLanguage:   strings.TrimSpace(getenv("PROXY_GROQ_STT_LANGUAGE", "ar")),
-		GroqSTTPrompt:     strings.TrimSpace(getenv("PROXY_GROQ_STT_PROMPT", "")),
-		GroqSTTTimeout:    parseAgyTimeout(getenv("PROXY_GROQ_STT_TIMEOUT", "90")),
+
+		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
+		ClaudeModel:        strings.TrimSpace(getenv("PROXY_CLAUDE_MODEL", "")),
+		ClaudeConcurrency:  parseAgyConcurrency(getenv("PROXY_CLAUDE_CONCURRENCY", "2")),
+		ClaudeTimeout:      parseAgyTimeout(getenv("PROXY_CLAUDE_TIMEOUT", "180")),
+		ClaudeOAuthToken:   strings.TrimSpace(getenv("PROXY_CLAUDE_OAUTH_TOKEN", "")),
+		ClaudeWorkDir:      strings.TrimSpace(getenv("PROXY_CLAUDE_WORKDIR", "")),
+		ClaudeSystemPrompt: strings.TrimSpace(getenv("PROXY_CLAUDE_SYSTEM_PROMPT", "")),
+		ClaudeSafeMode:     envFlag("PROXY_CLAUDE_SAFE_MODE", true),
+		ClaudeExtraArgs:    strings.TrimSpace(getenv("PROXY_CLAUDE_EXTRA_ARGS", "")),
+
+		GroqAPIKey:      strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),
+		GroqSTTModel:    strings.TrimSpace(getenv("PROXY_GROQ_STT_MODEL", "whisper-large-v3")),
+		GroqSTTLanguage: strings.TrimSpace(getenv("PROXY_GROQ_STT_LANGUAGE", "ar")),
+		GroqSTTPrompt:   strings.TrimSpace(getenv("PROXY_GROQ_STT_PROMPT", "")),
+		GroqSTTTimeout:  parseAgyTimeout(getenv("PROXY_GROQ_STT_TIMEOUT", "90")),
 
 		VirusTotalEnabled:    envFlag("PROXY_VIRUSTOTAL_ENABLED", true),
 		VirusTotalKeys:       strings.TrimSpace(getenv("PROXY_VIRUSTOTAL_KEYS", "")),
@@ -1668,6 +1692,12 @@ func handleMessages(cfg config) http.HandlerFunc {
 			serveAgyAnthropic(ctx, cfg, in, w, r)
 			return
 		}
+		// Forwarded-to = Claude: serve this alias from the local Claude Code CLI
+		// (`claude -p`) backed by a Claude subscription, instead of codex/openai.
+		if forwardForAlias(cfg, in.Model) == "claude" {
+			serveClaudeAnthropic(ctx, cfg, in, w, r)
+			return
+		}
 
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
@@ -1769,6 +1799,10 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			serveAgyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
+		if forwardForAlias(cfg, in.Model) == "claude" {
+			serveClaudeOpenAIChat(r.Context(), cfg, in, w, r)
+			return
+		}
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
 			if upstreamType == "antigravity" {
@@ -1836,6 +1870,10 @@ func handleResponses(cfg config) http.HandlerFunc {
 		// resolveModel rewrites in.Model to the upstream model name.
 		if forwardForAlias(cfg, in.Model) == "agy" {
 			serveAgyResponses(r.Context(), cfg, in, w, r)
+			return
+		}
+		if forwardForAlias(cfg, in.Model) == "claude" {
+			serveClaudeResponses(r.Context(), cfg, in, w, r)
 			return
 		}
 		in.Model = resolveModel(cfg, in.Model)
@@ -8062,6 +8100,16 @@ func modelStatusForRow(cfg config, alias, real string) string {
 	}
 	if forwardForAlias(cfg, alias) == "agy" {
 		if antigravityModels[strings.ToLower(strings.TrimSpace(real))] {
+			return "ok"
+		}
+		return "untested"
+	}
+	if forwardForAlias(cfg, alias) == "claude" {
+		low := strings.ToLower(strings.TrimSpace(real))
+		if i := strings.Index(low, "["); i > 0 {
+			low = strings.TrimSpace(low[:i])
+		}
+		if low == "sonnet" || low == "opus" || low == "haiku" || low == "fable" || strings.HasPrefix(low, "claude") {
 			return "ok"
 		}
 		return "untested"
