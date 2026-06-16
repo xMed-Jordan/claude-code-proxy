@@ -255,6 +255,133 @@ func claudeStreamTextDelta(line []byte) string {
 	return ""
 }
 
+// claudeRetries is the number of OUTER retries (re-running the CLI) on a
+// transient failure. The CLI already retries individual API calls internally
+// (Claude-Code style); this is a coarser layer for when it exhausts those and
+// surfaces a transient error. Bounded low because each outer retry re-runs the
+// whole turn (a tool loop can be costly) — unlike the cheap per-API-call retry.
+func claudeRetries(cfg config) int {
+	if cfg.ClaudeRetries < 0 {
+		return 0
+	}
+	return cfg.ClaudeRetries
+}
+
+// parseClaudeRetries parses PROXY_CLAUDE_RETRIES: default 3, floor 0 (set 0 to
+// disable outer retries), capped at 10 to bound cost/latency of re-running.
+func parseClaudeRetries(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		return 3
+	}
+	if n > 10 {
+		n = 10
+	}
+	return n
+}
+
+// claudeTransient reports whether a failed run looks like a transient,
+// retry-worthy condition (Anthropic 5xx / overloaded / rate limit / timeout /
+// connection reset / empty output) rather than a permanent one (auth, bad
+// request, disabled upstream, error_max_turns — re-running those just wastes
+// tokens and hits the same wall).
+func claudeTransient(res claudeResult, err error) bool {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	if !res.Ok && res.Error != "" {
+		msg += " " + res.Error
+	}
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "error_max_turns") || strings.Contains(msg, "max_turns") {
+		return false // not transient: needs more turns / a different prompt, not a retry
+	}
+	// NOTE: deliberately NOT matching the proxy's own deadline ("timed out
+	// after Ns") — re-running a turn that already exhausted the timeout just
+	// burns another full timeout and Connect would give up first. Only fast,
+	// server-side transients are retried.
+	for _, s := range []string{
+		"internal server error", "api error: 5", "server-side issue",
+		"overloaded", "529", "503", "502", "service unavailable", "bad gateway",
+		"rate limit", "429", "too many requests",
+		"connection reset", "connection refused", "econnreset",
+		"produced no output", "no output",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeBackoffWait sleeps with exponential backoff (1,2,4,…s, capped 30s)
+// before a retry, returning false if the context is cancelled meanwhile.
+func claudeBackoffWait(ctx context.Context, attempt int) bool {
+	d := time.Duration(1<<uint(attempt-1)) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// claudeTotalTimeout caps the WHOLE retry sequence so the proxy always answers
+// within Connect's HTTP wait (config ai.api.request_timeout, ~500s). If the
+// proxy ran longer, Connect would time out first and fall back — wasting the
+// retry. Keep this comfortably below the caller's timeout.
+func claudeTotalTimeout(cfg config) time.Duration {
+	if cfg.ClaudeTotalTimeout > 0 {
+		return cfg.ClaudeTotalTimeout
+	}
+	return 480 * time.Second
+}
+
+// claudeWithRetry runs `run` and retries it on transient failures (and on an
+// empty-but-successful result) up to claudeRetries(cfg) times with backoff —
+// but bounds the ENTIRE sequence by claudeTotalTimeout so it never overruns
+// Connect's timeout. Each attempt is therefore min(per-attempt, remaining
+// budget). Permanent errors and clean successes return immediately.
+func claudeWithRetry(ctx context.Context, cfg config, run func(context.Context) (claudeResult, error)) (claudeResult, error) {
+	totalCtx, cancel := context.WithTimeout(ctx, claudeTotalTimeout(cfg))
+	defer cancel()
+
+	retries := claudeRetries(cfg)
+	var res claudeResult
+	var err error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			if !claudeBackoffWait(totalCtx, attempt) {
+				return res, err // out of budget / cancelled — return the last result
+			}
+		}
+		res, err = run(totalCtx)
+		// Clean success with non-empty text → done.
+		if err == nil && res.Ok && strings.TrimSpace(res.Response) != "" {
+			return res, nil
+		}
+		// Out of total budget, or the caller cancelled → stop now.
+		if totalCtx.Err() != nil || ctx.Err() != nil {
+			return res, err
+		}
+		emptyOK := err == nil && res.Ok && strings.TrimSpace(res.Response) == ""
+		if !emptyOK && !claudeTransient(res, err) {
+			return res, err // permanent failure — don't waste a retry
+		}
+		// transient or empty → loop and retry (until retries or budget exhausted)
+	}
+	return res, err
+}
+
 // runClaude execs `claude` for a single prompt (non-streaming) and returns the
 // parsed result. It acquires a concurrency slot (ctx-aware) and bounds the run
 // with cfg.ClaudeTimeout; the prompt is piped on stdin.
@@ -264,6 +391,12 @@ func runClaude(ctx context.Context, cfg config, prompt, model string) (claudeRes
 	}
 	defer claudeRelease()
 
+	return claudeWithRetry(ctx, cfg, func(c context.Context) (claudeResult, error) {
+		return runClaudeAttempt(c, cfg, prompt, model)
+	})
+}
+
+func runClaudeAttempt(ctx context.Context, cfg config, prompt, model string) (claudeResult, error) {
 	cctx, cancel := context.WithTimeout(ctx, claudeTimeout(cfg))
 	defer cancel()
 
@@ -940,6 +1073,12 @@ func runClaudeTools(ctx context.Context, cfg config, prompt string, spec *claude
 	}
 	defer cleanup()
 
+	return claudeWithRetry(ctx, cfg, func(c context.Context) (claudeResult, error) {
+		return runClaudeToolsAttempt(c, cfg, prompt, spec, model, mcpPath)
+	})
+}
+
+func runClaudeToolsAttempt(ctx context.Context, cfg config, prompt string, spec *claudeToolSpec, model, mcpPath string) (claudeResult, error) {
 	cctx, cancel := context.WithTimeout(ctx, claudeToolTimeout(cfg))
 	defer cancel()
 

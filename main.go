@@ -130,6 +130,8 @@ type config struct {
 	ClaudeToolsEnabled bool          // PROXY_CLAUDE_TOOLS_ENABLED (master switch)
 	ClaudeToolMaxTurns int           // PROXY_CLAUDE_TOOL_MAX_TURNS (CLI --max-turns for tool loops)
 	ClaudeToolTimeout  time.Duration // PROXY_CLAUDE_TOOL_TIMEOUT (longer than chat; loops do many round-trips)
+	ClaudeRetries      int           // PROXY_CLAUDE_RETRIES — outer retries on transient errors (5xx/overloaded/timeout)
+	ClaudeTotalTimeout time.Duration // PROXY_CLAUDE_TOTAL_TIMEOUT — wall-clock cap on the whole retry sequence (keep < Connect's HTTP timeout)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -569,6 +571,8 @@ func loadConfig() config {
 		ClaudeToolsEnabled: envFlag("PROXY_CLAUDE_TOOLS_ENABLED", false),
 		ClaudeToolMaxTurns: parseClaudeToolMaxTurns(getenv("PROXY_CLAUDE_TOOL_MAX_TURNS", "20")),
 		ClaudeToolTimeout:  parseAgyTimeout(getenv("PROXY_CLAUDE_TOOL_TIMEOUT", "600")),
+		ClaudeRetries:      parseClaudeRetries(getenv("PROXY_CLAUDE_RETRIES", "3")),
+		ClaudeTotalTimeout: parseAgyTimeout(getenv("PROXY_CLAUDE_TOTAL_TIMEOUT", "480")),
 
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
 		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),
