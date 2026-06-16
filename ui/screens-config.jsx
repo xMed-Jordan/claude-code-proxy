@@ -284,6 +284,32 @@
           </div>
         </Card>
 
+        {/* Upstream services — enable/disable each backend completely */}
+        <Card title="Upstream services">
+          <div className="cfg-form">
+            {[
+              { key: "PROXY_CODEX_ENABLED", name: "Codex (ChatGPT)", hint: "OpenAI Codex via your ChatGPT subscription." },
+              { key: "PROXY_CLAUDE_ENABLED", name: "Claude Code", hint: "Anthropic Claude via the local Claude Code CLI." },
+              { key: "PROXY_AGY_ENABLED", name: "Antigravity (Gemini)", hint: "Google Antigravity via the local agy CLI." },
+            ].map(svc => {
+              const on = (cfg[svc.key] || "1") !== "0";
+              return (
+                <div className="cfg-row" key={svc.key}>
+                  <div className="cfg-label">
+                    <span className="cfg-label-name">{svc.name}</span>
+                    <span className="cfg-label-env mono">{svc.key}</span>
+                  </div>
+                  <div className="cfg-ctl">
+                    <Switch checked={on} onChange={v => update(svc.key, v ? "1" : "0")} label={on ? "Enabled" : "Disabled"} />
+                    <p className="cfg-hint">{svc.hint}{on ? "" : " Requests routed here return a clear “disabled” error."}</p>
+                  </div>
+                </div>
+              );
+            })}
+            <p className="cfg-hint">Disabling a service takes effect after a proxy restart.</p>
+          </div>
+        </Card>
+
         {/* Server */}
         <Card title="Server settings">
           <div className="cfg-form">

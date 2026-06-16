@@ -74,6 +74,9 @@ type config struct {
 	OpenAIAPIKey      string
 	OpenAIBaseURL     string
 	Upstream          string
+	CodexDisabled     bool // PROXY_CODEX_ENABLED=0 → refuse codex routing (zero value = enabled)
+	ClaudeDisabled    bool // PROXY_CLAUDE_ENABLED=0 → refuse the claude upstream
+	AgyDisabled       bool // PROXY_AGY_ENABLED=0 → refuse the agy upstream
 	CodexBaseURL      string
 	CodexAuthFile     string
 	CodexSessionFile  string
@@ -552,6 +555,10 @@ func loadConfig() config {
 		ClaudeSystemPrompt: strings.TrimSpace(getenv("PROXY_CLAUDE_SYSTEM_PROMPT", "")),
 		ClaudeSafeMode:     envFlag("PROXY_CLAUDE_SAFE_MODE", false),
 		ClaudeExtraArgs:    strings.TrimSpace(getenv("PROXY_CLAUDE_EXTRA_ARGS", "")),
+
+		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
+		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),
+		AgyDisabled:    !envFlag("PROXY_AGY_ENABLED", true),
 
 		GroqAPIKey:      strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),
 		GroqSTTModel:    strings.TrimSpace(getenv("PROXY_GROQ_STT_MODEL", "whisper-large-v3")),
@@ -1689,12 +1696,20 @@ func handleMessages(cfg config) http.HandlerFunc {
 		// Forwarded-to = Agy: serve this alias from the local agy (Antigravity)
 		// CLI via the agyj subprocess instead of the codex/openai HTTP path.
 		if forwardForAlias(cfg, in.Model) == "agy" {
+			if cfg.AgyDisabled {
+				writeAnthropicError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+				return
+			}
 			serveAgyAnthropic(ctx, cfg, in, w, r)
 			return
 		}
 		// Forwarded-to = Claude: serve this alias from the local Claude Code CLI
 		// (`claude -p`) backed by a Claude subscription, instead of codex/openai.
 		if forwardForAlias(cfg, in.Model) == "claude" {
+			if cfg.ClaudeDisabled {
+				writeAnthropicError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+				return
+			}
 			serveClaudeAnthropic(ctx, cfg, in, w, r)
 			return
 		}
@@ -1737,6 +1752,10 @@ func handleMessages(cfg config) http.HandlerFunc {
 			return
 		}
 		if cfg.Upstream == "codex" {
+			if cfg.CodexDisabled {
+				writeAnthropicError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
+				return
+			}
 			responsesReq := toResponses(cfg, in)
 			estimatedInput := max(estimateAnthropicRequestTokens(in), estimateCodexRequestTokens(responsesReq))
 			if decision := codexTokenLimitDecision(estimatedInput, in.MaxTokens); decision.Action != "" {
@@ -1796,10 +1815,18 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		}
 		applyCustomSessionToOpenAIRequest(r, &in)
 		if forwardForAlias(cfg, in.Model) == "agy" {
+			if cfg.AgyDisabled {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+				return
+			}
 			serveAgyOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
+			if cfg.ClaudeDisabled {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+				return
+			}
 			serveClaudeOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
@@ -1823,6 +1850,10 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		if cfg.Upstream == "openai" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
 			proxyOpenAIChat(r.Context(), cfg, in, w, r)
+			return
+		}
+		if cfg.CodexDisabled {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
 			return
 		}
 		out := openAIChatToResponses(cfg, in)
@@ -1869,10 +1900,18 @@ func handleResponses(cfg config) http.HandlerFunc {
 		// Forwarded-to = Agy is keyed on the public alias, so route before
 		// resolveModel rewrites in.Model to the upstream model name.
 		if forwardForAlias(cfg, in.Model) == "agy" {
+			if cfg.AgyDisabled {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "agy upstream is disabled")
+				return
+			}
 			serveAgyResponses(r.Context(), cfg, in, w, r)
 			return
 		}
 		if forwardForAlias(cfg, in.Model) == "claude" {
+			if cfg.ClaudeDisabled {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "claude upstream is disabled")
+				return
+			}
 			serveClaudeResponses(r.Context(), cfg, in, w, r)
 			return
 		}
@@ -1908,6 +1947,10 @@ func handleResponses(cfg config) http.HandlerFunc {
 		if cfg.Upstream == "openai" {
 			setRequestStat(r, requestStat{Model: in.Model, Upstream: in.Model, Stream: in.Stream})
 			proxyOpenAIResponses(r.Context(), cfg, in, w, r)
+			return
+		}
+		if cfg.CodexDisabled {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "codex upstream is disabled")
 			return
 		}
 		if decision := codexTokenLimitDecision(estimateCodexRequestTokens(in), in.MaxOutputTokens); decision.Action != "" {
