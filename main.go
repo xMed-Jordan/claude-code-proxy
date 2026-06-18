@@ -189,6 +189,13 @@ type anthropicRequest struct {
 
 type anthropicOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
+	// Summary overrides the codex reasoning-summary mode for this one request
+	// (none|concise|detailed|auto). It lets a caller suppress the reasoning
+	// summary per-request without touching the global CODEX_REASONING_SUMMARY
+	// default — e.g. Connect sends "none" for customer-facing chat agents (which
+	// discard the summary anyway) while Claude Code coding requests omit it and
+	// keep full reasoning. Empty = fall back to the global default.
+	Summary string `json:"reasoning_summary,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -2065,7 +2072,7 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
 	}
 	if effort := requestReasoningEffort(cfg, in); effort != "" {
-		out.Reasoning = &responsesReasoning{Effort: effort, Summary: codexReasoningSummaryMode()}
+		out.Reasoning = &responsesReasoning{Effort: effort, Summary: requestReasoningSummary(in)}
 	}
 	hasWebSearch := false
 	for _, tool := range in.Tools {
@@ -2454,6 +2461,33 @@ func codexReasoningSummaryMode() string {
 		return ""
 	case "concise", "detailed", "auto":
 		return strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_REASONING_SUMMARY")))
+	default:
+		return "auto"
+	}
+}
+
+// requestReasoningSummary resolves the codex reasoning-summary mode for a single
+// request. A caller may override the global CODEX_REASONING_SUMMARY default
+// per-request via output_config.reasoning_summary: Connect sets "none" for
+// customer-facing chat agents (which discard the summary anyway and must never
+// surface it to end users), while Claude Code coding requests omit the field and
+// keep the global default so full reasoning still flows. Empty/absent → default.
+func requestReasoningSummary(in anthropicRequest) string {
+	if in.OutputConfig != nil && strings.TrimSpace(in.OutputConfig.Summary) != "" {
+		return normalizeReasoningSummary(in.OutputConfig.Summary)
+	}
+	return codexReasoningSummaryMode()
+}
+
+// normalizeReasoningSummary maps a caller-supplied reasoning-summary value to a
+// valid codex mode. Disable synonyms collapse to "" (no summary); concise/
+// detailed/auto pass through; anything else defaults to "auto".
+func normalizeReasoningSummary(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "none", "off", "false", "0", "disabled", "no":
+		return ""
+	case "concise", "detailed", "auto":
+		return strings.ToLower(strings.TrimSpace(v))
 	default:
 		return "auto"
 	}

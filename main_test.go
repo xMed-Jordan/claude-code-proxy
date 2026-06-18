@@ -766,6 +766,45 @@ func TestFastModeMapsClaudeOpus46ToCodexPriority(t *testing.T) {
 	}
 }
 
+func TestRequestReasoningSummaryPerRequestOverride(t *testing.T) {
+	t.Setenv("CODEX_REASONING_SUMMARY", "auto")
+	cfg := config{Models: map[string]string{"opus[1m]": "gpt-5.5"}, ReasoningEffort: "high"}
+
+	// Default: no output_config → global default ("auto"); Claude Code coding
+	// requests keep full reasoning this way.
+	def := toResponses(cfg, anthropicRequest{
+		Model:    "opus[1m]",
+		Messages: []anthropicMessage{{Role: "user", Content: "hi"}},
+	})
+	if def.Reasoning == nil || def.Reasoning.Summary != "auto" {
+		t.Fatalf("default summary = %#v, want auto", def.Reasoning)
+	}
+
+	// Per-request "none" suppresses the reasoning summary (Connect chat agents).
+	off := toResponses(cfg, anthropicRequest{
+		Model:        "opus[1m]",
+		Messages:     []anthropicMessage{{Role: "user", Content: "hi"}},
+		OutputConfig: &anthropicOutputConfig{Summary: "none"},
+	})
+	if off.Reasoning == nil || off.Reasoning.Summary != "" {
+		t.Fatalf("none summary = %#v, want empty", off.Reasoning)
+	}
+	// Toggling the summary off must NOT lower the reasoning effort.
+	if off.Reasoning.Effort != "high" {
+		t.Fatalf("effort = %q, want high", off.Reasoning.Effort)
+	}
+
+	// An explicit mode passes through unchanged.
+	det := toResponses(cfg, anthropicRequest{
+		Model:        "opus[1m]",
+		Messages:     []anthropicMessage{{Role: "user", Content: "hi"}},
+		OutputConfig: &anthropicOutputConfig{Summary: "detailed"},
+	})
+	if det.Reasoning == nil || det.Reasoning.Summary != "detailed" {
+		t.Fatalf("detailed summary = %#v, want detailed", det.Reasoning)
+	}
+}
+
 func TestSaveModelAliasesPersistsOverridesAndDisabledRows(t *testing.T) {
 	t.Setenv("PROXY_MODEL_ALIASES", "")
 	t.Setenv("PROXY_MODEL_ALIASES_DISABLED", "")
