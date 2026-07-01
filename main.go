@@ -997,7 +997,15 @@ func openProxyDB(cfg config) (*sql.DB, error) {
 	if path == "" {
 		path = ".proxy.db"
 	}
-	return sql.Open("sqlite", path)
+	// WAL + a busy timeout so the shared config DB tolerates concurrent access
+	// instead of failing instantly with SQLITE_BUSY. The request auth path reads
+	// client_keys on every request while camera writes (camlog/analysis) and
+	// other handlers write; under load a plain rollback-journal DB returns
+	// "database is locked" rather than waiting. journal_mode=WAL is a persistent
+	// file setting (readers no longer block the writer); busy_timeout is applied
+	// to every pooled connection via the DSN so writers wait up to 5s for a lock.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	return sql.Open("sqlite", dsn)
 }
 
 func migrateProxyDB(db *sql.DB) error {
