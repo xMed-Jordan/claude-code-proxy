@@ -151,6 +151,39 @@ type config struct {
 	AdminUsername        string
 	AdminPasswordHash    string
 	AdminSessionSecret   string
+	// Camera / DVR monitoring subsystem (see camera*.go). All PROXY_CAM*/
+	// PROXY_CAMERA_*/PROXY_FF* keys. The scheduler respects CameraEnabled; the
+	// rest are captured at startup by initCameras.
+	CameraEnabled              bool          // PROXY_CAM_ENABLED — run the monitoring scheduler
+	CameraAnalysisAlias        string        // PROXY_CAMERA_ANALYSIS_ALIAS — vision-capable alias for analysis
+	CameraOrchMode             string        // PROXY_CAMERA_ORCH_MODE — server | claude_tools
+	CameraFFmpegBin            string        // PROXY_FFMPEG_BIN ("" → "ffmpeg" on PATH)
+	CameraFFprobeBin           string        // PROXY_FFPROBE_BIN ("" → "ffprobe" on PATH)
+	CameraCaptureConcurrency   int           // PROXY_CAM_CAPTURE_CONCURRENCY — parallel ffmpeg/http captures
+	CameraCaptureTimeout       time.Duration // PROXY_CAM_CAPTURE_TIMEOUT — per-capture kill
+	CameraDiscoverTimeout      time.Duration // PROXY_CAM_DISCOVER_TIMEOUT — per-discovery kill
+	CameraDiscoverMaxChannels  int           // PROXY_CAM_DISCOVER_MAX_CHANNELS — probe ceiling
+	CameraMediaDir             string        // PROXY_CAM_MEDIA_DIR — served capture root ("" → temp)
+	CameraMediaRetention       time.Duration // PROXY_CAM_MEDIA_RETENTION — keep captures this long
+	CameraClipMaxSeconds       int           // PROXY_CAM_CLIP_MAX_SECONDS — clip length cap
+	CameraClipMaxBytes         int64         // PROXY_CAM_CLIP_MAX_BYTES — ffmpeg -fs cap
+	CameraSnapshotHTTPFirst    bool          // PROXY_CAM_SNAPSHOT_HTTP_FIRST — prefer HTTP snapshot over ffmpeg
+	CameraRTSPTransport        string        // PROXY_CAM_RTSP_TRANSPORT — tcp | udp
+	CameraDefaultRTSPPort      int           // PROXY_CAM_DEFAULT_RTSP_PORT — default 554
+	CameraDefaultHTTPPort      int           // PROXY_CAM_DEFAULT_HTTP_PORT — default 80
+	CameraBlackLumaThreshold   float64       // PROXY_CAM_BLACK_LUMA_THRESHOLD — near-black mean-luma cutoff
+	CameraBlackStddevThreshold float64       // PROXY_CAM_BLACK_STDDEV_THRESHOLD — low-variance cutoff
+	CameraMosaicCols           int           // PROXY_CAM_MOSAIC_COLS — tiles per row
+	CameraMosaicCellW          int           // PROXY_CAM_MOSAIC_CELL_W — tile width
+	CameraMosaicCellH          int           // PROXY_CAM_MOSAIC_CELL_H — tile height
+	CameraMosaicMaxCams        int           // PROXY_CAM_MOSAIC_MAX_CAMS — cap cameras per mosaic
+	CameraONVIFDiscovery       bool          // PROXY_CAM_ONVIF_DISCOVERY — enable WS-Discovery
+	CameraMaxRounds            int           // PROXY_CAMERA_MAX_ROUNDS — escalation ladder cap (hard cap 6)
+	CameraMaxClips             int           // PROXY_CAMERA_MAX_CLIPS — clip fetches per run
+	CameraRunBudget            time.Duration // PROXY_CAMERA_RUN_BUDGET — wall-clock cap per run
+	CameraTickInterval         time.Duration // PROXY_CAMERA_TICK_INTERVAL — scheduler tick period
+	CameraWatchConcurrency     int           // PROXY_CAMERA_WATCH_CONCURRENCY — parallel watch runs
+	CameraLogLevel             string        // PROXY_CAMERA_LOG_LEVEL — debug | info | warn | error
 }
 
 type modelAliasConfig struct {
@@ -509,6 +542,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/openapi.json", handleOpenAPI(cfg))
 	mux.HandleFunc("/postman.json", handlePostmanCollection(cfg))
 	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
+	registerCameraRoutes(cfg, mux)
 	mux.HandleFunc("/", handleUI)
 	return mux
 }
@@ -601,6 +635,37 @@ func loadConfig() config {
 		AdminUsername:      strings.TrimSpace(getenv("ADMIN_USERNAME", "")),
 		AdminPasswordHash:  strings.TrimSpace(getenv("ADMIN_PASSWORD_HASH", "")),
 		AdminSessionSecret: strings.TrimSpace(getenv("ADMIN_SESSION_SECRET", "")),
+
+		CameraEnabled:              envFlag("PROXY_CAM_ENABLED", true),
+		CameraAnalysisAlias:        strings.TrimSpace(getenv("PROXY_CAMERA_ANALYSIS_ALIAS", "")),
+		CameraOrchMode:             strings.ToLower(strings.TrimSpace(getenv("PROXY_CAMERA_ORCH_MODE", "server"))),
+		CameraFFmpegBin:            strings.TrimSpace(getenv("PROXY_FFMPEG_BIN", "")),
+		CameraFFprobeBin:           strings.TrimSpace(getenv("PROXY_FFPROBE_BIN", "")),
+		CameraCaptureConcurrency:   parseIntDefault(getenv("PROXY_CAM_CAPTURE_CONCURRENCY", "3"), 3),
+		CameraCaptureTimeout:       parseAgyTimeout(getenv("PROXY_CAM_CAPTURE_TIMEOUT", "30")),
+		CameraDiscoverTimeout:      parseAgyTimeout(getenv("PROXY_CAM_DISCOVER_TIMEOUT", "20")),
+		CameraDiscoverMaxChannels:  parseIntDefault(getenv("PROXY_CAM_DISCOVER_MAX_CHANNELS", "64"), 64),
+		CameraMediaDir:             strings.TrimSpace(getenv("PROXY_CAM_MEDIA_DIR", "")),
+		CameraMediaRetention:       parseAgyTimeout(getenv("PROXY_CAM_MEDIA_RETENTION", "86400")),
+		CameraClipMaxSeconds:       parseIntDefault(getenv("PROXY_CAM_CLIP_MAX_SECONDS", "300"), 300),
+		CameraClipMaxBytes:         parseByteSize(getenv("PROXY_CAM_CLIP_MAX_BYTES", "200MB"), 200<<20),
+		CameraSnapshotHTTPFirst:    envFlag("PROXY_CAM_SNAPSHOT_HTTP_FIRST", true),
+		CameraRTSPTransport:        strings.ToLower(strings.TrimSpace(getenv("PROXY_CAM_RTSP_TRANSPORT", "tcp"))),
+		CameraDefaultRTSPPort:      parseIntDefault(getenv("PROXY_CAM_DEFAULT_RTSP_PORT", "554"), 554),
+		CameraDefaultHTTPPort:      parseIntDefault(getenv("PROXY_CAM_DEFAULT_HTTP_PORT", "80"), 80),
+		CameraBlackLumaThreshold:   camParseFloat(getenv("PROXY_CAM_BLACK_LUMA_THRESHOLD", "16"), 16),
+		CameraBlackStddevThreshold: camParseFloat(getenv("PROXY_CAM_BLACK_STDDEV_THRESHOLD", "6"), 6),
+		CameraMosaicCols:           parseIntDefault(getenv("PROXY_CAM_MOSAIC_COLS", "4"), 4),
+		CameraMosaicCellW:          parseIntDefault(getenv("PROXY_CAM_MOSAIC_CELL_W", "320"), 320),
+		CameraMosaicCellH:          parseIntDefault(getenv("PROXY_CAM_MOSAIC_CELL_H", "180"), 180),
+		CameraMosaicMaxCams:        parseIntDefault(getenv("PROXY_CAM_MOSAIC_MAX_CAMS", "16"), 16),
+		CameraONVIFDiscovery:       envFlag("PROXY_CAM_ONVIF_DISCOVERY", false),
+		CameraMaxRounds:            parseCamMaxRounds(getenv("PROXY_CAMERA_MAX_ROUNDS", "4")),
+		CameraMaxClips:             parseIntDefault(getenv("PROXY_CAMERA_MAX_CLIPS", "3"), 3),
+		CameraRunBudget:            parseAgyTimeout(getenv("PROXY_CAMERA_RUN_BUDGET", "300")),
+		CameraTickInterval:         parseAgyTimeout(getenv("PROXY_CAMERA_TICK_INTERVAL", "15")),
+		CameraWatchConcurrency:     parseIntDefault(getenv("PROXY_CAMERA_WATCH_CONCURRENCY", "1"), 1),
+		CameraLogLevel:             strings.ToLower(strings.TrimSpace(getenv("PROXY_CAMERA_LOG_LEVEL", "info"))),
 	}
 }
 
@@ -970,6 +1035,9 @@ func migrateProxyDB(db *sql.DB) error {
 		}
 	}
 	if err := ensureSQLiteColumn(db, "client_keys", "schema", "TEXT NOT NULL DEFAULT 'both'"); err != nil {
+		return err
+	}
+	if err := migrateCameraDB(db); err != nil {
 		return err
 	}
 	return nil

@@ -1,0 +1,327 @@
+/* screens-cameras.css — Cameras (RTSP/DVR monitoring), WP12.
+   All selectors prefixed .cam- (plus the shared .cfg-* row/label/ctl classes
+   from screens-config.css, reused for the Add-DVR wizard exactly like
+   screens-images.jsx reuses them for its Generate form).
+   Reuses base.css tokens + primitives; no inline hex colors. */
+
+.cam-tab-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* ── Sites strip + detail ── */
+
+.cam-site-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+}
+
+.cam-site-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color var(--speed) var(--ease), background var(--speed) var(--ease), color var(--speed) var(--ease);
+}
+.cam-site-chip:hover { border-color: var(--border-strong); color: var(--text); }
+.cam-site-chip.active { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+
+.cam-site-chip-name { font-weight: 500; }
+
+.cam-site-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5) var(--sp-5);
+  border-top: 1px solid var(--border);
+}
+
+.cam-site-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.cam-site-detail-name { font-size: var(--fs-lg); font-weight: 600; }
+.cam-site-detail-desc { font-size: var(--fs-sm); color: var(--text-2); max-width: 70ch; margin-top: 4px; }
+.cam-site-detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.cam-areas { display: flex; flex-wrap: wrap; gap: 8px; }
+.cam-area-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.cam-area-chip-name { font-weight: 600; color: var(--text); font-size: var(--fs-sm); }
+
+.cam-hint-fail { font-size: var(--fs-xs); color: var(--text-3); margin: 0; }
+
+/* ── Password reveal field ── */
+
+.cam-pw-row { display: flex; gap: 6px; align-items: center; }
+.cam-pw-row .input { flex: 1; min-width: 0; }
+
+/* ── Modal footers, row actions ── */
+
+.cam-modal-footer { display: flex; justify-content: flex-end; gap: var(--sp-2); }
+.cam-row-actions { display: flex; gap: 4px; align-items: center; justify-content: flex-end; white-space: nowrap; }
+
+/* ── Add-DVR wizard extras (base rows use .cfg-row/.cfg-label/.cfg-ctl) ── */
+
+.cam-inline-fields { display: flex; gap: 8px; }
+.cam-inline-fields .input { width: 110px; }
+.cam-wizard-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+
+/* ── Camera grid ── */
+
+.cam-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-5);
+}
+
+.cam-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  overflow: hidden;
+}
+.cam-card.disabled { opacity: 0.6; }
+
+.cam-card-thumb {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: var(--surface-3);
+}
+.cam-card-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.cam-card-thumb-empty {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+}
+.cam-card-thumb-empty.small {
+  aspect-ratio: auto;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-sm);
+  background: var(--surface-3);
+}
+.cam-card-thumb-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--r-full);
+  background: rgba(15, 18, 25, 0.55);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.cam-card-thumb-btn:hover { background: rgba(15, 18, 25, 0.72); }
+.cam-card-thumb-btn:disabled { cursor: not-allowed; opacity: 0.7; }
+
+.cam-card-body {
+  padding: var(--sp-3) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+}
+.cam-card-title-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.cam-card-name { font-weight: 600; font-size: var(--fs-sm); min-width: 0; }
+.cam-card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 20px; }
+.cam-card-unassigned { font-size: var(--fs-xs); }
+.cam-card-desc {
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  line-height: 1.45;
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.cam-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Questions inbox ── */
+
+.cam-questions { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-5); }
+.cam-question {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cam-question-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.cam-question-text { font-size: var(--fs-sm); font-weight: 500; margin: 0; }
+.cam-question-cams { display: flex; flex-wrap: wrap; gap: 10px; }
+.cam-question-cam { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--text-2); }
+.cam-question-cam img { width: 34px; height: 34px; object-fit: cover; border-radius: var(--r-sm); border: 1px solid var(--border); }
+.cam-question-answer { display: flex; flex-direction: column; gap: 8px; }
+.cam-question-actions { display: flex; gap: 8px; }
+.cam-question-answered { font-size: var(--fs-sm); margin: 0; }
+
+/* ── Watches editor ── */
+
+.cam-multiselect {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+}
+.cam-form-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); }
+
+/* ── Run history ── */
+
+.cam-run-row { cursor: pointer; }
+.cam-run-row.active td { background: var(--accent-soft); }
+.cam-run-summary { max-width: 280px; }
+.cam-run-loading { display: flex; align-items: center; gap: 10px; padding: 20px 4px; }
+
+.cam-rounds { display: flex; flex-direction: column; gap: var(--sp-4); margin-top: var(--sp-2); }
+.cam-round {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cam-round-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.cam-round-mosaic {
+  max-width: 100%;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+}
+.cam-round-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
+}
+.cam-round-tile { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cam-round-tile img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+}
+.cam-round-tile span {
+  font-size: 11px;
+  color: var(--text-2);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cam-round-clip {
+  max-width: 100%;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: #000;
+}
+.cam-round-decision { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); }
+.cam-round-summary { margin: 0; font-weight: 500; }
+.cam-round-obs { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-2); }
+.cam-round-obs li { display: flex; align-items: center; gap: 6px; }
+.cam-round-triggers { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.cam-fired {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cam-fired h4 { margin: 0; font-size: var(--fs-sm); display: flex; align-items: center; gap: 8px; }
+
+/* ── Diagnostics (WP13) ── */
+
+.cam-health-bins {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5) 0;
+}
+.cam-health-bin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.cam-health-bin-label { font-weight: 600; font-size: var(--fs-sm); }
+
+.cam-event-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cam-event-filters .input { width: 200px; }
+
+.cam-event-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.cam-recapture-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+.cam-recapture-thumb {
+  max-width: 320px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 800px) {
+  .cam-form-grid-2 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  .cam-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+  .cam-inline-fields .input { width: 90px; }
+  .cam-event-filters .input { width: 100%; }
+}

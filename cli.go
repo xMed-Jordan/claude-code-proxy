@@ -118,6 +118,8 @@ func runServe() error {
 	initVT(cfg)                // seed VirusTotal runtime keys/enabled from config
 	startMediaReaper(cfg)      // reap retained media scratch older than the window
 	startImageReaper(cfg)      // reap generated images older than the retention window
+	initCameras(cfg)           // size the camera capture semaphore + ensure media dir
+	startCameraMonitor(cfg)    // start the DVR monitoring scheduler (guarded by CameraEnabled)
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
 	// Auto-provision the Codex token refresh timer (Linux root only). First

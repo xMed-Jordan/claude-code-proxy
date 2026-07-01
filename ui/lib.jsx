@@ -185,6 +185,7 @@
     { id: "logs",      path: "/logs",      title: "Logs",               icon: "logs",      group: "Operate",      component: "Logs" },
     { id: "updates",   path: "/updates",   title: "Updates",            icon: "download",  group: "Operate",      component: "Updates" },
     { id: "browser",   path: "/browser",   title: "Antigravity Browser", icon: "globe",    group: "Integrations", component: "BrowserBridge" },
+    { id: "cameras",   path: "/cameras",   title: "Cameras",            icon: "globe",     group: "Integrations", component: "Cameras" },
     { id: "setup",     path: "/setup",     title: "Claude Code Setup",  icon: "terminal",  group: "Integrations", component: "Setup" },
   ];
 
