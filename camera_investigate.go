@@ -755,17 +755,22 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 		q = StreamMain
 	}
 
+	// Sample `count` INSTANTS spread across [from,to] and grab one fast frame at
+	// each (captureFrameAtTime) instead of downloading the whole window as a
+	// real-time clip. This keeps a wide "what happened between X and Y" pull quick,
+	// and — because every still is captioned with its exact time — makes it
+	// actually useful for locating WHEN something happened. Instants with no
+	// recording are skipped, so a partial-coverage window still returns what exists.
+	times := camSampleTimes(from, to, count)
+
 	var (
 		images  []string
 		media   []evidenceItem
 		fetches int
 		usedIDs []string
+		missing int
 	)
-	everySec := int(to.Sub(from).Seconds()) / count
 	for _, id := range ids {
-		if fetches >= mediaLeft {
-			break
-		}
 		c, ok := camByID[id]
 		if !ok {
 			continue
@@ -774,36 +779,64 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 		if !ok || !dv.Enabled {
 			continue
 		}
-		dest := filepath.Join(scratch, fmt.Sprintf("pf_%s_%d.mp4", id, time.Now().UnixNano()))
-		res, cerr := capturePlaybackClip(ctx, cfg, dv, c.Channel, q, from, to, dest)
-		fetches++
-		if cerr != nil {
-			continue // errNoRecording or a capture failure — already camlog'd
-		}
-		frameDir := filepath.Join(scratch, fmt.Sprintf("%s_pf_%d", id, time.Now().UnixNano()))
-		frames, ferr := sampleClipFrames(ctx, cfg, res.Path, frameDir, everySec, count, 0)
-		if ferr != nil || len(frames) == 0 {
-			continue
-		}
-		usedIDs = append(usedIDs, id)
-		for i, f := range frames {
-			named := filepath.Join(scratch, fmt.Sprintf("%s_pf_%02d.jpg", id, i+1))
-			if os.Rename(f, named) != nil {
-				named = f
+		loc := time.Local
+		if dv.Timezone != "" {
+			if l, e := time.LoadLocation(dv.Timezone); e == nil {
+				loc = l
 			}
-			if token, perr := camPersistCapture(db, cfg, "", site.ID, id, "frame", q.String(), named, "image/jpeg", 0, 0, from.Format(time.RFC3339), to.Format(time.RFC3339)); perr == nil {
-				media = append(media, evidenceItem{MediaURL: camMediaURL(cfg, r, token), Caption: fmt.Sprintf("%s — %s frame %d/%d", camDisplayName(c), windowLabel(from, to), i+1, len(frames))})
+		}
+		got := 0
+		for i, t := range times {
+			if fetches >= mediaLeft {
+				break
 			}
-			images = append(images, named)
+			dest := filepath.Join(scratch, fmt.Sprintf("pf_%s_%02d_%d.jpg", id, i, time.Now().UnixNano()))
+			res, cerr := captureFrameAtTime(ctx, cfg, dv, c.Channel, q, t, dest)
+			fetches++
+			if cerr != nil || res.Path == "" {
+				missing++
+				continue // no footage at this instant — skip it, keep sampling the rest
+			}
+			got++
+			ts := t.Format(time.RFC3339)
+			if token, perr := camPersistCapture(db, cfg, "", site.ID, id, "frame", q.String(), res.Path, "image/jpeg", res.Width, res.Height, ts, ts); perr == nil {
+				media = append(media, evidenceItem{MediaURL: camMediaURL(cfg, r, token), Caption: fmt.Sprintf("%s @ %s", camDisplayName(c), t.In(loc).Format("Jan 2 15:04:05"))})
+			}
+			images = append(images, res.Path)
+		}
+		if got > 0 {
+			usedIDs = append(usedIDs, id)
 		}
 	}
 	if len(images) == 0 {
-		return investigateToolResult{Summary: fmt.Sprintf("past_frames: no recorded footage found for %s in %s.", camIDsWithNames(ids, camByID), windowLabel(from, to)), Fetches: fetches}
+		return investigateToolResult{Summary: fmt.Sprintf("past_frames: no recorded footage found for %s at any of %d instants across %s.", camIDsWithNames(ids, camByID), len(times), windowLabel(from, to)), Fetches: fetches}
+	}
+	summary := fmt.Sprintf("Sampled %d still(s) at instants spread across %s for %s — each image caption gives its exact time.", len(images), windowLabel(from, to), camIDsWithNames(usedIDs, camByID))
+	if missing > 0 {
+		summary += fmt.Sprintf(" %d sampled instant(s) had no recording.", missing)
 	}
 	return investigateToolResult{
-		Summary: fmt.Sprintf("Sampled %d still(s) from recorded footage for %s covering %s.", len(images), camIDsWithNames(usedIDs, camByID), windowLabel(from, to)),
+		Summary: summary,
 		Media:   media, Images: images, Fetches: fetches,
 	}
+}
+
+// camSampleTimes returns count timestamps spread evenly across [from,to] inclusive
+// (both endpoints included when count>1), used by past_frames to sample instants
+// across an operator's search window. Degenerate windows collapse to a single time.
+func camSampleTimes(from, to time.Time, count int) []time.Time {
+	if count < 1 {
+		count = 1
+	}
+	if count == 1 || !to.After(from) {
+		return []time.Time{from}
+	}
+	span := int64(to.Sub(from))
+	out := make([]time.Time, count)
+	for i := 0; i < count; i++ {
+		out[i] = from.Add(time.Duration(span * int64(i) / int64(count-1)))
+	}
+	return out
 }
 
 // camToolPastClip saves a single recorded-footage clip as citable evidence

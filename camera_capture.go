@@ -458,6 +458,39 @@ func capturePlaybackClip(ctx context.Context, cfg config, dvr CamDVR, ch int, q 
 	return res, cerr
 }
 
+// pastFrameWindow is the tiny playback span captureFrameAtTime opens to land a
+// single still at an instant. ffmpeg -frames:v 1 exits on the first decodable
+// frame, so this bounds the range without ever downloading it in real time —
+// grabbing one frame at time t is fast regardless of how wide the operator's
+// overall search window is.
+const pastFrameWindow = 15 * time.Second
+
+// captureFrameAtTime grabs ONE recorded still at (approximately) time t via a fast
+// single-frame playback grab (NOT a real-time clip download), so sampling many
+// instants across a wide window stays quick. The destPath extension is normalized
+// to .jpg by the underlying grabber. Any error — including "no footage at t" — is
+// returned so the caller can simply skip that instant and keep sampling the rest.
+func captureFrameAtTime(ctx context.Context, cfg config, dvr CamDVR, ch int, q StreamQuality, t time.Time, destPath string) (captureResult, error) {
+	cameraFFmpegPreflight(cfg)
+	if err := camCaptureAcquire(ctx); err != nil {
+		return captureResult{}, fmt.Errorf("capture queue wait cancelled: %w", err)
+	}
+	defer camCaptureRelease()
+
+	brand := brandFor(dvr.Brand)
+	if brand == nil {
+		return captureResult{}, fmt.Errorf("no brand adapter available for %q", dvr.Brand)
+	}
+	rawURL, err := brand.PlaybackURL(dvr, ch, q, t, t.Add(pastFrameWindow))
+	if err != nil {
+		return captureResult{}, err
+	}
+	start := time.Now()
+	res, diag, cerr := captureSnapshotFFmpeg(ctx, cfg, rawURL, destPath)
+	logClipAttempt(dvr.ID, ch, q, "playback_frame", rawURL, 1, start, res, diag, cerr)
+	return res, cerr
+}
+
 // clampClipSeconds enforces a sane minimum and the configured maximum clip length.
 func clampClipSeconds(cfg config, seconds int) int {
 	if seconds <= 0 {
