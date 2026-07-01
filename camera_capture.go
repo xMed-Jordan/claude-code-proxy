@@ -477,7 +477,7 @@ func clampClipSeconds(cfg config, seconds int) int {
 // via -c copy (no transcode) with a byte cap and a stall guard:
 //
 //	ffmpeg -nostdin -loglevel error -rtsp_transport <t> -timeout <µs> -i <url>
-//	  -t <seconds> -c copy -movflags +faststart -fs <maxBytes> -y out.mp4
+//	  -t <seconds> -c:v copy -an -movflags +faststart -fs <maxBytes> -y out.mp4
 //
 // The process deadline is seconds+cfg.CameraCaptureTimeout (a start/stop grace
 // window), not cfg.CameraCaptureTimeout alone — otherwise a multi-minute clip
@@ -505,7 +505,13 @@ func runClipFFmpeg(ctx context.Context, cfg config, rawURL string, seconds int, 
 		"-timeout", strconv.FormatInt(rwTimeoutUs, 10),
 		"-i", rawURL,
 		"-t", strconv.Itoa(seconds),
-		"-c", "copy",
+		// Copy video as-is but DROP audio. Hikvision PLAYBACK streams advertise a
+		// pcm_mulaw audio track (often with zero packets) that cannot be muxed into
+		// MP4 via -c copy — it fails the entire clip ("codec not supported in
+		// container" / "nothing was written"), which the caller then mis-reports as
+		// "no recording". Live streams here have audio disabled, so -an is safe for
+		// both; video-only is what evidence review and frame-sampling need anyway.
+		"-c:v", "copy", "-an",
 		"-movflags", "+faststart",
 		"-fs", strconv.FormatInt(maxBytes, 10),
 		"-y", finalPath,
