@@ -11,7 +11,14 @@ package main
 //   Round 0 (ALWAYS): a cheap low-resolution MOSAIC of the SUB-stream snapshots of
 //     every monitored camera → analyzeWithAlias → parseDecision. If the model is
 //     unsuspicious (suspicion==none && rule_status==not_met) the run early-exits
-//     here, before paying for a single full image or clip.
+//     here, before paying for a single full image or clip. When a watch has MANY
+//     cameras, an optional ROSTER-FIRST pre-selection step (opt-in via
+//     PROXY_CAMERA_ROSTER_FIRST, see camSelectMosaicCameras) asks the model to pick
+//     the relevant subset from the roster's TEXT (reusing camSelectCameras from
+//     camera_investigate.go) and builds the round-0 mosaic from only those cameras,
+//     falling back to every active camera whenever selection is disabled, the watch
+//     is small, or the selection call errors/returns nothing — so default behavior
+//     is unchanged unless explicitly opted into.
 //   Escalation: the loop honors the model's need_more request each round —
 //     "full_images" → fresh MAIN-stream snapshots of the flagged cameras;
 //     "clip" → a past-playback clip for the requested window (agy is handed the
@@ -38,6 +45,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -279,7 +287,13 @@ func runEscalationServer(ctx context.Context, cfg config, w watch, cams []camera
 	sys := camMonitorSystemPrompt(w, active)
 
 	// ── Round 0: the low-quality mosaic (ALWAYS) ──
-	mosaicPath, legend, mosaicToken, merr := camBuildRoundMosaic(cctx, cfg, db, runID, w.SiteID, active, dvrByID, scratch)
+	// Roster-first pre-selection (opt-in, WP3): when there are many watched cameras,
+	// let the model pick the relevant subset from the roster text first, and build
+	// the mosaic from just that subset. Always falls back to `active` (every
+	// escalation round downstream, e.g. full_images/clip fallback, still considers
+	// the full `active` set — only the round-0 mosaic composition is narrowed).
+	mosaicCams := camSelectMosaicCameras(cctx, cfg, runID, alias, w, active)
+	mosaicPath, legend, mosaicToken, merr := camBuildRoundMosaic(cctx, cfg, db, runID, w.SiteID, mosaicCams, dvrByID, scratch)
 	if merr != nil {
 		return finalize(runResult{Status: "error", Suspicion: "none", RuleStatus: "not_met", Rounds: 0,
 			Summary: "could not build the camera mosaic: " + merr.Error()}, nil)
@@ -670,6 +684,88 @@ func camPersistCapture(db *sql.DB, cfg config, runID, siteID, cameraID, kind, qu
 
 // ─────────────────────────────── camera selection helpers ───────────────────────────────
 
+// camRosterFirstEnabled reports whether the optional roster-first mosaic
+// pre-selection step (camSelectMosaicCameras) is turned on. Off by default so
+// existing mosaic_only/escalate behavior is unchanged unless an operator opts in
+// (PROXY_CAMERA_ROSTER_FIRST=1/true/yes/on). This package has no config-struct
+// field for it — WP3 is scoped to camera_escalate.go only — so the env var is read
+// directly here, mirroring camera_log.go's PROXY_CAMERA_LOG_LEVEL.
+func camRosterFirstEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PROXY_CAMERA_ROSTER_FIRST"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// camRosterFirstMinCams is the minimum number of active cameras a watch needs
+// before roster-first pre-selection is worth its extra text-only model call —
+// below this the full mosaic is already cheap. Overridable via
+// PROXY_CAMERA_ROSTER_FIRST_MIN_CAMS; defaults to 6.
+func camRosterFirstMinCams() int {
+	if v := strings.TrimSpace(os.Getenv("PROXY_CAMERA_ROSTER_FIRST_MIN_CAMS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 6
+}
+
+// camSelectMosaicCameras narrows the round-0 mosaic's camera set via the
+// roster-first selector (camSelectCameras, camera_investigate.go) when the feature
+// is enabled and the watch has "many" active cameras (camRosterFirstMinCams). It
+// asks the model to pick the subset relevant to the watch's instruction from the
+// roster TEXT alone (no images — cheap), then filters `active` down to that subset.
+// It ALWAYS falls back to returning `active` unchanged — feature disabled, watch
+// too small, the selection call errors, or the model selects nothing — so this is
+// purely additive and every non-opted-in watch behaves exactly as before. Every
+// attempt is camlog'd (op=escalate_roster_select) with the outcome and latency.
+func camSelectMosaicCameras(ctx context.Context, cfg config, runID, alias string, w watch, active []camera) []camera {
+	if !camRosterFirstEnabled() || len(active) <= camRosterFirstMinCams() {
+		return active
+	}
+	start := time.Now()
+	ids, err := camSelectCameras(ctx, cfg, alias, w.Instruction, active)
+	fields := map[string]any{
+		"run_id": runID, "watch_id": w.ID, "cameras_total": len(active),
+		"latency_ms": time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		fields["ok"] = false
+		fields["error"] = err.Error()
+		camlog("warn", "escalate_roster_select", fields)
+		return active
+	}
+	subset := camFilterCamerasByID(active, ids)
+	fields["ok"] = true
+	fields["selected"] = len(subset)
+	if len(subset) == 0 {
+		camlog("info", "escalate_roster_select", fields)
+		return active
+	}
+	fields["camera_ids"] = ids
+	camlog("info", "escalate_roster_select", fields)
+	return subset
+}
+
+// camFilterCamerasByID returns the cameras in cams whose id appears in ids,
+// preserving ids' order (camSelectCameras already de-duplicates and validates
+// roster membership, so no further checks are needed here).
+func camFilterCamerasByID(cams []camera, ids []string) []camera {
+	byID := make(map[string]camera, len(cams))
+	for _, c := range cams {
+		byID[c.ID] = c
+	}
+	out := make([]camera, 0, len(ids))
+	for _, id := range ids {
+		if c, ok := byID[id]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // camPickCameras resolves which cameras an escalation round should fetch: the ids
 // the model flagged (already allowed-filtered by parseDecision), else the cameras it
 // marked notable this round, else — as a last resort — every active camera.
@@ -857,7 +953,8 @@ func camMonitorSystemPrompt(w watch, active []camera) string {
 	b.WriteString("\n")
 
 	b.WriteString("ESCALATION PROTOCOL:\n")
-	b.WriteString("- Round 1 shows a single low-resolution MOSAIC combining all cameras; later rounds show what you request.\n")
+	b.WriteString("- Round 1 shows a single low-resolution MOSAIC (the tile legend tells you exactly which monitored ")
+	b.WriteString("cameras it includes — this may be all of them or a relevant subset); later rounds show what you request.\n")
 	b.WriteString("- need_more.type \"full_images\": request full-resolution CURRENT snapshots for specific camera_ids.\n")
 	b.WriteString("- need_more.type \"clip\": request recorded footage; set clip.from_offset_sec and clip.to_offset_sec as ")
 	b.WriteString("seconds relative to NOW (negative = the past; e.g. from_offset_sec -180, to_offset_sec 0 = the last 3 minutes).\n")

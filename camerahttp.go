@@ -65,6 +65,12 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/ui/api/cameras/watches/toggle", noStore(requireAdmin(cfg, handleCameraWatchToggle(cfg))))
 	mux.HandleFunc("/ui/api/cameras/watches/run", noStore(requireAdmin(cfg, handleCameraWatchRun(cfg))))
 
+	// Ask-AI investigation chat (camera_investigate.go): start a run, reply to an
+	// ask_operator pause, list a site's investigations, and fetch a full transcript.
+	mux.HandleFunc("/ui/api/cameras/investigations", noStore(requireAdmin(cfg, handleCameraInvestigations(cfg))))
+	mux.HandleFunc("/ui/api/cameras/investigations/reply", noStore(requireAdmin(cfg, handleCameraInvestigationReply(cfg))))
+	mux.HandleFunc("/ui/api/cameras/investigations/get", noStore(requireAdmin(cfg, handleCameraInvestigationGet(cfg))))
+
 	mux.HandleFunc("/ui/api/cameras/runs", noStore(requireAdmin(cfg, handleCameraRuns(cfg))))
 	mux.HandleFunc("/ui/api/cameras/runs/get", noStore(requireAdmin(cfg, handleCameraRunGet(cfg))))
 	mux.HandleFunc("/ui/api/cameras/captures", noStore(requireAdmin(cfg, handleCameraCaptures(cfg))))

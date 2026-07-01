@@ -1539,6 +1539,290 @@
   }
 
   /* ─────────────────────────────────────────────────────────────
+     ASK AI — investigation chat (WP2)
+
+     Talks to camera_investigate.go's four endpoints:
+       POST /ui/api/cameras/investigations {site_id, question} -> {ok, id, status, investigation, messages}
+       POST /ui/api/cameras/investigations/reply {id, message}  -> same shape
+       GET  /ui/api/cameras/investigations?site_id=             -> {investigations: [...]}
+       GET  /ui/api/cameras/investigations/get?id=              -> {investigation, messages}
+     Runs are synchronous per request (the loop drives to its next
+     ask_operator/answer pause before responding), so Ask/Reply use a long
+     timeoutMs; the transcript still polls via useLive so a second tab (or a
+     slow/retried request) converges on the same state.
+     ───────────────────────────────────────────────────────────── */
+
+  const INVESTIGATION_STATUS_TONE = { active: "info", awaiting_operator: "warning", answered: "success", exhausted: "warning", closed: "neutral" };
+  function InvestigationStatusBadge({ status }) {
+    return (
+      <Badge tone={INVESTIGATION_STATUS_TONE[status] || "neutral"} pulse={status === "active"}>
+        {(status || "unknown").replace(/_/g, " ")}
+      </Badge>
+    );
+  }
+
+  // EvidenceMedia renders one cited {media_url, caption} — evidenceItem carries
+  // no explicit kind and /camera/media/<token> URLs have no file extension, so
+  // this tries an <img> first and falls back to a <video> if the browser can't
+  // decode it as an image (a past_clip citation).
+  function EvidenceMedia({ url, caption }) {
+    const [isVideo, setIsVideo] = useState(false);
+    if (!url) return null;
+    return (
+      <div className="cam-evidence-item">
+        {isVideo ? (
+          <video controls src={url} />
+        ) : (
+          <img src={url} alt={caption || "evidence"} onError={() => setIsVideo(true)} />
+        )}
+        {caption && <span className="cam-evidence-caption" title={caption}>{caption}</span>}
+      </div>
+    );
+  }
+
+  function EvidenceGrid({ media }) {
+    if (!Array.isArray(media) || media.length === 0) return null;
+    return (
+      <div className="cam-evidence-grid">
+        {media.map((m, i) => <EvidenceMedia key={i} url={m.media_url} caption={m.caption} />)}
+      </div>
+    );
+  }
+
+  // formatToolArgs renders an investigateArgs object (camera_ids/quality/from/to/count,
+  // decoded server-side from JSON) as a short mono summary line — empty fields omitted.
+  function formatToolArgs(args) {
+    if (!args || typeof args !== "object") return "";
+    const parts = [];
+    if (Array.isArray(args.camera_ids) && args.camera_ids.length > 0) parts.push("cameras: " + args.camera_ids.join(", "));
+    if (args.quality) parts.push("quality: " + args.quality);
+    if (args.from || args.to) parts.push("window: " + (args.from || "?") + " → " + (args.to || "?"));
+    if (args.count) parts.push("count: " + args.count);
+    return parts.join(" · ");
+  }
+
+  const INVESTIGATE_TOOL_LABEL = {
+    roster: "Roster", snapshot: "Snapshot", mosaic: "Mosaic", past_frames: "Past frames", past_clip: "Past clip",
+  };
+
+  // InvestigateMessage renders one camera_investigation_messages row as a chat
+  // bubble, styled by role — operator (the human), ai (a thought + either a
+  // tool call, an ask_operator question, or the final answer + evidence), tool
+  // (the loop's own result summary + any media it fetched), system (a bound/
+  // error notice from camStopInvestigation).
+  function InvestigateMessage({ m }) {
+    if (m.role === "operator") {
+      return (
+        <div className="cam-msg cam-msg-operator">
+          <div className="cam-msg-bubble">
+            <span className="cam-msg-role">Operator</span>
+            <p>{m.content}</p>
+          </div>
+        </div>
+      );
+    }
+    if (m.role === "system") {
+      return (
+        <div className="cam-msg cam-msg-system">
+          <Icon name="info" size={12} /><span>{m.content}</span>
+        </div>
+      );
+    }
+    if (m.role === "tool") {
+      const args = formatToolArgs(m.tool_args);
+      return (
+        <div className="cam-msg cam-msg-tool">
+          <div className="cam-msg-bubble">
+            <span className="cam-msg-role">
+              <Icon name="bolt" size={12} /> {INVESTIGATE_TOOL_LABEL[m.tool_name] || m.tool_name || "tool"} result
+            </span>
+            <p>{m.content}</p>
+            {args && <span className="cam-msg-args mono muted subtle">{args}</span>}
+            <EvidenceGrid media={m.media} />
+          </div>
+        </div>
+      );
+    }
+    // role === "ai"
+    const isAnswer = m.tool_name === "answer";
+    const isQuestion = m.tool_name === "ask_operator";
+    const args = formatToolArgs(m.tool_args);
+    return (
+      <div className="cam-msg cam-msg-ai">
+        <div className="cam-msg-bubble">
+          <span className="cam-msg-role">
+            <Icon name="shield" size={12} /> AI
+            {isAnswer && <Badge tone="success">answer</Badge>}
+            {isQuestion && <Badge tone="warning">question</Badge>}
+            {!isAnswer && !isQuestion && m.tool_name && <Badge tone="neutral">{INVESTIGATE_TOOL_LABEL[m.tool_name] || m.tool_name}</Badge>}
+          </span>
+          <p>{m.content}</p>
+          {args && <span className="cam-msg-args mono muted subtle">{args}</span>}
+          {isAnswer && <EvidenceGrid media={m.media} />}
+        </div>
+      </div>
+    );
+  }
+
+  // InvestigationThread renders one investigation's transcript + (unless
+  // closed) a reply box — always available, not just on awaiting_operator,
+  // since an "answered" OR "exhausted" (bound-terminated) investigation accepts
+  // follow-ups: the server reopens it to "active" and, because a non-ask_operator
+  // operator message starts a FRESH run, the follow-up gets a fresh budget and
+  // actually advances (per handleCameraInvestigationReply / camCountInvestigateProgress).
+  function InvestigationThread({ investigation, messages, notify, onReplied }) {
+    const [replyText, setReplyText] = useState("");
+    const [replying, setReplying] = useState(false);
+    const invId = investigation.id;
+
+    useEffect(() => { setReplyText(""); }, [invId]);
+
+    const isAsk = investigation.status === "awaiting_operator";
+    const canReply = investigation.status !== "closed";
+
+    const send = useCallback(async () => {
+      const msg = replyText.trim();
+      if (!msg) { notify("Type a message first", "error"); return; }
+      setReplying(true);
+      try {
+        const res = await api.post("/ui/api/cameras/investigations/reply", { id: invId, message: msg }, { timeoutMs: 400000 });
+        if (!res || res.ok === false) { notify((res && res.error) || "Failed to send", "error"); return; }
+        setReplyText("");
+        onReplied();
+      } catch (e) {
+        notify("Failed to send: " + ((e && e.message) || e), "error");
+      } finally { setReplying(false); }
+    }, [replyText, invId, notify, onReplied]);
+
+    return (
+      <div className="cam-investigate-thread">
+        <div className="cam-investigate-thread-head">
+          <h4 className="truncate">{investigation.title || investigation.question}</h4>
+          <InvestigationStatusBadge status={investigation.status} />
+        </div>
+
+        <div className="cam-msg-list">
+          {messages.length === 0 ? (
+            <div className="cam-run-loading"><Spinner size={16} /><span className="muted">Investigating…</span></div>
+          ) : messages.map((m) => <InvestigateMessage key={m.id} m={m} />)}
+        </div>
+
+        {canReply && (
+          <div className="cam-investigate-reply">
+            {isAsk && (
+              <div className="alert" data-tone="warning"><Icon name="info" size={13} /><span>The AI is waiting for your reply.</span></div>
+            )}
+            <Textarea
+              rows={2}
+              value={replyText}
+              onChange={(e) => setReplyText(e.target.value)}
+              placeholder={isAsk ? "Answer the AI's question…" : "Ask a follow-up…"}
+              disabled={replying}
+            />
+            <Button variant="primary" icon={replying ? undefined : "send"} loading={replying} disabled={replying || !replyText.trim()} onClick={send}>
+              {isAsk ? "Reply" : "Follow up"}
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function InvestigateTab({ site, investigations, listRefresh, notify }) {
+    const [question, setQuestion] = useState("");
+    const [asking, setAsking] = useState(false);
+    const [selectedId, setSelectedId] = useState("");
+
+    useEffect(() => { setSelectedId(""); setQuestion(""); }, [site.id]);
+
+    // Polls the selected investigation's full transcript regardless of status —
+    // mirrors RunHistoryTab's runDetailLive — so a reply sent from another tab,
+    // or a request that outlived the client's own timeout, still shows up here.
+    const detailLive = useLive(
+      selectedId ? `/ui/api/cameras/investigations/get?id=${encodeURIComponent(selectedId)}` : "",
+      { interval: 4000, enabled: !!selectedId }
+    );
+    const investigation = detailLive.data && detailLive.data.investigation;
+    const messages = (detailLive.data && detailLive.data.messages) || [];
+
+    const ask = useCallback(async () => {
+      const q = question.trim();
+      if (!q) { notify("Type a question first", "error"); return; }
+      setAsking(true);
+      try {
+        const res = await api.post("/ui/api/cameras/investigations", { site_id: site.id, question: q }, { timeoutMs: 400000 });
+        if (!res || res.ok === false) { notify((res && res.error) || "Failed to start investigation", "error"); return; }
+        setQuestion("");
+        setSelectedId(res.id);
+        listRefresh();
+        notify(
+          res.status === "answered" ? "Investigation answered"
+            : res.status === "awaiting_operator" ? "The AI needs your input"
+            : res.status === "exhausted" ? "Investigation stopped at a budget limit — send a follow-up to continue"
+            : "Investigation started",
+          res.status === "exhausted" ? "info" : "success"
+        );
+      } catch (e) {
+        notify("Failed to start investigation: " + ((e && e.message) || e), "error");
+      } finally { setAsking(false); }
+    }, [question, site, notify, listRefresh]);
+
+    const onReplied = useCallback(() => { detailLive.refresh(); listRefresh(); }, [detailLive, listRefresh]);
+
+    return (
+      <div className="cam-tab-body">
+        <Card title="Ask AI" description="Ask a freeform question about this site — the AI investigates across cameras and time, citing evidence.">
+          <div className="cam-investigate-ask">
+            <Textarea
+              rows={2}
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="What happened at reception around 15:00?"
+              disabled={asking}
+            />
+            <Button variant="primary" icon={asking ? undefined : "search"} loading={asking} disabled={asking || !question.trim()} onClick={ask}>
+              {asking ? "Investigating…" : "Ask"}
+            </Button>
+          </div>
+        </Card>
+
+        <div className="cam-investigate-layout">
+          <Card title="History" flush className="cam-investigate-history">
+            {investigations.length === 0 ? (
+              <EmptyState icon="search" title="No investigations yet" description="Ask a question above to start one." compact />
+            ) : (
+              <div className="cam-investigate-list">
+                {investigations.map((inv) => (
+                  <button
+                    key={inv.id}
+                    type="button"
+                    className={"cam-investigate-list-item" + (inv.id === selectedId ? " active" : "")}
+                    onClick={() => setSelectedId(inv.id)}
+                  >
+                    <span className="truncate">{inv.title || inv.question}</span>
+                    <InvestigationStatusBadge status={inv.status} />
+                    <span className="muted subtle">{ago(inv.updated_at)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          <Card title="Transcript" className="cam-investigate-transcript">
+            {!selectedId ? (
+              <EmptyState icon="info" title="Select an investigation" description="Pick one from the history, or ask a new question above." compact />
+            ) : !investigation ? (
+              <div className="cam-run-loading"><Spinner size={16} /><span className="muted">Loading…</span></div>
+            ) : (
+              <InvestigationThread investigation={investigation} messages={messages} notify={notify} onReplied={onReplied} />
+            )}
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  /* ─────────────────────────────────────────────────────────────
      Top-level screen
      ───────────────────────────────────────────────────────────── */
 
@@ -1591,6 +1875,10 @@
     const watchesLive = useLive(`/ui/api/cameras/watches?site_id=${encodeURIComponent(siteId)}`, { interval: 6000, enabled: !!siteId });
     const watches = (watchesLive.data && watchesLive.data.watches) || [];
 
+    const investigationsLive = useLive(`/ui/api/cameras/investigations?site_id=${encodeURIComponent(siteId)}`, { interval: 8000, enabled: !!siteId });
+    const investigations = (investigationsLive.data && investigationsLive.data.investigations) || [];
+    const awaitingInvestigations = useMemo(() => investigations.filter((i) => i.status === "awaiting_operator"), [investigations]);
+
     const [activeTab, setActiveTab] = useState("setup");
     const [selectedWatchId, setSelectedWatchId] = useState("");
     const [selectedRunId, setSelectedRunId] = useState("");
@@ -1607,16 +1895,17 @@
 
     const refreshAll = useCallback(() => {
       sitesLive.refresh(); dvrsLive.refresh(); camerasLive.refresh();
-      questionsLive.refresh(); watchesLive.refresh(); runsLive.refresh();
-    }, [sitesLive, dvrsLive, camerasLive, questionsLive, watchesLive, runsLive]);
+      questionsLive.refresh(); watchesLive.refresh(); runsLive.refresh(); investigationsLive.refresh();
+    }, [sitesLive, dvrsLive, camerasLive, questionsLive, watchesLive, runsLive, investigationsLive]);
 
     const tabDefs = useMemo(() => ([
       { id: "setup", label: "Cameras", icon: "server" },
       { id: "questions", label: "Questions", icon: "info", badge: openQuestions.length || undefined },
+      { id: "investigate", label: "Ask AI", icon: "search", badge: awaitingInvestigations.length || undefined },
       { id: "watches", label: "Watches", icon: "activity" },
       { id: "runs", label: "Run history", icon: "clock" },
       { id: "diag", label: "Diagnostics", icon: "shield" },
-    ]), [openQuestions.length]);
+    ]), [openQuestions.length, awaitingInvestigations.length]);
 
     return (
       <div className="screen screen-cameras">
@@ -1655,6 +1944,9 @@
             )}
             {activeTab === "questions" && (
               <QuestionsTab questions={questions} camerasById={camerasById} notify={notify} refresh={questionsLive.refresh} />
+            )}
+            {activeTab === "investigate" && (
+              <InvestigateTab site={site} investigations={investigations} listRefresh={investigationsLive.refresh} notify={notify} />
             )}
             {activeTab === "watches" && (
               <WatchesTab

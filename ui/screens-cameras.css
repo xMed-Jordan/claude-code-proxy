@@ -314,10 +314,89 @@
   border: 1px solid var(--border);
 }
 
+/* ── Ask AI investigation chat (WP2) ── */
+
+.cam-investigate-ask { display: flex; gap: 10px; align-items: flex-end; }
+.cam-investigate-ask .textarea { flex: 1; }
+
+.cam-investigate-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: var(--sp-4);
+  align-items: start;
+}
+.cam-investigate-history { min-width: 0; }
+.cam-investigate-transcript { min-width: 0; }
+
+.cam-investigate-list { display: flex; flex-direction: column; }
+.cam-investigate-list-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  padding: var(--sp-3) var(--sp-4);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+  font-size: var(--fs-sm);
+}
+.cam-investigate-list-item:last-child { border-bottom: none; }
+.cam-investigate-list-item:hover { background: var(--surface-2); color: var(--text); }
+.cam-investigate-list-item.active { background: var(--accent-soft); color: var(--text); }
+.cam-investigate-list-item .truncate { max-width: 100%; font-weight: 500; }
+
+.cam-investigate-thread { display: flex; flex-direction: column; gap: var(--sp-4); }
+.cam-investigate-thread-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.cam-investigate-thread-head h4 { margin: 0; font-size: var(--fs-md); font-weight: 600; min-width: 0; }
+
+.cam-msg-list { display: flex; flex-direction: column; gap: 12px; max-height: 560px; overflow-y: auto; padding-right: 4px; }
+
+.cam-msg { display: flex; }
+.cam-msg-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 82%;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.cam-msg-bubble p { margin: 0; font-size: var(--fs-sm); white-space: pre-wrap; }
+.cam-msg-role { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; }
+.cam-msg-args { font-size: 11px; }
+
+.cam-msg-operator { justify-content: flex-end; }
+.cam-msg-operator .cam-msg-bubble { background: var(--accent-soft); border-color: transparent; }
+
+.cam-msg-tool .cam-msg-bubble { background: var(--surface-3); }
+
+.cam-msg-system { justify-content: center; align-items: center; gap: 6px; color: var(--text-3); font-size: var(--fs-xs); }
+
+.cam-evidence-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-top: 4px; }
+.cam-evidence-item { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cam-evidence-item img, .cam-evidence-item video {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: #000;
+}
+.cam-evidence-caption { font-size: 11px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.cam-investigate-reply { display: flex; flex-direction: column; gap: 8px; padding-top: var(--sp-3); border-top: 1px solid var(--border); }
+.cam-investigate-reply .btn { align-self: flex-end; }
+
 /* ── Responsive ── */
 
 @media (max-width: 800px) {
   .cam-form-grid-2 { grid-template-columns: 1fr; }
+  .cam-investigate-layout { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 640px) {

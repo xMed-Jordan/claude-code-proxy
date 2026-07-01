@@ -184,6 +184,14 @@ type config struct {
 	CameraTickInterval         time.Duration // PROXY_CAMERA_TICK_INTERVAL — scheduler tick period
 	CameraWatchConcurrency     int           // PROXY_CAMERA_WATCH_CONCURRENCY — parallel watch runs
 	CameraLogLevel             string        // PROXY_CAMERA_LOG_LEVEL — debug | info | warn | error
+	// Ask-AI investigation chat (camera_investigate.go): a server-orchestrated
+	// agentic loop that lets an operator ask freeform questions about a site and
+	// have the model go back and forth across time with camera tools. Bounded by
+	// turns, media fetches, and a wall-clock budget so it can never loop unbounded.
+	CameraInvestigateAlias    string        // PROXY_CAMERA_INVESTIGATE_ALIAS — vision alias for the investigation loop
+	CameraInvestigateMaxTurns int           // PROXY_CAMERA_INVESTIGATE_MAX_TURNS — agentic loop turn cap
+	CameraInvestigateMaxMedia int           // PROXY_CAMERA_INVESTIGATE_MAX_MEDIA — media fetches per investigation
+	CameraInvestigateBudget   time.Duration // PROXY_CAMERA_INVESTIGATE_BUDGET — wall-clock cap per run
 }
 
 type modelAliasConfig struct {
@@ -666,6 +674,11 @@ func loadConfig() config {
 		CameraTickInterval:         parseAgyTimeout(getenv("PROXY_CAMERA_TICK_INTERVAL", "15")),
 		CameraWatchConcurrency:     parseIntDefault(getenv("PROXY_CAMERA_WATCH_CONCURRENCY", "1"), 1),
 		CameraLogLevel:             strings.ToLower(strings.TrimSpace(getenv("PROXY_CAMERA_LOG_LEVEL", "info"))),
+
+		CameraInvestigateAlias:    strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_ALIAS", "gemini-3.5-flash-medium")),
+		CameraInvestigateMaxTurns: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_TURNS", "12"), 12),
+		CameraInvestigateMaxMedia: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_MEDIA", "30"), 30),
+		CameraInvestigateBudget:   parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_BUDGET", "360")),
 	}
 }
 
@@ -6094,6 +6107,7 @@ var uiSPARoutes = map[string]bool{
 	"/updates":    true,
 	"/browser":    true,
 	"/setup":      true,
+	"/cameras":    true,
 }
 
 // uiIndexFile returns the SPA entry point: the new ui/index.html when present,

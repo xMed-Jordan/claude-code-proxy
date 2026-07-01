@@ -111,6 +111,45 @@ type camCapture struct {
 	ExpiresAt   string
 }
 
+// camInvestigation is one ask-AI investigation session: an operator's freeform
+// question about a site, answered by a server-orchestrated agentic loop over the
+// camera tools (camera_investigate.go). Status drives the UI: active (running),
+// awaiting_operator (paused on an ask_operator turn), answered (a clean final
+// narrative was produced; follow-ups may continue it), exhausted (the run stopped
+// at a turn/media/time bound or an analysis error rather than a clean answer —
+// still re-openable, and a follow-up starts a fresh run), closed (operator
+// dismissed).
+type camInvestigation struct {
+	ID        string
+	SiteID    string
+	Title     string
+	Question  string
+	Alias     string
+	Status    string // active | awaiting_operator | answered | exhausted | closed
+	CreatedAt string
+	UpdatedAt string
+}
+
+// camInvestigationMessage is one entry in an investigation's transcript. role is
+// operator | ai | tool | system; tool_name/tool_args are set on tool rows and
+// media_json carries the served capability tokens/URLs shown that turn. Fetches
+// records how many DVR device fetches a tool row cost (0 on non-tool rows) so
+// the media budget reconstructs across a pause/resume in the SAME unit the live
+// loop spends it (mediaUsed += tr.Fetches) — persisted media artifacts alone
+// diverge (past_frames: 1 fetch -> many frames; mosaic: many fetches -> 1 tile).
+type camInvestigationMessage struct {
+	ID              string
+	InvestigationID string
+	Seq             int
+	Role            string // operator | ai | tool | system
+	Content         string
+	ToolName        string
+	ToolArgs        string
+	MediaJSON       string
+	Fetches         int
+	CreatedAt       string
+}
+
 // camEvent is one diagnostics-trail row (written by appendCameraEvent).
 type camEvent struct {
 	ID        string
@@ -254,6 +293,28 @@ func migrateCameraDB(db *sql.DB) error {
 			detail TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS camera_investigations (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			question TEXT NOT NULL DEFAULT '',
+			alias TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_investigation_messages (
+			id TEXT PRIMARY KEY,
+			investigation_id TEXT NOT NULL,
+			seq INTEGER NOT NULL DEFAULT 0,
+			role TEXT NOT NULL DEFAULT '',
+			content TEXT NOT NULL DEFAULT '',
+			tool_name TEXT NOT NULL DEFAULT '',
+			tool_args TEXT NOT NULL DEFAULT '',
+			media_json TEXT NOT NULL DEFAULT '',
+			fetches INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cameras_site ON cameras(site_id, enabled)`,
 		`CREATE INDEX IF NOT EXISTS idx_cameras_dvr ON cameras(dvr_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_dvrs_site ON camera_dvrs(site_id)`,
@@ -263,6 +324,8 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_captures_token ON camera_captures(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_run ON camera_captures(watch_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_expires ON camera_captures(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_site ON camera_investigations(site_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_investigation_messages_inv ON camera_investigation_messages(investigation_id, seq)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_ts ON camera_events(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_dvr ON camera_events(dvr_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_op ON camera_events(op, ok)`,
@@ -271,6 +334,11 @@ func migrateCameraDB(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	// Additive column for databases created before the investigation media budget
+	// was tracked in device-fetch units (idempotent — a no-op once present).
+	if err := ensureSQLiteColumn(db, "camera_investigation_messages", "fetches", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -954,4 +1022,141 @@ func pruneCameraEvents(db *sql.DB, olderThan string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ─────────────────────────── camera_investigations ───────────────────────────
+
+const camInvestigationCols = `id, site_id, title, question, alias, status, created_at, updated_at`
+
+func scanInvestigation(s rowScanner) (camInvestigation, error) {
+	var v camInvestigation
+	err := s.Scan(&v.ID, &v.SiteID, &v.Title, &v.Question, &v.Alias, &v.Status, &v.CreatedAt, &v.UpdatedAt)
+	return v, err
+}
+
+func insertCameraInvestigation(db *sql.DB, inv camInvestigation) (string, error) {
+	if inv.ID == "" {
+		inv.ID = randomID("inv")
+	}
+	if inv.Status == "" {
+		inv.Status = "active"
+	}
+	now := nowRFC3339()
+	if inv.CreatedAt == "" {
+		inv.CreatedAt = now
+	}
+	if inv.UpdatedAt == "" {
+		inv.UpdatedAt = now
+	}
+	_, err := db.Exec(`INSERT INTO camera_investigations
+		(id, site_id, title, question, alias, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		inv.ID, inv.SiteID, inv.Title, inv.Question, inv.Alias, inv.Status, inv.CreatedAt, inv.UpdatedAt)
+	return inv.ID, err
+}
+
+func getCameraInvestigation(db *sql.DB, id string) (camInvestigation, error) {
+	return scanInvestigation(db.QueryRow(`SELECT `+camInvestigationCols+` FROM camera_investigations WHERE id = ?`, id))
+}
+
+// listCameraInvestigations lists a site's investigations newest-first; siteID==""
+// lists every site's investigations.
+func listCameraInvestigations(db *sql.DB, siteID string) ([]camInvestigation, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if strings.TrimSpace(siteID) == "" {
+		rows, err = db.Query(`SELECT ` + camInvestigationCols + ` FROM camera_investigations ORDER BY updated_at DESC`)
+	} else {
+		rows, err = db.Query(`SELECT `+camInvestigationCols+` FROM camera_investigations WHERE site_id = ? ORDER BY updated_at DESC`, siteID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camInvestigation
+	for rows.Next() {
+		v, err := scanInvestigation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// setCameraInvestigationStatus updates an investigation's lifecycle status and
+// stamps updated_at.
+func setCameraInvestigationStatus(db *sql.DB, id, status string) error {
+	_, err := db.Exec(`UPDATE camera_investigations SET status = ?, updated_at = ? WHERE id = ?`, status, nowRFC3339(), id)
+	return err
+}
+
+// ─────────────────────── camera_investigation_messages ───────────────────────
+
+const camInvMsgCols = `id, investigation_id, seq, role, content, tool_name, tool_args, media_json, fetches, created_at`
+
+func scanInvestigationMessage(s rowScanner) (camInvestigationMessage, error) {
+	var m camInvestigationMessage
+	err := s.Scan(&m.ID, &m.InvestigationID, &m.Seq, &m.Role, &m.Content, &m.ToolName, &m.ToolArgs, &m.MediaJSON, &m.Fetches, &m.CreatedAt)
+	return m, err
+}
+
+// appendCameraInvestigationMessage appends a transcript message, auto-assigning
+// the next seq within the investigation (when m.Seq is 0) and bumping the
+// investigation's updated_at so lists sort by recent activity. Returns the new id.
+func appendCameraInvestigationMessage(db *sql.DB, m camInvestigationMessage) (string, error) {
+	if m.ID == "" {
+		m.ID = randomID("imsg")
+	}
+	if m.CreatedAt == "" {
+		m.CreatedAt = nowRFC3339()
+	}
+	if m.Seq <= 0 {
+		var maxSeq sql.NullInt64
+		_ = db.QueryRow(`SELECT MAX(seq) FROM camera_investigation_messages WHERE investigation_id = ?`, m.InvestigationID).Scan(&maxSeq)
+		m.Seq = int(maxSeq.Int64) + 1
+	}
+	_, err := db.Exec(`INSERT INTO camera_investigation_messages
+		(id, investigation_id, seq, role, content, tool_name, tool_args, media_json, fetches, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.InvestigationID, m.Seq, m.Role, m.Content, m.ToolName, m.ToolArgs, m.MediaJSON, m.Fetches, m.CreatedAt)
+	if err != nil {
+		return "", err
+	}
+	_, _ = db.Exec(`UPDATE camera_investigations SET updated_at = ? WHERE id = ?`, nowRFC3339(), m.InvestigationID)
+	return m.ID, nil
+}
+
+// listCameraInvestigationMessages returns an investigation's transcript in seq order.
+func listCameraInvestigationMessages(db *sql.DB, investigationID string) ([]camInvestigationMessage, error) {
+	rows, err := db.Query(`SELECT `+camInvMsgCols+` FROM camera_investigation_messages WHERE investigation_id = ? ORDER BY seq`, investigationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camInvestigationMessage
+	for rows.Next() {
+		m, err := scanInvestigationMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// getCameraInvestigationWithMessages loads an investigation plus its full ordered
+// transcript in one call (the /get endpoint's shape).
+func getCameraInvestigationWithMessages(db *sql.DB, id string) (camInvestigation, []camInvestigationMessage, error) {
+	inv, err := getCameraInvestigation(db, id)
+	if err != nil {
+		return camInvestigation{}, nil, err
+	}
+	msgs, err := listCameraInvestigationMessages(db, id)
+	if err != nil {
+		return inv, nil, err
+	}
+	return inv, msgs, nil
 }
