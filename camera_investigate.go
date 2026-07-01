@@ -736,7 +736,7 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 	if len(ids) == 0 {
 		return investigateToolResult{Summary: "past_frames: no valid camera_ids given (must be exact ids from the roster)."}
 	}
-	from, to, terr := camParseWindow(args.From, args.To, cfg)
+	from, to, terr := camParseWindow(args.From, args.To, cfg, false)
 	if terr != nil {
 		return investigateToolResult{Summary: "past_frames: " + terr.Error()}
 	}
@@ -860,7 +860,7 @@ func camToolPastClip(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 	if !ok || !dv.Enabled {
 		return investigateToolResult{Summary: "past_clip: camera " + id + " has no enabled DVR."}
 	}
-	from, to, terr := camParseWindow(args.From, args.To, cfg)
+	from, to, terr := camParseWindow(args.From, args.To, cfg, true)
 	if terr != nil {
 		return investigateToolResult{Summary: "past_clip: " + terr.Error()}
 	}
@@ -893,7 +893,7 @@ func camToolPastClip(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 // precede "to", and the span is capped at cfg.CameraClipMaxSeconds (the same
 // ceiling clip captures already enforce) so a runaway request can't pull hours
 // of footage.
-func camParseWindow(fromRaw, toRaw string, cfg config) (from, to time.Time, err error) {
+func camParseWindow(fromRaw, toRaw string, cfg config, clampToClipMax bool) (from, to time.Time, err error) {
 	fromRaw, toRaw = strings.TrimSpace(fromRaw), strings.TrimSpace(toRaw)
 	if fromRaw == "" || toRaw == "" {
 		return time.Time{}, time.Time{}, errors.New(`"from" and "to" must both be RFC3339 timestamps`)
@@ -913,12 +913,17 @@ func camParseWindow(fromRaw, toRaw string, cfg config) (from, to time.Time, err 
 	if !from.Before(to) {
 		return time.Time{}, time.Time{}, errors.New(`"from" must be before "to"`)
 	}
-	maxSec := cfg.CameraClipMaxSeconds
-	if maxSec <= 0 {
-		maxSec = 300
-	}
-	if span := to.Sub(from); span > time.Duration(maxSec)*time.Second {
-		from = to.Add(-time.Duration(maxSec) * time.Second)
+	// past_clip pulls a REAL-TIME clip, so its window must be bounded to the clip
+	// max; past_frames samples instants (cost bounded by the frame count, not
+	// duration) and passes clampToClipMax=false so it can span the whole day.
+	if clampToClipMax {
+		maxSec := cfg.CameraClipMaxSeconds
+		if maxSec <= 0 {
+			maxSec = 300
+		}
+		if span := to.Sub(from); span > time.Duration(maxSec)*time.Second {
+			from = to.Add(-time.Duration(maxSec) * time.Second)
+		}
 	}
 	return from, to, nil
 }
