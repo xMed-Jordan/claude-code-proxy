@@ -458,6 +458,13 @@ func analyzeWithAgy(ctx context.Context, cfg config, alias, systemPrompt, userTe
 	return text, nil
 }
 
+// cameraClaudeAnalyzeTimeout is the per-call floor for a claude camera-analysis
+// run: a multi-image vision describe (16+ frames) or escalation round
+// legitimately takes minutes, far longer than the chat-oriented
+// cfg.ClaudeTimeout (180s default). It is applied via a LOCAL cfg copy so it
+// never changes the global (inbound/Connect) claude chat timeout.
+const cameraClaudeAnalyzeTimeout = 6 * time.Minute
+
 // analyzeWithClaude inlines the capture files as base64 image blocks via
 // claudeBuildInput and streams the run. Clips are pre-sampled to frames; images
 // are downscaled to keep the total under claudeMaxInlineMediaBytes. The system
@@ -495,7 +502,14 @@ func analyzeWithClaude(ctx context.Context, cfg config, alias, systemPrompt, use
 		"prompt_bytes": len(prompt), "inline_images": len(parts), "dropped_media": dropped, "media_in": mediaIn,
 	})
 
-	res, err := runClaudeStream(ctx, cfg, stdin, mediaIn, claudeModelFor(cfg, alias), nil)
+	// Raise the per-call claude timeout to a generous floor for this camera
+	// analysis so a multi-image describe/escalation round is not killed at the
+	// 180s chat default. A local cfg copy keeps inbound claude traffic untouched.
+	acfg := cfg
+	if acfg.ClaudeTimeout < cameraClaudeAnalyzeTimeout {
+		acfg.ClaudeTimeout = cameraClaudeAnalyzeTimeout
+	}
+	res, err := runClaudeStream(ctx, acfg, stdin, mediaIn, claudeModelFor(cfg, alias), nil)
 	if err != nil {
 		return "", fmt.Errorf("claude analysis failed: %w", err)
 	}
