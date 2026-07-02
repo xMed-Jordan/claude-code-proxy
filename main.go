@@ -188,10 +188,13 @@ type config struct {
 	// agentic loop that lets an operator ask freeform questions about a site and
 	// have the model go back and forth across time with camera tools. Bounded by
 	// turns, media fetches, and a wall-clock budget so it can never loop unbounded.
-	CameraInvestigateAlias    string        // PROXY_CAMERA_INVESTIGATE_ALIAS — vision alias for the investigation loop
-	CameraInvestigateMaxTurns int           // PROXY_CAMERA_INVESTIGATE_MAX_TURNS — agentic loop turn cap
-	CameraInvestigateMaxMedia int           // PROXY_CAMERA_INVESTIGATE_MAX_MEDIA — media fetches per investigation
-	CameraInvestigateBudget   time.Duration // PROXY_CAMERA_INVESTIGATE_BUDGET — wall-clock cap per run
+	CameraInvestigateAlias         string        // PROXY_CAMERA_INVESTIGATE_ALIAS — vision alias for the investigation loop
+	CameraInvestigateMaxTurns      int           // PROXY_CAMERA_INVESTIGATE_MAX_TURNS — agentic loop turn cap
+	CameraInvestigateMaxMedia      int           // PROXY_CAMERA_INVESTIGATE_MAX_MEDIA — media fetches per investigation
+	CameraInvestigateBudget        time.Duration // PROXY_CAMERA_INVESTIGATE_BUDGET — wall-clock cap per run
+	CameraInvestigateWorkerEnabled bool          // PROXY_CAMERA_INVESTIGATE_WORKER — run the durable background investigation queue (default true)
+	CameraInvestigateConcurrency   int           // PROXY_CAMERA_INVESTIGATE_CONCURRENCY — parallel investigation runs (default 2)
+	CameraInvestigateTickInterval  time.Duration // PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL — queue poll cadence (default 5s)
 	// Camera frame archive → S3-compatible object storage (Hetzner). The archiver
 	// (camera_archive.go) writes one JPEG per second per camera per quality; the
 	// investigate read-through (camera_investigate.go) serves past frames from here.
@@ -698,10 +701,13 @@ func loadConfig() config {
 		CameraWatchConcurrency:     parseIntDefault(getenv("PROXY_CAMERA_WATCH_CONCURRENCY", "1"), 1),
 		CameraLogLevel:             strings.ToLower(strings.TrimSpace(getenv("PROXY_CAMERA_LOG_LEVEL", "info"))),
 
-		CameraInvestigateAlias:    strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_ALIAS", "gemini-3.5-flash-medium")),
-		CameraInvestigateMaxTurns: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_TURNS", "12"), 12),
-		CameraInvestigateMaxMedia: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_MEDIA", "30"), 30),
-		CameraInvestigateBudget:   parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_BUDGET", "360")),
+		CameraInvestigateAlias:         strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_ALIAS", "gemini-3.5-flash-medium")),
+		CameraInvestigateMaxTurns:      parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_TURNS", "12"), 12),
+		CameraInvestigateMaxMedia:      parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_MEDIA", "30"), 30),
+		CameraInvestigateBudget:        parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_BUDGET", "1800")),
+		CameraInvestigateWorkerEnabled: envFlag("PROXY_CAMERA_INVESTIGATE_WORKER", true),
+		CameraInvestigateConcurrency:   parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_CONCURRENCY", "2"), 2),
+		CameraInvestigateTickInterval:  parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL", "5")),
 
 		CameraS3Endpoint:          strings.TrimSpace(getenv("PROXY_CAM_S3_ENDPOINT", "hel1.your-objectstorage.com")),
 		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams")),

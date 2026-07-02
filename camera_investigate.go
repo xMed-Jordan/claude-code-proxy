@@ -253,7 +253,10 @@ func camInvestigateMaxMedia(cfg config) int {
 func camInvestigateBudget(cfg config) time.Duration {
 	d := cfg.CameraInvestigateBudget
 	if d <= 0 {
-		d = 360 * time.Second
+		d = 30 * time.Minute // detached background run — no human is blocked on it
+	}
+	if d > time.Hour {
+		d = time.Hour // hard ceiling for a single detached run
 	}
 	return d
 }
@@ -1159,8 +1162,8 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	if err != nil {
 		return fmt.Errorf("load investigation: %w", err)
 	}
-	if inv.Status != "active" && inv.Status != "awaiting_operator" {
-		return nil // already terminal (answered/closed) — nothing to run
+	if inv.Status != "running" {
+		return nil // only a worker-claimed (running) row executes — the queue owns queued→running
 	}
 	site, err := getCameraSite(db, inv.SiteID)
 	if err != nil {
@@ -1307,6 +1310,166 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	}
 }
 
+// ─────────────────────── background investigation queue ───────────────────────
+
+// camInvestigateSem bounds concurrently RUNNING investigations across the whole
+// worker; one run can take up to the investigate budget (far longer than a tick).
+// Sized once by startCameraInvestigationWorker; stays nil when the worker is off.
+var camInvestigateSem chan struct{}
+
+// startCameraInvestigationWorker is the runServe hook for the DURABLE Ask-AI
+// investigation queue. The HTTP handlers ENQUEUE investigations (status "queued")
+// and this worker runs them detached from any request, so a page refresh/close
+// never kills a run. On startup it recovers rows stranded in "running" by a
+// crash/restart (resets them to "queued"), then polls for "queued" rows and runs
+// each to completion on a background context bounded by the wall-clock budget.
+func startCameraInvestigationWorker(cfg config) {
+	if !cfg.CameraInvestigateWorkerEnabled {
+		camlog("info", "investigate_worker", map[string]any{"enabled": false})
+		return
+	}
+	if strings.TrimSpace(cfg.PublicURL) == "" {
+		camlog("warn", "investigate_worker", map[string]any{"public_url": "unset",
+			"note": "background-run evidence links fall back to http://127.0.0.1 — set PROXY_PUBLIC_URL for externally reachable proof URLs"})
+	}
+	// Crash recovery: a "running" row is orphaned (its goroutine died with the
+	// process) — requeue for retry. runInvestigation is resumable, so this loses at
+	// most the single in-flight turn. Done once, before the ticker starts.
+	if db, err := openProxyDB(cfg); err == nil {
+		if n, rerr := requeueRunningCameraInvestigations(db); rerr != nil {
+			camlog("warn", "investigate_recover", map[string]any{"ok": false, "error": rerr.Error()})
+		} else if n > 0 {
+			camlog("info", "investigate_recover", map[string]any{"requeued": n})
+		}
+		db.Close()
+	}
+
+	interval := cfg.CameraInvestigateTickInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	conc := cfg.CameraInvestigateConcurrency
+	if conc < 1 {
+		conc = 1
+	}
+	camInvestigateSem = make(chan struct{}, conc)
+	camlog("info", "investigate_worker_start", map[string]any{"tick_ms": interval.Milliseconds(), "concurrency": conc})
+
+	go func() {
+		time.Sleep(camStartupJitter(interval))
+		camInvestigationTick(cfg)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			camInvestigationTick(cfg)
+		}
+	}()
+}
+
+// camInvestigationTick claims and dispatches queued investigations. It no-ops while
+// the proxy is globally paused (in-flight detached runs finish naturally).
+func camInvestigationTick(cfg config) {
+	if !proxyEnabled.Load() {
+		return
+	}
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		camlog("error", "investigate_tick", map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer db.Close()
+
+	// Runtime reaper: requeue "running" rows stranded by a crashed run or a lost
+	// terminalization write (idle longer than a whole run could take). Self-heals the
+	// stuck-"running" case without waiting for a process restart.
+	if n, rerr := requeueStaleRunningCameraInvestigations(db, camInvestigateBudget(cfg)+2*time.Minute); rerr != nil {
+		camlog("warn", "investigate_reap", map[string]any{"ok": false, "error": rerr.Error()})
+	} else if n > 0 {
+		camlog("info", "investigate_reap", map[string]any{"requeued_stale_running": n})
+	}
+
+	queued, err := listQueuedCameraInvestigations(db)
+	if err != nil {
+		camlog("error", "investigate_tick", map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	for _, inv := range queued {
+		camConsiderInvestigation(cfg, db, inv)
+	}
+}
+
+// camConsiderInvestigation acquires a concurrency slot, atomically claims the row
+// (queued→running), and spawns the bounded, DETACHED run — the same acquire-then-
+// claim, release-on-lost-claim shape as camConsiderWatch.
+func camConsiderInvestigation(cfg config, db *sql.DB, inv camInvestigation) {
+	select {
+	case camInvestigateSem <- struct{}{}:
+	default:
+		camlog("debug", "investigate_busy", map[string]any{"investigation_id": inv.ID})
+		return // reconsidered next tick; row stays "queued"
+	}
+	claimed, cerr := claimCameraInvestigation(db, inv.ID)
+	if cerr != nil {
+		<-camInvestigateSem
+		camlog("warn", "investigate_claim", map[string]any{"investigation_id": inv.ID, "ok": false, "error": cerr.Error()})
+		return
+	}
+	if !claimed {
+		<-camInvestigateSem // another tick/instance won the claim — not an error
+		return
+	}
+	go func() {
+		defer func() { <-camInvestigateSem }()
+		// recover() so a panic anywhere in the run (image decode / ffmpeg / model-output
+		// parsing) fails just THIS investigation instead of crashing the whole shared
+		// proxy — and terminalize the row so a deterministic panic can't become a
+		// restart crash-loop poison pill.
+		defer func() {
+			if rec := recover(); rec != nil {
+				camlog("error", "investigate_panic", map[string]any{"investigation_id": inv.ID, "panic": fmt.Sprint(rec)})
+				camTerminalizeInvestigation(cfg, inv.ID, "Investigation stopped: an internal error occurred.")
+			}
+		}()
+		// Detached context (NOT an HTTP request); runInvestigation applies the
+		// wall-clock budget internally. r == nil — media URLs come from cfg.PublicURL.
+		if rerr := runInvestigation(context.Background(), cfg, nil, inv.ID); rerr != nil {
+			// Non-nil == a setup failure that left the row "running" with no progress;
+			// mark it terminal so the poll shows a final state (in-loop failures already
+			// self-terminate to "exhausted"; if this write is lost, the runtime reaper
+			// requeueStaleRunningCameraInvestigations picks the row back up).
+			camlog("error", "investigate_run", map[string]any{"investigation_id": inv.ID, "ok": false, "error": rerr.Error()})
+			camTerminalizeInvestigation(cfg, inv.ID, "Investigation could not start: "+rerr.Error())
+		}
+	}()
+}
+
+// camTerminalizeInvestigation best-effort marks an investigation exhausted with a
+// note (the worker's error/panic paths). Best-effort by design: if the DB can't be
+// opened or the write fails, the runtime reaper (requeueStaleRunningCameraInvestigations)
+// eventually requeues the still-"running" row, so nothing strands permanently.
+func camTerminalizeInvestigation(cfg config, id, note string) {
+	if db, err := openProxyDB(cfg); err == nil {
+		_ = camStopInvestigation(db, id, note)
+		db.Close()
+	}
+}
+
+// camRunInvestigationInline drains a just-enqueued investigation synchronously on
+// the request goroutine — the fallback for when the background worker is DISABLED
+// (PROXY_CAMERA_INVESTIGATE_WORKER=false), so disabling it degrades to the legacy
+// synchronous behavior instead of stranding rows in "queued". It claims the row
+// (queued→running) first (a no-op if the worker somehow already grabbed it) and runs
+// with the live request r, so media URLs resolve even without PROXY_PUBLIC_URL.
+func camRunInvestigationInline(db *sql.DB, cfg config, r *http.Request, id string) {
+	if claimed, cerr := claimCameraInvestigation(db, id); cerr != nil || !claimed {
+		return
+	}
+	if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
+		camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
+		_ = camStopInvestigation(db, id, "Investigation could not start: "+rerr.Error())
+	}
+}
+
 // ─────────────────────────────── JSON row mappers ───────────────────────────────
 // Mirrors camerahttp.go's convention: store rows have no json tags, so every
 // response is built as an explicit snake_case map here (camDecodeJSON is
@@ -1355,9 +1518,10 @@ func handleCameraInvestigations(cfg config) http.HandlerFunc {
 }
 
 // handleCameraInvestigationStart implements the POST side of
-// handleCameraInvestigations: validates the request, creates the investigation
-// row + its opening operator message, runs the loop synchronously to its first
-// pause/answer, and returns the full transcript so far.
+// handleCameraInvestigations: validates the request, creates the investigation row
+// (status "queued") + its opening operator message, and returns immediately — the
+// background worker runs the loop detached from this request (or, if the worker is
+// disabled, it is drained inline). The UI polls /investigations/get for progress.
 func handleCameraInvestigationStart(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -1387,7 +1551,7 @@ func handleCameraInvestigationStart(cfg config) http.HandlerFunc {
 		}
 		alias := firstNonEmpty(strings.TrimSpace(body.Alias), strings.TrimSpace(cfg.CameraInvestigateAlias))
 		id, ierr := insertCameraInvestigation(db, camInvestigation{
-			SiteID: siteID, Title: truncateString(question, 80), Question: question, Alias: alias, Status: "active",
+			SiteID: siteID, Title: truncateString(question, 80), Question: question, Alias: alias, Status: "queued",
 		})
 		if ierr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": ierr.Error()})
@@ -1396,8 +1560,12 @@ func handleCameraInvestigationStart(cfg config) http.HandlerFunc {
 		camAppendInvestigateMessage(db, id, "operator", question, "", "", 0, nil)
 		camlog("info", "investigate_create", map[string]any{"investigation_id": id, "site_id": siteID, "alias": alias})
 
-		if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
-			camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
+		// The investigation runs in the BACKGROUND queue (startCameraInvestigationWorker),
+		// detached from this request — a page refresh/close never kills it; the UI's 4s
+		// poll on /investigations/get shows progress. If the worker is DISABLED, drain it
+		// synchronously here so disabling it degrades to legacy sync mode, not stranding.
+		if !cfg.CameraInvestigateWorkerEnabled {
+			camRunInvestigationInline(db, cfg, r, id)
 		}
 		inv, msgs, gerr := getCameraInvestigationWithMessages(db, id)
 		if gerr != nil {
@@ -1412,11 +1580,12 @@ func handleCameraInvestigationStart(cfg config) http.HandlerFunc {
 }
 
 // handleCameraInvestigationReply resumes an investigation: POST {id, message}
-// records the operator's message and continues the loop, returning the updated
-// transcript. Works both to answer an ask_operator pause and, per the plan's
-// "follow-ups may continue it" status semantics, to continue an already-answered
-// investigation with a related question (reopened to "active" first). Rejects
-// only an operator-closed investigation.
+// records the operator's message and RE-ENQUEUES the row (status "queued") for the
+// background worker to continue, returning immediately. Works both to answer an
+// ask_operator pause and to follow up on an already-answered/exhausted investigation.
+// Rejects a closed investigation, and rejects a reply while the row is still
+// queued/running (a worker owns it — wait for it to pause/finish). If the worker is
+// disabled the re-queued row is drained inline.
 func handleCameraInvestigationReply(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1448,21 +1617,30 @@ func handleCameraInvestigationReply(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "investigation not found"})
 			return
 		}
-		if inv.Status == "closed" {
+		switch inv.Status {
+		case "closed":
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
 			return
+		case "queued", "running":
+			// A worker owns this row right now; refusing to mutate it is what prevents
+			// the worker-vs-request lost-update race. Operator waits, then replies.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is still working — wait for it to pause or finish, then reply"})
+			return
 		}
+		// Settled (awaiting_operator | answered | exhausted): append the operator message
+		// FIRST (row still settled, so no worker touches it), THEN flip to "queued" so the
+		// background worker only ever claims a row whose transcript already includes this
+		// reply — this ordering closes the resume-on-stale-transcript race.
 		camAppendInvestigateMessage(db, id, "operator", message, "", "", 0, nil)
-		if inv.Status != "active" && inv.Status != "awaiting_operator" {
-			if serr := setCameraInvestigationStatus(db, id, "active"); serr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
-				return
-			}
+		if serr := setCameraInvestigationStatus(db, id, "queued"); serr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+			return
 		}
 		camlog("info", "investigate_reply", map[string]any{"investigation_id": id, "prev_status": inv.Status})
 
-		if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
-			camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
+		// Background worker resumes the re-queued row; drain inline if it's disabled.
+		if !cfg.CameraInvestigateWorkerEnabled {
+			camRunInvestigationInline(db, cfg, r, id)
 		}
 		outInv, msgs, gerr2 := getCameraInvestigationWithMessages(db, id)
 		if gerr2 != nil {

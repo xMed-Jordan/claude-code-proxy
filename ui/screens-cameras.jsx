@@ -1552,11 +1552,13 @@
      slow/retried request) converges on the same state.
      ───────────────────────────────────────────────────────────── */
 
-  const INVESTIGATION_STATUS_TONE = { active: "info", awaiting_operator: "warning", answered: "success", exhausted: "warning", closed: "neutral" };
+  const INVESTIGATION_STATUS_TONE = { queued: "info", running: "info", active: "info", awaiting_operator: "warning", answered: "success", exhausted: "warning", closed: "neutral" };
+  const INVESTIGATION_STATUS_LABEL = { queued: "queued", running: "working" };
   function InvestigationStatusBadge({ status }) {
+    const working = status === "queued" || status === "running" || status === "active";
     return (
-      <Badge tone={INVESTIGATION_STATUS_TONE[status] || "neutral"} pulse={status === "active"}>
-        {(status || "unknown").replace(/_/g, " ")}
+      <Badge tone={INVESTIGATION_STATUS_TONE[status] || "neutral"} pulse={working}>
+        {(INVESTIGATION_STATUS_LABEL[status] || status || "unknown").replace(/_/g, " ")}
       </Badge>
     );
   }
@@ -1678,7 +1680,8 @@
     useEffect(() => { setReplyText(""); }, [invId]);
 
     const isAsk = investigation.status === "awaiting_operator";
-    const canReply = investigation.status !== "closed";
+    const working = investigation.status === "queued" || investigation.status === "running";
+    const canReply = investigation.status !== "closed" && !working;
 
     const send = useCallback(async () => {
       const msg = replyText.trim();
@@ -1707,6 +1710,11 @@
           ) : messages.map((m) => <InvestigateMessage key={m.id} m={m} />)}
         </div>
 
+        {working && (
+          <div className="cam-investigate-reply">
+            <div className="alert" data-tone="info"><Spinner size={13} /><span>The AI is working in the background — safe to leave or refresh this page; progress keeps updating here.</span></div>
+          </div>
+        )}
         {canReply && (
           <div className="cam-investigate-reply">
             {isAsk && (
@@ -1759,8 +1767,8 @@
           res.status === "answered" ? "Investigation answered"
             : res.status === "awaiting_operator" ? "The AI needs your input"
             : res.status === "exhausted" ? "Investigation stopped at a budget limit — send a follow-up to continue"
-            : "Investigation started",
-          res.status === "exhausted" ? "info" : "success"
+            : "Investigation started — working in the background",
+          "success"
         );
       } catch (e) {
         notify("Failed to start investigation: " + ((e && e.message) || e), "error");

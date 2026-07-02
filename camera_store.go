@@ -325,6 +325,7 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_run ON camera_captures(watch_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_expires ON camera_captures(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_site ON camera_investigations(site_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_status ON camera_investigations(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigation_messages_inv ON camera_investigation_messages(investigation_id, seq)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_ts ON camera_events(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_dvr ON camera_events(dvr_id)`,
@@ -1091,6 +1092,76 @@ func listCameraInvestigations(db *sql.DB, siteID string) ([]camInvestigation, er
 func setCameraInvestigationStatus(db *sql.DB, id, status string) error {
 	_, err := db.Exec(`UPDATE camera_investigations SET status = ?, updated_at = ? WHERE id = ?`, status, nowRFC3339(), id)
 	return err
+}
+
+// claimCameraInvestigation atomically transitions an investigation from "queued"
+// to "running", returning true only if THIS caller won the claim (RowsAffected==1)
+// — the same compare-and-swap idiom as claimCameraWatch, so two worker ticks (or
+// two proxy instances) can never run the same investigation twice.
+func claimCameraInvestigation(db *sql.DB, id string) (bool, error) {
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'running', updated_at = ?
+		WHERE id = ? AND status = 'queued'`, nowRFC3339(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// listQueuedCameraInvestigations returns investigations awaiting a worker claim
+// (status='queued'), oldest-activity first so the queue is fair/FIFO.
+func listQueuedCameraInvestigations(db *sql.DB) ([]camInvestigation, error) {
+	rows, err := db.Query(`SELECT ` + camInvestigationCols +
+		` FROM camera_investigations WHERE status = 'queued' ORDER BY updated_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camInvestigation
+	for rows.Next() {
+		v, err := scanInvestigation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// requeueRunningCameraInvestigations resets investigations stranded in "running"
+// (a crash/restart left them with no live worker goroutine) back to "queued" for
+// retry. runInvestigation is resumable — it reloads the persisted transcript and
+// recomputes turn/media budgets — so at most the single in-flight turn is lost.
+// Returns how many were reset; run once at worker startup, before the ticker.
+func requeueRunningCameraInvestigations(db *sql.DB) (int64, error) {
+	// Also catch legacy "active" rows: the pre-queue build set that status while a
+	// synchronous run was in flight, so after upgrading such a row is orphaned too
+	// (the new code never writes "active"). Resumable, so re-running is safe.
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
+		WHERE status IN ('running', 'active')`, nowRFC3339())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// requeueStaleRunningCameraInvestigations is the RUNTIME reaper (called every tick):
+// it requeues "running" rows with no activity for longer than olderThan. A run's
+// context can't outlive the budget, and a healthy run bumps updated_at every turn,
+// so a "running" row idle for > budget+margin is orphaned (its goroutine crashed,
+// or its terminalization write was lost) and safe to re-run — which self-heals the
+// stuck-"running" case without waiting for a process restart. Returns how many.
+func requeueStaleRunningCameraInvestigations(db *sql.DB, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-olderThan).Format(time.RFC3339)
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
+		WHERE status = 'running' AND updated_at < ?`, nowRFC3339(), cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ─────────────────────── camera_investigation_messages ───────────────────────
