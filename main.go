@@ -206,7 +206,10 @@ type config struct {
 	CameraArchiveEnabled      bool          // PROXY_CAM_ARCHIVE_ENABLED — run the background frame archiver
 	CameraArchiveInterval     time.Duration // PROXY_CAM_ARCHIVE_INTERVAL — sub-stream cadence (default 15s)
 	CameraArchiveMainInterval time.Duration // PROXY_CAM_ARCHIVE_MAIN_INTERVAL — main-stream cadence (default 30s)
-	CameraArchiveConcurrency  int           // PROXY_CAM_ARCHIVE_CONCURRENCY — parallel archive captures (default 4)
+	CameraArchiveConcurrency  int           // PROXY_CAM_ARCHIVE_CONCURRENCY — parallel archive captures per stream pool (default 16)
+	CameraArchiveRetries      int           // PROXY_CAM_ARCHIVE_RETRIES — retry a failed frame capture+upload this many times (default 2)
+	CameraArchiveMainWidth    int           // PROXY_CAM_ARCHIVE_MAIN_WIDTH — requested main-snapshot width via ISAPI (default 2560)
+	CameraArchiveMainHeight   int           // PROXY_CAM_ARCHIVE_MAIN_HEIGHT — requested main-snapshot height via ISAPI (default 1440)
 }
 
 type modelAliasConfig struct {
@@ -704,7 +707,10 @@ func loadConfig() config {
 		CameraArchiveEnabled:      envFlag("PROXY_CAM_ARCHIVE_ENABLED", false),
 		CameraArchiveInterval:     parseAgyTimeout(getenv("PROXY_CAM_ARCHIVE_INTERVAL", "15")),
 		CameraArchiveMainInterval: parseAgyTimeout(getenv("PROXY_CAM_ARCHIVE_MAIN_INTERVAL", "30")),
-		CameraArchiveConcurrency:  parseIntDefault(getenv("PROXY_CAM_ARCHIVE_CONCURRENCY", "4"), 4),
+		CameraArchiveConcurrency:  parseIntDefault(getenv("PROXY_CAM_ARCHIVE_CONCURRENCY", "16"), 16),
+		CameraArchiveRetries:      parseIntDefault(getenv("PROXY_CAM_ARCHIVE_RETRIES", "2"), 2),
+		CameraArchiveMainWidth:    parseIntDefault(getenv("PROXY_CAM_ARCHIVE_MAIN_WIDTH", "2560"), 2560),
+		CameraArchiveMainHeight:   parseIntDefault(getenv("PROXY_CAM_ARCHIVE_MAIN_HEIGHT", "1440"), 1440),
 	}
 }
 
