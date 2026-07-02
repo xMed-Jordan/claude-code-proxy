@@ -72,25 +72,27 @@ func startCameraArchiver(cfg config) {
 		mainInterval = 30 * time.Second
 	}
 
-	// Both streams are cheap HTTP snapshots, so the pools are NOT bounded by the
-	// ffmpeg-oriented captureSem — each stream gets its own pool of
-	// cfg.CameraArchiveConcurrency HTTP workers, so the archiver scales to many
-	// DVRs/cameras. (Only a brand without an HTTP snapshot drops to the ffmpeg
-	// fallback, which still takes a captureSem slot and is thereby bounded.)
-	workers := cfg.CameraArchiveConcurrency
-	if workers < 1 {
-		workers = 16
+	// Both streams are cheap HTTP snapshots, NOT ffmpeg, so the archiver isn't
+	// bounded by the ffmpeg-oriented captureSem. Concurrency is bounded PER DVR
+	// (cfg.CameraArchiveConcurrency) and DVRs are archived in PARALLEL, so a single
+	// DVR is never hammered with too many simultaneous full-res snapshots (which
+	// slows it down and triggers retries) while total throughput still scales with
+	// the number of DVRs. (Only a brand without an HTTP snapshot drops to the
+	// ffmpeg fallback, which still takes a captureSem slot and is thereby bounded.)
+	perDVR := cfg.CameraArchiveConcurrency
+	if perDVR < 1 {
+		perDVR = 6
 	}
 
 	camlog("info", "archiver_start", map[string]any{
 		"sub_interval_ms": interval.Milliseconds(), "main_interval_ms": mainInterval.Milliseconds(),
-		"workers_per_stream": workers, "retries": cfg.CameraArchiveRetries,
+		"per_dvr_concurrency": perDVR, "retries": cfg.CameraArchiveRetries,
 		"main_res": fmt.Sprintf("%dx%d", cfg.CameraArchiveMainWidth, cfg.CameraArchiveMainHeight),
 		"bucket": cfg.CameraS3Bucket, "endpoint": cfg.CameraS3Endpoint,
 	})
 
-	go camArchiveStreamLoop(cfg, "sub", StreamSub, interval, workers)
-	go camArchiveStreamLoop(cfg, "main", StreamMain, mainInterval, workers)
+	go camArchiveStreamLoop(cfg, "sub", StreamSub, interval, perDVR)
+	go camArchiveStreamLoop(cfg, "main", StreamMain, mainInterval, perDVR)
 }
 
 // camArchiveStreamLoop runs one stream's archiver forever: it ticks at `interval`
@@ -100,16 +102,16 @@ func startCameraArchiver(cfg config) {
 // restart. Because a cycle runs to completion before the next iteration, Go's
 // time.Ticker (which drops, not queues, unread ticks) gives us "skip the next tick
 // if this one is still running" for free.
-func camArchiveStreamLoop(cfg config, label string, q StreamQuality, interval time.Duration, workers int) {
-	if workers < 1 {
-		workers = 1
+func camArchiveStreamLoop(cfg config, label string, q StreamQuality, interval time.Duration, perDVR int) {
+	if perDVR < 1 {
+		perDVR = 1
 	}
 	time.Sleep(camStartupJitter(interval))
-	camArchiveStreamCycle(cfg, label, q, interval, workers)
+	camArchiveStreamCycle(cfg, label, q, interval, perDVR)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		camArchiveStreamCycle(cfg, label, q, interval, workers)
+		camArchiveStreamCycle(cfg, label, q, interval, perDVR)
 	}
 }
 
@@ -119,7 +121,7 @@ func camArchiveStreamLoop(cfg config, label string, q StreamQuality, interval ti
 // finished. The write instant is snapped to THIS stream's grid
 // (camS3SnapArchiveTime) so the object key matches what the read-through looks up.
 // Skipped entirely while the operator has paused the proxy.
-func camArchiveStreamCycle(cfg config, label string, q StreamQuality, interval time.Duration, workers int) {
+func camArchiveStreamCycle(cfg config, label string, q StreamQuality, interval time.Duration, perDVR int) {
 	if !proxyEnabled.Load() {
 		return
 	}
@@ -139,35 +141,16 @@ func camArchiveStreamCycle(cfg config, label string, q StreamQuality, interval t
 		return
 	}
 
-	type archiveJob struct {
-		dvr CamDVR
-		cam camera
-	}
-	jobs := make(chan archiveJob)
-	var uploaded, failed int
+	var uploaded, failed, cameras int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	if workers < 1 {
-		workers = 1
+	if perDVR < 1 {
+		perDVR = 1
 	}
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				ok := camArchiveFrame(cfg, j.dvr, j.cam, q, t)
-				mu.Lock()
-				if ok {
-					uploaded++
-				} else {
-					failed++
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-
-	var cameras int
+	// Archive every DVR in PARALLEL; within a DVR, bound concurrent snapshots to
+	// perDVR so one DVR is never overwhelmed by simultaneous full-res grabs (which
+	// slows it down and triggers retries). Total concurrency therefore scales with
+	// the number of DVRs, not the camera count on any single one.
 	for _, dvr := range dvrs {
 		if !dvr.Enabled {
 			continue
@@ -177,15 +160,36 @@ func camArchiveStreamCycle(cfg config, label string, q StreamQuality, interval t
 			camlog("warn", "archive_cycle", map[string]any{"stream": label, "dvr_id": dvr.ID, "ok": false, "error": cerr.Error()})
 			continue
 		}
-		for _, cam := range cams {
-			if !cam.Enabled {
-				continue
+		wg.Add(1)
+		go func(dvr CamDVR, cams []camera) {
+			defer wg.Done()
+			sem := make(chan struct{}, perDVR)
+			var dwg sync.WaitGroup
+			for _, cam := range cams {
+				if !cam.Enabled {
+					continue
+				}
+				mu.Lock()
+				cameras++
+				mu.Unlock()
+				sem <- struct{}{}
+				dwg.Add(1)
+				go func(cam camera) {
+					defer dwg.Done()
+					defer func() { <-sem }()
+					ok := camArchiveFrame(cfg, dvr, cam, q, t)
+					mu.Lock()
+					if ok {
+						uploaded++
+					} else {
+						failed++
+					}
+					mu.Unlock()
+				}(cam)
 			}
-			cameras++
-			jobs <- archiveJob{dvr: dvr, cam: cam}
-		}
+			dwg.Wait()
+		}(dvr, cams)
 	}
-	close(jobs)
 	wg.Wait()
 
 	dur := time.Since(start)
