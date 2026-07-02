@@ -286,10 +286,15 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now time.Time, tz
 
 	b.WriteString("TOOLS you may call (action.tool):\n")
 	b.WriteString("- roster: re-read the camera roster above as text (no images; use this to double-check exact camera ids).\n")
-	b.WriteString("- snapshot: args.camera_ids (required), args.quality \"sub\"|\"main\" (default main) — a fresh CURRENT still per camera.\n")
+	b.WriteString("- snapshot: args.camera_ids (required), args.quality \"sub\"|\"main\" (see QUALITY below; default main) — a fresh CURRENT still per camera.\n")
 	b.WriteString("- mosaic: args.camera_ids (optional, default = every enabled camera) — one low-res grid of CURRENT sub-stream stills.\n")
-	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6) — stills sampled from RECORDED footage; use this to actually SEE what happened over a time window.\n")
-	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n\n")
+	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use this to actually SEE what happened over a time window.\n")
+	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n\n")
+
+	b.WriteString("QUALITY (args.quality) — choose per request:\n")
+	b.WriteString("- \"main\" = full-resolution: use when FINE DETAIL matters — reading text/labels/signage, checking cleanliness or condition, or identifying small objects, faces, or license plates.\n")
+	b.WriteString("- \"sub\" = lower-resolution and cheaper: fine for counting people, presence/absence, or general activity/movement.\n")
+	b.WriteString("- Default to \"sub\" unless the task needs fine detail; switch to \"main\" only when it does.\n\n")
 
 	b.WriteString("PROTOCOL:\n")
 	b.WriteString("- Roster-first: read the roster above and pick the SMALLEST set of cameras worth pulling imagery from before fetching anything.\n")
@@ -726,11 +731,24 @@ func camToolMosaic(ctx context.Context, cfg config, db *sql.DB, r *http.Request,
 	}
 }
 
-// camToolPastFrames pulls a past-playback clip per requested camera (preferring
-// the SUB stream — main is slow for retrospective pulls, per the plan; "main"
-// can be requested explicitly) for [from,to], samples it into up to args.Count
-// stills via sampleClipFrames, persists each as a served frame capture, and
-// returns all sampled paths for the model's next turn.
+// camToolPastFrames samples up to args.Count recorded stills spread across
+// [from,to] for each requested camera (preferring the SUB stream — main is slow
+// for retrospective pulls, per the plan; "main" can be requested explicitly),
+// persists each as a served frame capture, and returns all sampled paths for the
+// model's next turn.
+//
+// S3 READ-THROUGH (WP1): when camS3Enabled(cfg), each sample timestamp is first
+// snapped to the archive grid (camS3SnapArchiveTime — nearest multiple of the
+// background archiver's interval) and looked up in object storage
+// (s3GetObject at camS3FrameKey(id, quality, t)). A HIT is written to a local
+// temp .jpg and used directly — fast, no DVR round-trip. A MISS (errS3NotFound)
+// falls back to the live DVR pull (captureFrameAtTime) exactly as before, and on
+// success the frame is ALSO uploaded (s3PutObject) under the same key so the next
+// query for that instant is a hit — the read-through's own back-fill, plus grid
+// snapping, makes repeated/overlapping investigations converge on the same keys.
+// With S3 disabled the behaviour is byte-for-byte the pre-WP1 DVR path. Every
+// frame is camlog'd with its source (s3|dvr). An S3 hit still counts as one media
+// artifact against the fetch budget (logged as a cheap fetch).
 func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, scratch string, mediaLeft int) investigateToolResult {
 	ids := camFilterAllowed(args.CameraIDs, allowed)
 	if len(ids) == 0 {
@@ -754,6 +772,28 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 	if strings.EqualFold(strings.TrimSpace(args.Quality), "main") {
 		q = StreamMain
 	}
+	qStr := q.String()
+	s3Enabled := camS3Enabled(cfg)
+	// Snap read-through lookups to the SAME grid the archiver wrote on. Main
+	// frames are archived on the slower main cadence, so main lookups must snap
+	// to the main grid — snapping them to the sub grid would target instants
+	// where no main frame was ever written (defaults mirror the archiver: 15s
+	// sub / 30s main).
+	snapInterval := cfg.CameraArchiveInterval
+	if snapInterval <= 0 {
+		snapInterval = 15 * time.Second
+	}
+	if q == StreamMain {
+		snapInterval = cfg.CameraArchiveMainInterval
+		if snapInterval <= 0 {
+			snapInterval = 30 * time.Second
+		}
+	}
+	// s3Down is a per-request circuit breaker: the first transient S3 error
+	// (timeout/blackhole/5xx) trips it and every remaining sample skips S3 and
+	// goes straight to the DVR, so an S3 outage degrades to plain DVR latency
+	// instead of paying the client timeout once per sampled instant per camera.
+	s3Down := false
 
 	// Sample `count` INSTANTS spread across [from,to] and grab one fast frame at
 	// each (captureFrameAtTime) instead of downloading the whole window as a
@@ -790,17 +830,76 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 			if fetches >= mediaLeft {
 				break
 			}
+			// Snap to the archive grid when S3 is on so the lookup key (and any
+			// back-fill) lines up with the archiver and with other investigations.
+			ft := t
+			if s3Enabled {
+				ft = camS3SnapArchiveTime(t, snapInterval)
+			}
 			dest := filepath.Join(scratch, fmt.Sprintf("pf_%s_%02d_%d.jpg", id, i, time.Now().UnixNano()))
-			res, cerr := captureFrameAtTime(ctx, cfg, dv, c.Channel, q, t, dest)
-			fetches++
-			if cerr != nil || res.Path == "" {
+
+			var (
+				res    captureResult
+				source string
+				ok     bool
+				s3Miss bool
+				s3Key  string
+			)
+			// 1) S3 read-through: try object storage first (fast, no DVR). Skip
+			// entirely once the per-request circuit breaker has tripped.
+			if s3Enabled && !s3Down {
+				s3Key = camS3FrameKey(id, qStr, ft)
+				data, gerr := s3GetObject(ctx, cfg, s3Key)
+				switch {
+				case gerr == nil:
+					if werr := os.WriteFile(dest, data, 0o600); werr == nil {
+						w, h := imageDimensions(dest)
+						res = captureResult{Path: dest, ContentType: "image/jpeg", Bytes: int64(len(data)), Width: w, Height: h, Method: "s3"}
+						source, ok = "s3", true
+					}
+				case errors.Is(gerr, errS3NotFound):
+					s3Miss = true // genuine miss — fall back to the DVR and back-fill below
+				default:
+					// Transient S3 error (timeout/blackhole/5xx): trip the circuit
+					// breaker so the rest of this request skips S3, then fall back
+					// to the DVR for this sample (don't re-upload).
+					s3Down = true
+					camlog("warn", "investigate_frame_s3", map[string]any{
+						"camera_id": id, "quality": qStr, "key": s3Key, "op": "get",
+						"error": gerr.Error(), "circuit_open": true,
+					})
+				}
+			}
+			// 2) MISS (or S3 off): pull the frame live from the DVR as before.
+			if !ok {
+				r2, cerr := captureFrameAtTime(ctx, cfg, dv, c.Channel, q, ft, dest)
+				if cerr == nil && r2.Path != "" {
+					res, source, ok = r2, "dvr", true
+					// Back-fill S3 on a genuine miss so the next query is a hit.
+					if s3Enabled && s3Miss {
+						if body, rerr := os.ReadFile(r2.Path); rerr == nil {
+							if perr := s3PutObject(ctx, cfg, s3Key, body, "image/jpeg"); perr != nil {
+								camlog("warn", "investigate_frame_s3", map[string]any{
+									"camera_id": id, "quality": qStr, "key": s3Key, "op": "put", "error": perr.Error(),
+								})
+							}
+						}
+					}
+				}
+			}
+			fetches++ // one media artifact per sampled instant (an S3 hit is a cheap fetch)
+			if !ok {
 				missing++
 				continue // no footage at this instant — skip it, keep sampling the rest
 			}
 			got++
-			ts := t.Format(time.RFC3339)
-			if token, perr := camPersistCapture(db, cfg, "", site.ID, id, "frame", q.String(), res.Path, "image/jpeg", res.Width, res.Height, ts, ts); perr == nil {
-				media = append(media, evidenceItem{MediaURL: camMediaURL(cfg, r, token), Caption: fmt.Sprintf("%s @ %s", camDisplayName(c), t.In(loc).Format("Jan 2 15:04:05"))})
+			camlog("debug", "investigate_frame", map[string]any{
+				"camera_id": id, "quality": qStr, "source": source,
+				"time": ft.Format(time.RFC3339), "s3": s3Enabled,
+			})
+			ts := ft.Format(time.RFC3339)
+			if token, perr := camPersistCapture(db, cfg, "", site.ID, id, "frame", qStr, res.Path, "image/jpeg", res.Width, res.Height, ts, ts); perr == nil {
+				media = append(media, evidenceItem{MediaURL: camMediaURL(cfg, r, token), Caption: fmt.Sprintf("%s @ %s", camDisplayName(c), ft.In(loc).Format("Jan 2 15:04:05"))})
 			}
 			images = append(images, res.Path)
 		}
@@ -837,6 +936,20 @@ func camSampleTimes(from, to time.Time, count int) []time.Time {
 		out[i] = from.Add(time.Duration(span * int64(i) / int64(count-1)))
 	}
 	return out
+}
+
+// camS3SnapArchiveTime rounds t to the nearest instant on the background
+// archiver's grid (a multiple of its sub-stream interval, camS3FrameKey being
+// second-granular) so a read-through lookup lands on the SAME object key the
+// archiver wrote — and so two investigations sampling the same window snap to
+// identical keys, letting each other's put-on-miss back-fills hit. Rounding is
+// on the absolute (UTC) instant, matching camS3FrameKey's t.UTC() layout; it
+// falls back to a 15s grid when the interval is unset. Only used when S3 is on.
+func camS3SnapArchiveTime(t time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	return t.Round(interval)
 }
 
 // camToolPastClip saves a single recorded-footage clip as citable evidence

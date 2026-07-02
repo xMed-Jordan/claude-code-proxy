@@ -192,6 +192,21 @@ type config struct {
 	CameraInvestigateMaxTurns int           // PROXY_CAMERA_INVESTIGATE_MAX_TURNS — agentic loop turn cap
 	CameraInvestigateMaxMedia int           // PROXY_CAMERA_INVESTIGATE_MAX_MEDIA — media fetches per investigation
 	CameraInvestigateBudget   time.Duration // PROXY_CAMERA_INVESTIGATE_BUDGET — wall-clock cap per run
+	// Camera frame archive → S3-compatible object storage (Hetzner). The archiver
+	// (camera_archive.go) writes one JPEG per second per camera per quality; the
+	// investigate read-through (camera_investigate.go) serves past frames from here.
+	// Virtual-hosted addressing: request host = <bucket>.<endpoint>. Credentials are
+	// injected via .env at deploy and MUST NOT be hardcoded.
+	CameraS3Endpoint          string        // PROXY_CAM_S3_ENDPOINT — host only (default hel1.your-objectstorage.com)
+	CameraS3Bucket            string        // PROXY_CAM_S3_BUCKET — default connect-cams
+	CameraS3Region            string        // PROXY_CAM_S3_REGION — SigV4 region (default hel1)
+	CameraS3AccessKey         string        // PROXY_CAM_S3_ACCESS_KEY — SigV4 access key id
+	CameraS3Secret            string        // PROXY_CAM_S3_SECRET — SigV4 secret key
+	CameraS3Prefix            string        // PROXY_CAM_S3_PREFIX — object key prefix (default "")
+	CameraArchiveEnabled      bool          // PROXY_CAM_ARCHIVE_ENABLED — run the background frame archiver
+	CameraArchiveInterval     time.Duration // PROXY_CAM_ARCHIVE_INTERVAL — sub-stream cadence (default 15s)
+	CameraArchiveMainInterval time.Duration // PROXY_CAM_ARCHIVE_MAIN_INTERVAL — main-stream cadence (default 30s)
+	CameraArchiveConcurrency  int           // PROXY_CAM_ARCHIVE_CONCURRENCY — parallel archive captures (default 4)
 }
 
 type modelAliasConfig struct {
@@ -679,6 +694,17 @@ func loadConfig() config {
 		CameraInvestigateMaxTurns: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_TURNS", "12"), 12),
 		CameraInvestigateMaxMedia: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_MEDIA", "30"), 30),
 		CameraInvestigateBudget:   parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_BUDGET", "360")),
+
+		CameraS3Endpoint:          strings.TrimSpace(getenv("PROXY_CAM_S3_ENDPOINT", "hel1.your-objectstorage.com")),
+		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams")),
+		CameraS3Region:            strings.TrimSpace(getenv("PROXY_CAM_S3_REGION", "hel1")),
+		CameraS3AccessKey:         strings.TrimSpace(getenv("PROXY_CAM_S3_ACCESS_KEY", "")),
+		CameraS3Secret:            strings.TrimSpace(getenv("PROXY_CAM_S3_SECRET", "")),
+		CameraS3Prefix:            strings.TrimSpace(getenv("PROXY_CAM_S3_PREFIX", "")),
+		CameraArchiveEnabled:      envFlag("PROXY_CAM_ARCHIVE_ENABLED", false),
+		CameraArchiveInterval:     parseAgyTimeout(getenv("PROXY_CAM_ARCHIVE_INTERVAL", "15")),
+		CameraArchiveMainInterval: parseAgyTimeout(getenv("PROXY_CAM_ARCHIVE_MAIN_INTERVAL", "30")),
+		CameraArchiveConcurrency:  parseIntDefault(getenv("PROXY_CAM_ARCHIVE_CONCURRENCY", "4"), 4),
 	}
 }
 

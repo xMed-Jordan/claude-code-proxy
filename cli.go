@@ -120,6 +120,7 @@ func runServe() error {
 	startImageReaper(cfg)      // reap generated images older than the retention window
 	initCameras(cfg)           // size the camera capture semaphore + ensure media dir
 	startCameraMonitor(cfg)    // start the DVR monitoring scheduler (guarded by CameraEnabled)
+	startCameraArchiver(cfg)   // start the S3 frame archiver (guarded by CameraArchiveEnabled + camS3Enabled)
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
 	// Auto-provision the Codex token refresh timer (Linux root only). First
