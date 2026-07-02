@@ -77,6 +77,19 @@ func camToolContactSheet(ctx context.Context, cfg config, db *sql.DB, r *http.Re
 	}
 	qStr := q.String()
 
+	// mode: "motion" (default) keeps only frames where the scene CHANGED — right for
+	// a door/quiet scene. "interval" is a uniform time-lapse (no motion filter) —
+	// right for a BUSY area (reception) where constant staff movement makes motion
+	// filtering useless; the model counts occupancy per cell / spots empty cells.
+	mode := strings.ToLower(strings.TrimSpace(args.Mode))
+	if mode == "uniform" {
+		mode = "interval"
+	}
+	if mode != "interval" {
+		mode = "motion"
+	}
+	needMotion := mode == "motion"
+
 	loc := time.Local
 	if dv.Timezone != "" {
 		if l, e := time.LoadLocation(dv.Timezone); e == nil {
@@ -124,54 +137,80 @@ func camToolContactSheet(ctx context.Context, cfg config, db *sql.DB, r *http.Re
 			if err != nil {
 				return
 			}
-			sig, serr := camMotionSignature(data)
-			if serr != nil {
-				return
+			var sig []uint8
+			if needMotion {
+				sg, serr := camMotionSignature(data)
+				if serr != nil {
+					return
+				}
+				sig = sg
 			}
 			scans[i] = scanFrame{t: t, sig: sig, data: data, ok: true}
 		}(i, t)
 	}
 	wg.Wait()
 
-	// Motion filter: keep a frame only if it differs enough from the previous KEPT
-	// frame (the first available frame is always kept as the baseline).
+	// Frames that actually came back from S3, already in time order (scans indexed
+	// by the ascending instant list).
+	var okIdx []int
+	for i := range scans {
+		if scans[i].ok {
+			okIdx = append(okIdx, i)
+		}
+	}
+	scanned := len(okIdx)
+	if scanned == 0 {
+		return investigateToolResult{Summary: fmt.Sprintf("contact_sheet: no archived frames found for %s across %s (the window likely predates the 1-fps archive).", camDisplayName(c), windowLabel(from, to))}
+	}
+
 	type keptFrame struct {
 		idx    int
 		motion float64
 	}
 	var keeps []keptFrame
-	var prevSig []uint8
-	scanned := 0
-	for i := range scans {
-		if !scans[i].ok {
-			continue
-		}
-		scanned++
-		if prevSig == nil {
-			keeps = append(keeps, keptFrame{idx: i, motion: 0})
-			prevSig = scans[i].sig
-			continue
-		}
-		m := camMotionScore(scans[i].sig, prevSig)
-		if m >= camContactMotionMin {
-			keeps = append(keeps, keptFrame{idx: i, motion: m})
-			prevSig = scans[i].sig
-		}
-	}
-	if len(keeps) == 0 {
-		if scanned == 0 {
-			return investigateToolResult{Summary: fmt.Sprintf("contact_sheet: no archived frames found for %s across %s (the window likely predates the 1-fps archive).", camDisplayName(c), windowLabel(from, to))}
-		}
-		return investigateToolResult{Summary: fmt.Sprintf("contact_sheet: scanned %d archived frames for %s across %s and detected NO motion — the scene was static the whole time (nobody entered/moved).", scanned, camDisplayName(c), windowLabel(from, to))}
-	}
-
-	// Too much activity to fit one sheet: keep the highest-motion cells, then restore
-	// chronological order so the sheet reads left-to-right in time.
 	truncated := 0
-	if len(keeps) > camContactMaxCells {
-		sort.Slice(keeps, func(a, b int) bool { return keeps[a].motion > keeps[b].motion })
-		truncated = len(keeps) - camContactMaxCells
-		keeps = keeps[:camContactMaxCells]
+
+	if needMotion {
+		// MOTION mode: keep a frame only when it differs enough from the previous
+		// KEPT frame (first frame is the baseline). Right for doors/quiet scenes.
+		var prevSig []uint8
+		for _, i := range okIdx {
+			if prevSig == nil {
+				keeps = append(keeps, keptFrame{idx: i, motion: 0})
+				prevSig = scans[i].sig
+				continue
+			}
+			m := camMotionScore(scans[i].sig, prevSig)
+			if m >= camContactMotionMin {
+				keeps = append(keeps, keptFrame{idx: i, motion: m})
+				prevSig = scans[i].sig
+			}
+		}
+		if len(keeps) == 0 {
+			return investigateToolResult{Summary: fmt.Sprintf("contact_sheet: scanned %d archived frames for %s across %s and detected NO motion — the scene was static the whole time (nobody entered/moved). For a busy area, retry with mode \"interval\".", scanned, camDisplayName(c), windowLabel(from, to))}
+		}
+		if len(keeps) > camContactMaxCells {
+			// keep the busiest cells, then restore chronological order below
+			sort.Slice(keeps, func(a, b int) bool { return keeps[a].motion > keeps[b].motion })
+			truncated = len(keeps) - camContactMaxCells
+			keeps = keeps[:camContactMaxCells]
+		}
+	} else {
+		// INTERVAL mode: uniform time-lapse — evenly pick up to camContactMaxCells
+		// frames across the window regardless of motion. Right for busy areas
+		// (occupancy over time / when-empty).
+		sel := okIdx
+		if len(sel) > camContactMaxCells {
+			picked := make([]int, camContactMaxCells)
+			for k := 0; k < camContactMaxCells; k++ {
+				picked[k] = sel[k*(len(sel)-1)/(camContactMaxCells-1)]
+			}
+			truncated = len(sel) - camContactMaxCells
+			sel = picked
+		}
+		for _, i := range sel {
+			keeps = append(keeps, keptFrame{idx: i, motion: 0})
+		}
 	}
 	sort.Slice(keeps, func(a, b int) bool { return scans[keeps[a].idx].t.Before(scans[keeps[b].idx].t) })
 
@@ -206,10 +245,21 @@ func camToolContactSheet(ctx context.Context, cfg config, db *sql.DB, r *http.Re
 		media = append(media, evidenceItem{MediaURL: camMediaURL(cfg, r, token), Caption: fmt.Sprintf("contact sheet — %s %s", camDisplayName(c), windowLabel(from, to))})
 	}
 
-	summary := fmt.Sprintf("Contact sheet for %s across %s: scanned %d archived %s frames, kept %d NUMBERED cells where the scene CHANGED (motion above the static background). Each cell is one moment of activity. Look at the sheet, pick the cells that show a person, then call past_frames at those exact times (quality \"main\" for a clear face/detail) to confirm and read the entry time. Cells with the same person seconds apart are the same entry, not new people.\nCELL=TIME (%s): %s",
-		camDisplayName(c), windowLabel(from, to), scanned, qStr, len(items), loc.String(), strings.Join(legendLines, "  "))
+	var lead string
+	if needMotion {
+		lead = fmt.Sprintf("Contact sheet (MOTION mode) for %s across %s: scanned %d archived %s frames, kept %d NUMBERED cells where the scene CHANGED. Each cell is a moment of activity — pick the cells showing a person and past_frames those exact times (quality \"main\") to confirm and read each time. The SAME person in cells a few seconds apart is ONE entry, not several.",
+			camDisplayName(c), windowLabel(from, to), scanned, qStr, len(items))
+	} else {
+		lead = fmt.Sprintf("Contact sheet (INTERVAL time-lapse) for %s across %s: %d NUMBERED cells sampled evenly from %d archived %s frames (motion NOT filtered — right for a busy area). Count the people visible in each cell over time; use the roster to tell staff from visitors; cells with nobody show when it was empty. past_frames a cell's time (quality \"main\") for detail.",
+			camDisplayName(c), windowLabel(from, to), len(items), scanned, qStr)
+	}
+	summary := lead + fmt.Sprintf("\nCELL=TIME (%s): %s", loc.String(), strings.Join(legendLines, "  "))
 	if truncated > 0 {
-		summary += fmt.Sprintf("\nNOTE: %d more active moments existed than fit on one sheet — if you need them, narrow the window and scan again.", truncated)
+		if needMotion {
+			summary += fmt.Sprintf("\nNOTE: %d more active moments existed than fit on one sheet — narrow the window and scan again for the rest.", truncated)
+		} else {
+			summary += "\nNOTE: sampled evenly to fit one sheet — narrow the window for finer time resolution."
+		}
 	}
 	return investigateToolResult{Summary: summary, Media: media, Images: []string{sheetPath}, Fetches: 1}
 }
