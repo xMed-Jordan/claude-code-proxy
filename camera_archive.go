@@ -63,6 +63,13 @@ func startCameraArchiver(cfg config) {
 		return
 	}
 
+	// Streaming mode: persistent RTSP connections at ~1 fps instead of snapshot
+	// polling (camera_stream_archive.go). Replaces the snapshot loops below.
+	if cfg.CameraStreamEnabled {
+		startCameraStreamArchiver(cfg)
+		return
+	}
+
 	interval := cfg.CameraArchiveInterval
 	if interval <= 0 {
 		interval = 15 * time.Second

@@ -210,6 +210,11 @@ type config struct {
 	CameraArchiveRetries      int           // PROXY_CAM_ARCHIVE_RETRIES — retry a failed frame capture+upload this many times (default 2)
 	CameraArchiveMainWidth    int           // PROXY_CAM_ARCHIVE_MAIN_WIDTH — requested main-snapshot width via ISAPI (default 2560)
 	CameraArchiveMainHeight   int           // PROXY_CAM_ARCHIVE_MAIN_HEIGHT — requested main-snapshot height via ISAPI (default 1440)
+	CameraStreamEnabled       bool          // PROXY_CAM_STREAM_ENABLED — archive via persistent RTSP streams (~1fps) instead of snapshot polling
+	CameraStreamFPS           int           // PROXY_CAM_STREAM_FPS — frames/sec sampled from each stream (default 1)
+	CameraStreamMaxWorkers    int           // PROXY_CAM_STREAM_MAX_WORKERS — cap on concurrent persistent ffmpeg stream workers (default 64)
+	CameraStreamMainMode      string        // PROXY_CAM_STREAM_MAIN_MODE — "keyframe" (I-frames only, light) or "full" (full decode) for the main stream (default keyframe)
+	CameraStreamReconcile     time.Duration // PROXY_CAM_STREAM_RECONCILE — how often the supervisor reconciles workers with the camera list (default 30s)
 }
 
 type modelAliasConfig struct {
@@ -711,6 +716,11 @@ func loadConfig() config {
 		CameraArchiveRetries:      parseIntDefault(getenv("PROXY_CAM_ARCHIVE_RETRIES", "2"), 2),
 		CameraArchiveMainWidth:    parseIntDefault(getenv("PROXY_CAM_ARCHIVE_MAIN_WIDTH", "2560"), 2560),
 		CameraArchiveMainHeight:   parseIntDefault(getenv("PROXY_CAM_ARCHIVE_MAIN_HEIGHT", "1440"), 1440),
+		CameraStreamEnabled:       envFlag("PROXY_CAM_STREAM_ENABLED", false),
+		CameraStreamFPS:           parseIntDefault(getenv("PROXY_CAM_STREAM_FPS", "1"), 1),
+		CameraStreamMaxWorkers:    parseIntDefault(getenv("PROXY_CAM_STREAM_MAX_WORKERS", "64"), 64),
+		CameraStreamMainMode:      strings.TrimSpace(getenv("PROXY_CAM_STREAM_MAIN_MODE", "keyframe")),
+		CameraStreamReconcile:     parseAgyTimeout(getenv("PROXY_CAM_STREAM_RECONCILE", "30")),
 	}
 }
 
