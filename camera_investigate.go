@@ -264,7 +264,7 @@ func camInvestigateBudget(cfg config) time.Duration {
 // can construct absolute RFC3339 windows), the camera roster (reused from
 // camBuildRoster — the roster-first contract), the tool list + JSON contract,
 // and the investigation protocol.
-func camInvestigateSystemPrompt(site camSite, active []camera, now time.Time, tzName string) string {
+func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock time.Time, dvrClockOK bool, tzName string) string {
 	var b strings.Builder
 	b.WriteString("You are a security investigator for a physical premises")
 	if n := strings.TrimSpace(site.Name); n != "" {
@@ -276,9 +276,26 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now time.Time, tz
 	b.WriteString("calling TOOLS that the loop executes for you — you never fetch media yourself, only request it, and every ")
 	b.WriteString("tool result (images and/or text) is shown to you on your NEXT turn.\n\n")
 
-	fmt.Fprintf(&b, "CURRENT TIME: %s (timezone %s). Use RFC3339 timestamps with this exact UTC offset for every "+
-		"\"from\"/\"to\" argument — e.g. \"earlier today at 15:00\" means today's date at 15:00 with this offset.\n\n",
-		now.Format(time.RFC3339), tzName)
+	fmt.Fprintf(&b, "CURRENT TIME (real / operator now): %s — today is %s, timezone %s.\n",
+		now.Format(time.RFC3339), now.Format("Monday 2 January 2006"), tzName)
+	if dvrClockOK {
+		skew := dvrClock.Sub(now)
+		mag := skew
+		if mag < 0 {
+			mag = -mag
+		}
+		if mag >= 45*time.Second {
+			dir := "AHEAD of"
+			if skew < 0 {
+				dir = "BEHIND"
+			}
+			fmt.Fprintf(&b, "DVR CLOCK: %s — the DVR stamps its RECORDINGS with this clock, which is currently ~%s %s the real time. When you request past_frames/past_clip, express \"from\"/\"to\" against the DVR CLOCK so the window lines up with the recordings.\n",
+				dvrClock.Format(time.RFC3339), mag.Round(time.Second), dir)
+		} else {
+			fmt.Fprintf(&b, "DVR CLOCK: %s (in sync with real time).\n", dvrClock.Format(time.RFC3339))
+		}
+	}
+	b.WriteString("Use RFC3339 timestamps with this exact UTC offset for every \"from\"/\"to\" argument; e.g. \"yesterday at 15:00\" = yesterday's date at 15:00 with this offset.\n\n")
 
 	b.WriteString("CAMERA ROSTER (id — name [area]: description):\n")
 	b.WriteString(camBuildRoster(active))
@@ -1107,7 +1124,15 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 
 	alias := firstNonEmpty(strings.TrimSpace(inv.Alias), strings.TrimSpace(cfg.CameraInvestigateAlias))
 	loc, tzName := camSiteTimezone(dvrs)
-	sys := camInvestigateSystemPrompt(site, active, time.Now().In(loc), tzName)
+	srvNow := time.Now().In(loc)
+	var dvrClock time.Time
+	dvrClockOK := false
+	if len(dvrs) > 0 {
+		if t, ok := camDVRClock(ctx, dvrs[0]); ok {
+			dvrClock, dvrClockOK = t.In(loc), true
+		}
+	}
+	sys := camInvestigateSystemPrompt(site, active, srvNow, dvrClock, dvrClockOK, tzName)
 
 	maxTurns := camInvestigateMaxTurns(cfg)
 	maxMedia := camInvestigateMaxMedia(cfg)

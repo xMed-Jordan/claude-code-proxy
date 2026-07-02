@@ -58,6 +58,41 @@ func hikHTTPPort(dvr CamDVR) int {
 	return 80
 }
 
+// camDVRClock fetches the DVR's OWN wall-clock (Hikvision ISAPI /System/time) so
+// the investigation prompt can tell the model both the real/operator time and the
+// time the DVR actually stamps on its recordings — these drift apart when the DVR
+// runs on manual (non-NTP) time. Best-effort: returns ok=false on any error or for
+// brands without a known time endpoint, and the caller falls back to the server clock.
+func camDVRClock(ctx context.Context, dvr CamDVR) (time.Time, bool) {
+	if !strings.EqualFold(strings.TrimSpace(dvr.Brand), "hikvision") {
+		return time.Time{}, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	scheme := "http"
+	if hikHTTPPort(dvr) == 443 {
+		scheme = "https"
+	}
+	rawURL := fmt.Sprintf("%s://%s/ISAPI/System/time", scheme, net.JoinHostPort(dvr.Host, strconv.Itoa(hikHTTPPort(dvr))))
+	resp, err := httpDigestGet(cctx, camHTTPClient(), rawURL, dvr.Username, dvr.Password)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	var doc struct {
+		LocalTime string `xml:"localTime"`
+	}
+	if xml.Unmarshal(body, &doc) != nil {
+		return time.Time{}, false
+	}
+	t, perr := time.Parse(time.RFC3339, strings.TrimSpace(doc.LocalTime))
+	if perr != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func hikRTSPPort(dvr CamDVR) int {
 	if dvr.Port > 0 {
 		return dvr.Port
