@@ -133,6 +133,58 @@ func buildMosaic(cfg config, items []mosaicItem) (mosaicResult, error) {
 	return mosaicResult{PNG: buf.Bytes(), Width: gridW, Height: gridH, Legend: legend}, nil
 }
 
+// buildContactSheet tiles items into an explicit cols-wide grid of cellW x cellH
+// cells — like buildMosaic but with caller-chosen geometry and NO max-cams cap —
+// for the investigate contact_sheet tool: many time-sampled frames of ONE camera
+// laid out as a numbered grid so the model can scan a whole window in a single image
+// and then drill into the cells that show activity. Each cell is labeled with its
+// 1-based index; the returned Legend maps index -> the frame's timestamp (carried in
+// each item's Name).
+func buildContactSheet(items []mosaicItem, cols, cellW, cellH int) (mosaicResult, error) {
+	if len(items) == 0 {
+		return mosaicResult{}, fmt.Errorf("contact sheet: no items")
+	}
+	if cols <= 0 {
+		cols = 10
+	}
+	if cellW <= 0 {
+		cellW = 160
+	}
+	if cellH <= 0 {
+		cellH = 90
+	}
+	rows := (len(items) + cols - 1) / cols
+	gridW, gridH := cols*cellW, rows*cellH
+	canvas := image.NewRGBA(image.Rect(0, 0, gridW, gridH))
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.RGBA{32, 32, 32, 255}}, image.Point{}, draw.Src)
+
+	legend := make([]mosaicLegendEntry, 0, len(items))
+	for i, item := range items {
+		col, row := i%cols, i/cols
+		ox, oy := col*cellW, row*cellH
+		cellRect := image.Rect(ox, oy, ox+cellW, oy+cellH)
+		if cellImg, err := loadAndFitCell(item.Path, cellW, cellH); err != nil {
+			camlog("warn", "contact_cell_failed", map[string]any{"path": item.Path, "ok": false, "error": err.Error()})
+		} else {
+			draw.Draw(canvas, cellRect, cellImg, image.Point{}, draw.Src)
+		}
+		idx := item.Index
+		if idx <= 0 {
+			idx = i + 1
+		}
+		drawMosaicLabel(canvas, ox, oy, idx)
+		legend = append(legend, mosaicLegendEntry{Index: idx, CameraID: item.CameraID, Name: item.Name})
+	}
+
+	dst := image.NewPaletted(canvas.Bounds(), palette.Plan9)
+	draw.FloydSteinberg.Draw(dst, canvas.Bounds(), canvas, image.Point{})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, dst); err != nil {
+		return mosaicResult{}, fmt.Errorf("encode contact sheet png: %w", err)
+	}
+	return mosaicResult{PNG: buf.Bytes(), Width: gridW, Height: gridH, Legend: legend}, nil
+}
+
 // loadAndFitCell decodes path and box-downscales it to exactly w x h (stretch-fit
 // — the plan calls for cellW x cellH cells, not aspect-preserved letterboxing).
 func loadAndFitCell(path string, w, h int) (image.Image, error) {

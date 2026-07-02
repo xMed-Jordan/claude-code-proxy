@@ -107,7 +107,7 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "past_frames", "past_clip"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
@@ -305,8 +305,10 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString("- roster: re-read the camera roster above as text (no images; use this to double-check exact camera ids).\n")
 	b.WriteString("- snapshot: args.camera_ids (required), args.quality \"sub\"|\"main\" (see QUALITY below; default main) — a fresh CURRENT still per camera.\n")
 	b.WriteString("- mosaic: args.camera_ids (optional, default = every enabled camera) — one low-res grid of CURRENT sub-stream stills.\n")
-	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use this to actually SEE what happened over a time window.\n")
+	b.WriteString("- contact_sheet: args.camera_ids (ONE id), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (default sub) — scans that ONE camera's 1-fps archive across the window, DROPS static frames via motion detection, and returns a SINGLE numbered composite image of only the moments where the scene CHANGED, plus a \"cell=time\" map. Cheap: one image instead of hundreds. Use this FIRST for \"how many people/cars entered or passed over a time window, and when\" — review the sheet, note which numbered cells show a person, then past_frames those exact times to confirm and read each entry time. Frames of the same person a few seconds apart are ONE entry, not several.\n")
+	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use to SEE a window directly, or to zoom into the exact times a contact_sheet flagged.\n")
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n\n")
+	b.WriteString("STRATEGY for \"count how many entered/passed door X over a window\": (1) if unsure which camera is that door, use the ROSTER descriptions to pick the ONE camera; (2) contact_sheet that one camera over the window; (3) read the numbered sheet, count distinct people, and past_frames the specific cells for detail/time. Do NOT blindly past_frames a wide multi-camera window — it is slow and misses people.\n\n")
 
 	b.WriteString("QUALITY (args.quality) — choose per request:\n")
 	b.WriteString("- \"main\" = full-resolution: use when FINE DETAIL matters — reading text/labels/signage, checking cleanliness or condition, or identifying small objects, faces, or license plates.\n")
@@ -323,7 +325,7 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|ask_operator|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"roster|snapshot|mosaic|past_frames|past_clip","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6},`)
+	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
@@ -620,6 +622,8 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 		return camToolSnapshot(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "mosaic":
 		return camToolMosaic(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
+	case "contact_sheet":
+		return camToolContactSheet(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "past_frames":
 		return camToolPastFrames(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "past_clip":
