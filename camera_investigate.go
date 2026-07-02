@@ -323,7 +323,7 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString("- Roster-first: read the roster above and pick the SMALLEST set of cameras worth pulling imagery from before fetching anything.\n")
 	b.WriteString("- Investigate step by step: snapshot/mosaic for \"right now\", past_frames/past_clip for \"what happened at/around <time>\".\n")
 	b.WriteString("- Use ask_operator ONLY when you genuinely need information only the operator has (an exact time, a name, which entrance, etc).\n")
-	b.WriteString("- Cite evidence in your final answer using the exact media_url values already returned to you by the tools.\n")
+	b.WriteString("- Cite evidence in your final answer by COPYING the exact media_url= values shown in the TOOL RESULT lines above — that is how the operator sees the proof frames/clips. Always attach the frames your answer relies on (e.g. one per person you counted).\n")
 	b.WriteString("- Be economical: stop investigating and answer as soon as you can do so confidently.\n\n")
 
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
@@ -444,6 +444,27 @@ func camInvestigateTranscriptText(msgs []camInvestigationMessage) string {
 			b.WriteString("): ")
 			b.WriteString(strings.TrimSpace(m.Content))
 			b.WriteString("\n")
+			// Expose the EXACT media_url of every artifact this tool minted so the
+			// model can cite it verbatim as evidence. The final answer's evidence is
+			// validated against these exact strings, so if we never show them here the
+			// model can only guess URLs and every citation gets dropped (kept=0).
+			if raw := strings.TrimSpace(m.MediaJSON); raw != "" && raw != "null" && raw != "[]" {
+				var media []evidenceItem
+				if json.Unmarshal([]byte(raw), &media) == nil {
+					for _, it := range media {
+						if u := strings.TrimSpace(it.MediaURL); u != "" {
+							b.WriteString("    evidence media_url=")
+							b.WriteString(u)
+							if capt := strings.TrimSpace(it.Caption); capt != "" {
+								b.WriteString("  (")
+								b.WriteString(capt)
+								b.WriteString(")")
+							}
+							b.WriteString("\n")
+						}
+					}
+				}
+			}
 		case "system":
 			b.WriteString("SYSTEM: ")
 			b.WriteString(strings.TrimSpace(m.Content))
@@ -541,14 +562,16 @@ func camStopInvestigation(db *sql.DB, invID, note string) error {
 	return setCameraInvestigationStatus(db, invID, "exhausted")
 }
 
-// camCollectMintedMediaURLs returns the set of /camera/media/<token> URLs the
-// loop's tools actually minted and returned across an investigation's WHOLE
-// transcript (every tool row's persisted media_json, so evidence from a
-// pre-ask_operator pause or an earlier follow-up round still counts). The final
-// answer's cited evidence is validated against this set so a hallucinated or
-// mistyped media_url is never persisted and rendered as a broken evidence link.
-func camCollectMintedMediaURLs(msgs []camInvestigationMessage) map[string]bool {
-	set := make(map[string]bool)
+// camCollectMintedMedia returns the /camera/media/<token> URLs the loop's tools
+// actually minted across an investigation's WHOLE transcript (every tool row's
+// persisted media_json, so evidence from a pre-ask_operator pause or an earlier
+// follow-up round still counts): both the exact-string set and a token->canonical-URL
+// index. The final answer's cited evidence is validated against these so a
+// hallucinated media_url is dropped, while one that differs only in host/formatting
+// but carries a real token is rewritten to the canonical served URL.
+func camCollectMintedMedia(msgs []camInvestigationMessage) (set map[string]bool, byToken map[string]string) {
+	set = make(map[string]bool)
+	byToken = make(map[string]string)
 	for _, m := range msgs {
 		if m.Role != "tool" || strings.TrimSpace(m.MediaJSON) == "" {
 			continue
@@ -560,10 +583,27 @@ func camCollectMintedMediaURLs(msgs []camInvestigationMessage) map[string]bool {
 		for _, it := range media {
 			if u := strings.TrimSpace(it.MediaURL); u != "" {
 				set[u] = true
+				if tok := camMediaToken(u); tok != "" {
+					byToken[tok] = u
+				}
 			}
 		}
 	}
-	return set
+	return set, byToken
+}
+
+// camMediaToken extracts the capability token (last path segment, minus any query)
+// from a /camera/media/<token> URL, so a cited evidence URL that differs only in
+// scheme/host/formatting can still be matched back to the exact artifact minted.
+func camMediaToken(u string) string {
+	u = strings.TrimSpace(u)
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	if i := strings.LastIndex(u, "/"); i >= 0 {
+		u = u[i+1:]
+	}
+	return u
 }
 
 // camFilterEvidence keeps only cited evidence whose media_url was actually minted
@@ -571,13 +611,31 @@ func camCollectMintedMediaURLs(msgs []camInvestigationMessage) map[string]bool {
 // invented or mistyped. Order and captions are preserved; the drop count is
 // returned for logging. Enforces the "cite the exact media_url values already
 // returned to you" contract without ever fabricating a URL of our own.
-func camFilterEvidence(evidence []evidenceItem, allowed map[string]bool) (kept []evidenceItem, dropped int) {
+func camFilterEvidence(evidence []evidenceItem, allowed map[string]bool, byToken map[string]string) (kept []evidenceItem, dropped int) {
+	seen := make(map[string]bool)
 	for _, e := range evidence {
-		if allowed[strings.TrimSpace(e.MediaURL)] {
-			kept = append(kept, e)
-		} else {
-			dropped++
+		u := strings.TrimSpace(e.MediaURL)
+		canonical := ""
+		switch {
+		case allowed[u]:
+			canonical = u
+		default:
+			// Cited URL isn't an exact minted string — accept it only if its
+			// capability token matches one we minted, and rewrite to the canonical
+			// served URL so the UI always renders a working link.
+			if c, ok := byToken[camMediaToken(u)]; ok {
+				canonical = c
+			}
 		}
+		if canonical == "" {
+			dropped++
+			continue
+		}
+		if seen[canonical] {
+			continue // de-dup repeated citations of the same artifact
+		}
+		seen[canonical] = true
+		kept = append(kept, evidenceItem{MediaURL: canonical, Caption: e.Caption})
 	}
 	return kept, dropped
 }
@@ -1196,12 +1254,11 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			// Only cite evidence the tools actually minted this investigation —
 			// drop any hallucinated/mistyped media_url so the UI never renders a
 			// broken evidence link (finding: "cite real evidence" contract).
-			evidence, dropped := camFilterEvidence(act.Action.Evidence, camCollectMintedMediaURLs(msgs))
-			if dropped > 0 {
-				camlog("warn", "investigate_evidence", map[string]any{
-					"investigation_id": invID, "cited": len(act.Action.Evidence), "kept": len(evidence), "dropped": dropped,
-				})
-			}
+			mintedSet, mintedByToken := camCollectMintedMedia(msgs)
+			evidence, dropped := camFilterEvidence(act.Action.Evidence, mintedSet, mintedByToken)
+			camlog("info", "investigate_evidence", map[string]any{
+				"investigation_id": invID, "cited": len(act.Action.Evidence), "kept": len(evidence), "dropped": dropped,
+			})
 			m := camAppendInvestigateMessage(db, invID, "ai", camAIMessageContent(act.Thought, act.Action.Answer), "answer", "", 0, evidence)
 			msgs = append(msgs, m)
 			if serr := setCameraInvestigationStatus(db, invID, "answered"); serr != nil {

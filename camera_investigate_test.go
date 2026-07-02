@@ -420,34 +420,39 @@ func TestCamCountInvestigateProgressPreservesBudgetAcrossAskOperator(t *testing.
 // ─────────────────────── evidence validation ───────────────────────
 
 // TestCamFilterEvidence confirms only tool-minted media_urls survive: a
-// hallucinated/mistyped URL is dropped (never rendered as a broken evidence link),
-// exact-but-whitespace-padded matches are kept, and empty URLs are dropped.
+// hallucinated URL is dropped, padded/other-host citations that share a real
+// capability token are kept and rewritten to the canonical URL, duplicates collapse,
+// and empty URLs are dropped.
 func TestCamFilterEvidence(t *testing.T) {
 	msgs := []camInvestigationMessage{
 		{Role: "ai", ToolName: "past_frames"},
 		{Role: "tool", ToolName: "past_frames", MediaJSON: mustJSON([]evidenceItem{{MediaURL: "/camera/media/tokA"}, {MediaURL: "/camera/media/tokB"}})},
 		{Role: "ai", ToolName: "answer", MediaJSON: mustJSON([]evidenceItem{{MediaURL: "/camera/media/should_be_ignored"}})}, // ai row, not a mint source
 	}
-	allowed := camCollectMintedMediaURLs(msgs)
-	if !allowed["/camera/media/tokA"] || !allowed["/camera/media/tokB"] {
-		t.Fatalf("minted set = %v, want tokA+tokB", allowed)
+	set, byToken := camCollectMintedMedia(msgs)
+	if !set["/camera/media/tokA"] || !set["/camera/media/tokB"] {
+		t.Fatalf("minted set = %v, want tokA+tokB", set)
 	}
-	if allowed["/camera/media/should_be_ignored"] {
+	if set["/camera/media/should_be_ignored"] {
 		t.Errorf("ai-row media must not be treated as tool-minted")
+	}
+	if byToken["tokA"] != "/camera/media/tokA" {
+		t.Errorf("byToken[tokA] = %q, want /camera/media/tokA", byToken["tokA"])
 	}
 
 	cited := []evidenceItem{
-		{MediaURL: "/camera/media/tokA", Caption: "keep"},
+		{MediaURL: "/camera/media/tokA", Caption: "exact"},
 		{MediaURL: "/camera/media/ghost", Caption: "hallucinated"},
 		{MediaURL: " /camera/media/tokB ", Caption: "padded but real"},
+		{MediaURL: "https://cam.example.com/camera/media/tokA?x=1", Caption: "same tokA via other host"},
 		{MediaURL: "", Caption: "empty"},
 	}
-	kept, dropped := camFilterEvidence(cited, allowed)
-	if dropped != 2 {
+	kept, dropped := camFilterEvidence(cited, set, byToken)
+	if dropped != 2 { // ghost + empty (the other-host tokA is a dedup, not a drop)
 		t.Errorf("dropped = %d, want 2 (ghost + empty)", dropped)
 	}
-	if len(kept) != 2 || kept[0].MediaURL != "/camera/media/tokA" || kept[1].Caption != "padded but real" {
-		t.Errorf("kept = %+v, want [tokA, padded tokB]", kept)
+	if len(kept) != 2 || kept[0].MediaURL != "/camera/media/tokA" || kept[1].MediaURL != "/camera/media/tokB" {
+		t.Errorf("kept = %+v, want canonical [tokA, tokB]", kept)
 	}
 }
 
