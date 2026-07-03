@@ -285,10 +285,16 @@ func camSettlePayload(cfg config, inv camInvestigation, msgs []camInvestigationM
 				continue // capture row gone (expired/reaped) — not fetchable, skip
 			}
 			seen[tok] = true
-			evidence = append(evidence, map[string]any{
+			ev := map[string]any{
 				"token": tok, "media_url": camMediaURL(cfg, nil, tok), "caption": it.Caption,
 				"content_type": cap.ContentType, "kind": cap.Kind, "camera_id": cap.CameraID,
-			})
+			}
+			// A clip uploaded to object storage carries a direct public link; hand it
+			// out so large videos can be delivered as a URL instead of a re-hosted file.
+			if strings.TrimSpace(cap.S3URL) != "" {
+				ev["public_url"] = cap.S3URL
+			}
+			evidence = append(evidence, ev)
 			if len(evidence) >= camSettleEvidenceMax {
 				break
 			}

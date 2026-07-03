@@ -1229,12 +1229,48 @@ func camToolPastClip(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 	if perr != nil {
 		return investigateToolResult{Summary: "past_clip: captured but could not be saved: " + perr.Error(), Fetches: 1}
 	}
+	// Best-effort: also upload the clip to public object storage so it can be
+	// delivered as a direct link (large videos exceed chat inline-media limits).
+	s3url := camUploadClipS3(ctx, cfg, db, token, site.ID, id, res.Path)
+	// The evidence media_url stays the token URL so settle can resolve the capture;
+	// the cited link prefers the direct S3 URL when the upload succeeded.
 	mediaURL := camMediaURL(cfg, r, token)
+	cite := mediaURL
+	if s3url != "" {
+		cite = s3url
+	}
 	return investigateToolResult{
-		Summary: fmt.Sprintf("Saved a recorded clip for %s covering %s as evidence: %s", camDisplayName(c), windowLabel(from, to), mediaURL),
+		Summary: fmt.Sprintf("Saved a recorded clip for %s covering %s as evidence (direct video link): %s", camDisplayName(c), windowLabel(from, to), cite),
 		Media:   []evidenceItem{{MediaURL: mediaURL, Caption: camDisplayName(c) + " — " + windowLabel(from, to)}},
 		Fetches: 1,
 	}
+}
+
+// camUploadClipS3 best-effort uploads a recorded clip to public object storage and
+// records the resulting public URL on the capture, so evidence can be delivered as
+// a direct link. Returns the public URL, or "" when S3 is disabled or the upload
+// failed (the proxy-served URL then remains the only link). Never fatal.
+func camUploadClipS3(ctx context.Context, cfg config, db *sql.DB, token, siteID, cameraID, localPath string) string {
+	if !camS3Enabled(cfg) {
+		return ""
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		camlog("warn", "clip_s3", map[string]any{"token": token, "ok": false, "error": err.Error()})
+		return ""
+	}
+	key := camS3ClipKey(siteID, cameraID, time.Now())
+	if err := s3PutObjectPublic(ctx, cfg, key, data, "video/mp4"); err != nil {
+		camlog("warn", "clip_s3", map[string]any{"token": token, "ok": false, "error": err.Error()})
+		return ""
+	}
+	url := camS3PublicURL(cfg, key)
+	if err := setCameraCaptureS3URL(db, token, url); err != nil {
+		// The object is already public; still return the URL so this run can cite it.
+		camlog("warn", "clip_s3", map[string]any{"token": token, "ok": false, "error": "persist url: " + err.Error()})
+	}
+	camlog("info", "clip_s3", map[string]any{"site_id": siteID, "camera_id": cameraID, "ok": true, "bytes": len(data)})
+	return url
 }
 
 // camToolMotionSearch queries the coalesced DVR motion history

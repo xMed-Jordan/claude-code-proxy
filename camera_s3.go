@@ -97,7 +97,7 @@ func s3PutObject(ctx context.Context, cfg config, key string, body []byte, conte
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	resp, err := s3DoRequest(ctx, cfg, http.MethodPut, key, body, contentType)
+	resp, err := s3DoRequest(ctx, cfg, http.MethodPut, key, body, contentType, false)
 	if err != nil {
 		return err
 	}
@@ -109,9 +109,41 @@ func s3PutObject(ctx context.Context, cfg config, key string, body []byte, conte
 	return s3RespError("PUT", key, resp)
 }
 
+// s3PutObjectPublic uploads body under key with a public-read canned ACL so the
+// object is anonymously readable at its virtual-hosted URL (camS3PublicURL). Used
+// for large evidence clips we want to hand out as a direct link. Succeeds on
+// 200/201.
+func s3PutObjectPublic(ctx context.Context, cfg config, key string, body []byte, contentType string) error {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	resp, err := s3DoRequest(ctx, cfg, http.MethodPut, key, body, contentType, true)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	return s3RespError("PUT(public)", key, resp)
+}
+
+// camS3PublicURL is the anonymous, virtual-hosted URL of a public-read object.
+func camS3PublicURL(cfg config, key string) string {
+	return "https://" + s3Host(cfg) + "/" + s3EscapePath(key)
+}
+
+// camS3ClipKey is the object key for an evidence clip:
+// <prefix>clips/<site>/<camera>/<UTC yyyy/mm/dd/HHMMSS>.mp4
+func camS3ClipKey(siteID, cameraID string, t time.Time) string {
+	return cameraCfg.CameraS3Prefix + "clips/" + siteID + "/" + cameraID + "/" +
+		t.UTC().Format("2006/01/02/150405") + ".mp4"
+}
+
 // s3GetObject fetches key. Returns errS3NotFound on HTTP 404.
 func s3GetObject(ctx context.Context, cfg config, key string) ([]byte, error) {
-	resp, err := s3DoRequest(ctx, cfg, http.MethodGet, key, nil, "")
+	resp, err := s3DoRequest(ctx, cfg, http.MethodGet, key, nil, "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +161,7 @@ func s3GetObject(ctx context.Context, cfg config, key string) ([]byte, error) {
 
 // s3HeadObject reports whether key exists (200 → true, 404 → false).
 func s3HeadObject(ctx context.Context, cfg config, key string) (bool, error) {
-	resp, err := s3DoRequest(ctx, cfg, http.MethodHead, key, nil, "")
+	resp, err := s3DoRequest(ctx, cfg, http.MethodHead, key, nil, "", false)
 	if err != nil {
 		return false, err
 	}
@@ -147,7 +179,7 @@ func s3HeadObject(ctx context.Context, cfg config, key string) (bool, error) {
 
 // s3DoRequest builds, signs and executes a single request. A nil body means no
 // request body (GET/HEAD); its payload hash is that of the empty string.
-func s3DoRequest(ctx context.Context, cfg config, method, key string, body []byte, contentType string) (*http.Response, error) {
+func s3DoRequest(ctx context.Context, cfg config, method, key string, body []byte, contentType string, aclPublic bool) (*http.Response, error) {
 	host := s3Host(cfg)
 	rawURL := "https://" + host + "/" + s3EscapePath(key)
 	var rdr io.Reader
@@ -163,27 +195,37 @@ func s3DoRequest(ctx context.Context, cfg config, method, key string, body []byt
 	}
 	// sha256(nil) == sha256("") == emptyPayloadSHA256, so this is correct for GET/HEAD.
 	payloadHash := sha256Hex(body)
-	s3SignRequest(cfg, req, payloadHash, time.Now())
+	s3SignRequest(cfg, req, payloadHash, time.Now(), aclPublic)
 	return s3HTTPClient.Do(req)
 }
 
 // s3SignRequest sets the x-amz-* and Authorization headers on req per SigV4. The
 // canonical URI is taken from req.URL.EscapedPath() so the signed path is byte-for-
 // byte what goes on the wire.
-func s3SignRequest(cfg config, req *http.Request, payloadHash string, t time.Time) {
+func s3SignRequest(cfg config, req *http.Request, payloadHash string, t time.Time, aclPublic bool) {
 	amzDate := t.UTC().Format("20060102T150405Z")
 	host := req.URL.Host
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	// Canonical headers, already sorted (host < x-amz-content-sha256 < x-amz-date),
-	// each terminated with a newline.
+	// Canonical headers, already sorted, each terminated with a newline.
+	signedHeaders := s3SignedHeaders
 	canonicalHeaders := "host:" + host + "\n" +
 		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
+	if aclPublic {
+		// x-amz-acl must be both sent AND signed; it sorts between host and
+		// x-amz-content-sha256.
+		req.Header.Set("X-Amz-Acl", "public-read")
+		signedHeaders = "host;x-amz-acl;x-amz-content-sha256;x-amz-date"
+		canonicalHeaders = "host:" + host + "\n" +
+			"x-amz-acl:public-read\n" +
+			"x-amz-content-sha256:" + payloadHash + "\n" +
+			"x-amz-date:" + amzDate + "\n"
+	}
 	auth := s3Authorization(
 		cfg.CameraS3AccessKey, cfg.CameraS3Secret, s3Region(cfg), s3Service,
 		amzDate, req.Method, req.URL.EscapedPath(), req.URL.RawQuery,
-		s3SignedHeaders, canonicalHeaders, payloadHash,
+		signedHeaders, canonicalHeaders, payloadHash,
 	)
 	req.Header.Set("Authorization", auth)
 }

@@ -9,9 +9,53 @@ package main
 // path escaping and the enabled predicate.
 
 import (
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestS3SignRequestPublicACL verifies that the public-read variant sets the
+// x-amz-acl header AND includes it (sorted) in the signed-headers list — the
+// canned ACL is what makes an uploaded clip anonymously readable at its URL.
+func TestS3SignRequestPublicACL(t *testing.T) {
+	cfg := config{CameraS3AccessKey: "AKIDEXAMPLE", CameraS3Secret: "secret", CameraS3Bucket: "connect-cams", CameraS3Endpoint: "hel1.your-objectstorage.com", CameraS3Region: "hel1"}
+	req, _ := http.NewRequest(http.MethodPut, "https://connect-cams.hel1.your-objectstorage.com/clips/s/c/x.mp4", strings.NewReader("body"))
+	s3SignRequest(cfg, req, sha256Hex([]byte("body")), time.Unix(1700000000, 0).UTC(), true)
+	if got := req.Header.Get("X-Amz-Acl"); got != "public-read" {
+		t.Fatalf("X-Amz-Acl = %q, want public-read", got)
+	}
+	auth := req.Header.Get("Authorization")
+	if !strings.Contains(auth, "SignedHeaders=host;x-amz-acl;x-amz-content-sha256;x-amz-date") {
+		t.Fatalf("public-read signed headers missing x-amz-acl: %s", auth)
+	}
+
+	// The non-public path must NOT sign x-amz-acl.
+	req2, _ := http.NewRequest(http.MethodGet, "https://connect-cams.hel1.your-objectstorage.com/clips/s/c/x.mp4", nil)
+	s3SignRequest(cfg, req2, sha256Hex(nil), time.Unix(1700000000, 0).UTC(), false)
+	if strings.Contains(req2.Header.Get("Authorization"), "x-amz-acl") {
+		t.Fatal("non-public request must not sign x-amz-acl")
+	}
+	if req2.Header.Get("X-Amz-Acl") != "" {
+		t.Fatal("non-public request must not set X-Amz-Acl")
+	}
+}
+
+// TestCamS3ClipKeyAndURL checks the clip key layout and the public URL join.
+func TestCamS3ClipKeyAndURL(t *testing.T) {
+	saved := cameraCfg.CameraS3Prefix
+	defer func() { cameraCfg.CameraS3Prefix = saved }()
+	cameraCfg.CameraS3Prefix = ""
+
+	cfg := config{CameraS3Bucket: "connect-cams", CameraS3Endpoint: "hel1.your-objectstorage.com"}
+	key := camS3ClipKey("site_A", "cam_B", time.Date(2026, 7, 3, 8, 2, 15, 0, time.UTC))
+	if key != "clips/site_A/cam_B/2026/07/03/080215.mp4" {
+		t.Fatalf("clip key = %q", key)
+	}
+	if url := camS3PublicURL(cfg, key); url != "https://connect-cams.hel1.your-objectstorage.com/clips/site_A/cam_B/2026/07/03/080215.mp4" {
+		t.Fatalf("public url = %q", url)
+	}
+}
 
 // TestS3AuthorizationGetVanilla verifies the full SigV4 pipeline against the
 // canonical "get-vanilla" case from AWS's official aws-sig-v4-test-suite.

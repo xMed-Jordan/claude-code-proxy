@@ -110,6 +110,7 @@ type camCapture struct {
 	ToTS        string
 	CreatedAt   string
 	ExpiresAt   string
+	S3URL       string // public object-storage URL for large evidence (clips); "" = proxy-served only
 }
 
 // camInvestigation is one ask-AI investigation session: an operator's freeform
@@ -508,6 +509,11 @@ func migrateCameraDB(db *sql.DB) error {
 		return err
 	}
 	if err := ensureSQLiteColumn(db, "cameras", "notes", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// Public S3 URL for large evidence (recorded clips uploaded to object storage so
+	// they can be delivered as a direct link instead of a proxy-served download).
+	if err := ensureSQLiteColumn(db, "camera_captures", "s3_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
@@ -1071,12 +1077,12 @@ func setCameraQuestionStatus(db *sql.DB, id, status string) error {
 
 // ─────────────────────────── camera_captures ───────────────────────────
 
-const camCaptureCols = `id, site_id, camera_id, watch_run_id, kind, quality, token, path, content_type, width, height, bytes, from_ts, to_ts, created_at, expires_at`
+const camCaptureCols = `id, site_id, camera_id, watch_run_id, kind, quality, token, path, content_type, width, height, bytes, from_ts, to_ts, created_at, expires_at, s3_url`
 
 func scanCapture(s rowScanner) (camCapture, error) {
 	var c camCapture
 	err := s.Scan(&c.ID, &c.SiteID, &c.CameraID, &c.WatchRunID, &c.Kind, &c.Quality, &c.Token, &c.Path,
-		&c.ContentType, &c.Width, &c.Height, &c.Bytes, &c.FromTS, &c.ToTS, &c.CreatedAt, &c.ExpiresAt)
+		&c.ContentType, &c.Width, &c.Height, &c.Bytes, &c.FromTS, &c.ToTS, &c.CreatedAt, &c.ExpiresAt, &c.S3URL)
 	return c, err
 }
 
@@ -1091,11 +1097,18 @@ func insertCameraCapture(db *sql.DB, c camCapture) (string, error) {
 		c.CreatedAt = nowRFC3339()
 	}
 	_, err := db.Exec(`INSERT INTO camera_captures
-		(id, site_id, camera_id, watch_run_id, kind, quality, token, path, content_type, width, height, bytes, from_ts, to_ts, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, site_id, camera_id, watch_run_id, kind, quality, token, path, content_type, width, height, bytes, from_ts, to_ts, created_at, expires_at, s3_url)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.SiteID, c.CameraID, c.WatchRunID, c.Kind, c.Quality, c.Token, c.Path, c.ContentType,
-		c.Width, c.Height, c.Bytes, c.FromTS, c.ToTS, c.CreatedAt, c.ExpiresAt)
+		c.Width, c.Height, c.Bytes, c.FromTS, c.ToTS, c.CreatedAt, c.ExpiresAt, c.S3URL)
 	return c.ID, err
+}
+
+// setCameraCaptureS3URL records the public object-storage URL for a capture (a
+// clip uploaded to S3) so the settle payload can hand out a direct link.
+func setCameraCaptureS3URL(db *sql.DB, token, url string) error {
+	_, err := db.Exec(`UPDATE camera_captures SET s3_url = ? WHERE token = ?`, url, token)
+	return err
 }
 
 func getCameraCapture(db *sql.DB, id string) (camCapture, error) {
