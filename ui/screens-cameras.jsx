@@ -2458,6 +2458,188 @@
   }
 
   /* ─────────────────────────────────────────────────────────────
+     Connect integration — service tokens
+     ───────────────────────────────────────────────────────────── */
+
+  // ServiceTokenModal mints the bearer token the Connect platform pastes into
+  // its System panel. The plaintext comes back from POST exactly once, so it
+  // lives ONLY in local state (`minted`) surfaced in a copy-once reveal — it is
+  // never re-fetched, logged, or persisted client-side.
+  function ServiceTokenModal({ open, onClose, notify, onMinted }) {
+    const [scope, setScope] = useState("management");
+    const [label, setLabel] = useState("");
+    const [siteId, setSiteId] = useState("");
+    const [saving, setSaving] = useState(false);
+    const [minted, setMinted] = useState("");
+    const [copied, setCopied] = useState(false);
+
+    useEffect(() => {
+      if (!open) return;
+      setScope("management"); setLabel(""); setSiteId("");
+      setSaving(false); setMinted(""); setCopied(false);
+    }, [open]);
+
+    const mint = useCallback(async () => {
+      const lbl = label.trim();
+      if (!lbl) { notify("Label is required", "error"); return; }
+      if (scope === "site" && !siteId.trim()) { notify("Site ID is required for a site token", "error"); return; }
+      setSaving(true);
+      try {
+        const body = { scope, label: lbl };
+        if (scope === "site") body.site_id = siteId.trim();
+        const res = await api.post("/ui/api/cameras/service-tokens", body);
+        if (!res || res.ok === false || !res.token) { notify((res && res.error) || "Mint failed", "error"); return; }
+        setMinted(res.token);
+        notify("Token minted", "success");
+        onMinted();
+      } catch (e) {
+        notify("Mint failed: " + ((e && e.message) || e), "error");
+      } finally { setSaving(false); }
+    }, [scope, label, siteId, notify, onMinted]);
+
+    const copyToken = useCallback(() => {
+      if (navigator.clipboard) navigator.clipboard.writeText(minted).catch(() => {});
+      setCopied(true);
+    }, [minted]);
+
+    return (
+      <Modal
+        open={open}
+        onClose={onClose}
+        title={minted ? "Copy your new token" : "Mint service token"}
+        description={minted
+          ? "Copy this now — it will not be shown again. The proxy keeps only a hash."
+          : "Bearer token the Connect platform uses to reach this proxy's camera service API."}
+        width={560}
+        footer={minted ? (
+          <div className="cam-modal-footer">
+            <Button variant="primary" size="md" icon={copied ? "check" : "copy"} onClick={copyToken}>{copied ? "Copied" : "Copy token"}</Button>
+            <Button variant="secondary" onClick={onClose}>Done</Button>
+          </div>
+        ) : (
+          <div className="cam-modal-footer">
+            <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+            <Button variant="primary" icon="key" loading={saving} onClick={mint}>Mint token</Button>
+          </div>
+        )}
+      >
+        {minted ? (
+          <Field label="Bearer token" hint="Paste into Connect → System → Camera Proxy Servers.">
+            <Input mono readOnly value={minted} onFocus={(e) => e.target.select()} />
+          </Field>
+        ) : (
+          <>
+            <Field label="Scope" hint="Management tokens administer every site; site tokens are scoped to one company's cameras.">
+              <Select
+                options={[{ value: "management", label: "Management (all sites)" }, { value: "site", label: "Site" }]}
+                value={scope}
+                onChange={(e) => setScope(e.target.value)}
+                disabled={saving}
+              />
+            </Field>
+            <Field label="Label" hint="A human name so you can recognise this token later.">
+              <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="connect-production" disabled={saving} />
+            </Field>
+            {scope === "site" && (
+              <Field label="Site ID" hint="The camera site this token is limited to (optional — most operators mint a management token).">
+                <Input mono value={siteId} onChange={(e) => setSiteId(e.target.value)} placeholder="site_…" disabled={saving} />
+              </Field>
+            )}
+          </>
+        )}
+      </Modal>
+    );
+  }
+
+  // IntegrationTab lists the global (not per-site) service tokens and mints new
+  // ones. Accepts the shared `notify`; any site/context props are ignored.
+  function IntegrationTab({ notify }) {
+    const tokensLive = useLive("/ui/api/cameras/service-tokens", { interval: 15000 });
+    const tokens = (tokensLive.data && tokensLive.data.tokens) || [];
+
+    const [mintOpen, setMintOpen] = useState(false);
+    const [revokeId, setRevokeId] = useState("");
+    const [revoking, setRevoking] = useState(false);
+
+    const revoke = useCallback(async () => {
+      if (!revokeId) return;
+      setRevoking(true);
+      try {
+        const res = await api.post("/ui/api/cameras/service-tokens/revoke", { id: revokeId });
+        if (!res || res.ok === false) { notify((res && res.error) || "Revoke failed", "error"); return; }
+        notify("Token revoked", "success");
+        setRevokeId("");
+        tokensLive.refresh();
+      } catch (e) {
+        notify("Revoke failed: " + ((e && e.message) || e), "error");
+      } finally { setRevoking(false); }
+    }, [revokeId, notify, tokensLive]);
+
+    return (
+      <div className="cam-tab-body">
+        <Card
+          title="Connect service tokens"
+          description="Mint a management token and paste it into Connect → System → Camera Proxy Servers. Site tokens are created automatically when a company adds the camera plugin."
+          actions={<Button size="sm" variant="primary" icon="plus" onClick={() => setMintOpen(true)}>Mint token</Button>}
+          flush
+        >
+          {tokens.length === 0 ? (
+            <EmptyState icon="key" title="No service tokens yet" description="Mint a management token so the Connect platform can reach this proxy's camera API." compact />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr><th>Scope</th><th>Label</th><th>Token</th><th>Site</th><th>Status</th><th>Last used</th><th>Created</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {tokens.map((t) => {
+                    const disabled = t.enabled === false;
+                    return (
+                      <tr key={t.id} className={disabled ? "muted" : undefined}>
+                        <td>{t.scope === "site" ? <Badge tone="neutral">Site</Badge> : <Badge tone="accent">Management</Badge>}</td>
+                        <td>{t.label || "—"}</td>
+                        <td className="mono">{t.token_preview || "—"}</td>
+                        <td className="mono">{t.site_id || "—"}</td>
+                        <td>{disabled ? <Badge tone="neutral">Revoked</Badge> : <Badge tone="success">Enabled</Badge>}</td>
+                        <td>{ago(t.last_used_at)}</td>
+                        <td>{ago(t.created_at)}</td>
+                        <td className="cam-row-actions">
+                          {!disabled && (
+                            <Button size="sm" variant="ghost" icon="trash" onClick={() => setRevokeId(t.id)}>Revoke</Button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <ServiceTokenModal
+          open={mintOpen}
+          notify={notify}
+          onClose={() => setMintOpen(false)}
+          onMinted={() => tokensLive.refresh()}
+        />
+        <Modal
+          open={!!revokeId}
+          onClose={() => { if (!revoking) setRevokeId(""); }}
+          title="Revoke this token?"
+          description="Connect immediately loses access with this token. This cannot be undone — mint a new one to restore access."
+          footer={
+            <div className="cam-modal-footer">
+              <Button variant="secondary" onClick={() => setRevokeId("")} disabled={revoking}>Cancel</Button>
+              <Button variant="danger" icon="trash" loading={revoking} onClick={revoke}>Revoke token</Button>
+            </div>
+          }
+        />
+      </div>
+    );
+  }
+
+  /* ─────────────────────────────────────────────────────────────
      Top-level screen
      ───────────────────────────────────────────────────────────── */
 
@@ -2547,6 +2729,7 @@
       { id: "watches", label: "Watches", icon: "activity" },
       { id: "runs", label: "Run history", icon: "clock" },
       { id: "diag", label: "Diagnostics", icon: "shield" },
+      { id: "integration", label: "Connect", icon: "key" },
     ]), [openQuestions.length, awaitingInvestigations.length, pendingCandidates]);
 
     return (
@@ -2612,6 +2795,9 @@
             )}
             {activeTab === "diag" && (
               <DiagnosticsTab cameras={cameras} notify={notify} />
+            )}
+            {activeTab === "integration" && (
+              <IntegrationTab notify={notify} />
             )}
           </>
         )}
