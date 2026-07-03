@@ -345,19 +345,46 @@ func camNotifyInvestigationSettled(cfg config, invID, status string) {
 	}
 	db.Close() // release before the (potentially minutes-long) retry ladder
 
+	body, merr := json.Marshal(camSettlePayload(cfg, inv, msgs, status, capByToken, time.Now()))
+	if merr != nil {
+		camlog("error", "investigation_callback", map[string]any{"investigation_id": invID, "ok": false, "error": merr.Error()})
+		return
+	}
+	camPostSignedCallback(cfg, cb, body, "investigation_callback", map[string]any{
+		"investigation_id": invID, "site_id": inv.SiteID, "status": status,
+	})
+}
+
+// camMergeFields returns a fresh map that is base overlaid with extra, so the
+// per-attempt log fields never mutate the caller's base map across retries.
+func camMergeFields(base, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+// camPostSignedCallback delivers a JSON body to a site's registered callback with
+// the same auth (Bearer per-site secret + X-Camera-Signature: sha256=HMAC(secret,
+// body)), client selection (SSRF-guarded unless cfg.CameraCallbackAllowPrivate),
+// per-attempt timeout, and {0,30s,5min} at-least-once retry ladder used by every
+// camera webhook. logOp/logFields let each caller (investigation_callback,
+// motion_callback) label its own log line; per-attempt fields (attempt/ok/
+// http_status) are merged in. The caller runs this on its own goroutine (the
+// retry ladder sleeps inline), decrypting nothing itself — the secret is derived
+// here from cb.SecretEnc.
+func camPostSignedCallback(cfg config, cb camSiteCallback, body []byte, logOp string, logFields map[string]any) {
 	secret := ""
 	if strings.TrimSpace(cb.SecretEnc) != "" {
 		if s, derr := decryptSecret(cfg, cb.SecretEnc); derr == nil {
 			secret = s
 		} else {
-			camlog("warn", "investigation_callback", map[string]any{"investigation_id": invID, "ok": false, "error": "secret decrypt failed"})
+			camlog("warn", logOp, camMergeFields(logFields, map[string]any{"ok": false, "error": "secret decrypt failed"}))
 		}
-	}
-
-	body, merr := json.Marshal(camSettlePayload(cfg, inv, msgs, status, capByToken, time.Now()))
-	if merr != nil {
-		camlog("error", "investigation_callback", map[string]any{"investigation_id": invID, "ok": false, "error": merr.Error()})
-		return
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
@@ -379,7 +406,7 @@ func camNotifyInvestigationSettled(cfg config, invID, status string) {
 		}
 		req, rerr := http.NewRequest(http.MethodPost, cb.URL, bytes.NewReader(body))
 		if rerr != nil {
-			camlog("error", "investigation_callback", map[string]any{"investigation_id": invID, "ok": false, "error": rerr.Error()})
+			camlog("error", logOp, camMergeFields(logFields, map[string]any{"ok": false, "error": rerr.Error()}))
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -389,10 +416,7 @@ func camNotifyInvestigationSettled(cfg config, invID, status string) {
 		}
 		resp, derr := client.Do(req)
 		if derr != nil {
-			camlog("warn", "investigation_callback", map[string]any{
-				"investigation_id": invID, "site_id": inv.SiteID, "status": status,
-				"attempt": i + 1, "ok": false, "error": derr.Error(),
-			})
+			camlog("warn", logOp, camMergeFields(logFields, map[string]any{"attempt": i + 1, "ok": false, "error": derr.Error()}))
 			continue
 		}
 		_ = readAllLimited(resp.Body, 4096) // drain for connection reuse; body unused
@@ -402,14 +426,51 @@ func camNotifyInvestigationSettled(cfg config, invID, status string) {
 		if !ok {
 			level = "warn"
 		}
-		camlog(level, "investigation_callback", map[string]any{
-			"investigation_id": invID, "site_id": inv.SiteID, "status": status,
-			"attempt": i + 1, "ok": ok, "http_status": resp.StatusCode,
-		})
+		camlog(level, logOp, camMergeFields(logFields, map[string]any{"attempt": i + 1, "ok": ok, "http_status": resp.StatusCode}))
 		if ok {
 			return
 		}
 	}
+}
+
+// camNotifyMotion delivers the real-time camera_motion webhook for a fired motion
+// episode to the site's registered callback. A site with no enabled callback is a
+// cheap no-op. Payload {event:"camera_motion", site_id, camera_id, camera_name,
+// event_type, at, snapshot:{token, media_url}} — the snapshot media_url is a
+// served /camera/media/<token> URL (blank when the snapshot couldn't be captured).
+// Always spawned `go ...`; the retry ladder runs inline on that goroutine.
+func camNotifyMotion(cfg config, siteID, cameraID, cameraName, eventType, at, snapshotToken string) {
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		camlog("warn", "motion_callback", map[string]any{"site_id": siteID, "camera_id": cameraID, "ok": false, "error": err.Error()})
+		return
+	}
+	cb, cerr := getCameraSiteCallback(db, siteID)
+	db.Close()
+	if cerr != nil || !cb.Enabled || strings.TrimSpace(cb.URL) == "" {
+		return // no registered callback — cheap no-op
+	}
+	snapshot := map[string]any{"token": snapshotToken, "media_url": ""}
+	if strings.TrimSpace(snapshotToken) != "" {
+		snapshot["media_url"] = camMediaURL(cfg, nil, snapshotToken)
+	}
+	payload := map[string]any{
+		"event":       "camera_motion",
+		"site_id":     siteID,
+		"camera_id":   cameraID,
+		"camera_name": cameraName,
+		"event_type":  eventType,
+		"at":          at,
+		"snapshot":    snapshot,
+	}
+	body, merr := json.Marshal(payload)
+	if merr != nil {
+		camlog("error", "motion_callback", map[string]any{"site_id": siteID, "camera_id": cameraID, "ok": false, "error": merr.Error()})
+		return
+	}
+	camPostSignedCallback(cfg, cb, body, "motion_callback", map[string]any{
+		"site_id": siteID, "camera_id": cameraID, "event_type": eventType,
+	})
 }
 
 // ─────────────────────────── rate limiting + last-used ───────────────────────────
@@ -558,6 +619,8 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/playbooks/delete", noStore(requireCameraService(cfg, "site", handleSvcPlaybookDelete(cfg))))
 	mux.HandleFunc("/api/cameras/media/", noStore(requireCameraService(cfg, "site", handleSvcMedia(cfg))))
 	mux.HandleFunc("/api/cameras/callback", noStore(requireCameraService(cfg, "site", handleSvcCallback(cfg))))
+	mux.HandleFunc("/api/cameras/motion/arm", noStore(requireCameraService(cfg, "site", handleSvcMotionArm(cfg))))
+	mux.HandleFunc("/api/cameras/motion/events", noStore(requireCameraService(cfg, "site", handleSvcMotionEvents(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────
@@ -2288,4 +2351,165 @@ func handleCameraServiceTokenRevoke(cfg config) http.HandlerFunc {
 		camlog("info", "service_token_revoke", map[string]any{"token_id": id})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
+}
+
+// ─────────────────────────── motion ───────────────────────────
+
+// camMotionArmView renders an arm row for the API (event_types decoded back into
+// a JSON array; an unparseable stored value degrades to []).
+func camMotionArmView(a camMotionArm) map[string]any {
+	types := []string{}
+	if strings.TrimSpace(a.EventTypes) != "" {
+		_ = json.Unmarshal([]byte(a.EventTypes), &types)
+	}
+	if types == nil {
+		types = []string{}
+	}
+	return map[string]any{
+		"camera_id": a.CameraID, "event_types": types,
+		"cooldown_seconds": a.CooldownSeconds, "enabled": a.Enabled,
+	}
+}
+
+// handleSvcMotionArm serves POST /api/cameras/motion/arm {camera_ids[],
+// event_types[], cooldown_seconds, enabled} → upserts one arm row per camera for
+// sc.SiteID (every camera_id must belong to the token's site) / GET → the site's
+// current arm config. Site is ALWAYS sc.SiteID, never the request.
+func handleSvcMotionArm(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		switch r.Method {
+		case http.MethodGet:
+			arms, err := listCameraMotionArm(db, sc.SiteID)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			out := make([]map[string]any, 0, len(arms))
+			for _, a := range arms {
+				out = append(out, camMotionArmView(a))
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"arms": out})
+		case http.MethodPost:
+			var body struct {
+				CameraIDs       []string `json:"camera_ids"`
+				EventTypes      []string `json:"event_types"`
+				CooldownSeconds int      `json:"cooldown_seconds"`
+				Enabled         *bool    `json:"enabled"`
+			}
+			if !camSvcDecode(w, r, &body) {
+				return
+			}
+			if len(body.CameraIDs) == 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "camera_ids is required"})
+				return
+			}
+			// Validate every camera belongs to the token's site before writing any.
+			ids := make([]string, 0, len(body.CameraIDs))
+			for _, raw := range body.CameraIDs {
+				cam, ok := camSvcCamera(db, w, raw, sc.SiteID)
+				if !ok {
+					return // camSvcCamera already wrote the 404
+				}
+				ids = append(ids, cam.ID)
+			}
+			// Normalize event_types: trim, drop blanks. Empty list = "any type".
+			types := make([]string, 0, len(body.EventTypes))
+			for _, t := range body.EventTypes {
+				if t = strings.TrimSpace(t); t != "" {
+					types = append(types, t)
+				}
+			}
+			typesJSON, _ := json.Marshal(types)
+			enabled := true
+			if body.Enabled != nil {
+				enabled = *body.Enabled
+			}
+			cooldown := body.CooldownSeconds
+			if cooldown < 0 {
+				cooldown = 0
+			}
+			for _, id := range ids {
+				if err := upsertCameraMotionArm(db, sc.SiteID, id, string(typesJSON), cooldown, enabled); err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+					return
+				}
+			}
+			camlog("info", "svc_motion_arm", map[string]any{
+				"site_id": sc.SiteID, "cameras": len(ids), "enabled": enabled,
+				"cooldown_seconds": cooldown, "event_types": types,
+			})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "armed": len(ids), "event_types": types,
+				"cooldown_seconds": cooldown, "enabled": enabled,
+			})
+		default:
+			camSvcMethodNotAllowed(w)
+		}
+	}
+}
+
+// handleSvcMotionEvents serves GET /api/cameras/motion/events?camera_ids=&from=
+// &to=&event_type= → the site's coalesced motion episodes (started_at/ended_at
+// are UTC RFC3339). from/to are parsed as RFC3339 and normalized to UTC for the
+// range filter; an unparseable bound is ignored. Always scoped to sc.SiteID.
+func handleSvcMotionEvents(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		q := r.URL.Query()
+		var ids []string
+		for _, part := range strings.Split(q.Get("camera_ids"), ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				ids = append(ids, p)
+			}
+		}
+		fromTS := camMotionParseBoundUTC(q.Get("from"))
+		toTS := camMotionParseBoundUTC(q.Get("to"))
+		eventType := strings.TrimSpace(q.Get("event_type"))
+		events, truncated, err := listCameraMotionEvents(db, sc.SiteID, ids, fromTS, toTS, eventType)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		names := map[string]string{}
+		if cams, cerr := listCamerasBySite(db, sc.SiteID); cerr == nil {
+			for _, c := range cams {
+				names[c.ID] = camDisplayName(c)
+			}
+		}
+		out := make([]map[string]any, 0, len(events))
+		for _, e := range events {
+			out = append(out, map[string]any{
+				"camera_id": e.CameraID, "camera_name": names[e.CameraID],
+				"event_type": e.EventType, "started_at": e.StartedAt, "ended_at": e.EndedAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": out, "truncated": truncated})
+	}
+}
+
+// camMotionParseBoundUTC parses an RFC3339 range bound into a UTC RFC3339 string
+// suitable for the started_at (UTC-stored) comparison; "" for blank/unparseable.
+func camMotionParseBoundUTC(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }

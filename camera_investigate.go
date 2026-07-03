@@ -68,8 +68,8 @@ import (
 // emits. Its nested Action carries the actual command:
 //
 //	{"thought":"...","action":{"type":"call_tool|ask_operator|answer",
-//	  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate",
-//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,
+//	  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate",
+//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"VMD",
 //	    "name":"<playbook or api tool>","params":{"key":"value"},
 //	    "avatar_id":"...","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},
 //	  "question":"...(ask_operator)","answer":"...(final narrative)",
@@ -96,16 +96,17 @@ type investigateCommand struct {
 // flexInt decoder so a text model emitting "6" is still accepted.
 type investigateArgs struct {
 	CameraIDs []string        `json:"camera_ids"`
-	Quality   string          `json:"quality"`   // sub | main
-	From      string          `json:"from"`      // RFC3339 absolute time (DVR timezone honored by the loop)
-	To        string          `json:"to"`        // RFC3339 absolute time
-	Count     flexInt         `json:"count"`     // desired still count for past_frames
-	Mode      string          `json:"mode"`      // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
-	Name      string          `json:"name"`      // playbook / call_api: the catalog entry to invoke (exact name)
-	Params    map[string]any  `json:"params"`    // call_api: {{placeholder}} values (stringified tolerantly)
-	AvatarID  string          `json:"avatar_id"` // avatar_info / avatar_check / avatar_find: the avatar to inspect/match
-	Time      string          `json:"time"`      // avatar_check / annotate: RFC3339 archive instant
-	BBox      json.RawMessage `json:"bbox"`      // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
+	Quality   string          `json:"quality"`    // sub | main
+	From      string          `json:"from"`       // RFC3339 absolute time (DVR timezone honored by the loop)
+	To        string          `json:"to"`         // RFC3339 absolute time
+	Count     flexInt         `json:"count"`      // desired still count for past_frames
+	Mode      string          `json:"mode"`       // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
+	Name      string          `json:"name"`       // playbook / call_api: the catalog entry to invoke (exact name)
+	Params    map[string]any  `json:"params"`     // call_api: {{placeholder}} values (stringified tolerantly)
+	AvatarID  string          `json:"avatar_id"`  // avatar_info / avatar_check / avatar_find: the avatar to inspect/match
+	Time      string          `json:"time"`       // avatar_check / annotate: RFC3339 archive instant
+	BBox      json.RawMessage `json:"bbox"`       // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
+	EventType string          `json:"event_type"` // motion_search: optional exact event-type filter (VMD | linedetection | …)
 }
 
 // evidenceItem is one media artifact cited in a final answer: a served
@@ -117,7 +118,7 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
@@ -415,6 +416,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("  Then past_frames the specific numbered cells (quality \"main\") to confirm/read detail. Frames of the same person seconds apart are ONE entry, not several.\n")
 	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use to SEE a window directly, or to zoom into the exact times a contact_sheet flagged.\n")
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
+	b.WriteString("- motion_search: args.camera_ids (optional, default = all cameras), args.from + args.to (RFC3339, required), args.event_type (optional exact type) — queries the DVR MOTION LOG and returns the exact times motion/line-cross/intrusion episodes occurred, WITHOUT pulling any footage (costs no media budget). Use FIRST to find WHEN activity happened, then past_frames/contact_sheet/avatar_check those exact windows — don't brute-scan.\n")
 	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS) — returns that procedure's full\n")
 	b.WriteString("  instructions plus operator-approved reference images (shown to you next turn). Costs no media budget.\n")
 	b.WriteString("- call_api: args.name (EXACT name from EXTERNAL API TOOLS), args.params {\"key\":\"value\"} — the loop\n")
@@ -435,6 +437,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("- answer: finish with action.answer plus action.evidence citing exact media_url values from TOOL RESULT lines.\n\n")
 
 	b.WriteString("STRATEGY for counting people/occupancy over a time window: (1) use the ROSTER descriptions to pick the ONE relevant camera AND to judge whether it is a DOOR (mostly still) or a BUSY area (constant movement); (2) contact_sheet that camera with mode \"motion\" for a door or mode \"interval\" for a busy area; (3) read the numbered sheet, count DISTINCT people, and past_frames specific cells for detail/time. Do NOT blindly past_frames a wide multi-camera window — it is slow and misses people.\n\n")
+	b.WriteString("STRATEGY for finding WHEN something happened (\"first person to arrive\", \"any activity after hours\"): call motion_search FIRST on the relevant camera(s) and window — it returns the exact episode times cheaply from the motion log — then drill into those precise windows with past_frames/contact_sheet/avatar_check instead of scanning the whole day.\n\n")
 	if hasAvatars {
 		b.WriteString("STRATEGY for tracking a NAMED person across a day: (1) avatars → find their id; (2) avatar_info to study their references; (3) from the roster pick the entry/exit cameras and their usual areas; (4) avatar_find each such camera across the window to collect sightings; (5) avatar_check the pivotal ones (arrival, departure, anything unusual); (6) answer with a chronological timeline citing the annotated frames.\n\n")
 	}
@@ -457,7 +460,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|ask_operator|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
+	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
@@ -824,6 +827,8 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 		return camToolPastFrames(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "past_clip":
 		return camToolPastClip(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
+	case "motion_search":
+		return camToolMotionSearch(cfg, db, site, args, allowed, camByID, dvrByID)
 	case "playbook":
 		return camToolPlaybook(ctx, cfg, db, r, site, args, scratch)
 	case "call_api":
@@ -1230,6 +1235,132 @@ func camToolPastClip(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 		Media:   []evidenceItem{{MediaURL: mediaURL, Caption: camDisplayName(c) + " — " + windowLabel(from, to)}},
 		Fetches: 1,
 	}
+}
+
+// camToolMotionSearch queries the coalesced DVR motion history
+// (camera_motion_events) for a [from,to] window and returns episode times as
+// TEXT — no imagery, no media budget (Fetches:0). It is the cheap "when did
+// activity happen" lookup the model runs BEFORE brute-scanning footage: the
+// results tell it exactly which windows to drill into with
+// past_frames/contact_sheet/avatar_check. camera_ids is optional (default = all
+// enabled cameras); event_type optionally narrows to one type. Episode times are
+// rendered in the site timezone.
+func camToolMotionSearch(cfg config, db *sql.DB, site camSite, args investigateArgs, allowed map[string]bool, camByID map[string]camera, dvrByID map[string]CamDVR) investigateToolResult {
+	explicit := len(args.CameraIDs) > 0
+	ids := camFilterAllowed(args.CameraIDs, allowed)
+	if explicit && len(ids) == 0 {
+		return investigateToolResult{Summary: "motion_search: no valid camera_ids given (must be exact ids from the roster; omit to search all cameras)."}
+	}
+	if len(ids) == 0 {
+		// Default = the cameras THIS investigation may see (enabled cameras on
+		// enabled DVRs), never every row in the site — mirror the allowed-set
+		// discipline every other tool enforces so a disabled camera can't leak.
+		for id := range allowed {
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			return investigateToolResult{Summary: "motion_search: no enabled cameras available to search."}
+		}
+	}
+	from, to, terr := camParseWindow(args.From, args.To, cfg, false)
+	if terr != nil {
+		return investigateToolResult{Summary: "motion_search: " + terr.Error()}
+	}
+	fromUTC := from.UTC().Format(time.RFC3339)
+	toUTC := to.UTC().Format(time.RFC3339)
+	eventType := strings.TrimSpace(args.EventType)
+	events, truncated, err := listCameraMotionEvents(db, site.ID, ids, fromUTC, toUTC, eventType)
+	if err != nil {
+		return investigateToolResult{Summary: "motion_search: " + err.Error()}
+	}
+
+	dvrs := make([]CamDVR, 0, len(dvrByID))
+	for _, d := range dvrByID {
+		dvrs = append(dvrs, d)
+	}
+	loc, tzName := camSiteTimezone(dvrs)
+
+	scope := "all cameras"
+	if explicit {
+		scope = camIDsWithNames(ids, camByID)
+	}
+	typeNote := ""
+	if eventType != "" {
+		typeNote = " of type " + eventType
+	}
+	if len(events) == 0 {
+		return investigateToolResult{Summary: fmt.Sprintf("motion_search: no motion episodes%s recorded for %s in %s.", typeNote, scope, windowLabel(from, to))}
+	}
+
+	// Group episodes per camera in first-seen order (events arrive oldest-first).
+	order := []string{}
+	byCam := map[string][]camMotionEvent{}
+	var earliest, latest string
+	for _, e := range events {
+		if _, ok := byCam[e.CameraID]; !ok {
+			order = append(order, e.CameraID)
+		}
+		byCam[e.CameraID] = append(byCam[e.CameraID], e)
+		if earliest == "" || e.StartedAt < earliest {
+			earliest = e.StartedAt
+		}
+		if e.StartedAt > latest {
+			latest = e.StartedAt
+		}
+	}
+
+	const perCamCap = 25
+	var b strings.Builder
+	fmt.Fprintf(&b, "motion_search: %d motion episode(s)%s across %d camera(s) in %s (times in %s). Earliest %s, latest %s.\n",
+		len(events), typeNote, len(order), windowLabel(from, to), tzName,
+		camMotionClock(earliest, loc), camMotionClock(latest, loc))
+	if truncated {
+		fmt.Fprintf(&b, "NOTE: only the earliest %d episodes are shown — more matched this window. Narrow the time range or specify fewer cameras for complete coverage.\n", camMotionEventQueryLimit)
+	}
+	for _, camID := range order {
+		list := byCam[camID]
+		name := camID
+		if c, ok := camByID[camID]; ok {
+			name = camDisplayName(c)
+		}
+		fmt.Fprintf(&b, "- %s (%s): %d episode(s); ", camID, name, len(list))
+		parts := make([]string, 0, perCamCap)
+		for i, e := range list {
+			if i >= perCamCap {
+				parts = append(parts, fmt.Sprintf("…(+%d more)", len(list)-perCamCap))
+				break
+			}
+			parts = append(parts, camMotionEpisodeLabel(e, loc))
+		}
+		b.WriteString(strings.Join(parts, "; "))
+		b.WriteString("\n")
+	}
+	return investigateToolResult{Summary: strings.TrimRight(b.String(), "\n")}
+}
+
+// camMotionClock renders a stored UTC RFC3339 instant as HH:MM:SS in loc.
+func camMotionClock(utcRFC3339 string, loc *time.Location) string {
+	t, err := time.Parse(time.RFC3339, utcRFC3339)
+	if err != nil {
+		return utcRFC3339
+	}
+	return t.In(loc).Format("15:04:05 Jan 2")
+}
+
+// camMotionEpisodeLabel renders one episode as "HH:MM:SS–HH:MM:SS type" (or just
+// "HH:MM:SS type" while the episode is still open / had no distinct end).
+func camMotionEpisodeLabel(e camMotionEvent, loc *time.Location) string {
+	start, serr := time.Parse(time.RFC3339, e.StartedAt)
+	if serr != nil {
+		return e.StartedAt + " " + e.EventType
+	}
+	label := start.In(loc).Format("15:04:05")
+	if strings.TrimSpace(e.EndedAt) != "" {
+		if end, eerr := time.Parse(time.RFC3339, e.EndedAt); eerr == nil && end.After(start) {
+			label += "–" + end.In(loc).Format("15:04:05")
+		}
+	}
+	return label + " " + e.EventType
 }
 
 // camParseWindow validates a tool's [from,to] time-window args: both must be

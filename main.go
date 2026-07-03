@@ -244,6 +244,14 @@ type config struct {
 	CameraServiceRate          int           // PROXY_CAMERA_SERVICE_RATE — service-token requests/min (default 120; media fetches 5x)
 	CameraCallbackAllowPrivate bool          // PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE — allow settle webhooks to private IPs (local dev only; default false)
 	CameraCallbackTimeout      time.Duration // PROXY_CAMERA_CALLBACK_TIMEOUT — per-attempt settle-webhook timeout (default 20s)
+	// DVR motion listeners (camera_motion.go): one long-lived Hikvision ISAPI
+	// alert-stream connection per DVR that coalesces motion into episodes, stores a
+	// queryable history, and fires a signed camera_motion webhook for armed cameras.
+	CameraMotionEnabled   bool          // PROXY_CAM_MOTION_ENABLED — run the DVR motion-alert listeners (default false)
+	CameraMotionRetention time.Duration // PROXY_CAM_MOTION_RETENTION — keep motion-event history this long (default 720h/30d)
+	CameraMotionCooldown  time.Duration // PROXY_CAM_MOTION_COOLDOWN — default per-(camera,event) webhook cooldown (default 60s)
+	CameraMotionReconnect time.Duration // PROXY_CAM_MOTION_RECONNECT — base reconnect backoff for a dropped alert stream (default 5s)
+	CameraMotionReconcile time.Duration // PROXY_CAM_MOTION_RECONCILE — how often the supervisor reconciles listeners with the DVR list (default 30s)
 }
 
 type modelAliasConfig struct {
@@ -776,6 +784,12 @@ func loadConfig() config {
 		CameraServiceRate:          parseIntDefault(getenv("PROXY_CAMERA_SERVICE_RATE", "120"), 120),
 		CameraCallbackAllowPrivate: envFlag("PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE", false),
 		CameraCallbackTimeout:      parseAgyTimeout(getenv("PROXY_CAMERA_CALLBACK_TIMEOUT", "20")),
+
+		CameraMotionEnabled:   envFlag("PROXY_CAM_MOTION_ENABLED", false),
+		CameraMotionRetention: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RETENTION", "2592000")), // 720h = 30d
+		CameraMotionCooldown:  parseAgyTimeout(getenv("PROXY_CAM_MOTION_COOLDOWN", "60")),
+		CameraMotionReconnect: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RECONNECT", "5")),
+		CameraMotionReconcile: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RECONCILE", "30")),
 	}
 }
 

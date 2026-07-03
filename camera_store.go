@@ -466,6 +466,30 @@ func migrateCameraDB(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cam_svc_tokens_hash ON camera_service_tokens(token_hash, enabled)`,
+		// ── Motion detection (camera_motion.go): every coalesced DVR motion episode
+		// (queryable history for the AI) plus the per-(site,camera) arming config that
+		// decides which episodes fire a real-time camera_motion webhook.
+		`CREATE TABLE IF NOT EXISTS camera_motion_events (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			camera_id TEXT NOT NULL,
+			event_type TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			ended_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_motion_arm (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			camera_id TEXT NOT NULL,
+			event_types TEXT NOT NULL DEFAULT '',
+			cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_motion_events_site ON camera_motion_events(site_id, camera_id, started_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_motion_arm_uniq ON camera_motion_arm(site_id, camera_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -1139,6 +1163,198 @@ func deleteExpiredCameraCaptures(db *sql.DB, now string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ─────────────────────────── camera_motion_events ───────────────────────────
+//
+// One coalesced motion EPISODE per row (camera_motion.go collapses the DVR's
+// repeated active heartbeats into a single episode: started_at on first active,
+// ended_at filled when the episode closes on an inactive event or an idle gap).
+// started_at/ended_at are stored as UTC RFC3339 so lexicographic range filters
+// hold across DVRs on different local offsets; callers render them in the site
+// timezone. Written for EVERY camera regardless of arming — this is the
+// queryable history the motion_search investigate tool reads.
+
+// camMotionEvent is an in-memory view of a camera_motion_events row.
+type camMotionEvent struct {
+	ID        string
+	SiteID    string
+	CameraID  string
+	EventType string
+	StartedAt string // UTC RFC3339
+	EndedAt   string // UTC RFC3339, "" while the episode is still open
+	CreatedAt string
+}
+
+const camMotionEventCols = `id, site_id, camera_id, event_type, started_at, ended_at, created_at`
+
+func scanMotionEvent(s rowScanner) (camMotionEvent, error) {
+	var e camMotionEvent
+	err := s.Scan(&e.ID, &e.SiteID, &e.CameraID, &e.EventType, &e.StartedAt, &e.EndedAt, &e.CreatedAt)
+	return e, err
+}
+
+// insertCameraMotionEvent opens a new episode (ended_at blank) and returns its id
+// so the caller can updateMotionEventEnd it when the episode closes.
+func insertCameraMotionEvent(db *sql.DB, siteID, cameraID, eventType, startedAt string) (string, error) {
+	id := randomID("mev")
+	_, err := db.Exec(`INSERT INTO camera_motion_events
+		(id, site_id, camera_id, event_type, started_at, ended_at, created_at)
+		VALUES (?, ?, ?, ?, ?, '', ?)`,
+		id, siteID, cameraID, eventType, startedAt, nowRFC3339())
+	return id, err
+}
+
+// updateMotionEventEnd stamps an episode's ended_at (episode close).
+func updateMotionEventEnd(db *sql.DB, id, endedAt string) error {
+	_, err := db.Exec(`UPDATE camera_motion_events SET ended_at = ? WHERE id = ?`, endedAt, id)
+	return err
+}
+
+// camMotionEventQueryLimit caps how many episodes a single motion query returns.
+// The caller is told (truncated=true) when the cap is hit so a wide/busy-site
+// window is never SILENTLY under-reported — the tool/API surface a "narrow the
+// window" note rather than presenting a partial answer as complete.
+const camMotionEventQueryLimit = 8000
+
+// listCameraMotionEvents returns motion episodes for a site, oldest first,
+// optionally filtered by a set of camera ids, a [fromTS,toTS] started_at window
+// (both UTC RFC3339; "" disables that bound), and an exact event_type. Always
+// scoped to siteID so a leaked/mismatched camera id can never cross sites. The
+// returned truncated is true when more episodes matched than the cap returned
+// (results are the OLDEST camMotionEventQueryLimit — the caller should narrow).
+func listCameraMotionEvents(db *sql.DB, siteID string, cameraIDs []string, fromTS, toTS, eventType string) ([]camMotionEvent, bool, error) {
+	q := `SELECT ` + camMotionEventCols + ` FROM camera_motion_events WHERE site_id = ?`
+	args := []any{siteID}
+	if len(cameraIDs) > 0 {
+		q += ` AND camera_id IN (` + strings.TrimRight(strings.Repeat("?,", len(cameraIDs)), ",") + `)`
+		for _, id := range cameraIDs {
+			args = append(args, id)
+		}
+	}
+	if strings.TrimSpace(fromTS) != "" {
+		q += ` AND started_at >= ?`
+		args = append(args, fromTS)
+	}
+	if strings.TrimSpace(toTS) != "" {
+		q += ` AND started_at <= ?`
+		args = append(args, toTS)
+	}
+	if strings.TrimSpace(eventType) != "" {
+		q += ` AND event_type = ?`
+		args = append(args, eventType)
+	}
+	// Fetch one past the cap so an exact-cap match is distinguishable from a real
+	// overflow (truncated only when a genuine extra row exists).
+	q += ` ORDER BY started_at LIMIT ?`
+	args = append(args, camMotionEventQueryLimit+1)
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var out []camMotionEvent
+	for rows.Next() {
+		e, serr := scanMotionEvent(rows)
+		if serr != nil {
+			return nil, false, serr
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := false
+	if len(out) > camMotionEventQueryLimit {
+		out = out[:camMotionEventQueryLimit]
+		truncated = true
+	}
+	return out, truncated, nil
+}
+
+// deleteOldCameraMotionEvents prunes episodes created before cutoff (server-clock
+// created_at, so a skewed DVR clock can't defeat retention). Returns rows deleted.
+func deleteOldCameraMotionEvents(db *sql.DB, cutoffRFC3339 string) (int64, error) {
+	res, err := db.Exec(`DELETE FROM camera_motion_events WHERE created_at < ?`, cutoffRFC3339)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ─────────────────────────── camera_motion_arm ───────────────────────────
+//
+// Per-(site,camera) arming for real-time firing: which event types wake a
+// camera_motion webhook and the per-camera cooldown between fires. Mirrors the
+// getCameraSiteCallback/setCameraSiteCallback upsert shape. UNIQUE(site_id,
+// camera_id) makes upsertCameraMotionArm an update-or-insert.
+
+// camMotionArm is an in-memory view of a camera_motion_arm row. EventTypes is a
+// JSON array string (empty/"[]" means "any event type").
+type camMotionArm struct {
+	ID              string
+	SiteID          string
+	CameraID        string
+	EventTypes      string // JSON array
+	CooldownSeconds int
+	Enabled         bool
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+const camMotionArmCols = `id, site_id, camera_id, event_types, cooldown_seconds, enabled, created_at, updated_at`
+
+func scanMotionArm(s rowScanner) (camMotionArm, error) {
+	var a camMotionArm
+	var enabled int
+	err := s.Scan(&a.ID, &a.SiteID, &a.CameraID, &a.EventTypes, &a.CooldownSeconds, &enabled, &a.CreatedAt, &a.UpdatedAt)
+	a.Enabled = enabled != 0
+	return a, err
+}
+
+// upsertCameraMotionArm inserts or updates the arm row for (siteID, cameraID).
+func upsertCameraMotionArm(db *sql.DB, siteID, cameraID, eventTypesJSON string, cooldownSeconds int, enabled bool) error {
+	now := nowRFC3339()
+	res, err := db.Exec(`UPDATE camera_motion_arm
+		SET event_types = ?, cooldown_seconds = ?, enabled = ?, updated_at = ?
+		WHERE site_id = ? AND camera_id = ?`,
+		eventTypesJSON, cooldownSeconds, boolToInt(enabled), now, siteID, cameraID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	_, err = db.Exec(`INSERT INTO camera_motion_arm
+		(id, site_id, camera_id, event_types, cooldown_seconds, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		randomID("marm"), siteID, cameraID, eventTypesJSON, cooldownSeconds, boolToInt(enabled), now, now)
+	return err
+}
+
+// listCameraMotionArm returns every arm row for a site.
+func listCameraMotionArm(db *sql.DB, siteID string) ([]camMotionArm, error) {
+	rows, err := db.Query(`SELECT `+camMotionArmCols+` FROM camera_motion_arm WHERE site_id = ? ORDER BY created_at`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camMotionArm
+	for rows.Next() {
+		a, serr := scanMotionArm(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// getCameraMotionArm loads the arm row for (siteID, cameraID); sql.ErrNoRows when
+// the camera was never armed.
+func getCameraMotionArm(db *sql.DB, siteID, cameraID string) (camMotionArm, error) {
+	return scanMotionArm(db.QueryRow(`SELECT `+camMotionArmCols+`
+		FROM camera_motion_arm WHERE site_id = ? AND camera_id = ?`, siteID, cameraID))
 }
 
 // ─────────────────────────── camera_events ───────────────────────────
