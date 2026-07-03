@@ -1,0 +1,11 @@
+# Pinned for reproducible installs on Ubuntu 22.04/24.04 (CPU-only).
+# insightface ships only an sdist on PyPI and compiles Cython/C++ at install
+# time — install.sh installs the gcc/g++/python3-dev/cython build prerequisites.
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+insightface==0.7.3
+onnxruntime==1.18.1
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pillow==10.4.0
+cython==3.0.10

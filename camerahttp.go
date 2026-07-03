@@ -82,6 +82,37 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/ui/api/cameras/events", noStore(requireAdmin(cfg, handleCameraEvents(cfg))))
 	mux.HandleFunc("/ui/api/cameras/recapture", noStore(requireAdmin(cfg, handleCameraRecapture(cfg))))
 
+	// Knowledge layer: operator playbooks + reference media (camera_playbooks.go)
+	// and operator-defined external API tools (camera_apitools.go).
+	mux.HandleFunc("/ui/api/cameras/playbooks", noStore(requireAdmin(cfg, handleCameraPlaybooks(cfg))))
+	mux.HandleFunc("/ui/api/cameras/playbooks/update", noStore(requireAdmin(cfg, handleCameraPlaybookUpdate(cfg))))
+	mux.HandleFunc("/ui/api/cameras/playbooks/delete", noStore(requireAdmin(cfg, handleCameraPlaybookDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/playbooks/media", noStore(requireAdmin(cfg, handleCameraPlaybookMedia(cfg))))
+	mux.HandleFunc("/ui/api/cameras/playbooks/media/delete", noStore(requireAdmin(cfg, handleCameraPlaybookMediaDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/apitools", noStore(requireAdmin(cfg, handleCameraAPITools(cfg))))
+	mux.HandleFunc("/ui/api/cameras/apitools/update", noStore(requireAdmin(cfg, handleCameraAPIToolUpdate(cfg))))
+	mux.HandleFunc("/ui/api/cameras/apitools/delete", noStore(requireAdmin(cfg, handleCameraAPIToolDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/apitools/test", noStore(requireAdmin(cfg, handleCameraAPIToolTest(cfg))))
+
+	// Avatars: registry + reference media (camera_avatars.go), enrollment scans +
+	// candidate review (camera_avatar_scan.go handlers live in camera_avatars.go).
+	mux.HandleFunc("/ui/api/cameras/avatars", noStore(requireAdmin(cfg, handleCameraAvatars(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/update", noStore(requireAdmin(cfg, handleCameraAvatarUpdate(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/delete", noStore(requireAdmin(cfg, handleCameraAvatarDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/media", noStore(requireAdmin(cfg, handleCameraAvatarMedia(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/media/upload", noStore(requireAdmin(cfg, handleCameraAvatarMediaUpload(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/media/delete", noStore(requireAdmin(cfg, handleCameraAvatarMediaDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/scan", noStore(requireAdmin(cfg, handleCameraAvatarScan(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/scans", noStore(requireAdmin(cfg, handleCameraAvatarScans(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/candidates", noStore(requireAdmin(cfg, handleCameraAvatarCandidates(cfg))))
+	mux.HandleFunc("/ui/api/cameras/avatars/candidates/review", noStore(requireAdmin(cfg, handleCameraAvatarCandidateReview(cfg))))
+
+	// Service tokens for the Connect-facing /api/cameras/* service API
+	// (camera_serviceapi.go — the service routes themselves are registered by
+	// registerCameraServiceRoutes from newProxyMux).
+	mux.HandleFunc("/ui/api/cameras/service-tokens", noStore(requireAdmin(cfg, handleCameraServiceTokens(cfg))))
+	mux.HandleFunc("/ui/api/cameras/service-tokens/revoke", noStore(requireAdmin(cfg, handleCameraServiceTokenRevoke(cfg))))
+
 	mux.HandleFunc("/camera/media/", noStore(requireAdmin(cfg, handleCameraMedia(cfg))))
 }
 
@@ -105,6 +136,7 @@ func dvrJSON(v camDVRView) map[string]any {
 		"id": v.ID, "site_id": v.SiteID, "name": v.Name, "brand": v.Brand,
 		"host": v.Host, "port": v.Port, "http_port": v.HTTPPort, "username": v.Username,
 		"password_preview": v.PasswordPreview, "timezone": v.Timezone,
+		"ai_instructions":     v.AIInstructions,
 		"channels_discovered": v.ChannelsDiscovered, "enabled": v.Enabled,
 		"last_discovered_at": v.LastDiscoveredAt, "created_at": v.CreatedAt, "updated_at": v.UpdatedAt,
 	}
@@ -122,6 +154,7 @@ func cameraJSON(c camera, thumbToken string) map[string]any {
 	return map[string]any{
 		"id": c.ID, "site_id": c.SiteID, "dvr_id": c.DVRID, "channel": c.Channel,
 		"name": c.Name, "area": c.Area, "ai_description": c.AIDescription, "ai_location": c.AILocation,
+		"notes":   c.Notes,
 		"enabled": c.Enabled, "disabled_reason": c.DisabledReason, "snapshot_token": thumbToken,
 		"created_at": c.CreatedAt, "updated_at": c.UpdatedAt,
 	}
@@ -340,19 +373,21 @@ func handleCameraSiteDelete(cfg config) http.HandlerFunc {
 			return
 		}
 		defer db.Close()
-		removed := camCascadeDeleteSite(db, id)
+		removed := camCascadeDeleteSite(db, cfg, id)
 		camlog("info", "site_delete", map[string]any{"site_id": id, "dvrs_removed": removed})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
 
-// camCascadeDeleteSite removes a site's DVRs, their cameras, and its watches
-// before the site row itself, using only the existing granular delete
-// helpers (camera_store.go) — no ad hoc SQL. Historical camera_watch_runs/
-// camera_questions/camera_captures rows are intentionally left as-is (they are
-// records of what already happened, and the hourly reaper still cleans up
-// expired capture files); this is a documented TODO for a later phase.
-func camCascadeDeleteSite(db *sql.DB, siteID string) int {
+// camCascadeDeleteSite removes a site's DVRs, their cameras, its watches, and all
+// of the site-scoped feature data (playbooks, external API tools, avatars with
+// their pinned reference captures + candidates + scans, the settle-callback row,
+// and any service tokens) before the site row itself, reusing the granular
+// delete helpers so pinned capture rows AND files are released — otherwise
+// avatar/playbook reference images (expires_at=”) survive every reaper forever.
+// Historical camera_watch_runs/camera_questions/investigation rows are left as-is
+// (records of what already happened); expired capture files are still reaped.
+func camCascadeDeleteSite(db *sql.DB, cfg config, siteID string) int {
 	dvrs, _ := listCameraDVRViews(db, siteID)
 	for _, d := range dvrs {
 		cams, _ := listCamerasByDVR(db, d.ID)
@@ -365,6 +400,28 @@ func camCascadeDeleteSite(db *sql.DB, siteID string) int {
 	for _, wt := range watches {
 		_ = deleteCameraWatch(db, wt.ID)
 	}
+	// Avatars: cascades avatar_media (+ pinned capture rows/files), candidates,
+	// and scans via the granular helper.
+	if avatars, err := listCameraAvatars(db, siteID, true); err == nil {
+		for _, av := range avatars {
+			_ = deleteCameraAvatar(db, cfg, av.ID)
+		}
+	}
+	// Playbooks: cascades playbook_media and releases/unpins their captures.
+	if playbooks, err := listCameraPlaybooks(db, siteID, false); err == nil {
+		for _, pb := range playbooks {
+			_ = deleteCameraPlaybook(db, cfg, pb.ID)
+		}
+	}
+	// External API tools (rows carry encrypted bearer secrets).
+	if tools, err := listCameraAPITools(db, siteID, false); err == nil {
+		for _, t := range tools {
+			_ = deleteCameraAPITool(db, t.ID)
+		}
+	}
+	// Settle callback + any service tokens minted for this site.
+	_, _ = db.Exec(`DELETE FROM camera_site_callbacks WHERE site_id = ?`, siteID)
+	_, _ = db.Exec(`UPDATE camera_service_tokens SET enabled = 0, updated_at = ? WHERE site_id = ?`, nowRFC3339(), siteID)
 	_ = deleteCameraSite(db, siteID)
 	return len(dvrs)
 }
@@ -423,15 +480,16 @@ func handleCameraDVRs(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusOK, map[string]any{"dvrs": dvrListJSON(dvrs)})
 		case http.MethodPost:
 			var body struct {
-				SiteID   string `json:"site_id"`
-				Name     string `json:"name"`
-				Brand    string `json:"brand"`
-				Host     string `json:"host"`
-				Port     int    `json:"port"`
-				HTTPPort int    `json:"http_port"`
-				Username string `json:"username"`
-				Password string `json:"password"`
-				Timezone string `json:"timezone"`
+				SiteID         string `json:"site_id"`
+				Name           string `json:"name"`
+				Brand          string `json:"brand"`
+				Host           string `json:"host"`
+				Port           int    `json:"port"`
+				HTTPPort       int    `json:"http_port"`
+				Username       string `json:"username"`
+				Password       string `json:"password"`
+				Timezone       string `json:"timezone"`
+				AIInstructions string `json:"ai_instructions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -451,7 +509,8 @@ func handleCameraDVRs(cfg config) http.HandlerFunc {
 			id, err := insertCameraDVR(db, cfg, CamDVR{
 				SiteID: siteID, Name: strings.TrimSpace(body.Name), Brand: brand, Host: host,
 				Port: body.Port, HTTPPort: body.HTTPPort, Username: strings.TrimSpace(body.Username),
-				Password: body.Password, Timezone: strings.TrimSpace(body.Timezone), Enabled: true,
+				Password: body.Password, Timezone: strings.TrimSpace(body.Timezone),
+				AIInstructions: strings.TrimSpace(body.AIInstructions), Enabled: true,
 			})
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -482,7 +541,10 @@ func handleCameraDVRUpdate(cfg config) http.HandlerFunc {
 			Username string `json:"username"`
 			Password string `json:"password"`
 			Timezone string `json:"timezone"`
-			Enabled  *bool  `json:"enabled"`
+			// Pointer so an operator can CLEAR the instructions (the "non-empty
+			// means set" idiom would make clearing impossible).
+			AIInstructions *string `json:"ai_instructions"`
+			Enabled        *bool   `json:"enabled"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -528,6 +590,9 @@ func handleCameraDVRUpdate(cfg config) http.HandlerFunc {
 		}
 		if tz := strings.TrimSpace(body.Timezone); tz != "" {
 			dvr.Timezone = tz
+		}
+		if body.AIInstructions != nil {
+			dvr.AIInstructions = strings.TrimSpace(*body.AIInstructions)
 		}
 		if body.Enabled != nil {
 			dvr.Enabled = *body.Enabled
@@ -771,10 +836,13 @@ func handleCameraUpdate(cfg config) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Area    string `json:"area"`
-			Enabled *bool  `json:"enabled"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Area string `json:"area"`
+			// Pointer so an operator can CLEAR the notes; area keeps its existing
+			// unconditional-set behavior untouched.
+			Notes   *string `json:"notes"`
+			Enabled *bool   `json:"enabled"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -800,6 +868,9 @@ func handleCameraUpdate(cfg config) http.HandlerFunc {
 			cam.Name = n
 		}
 		cam.Area = strings.TrimSpace(body.Area)
+		if body.Notes != nil {
+			cam.Notes = strings.TrimSpace(*body.Notes)
+		}
 		if body.Enabled != nil {
 			cam.Enabled = *body.Enabled
 			if cam.Enabled {

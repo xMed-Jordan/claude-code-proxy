@@ -320,7 +320,7 @@
      ───────────────────────────────────────────────────────────── */
 
   function AddDvrWizard({ siteId, notify, onAdded }) {
-    const blank = { name: "", brand: "", host: "", port: 554, http_port: 80, username: "", password: "", timezone: "" };
+    const blank = { name: "", brand: "", host: "", port: 554, http_port: 80, username: "", password: "", timezone: "", ai_instructions: "" };
     const [form, setForm] = useState(blank);
     const [busy, setBusy] = useState(false);
     const [result, setResult] = useState(null);
@@ -335,6 +335,7 @@
           site_id: siteId, name: form.name.trim(), brand: form.brand, host,
           port: Number(form.port) || 0, http_port: Number(form.http_port) || 0,
           username: form.username.trim(), password: form.password, timezone: form.timezone.trim(),
+          ai_instructions: form.ai_instructions,
         });
         if (!res || !res.ok) { notify((res && res.error) || "Failed to add DVR", "error"); return; }
         notify("DVR added — discovering channels…", "info");
@@ -389,6 +390,13 @@
               <p className="cfg-hint">Used to format past-playback time windows correctly (Dahua uses local time).</p>
             </div>
           </div>
+          <div className="cfg-row">
+            <div className="cfg-label"><span className="cfg-label-name">AI instructions</span><span className="cfg-label-env">Optional</span></div>
+            <div className="cfg-ctl">
+              <Textarea rows={4} value={form.ai_instructions} onChange={set("ai_instructions")} placeholder="Staff enter via camera 3's door; camera 16's closed door leads to the staff room…" disabled={busy} />
+              <p className="cfg-hint">Operator knowledge injected into every investigation — doors, rooms, movement rules for this DVR's cameras.</p>
+            </div>
+          </div>
         </div>
         <div className="cam-wizard-actions">
           <Button variant="primary" icon={busy ? undefined : "bolt"} loading={busy} disabled={busy || !form.host.trim()} onClick={submit}>
@@ -410,6 +418,7 @@
           name: dvr.name || "", brand: dvr.brand || "", host: dvr.host || "",
           port: dvr.port || 554, http_port: dvr.http_port || 80,
           username: dvr.username || "", password: "", timezone: dvr.timezone || "",
+          ai_instructions: dvr.ai_instructions || "",
         });
       }
     }, [open, dvr]);
@@ -424,6 +433,7 @@
           id: dvr.id, name: form.name, brand: form.brand, host: form.host,
           port: Number(form.port) || 0, http_port: Number(form.http_port) || 0,
           username: form.username, timezone: form.timezone,
+          ai_instructions: form.ai_instructions,
         };
         if (form.password) body.password = form.password;
         const res = await api.post("/ui/api/cameras/dvrs/update", body);
@@ -458,6 +468,9 @@
           <PasswordField value={form.password} onChange={set("password")} placeholder="Unchanged" disabled={saving} />
         </Field>
         <Field label="Timezone"><Input value={form.timezone} onChange={set("timezone")} placeholder="Asia/Amman" disabled={saving} /></Field>
+        <Field label="AI instructions" hint="Operator knowledge injected into every investigation — doors, rooms, movement rules for this DVR's cameras.">
+          <Textarea rows={4} value={form.ai_instructions} onChange={set("ai_instructions")} disabled={saving} />
+        </Field>
       </Modal>
     );
   }
@@ -465,10 +478,11 @@
   function CameraEditModal({ open, camera, notify, onClose, onSaved }) {
     const [name, setName] = useState("");
     const [area, setArea] = useState("");
+    const [notes, setNotes] = useState("");
     const [saving, setSaving] = useState(false);
 
     useEffect(() => {
-      if (open && camera) { setName(camera.name || ""); setArea(camera.area || ""); }
+      if (open && camera) { setName(camera.name || ""); setArea(camera.area || ""); setNotes(camera.notes || ""); }
     }, [open, camera]);
 
     if (!camera) return null;
@@ -476,7 +490,7 @@
     const save = async () => {
       setSaving(true);
       try {
-        const res = await api.post("/ui/api/cameras/update", { id: camera.id, name, area });
+        const res = await api.post("/ui/api/cameras/update", { id: camera.id, name, area, notes });
         if (!res || !res.ok) { notify((res && res.error) || "Save failed", "error"); return; }
         notify("Camera updated", "success");
         onSaved();
@@ -501,6 +515,9 @@
         <Field label="Name"><Input value={name} onChange={(e) => setName(e.target.value)} disabled={saving} /></Field>
         <Field label="Area" hint="e.g. Waiting room, Reception, Back entrance">
           <Input value={area} onChange={(e) => setArea(e.target.value)} disabled={saving} />
+        </Field>
+        <Field label="Operator notes" hint="e.g. 'the closed door here leads to the staff room'">
+          <Textarea rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} disabled={saving} />
         </Field>
       </Modal>
     );
@@ -1566,8 +1583,10 @@
   // EvidenceMedia renders one cited {media_url, caption} — evidenceItem carries
   // no explicit kind and /camera/media/<token> URLs have no file extension, so
   // this tries an <img> first and falls back to a <video> if the browser can't
-  // decode it as an image (a past_clip citation).
-  function EvidenceMedia({ url, caption }) {
+  // decode it as an image (a past_clip citation). When onAttach is provided the
+  // tile grows an "Attach to playbook…" action (design B4 — the interactive
+  // playbook-authoring loop).
+  function EvidenceMedia({ url, caption, onAttach }) {
     const [isVideo, setIsVideo] = useState(false);
     if (!url) return null;
     return (
@@ -1578,21 +1597,111 @@
           <img src={url} alt={caption || "evidence"} onError={() => setIsVideo(true)} />
         )}
         {caption && <span className="cam-evidence-caption" title={caption}>{caption}</span>}
+        {onAttach && (
+          <Button size="sm" variant="ghost" icon="pin" onClick={() => onAttach(url)}>Attach to playbook…</Button>
+        )}
       </div>
     );
   }
 
-  function EvidenceGrid({ media }) {
+  function EvidenceGrid({ media, onAttach }) {
     if (!Array.isArray(media) || media.length === 0) return null;
     return (
       <div className="cam-evidence-grid">
-        {media.map((m, i) => <EvidenceMedia key={i} url={m.media_url} caption={m.caption} />)}
+        {media.map((m, i) => <EvidenceMedia key={i} url={m.media_url} caption={m.caption} onAttach={onAttach} />)}
       </div>
     );
   }
 
-  // formatToolArgs renders an investigateArgs object (camera_ids/quality/from/to/count,
-  // decoded server-side from JSON) as a short mono summary line — empty fields omitted.
+  // tokenFromMediaURL extracts the camera_captures token from a served media
+  // URL ("/camera/media/<token>", relative or absolute) — the playbook media
+  // attach endpoint wants the bare token, not the URL.
+  function tokenFromMediaURL(url) {
+    if (!url) return "";
+    const path = String(url).split(/[?#]/)[0];
+    const segs = path.split("/").filter(Boolean);
+    return segs.length > 0 ? segs[segs.length - 1] : "";
+  }
+
+  // AttachToPlaybookModal turns an investigation evidence tile into a pinned
+  // playbook reference image: pick a playbook, annotate it, POST the token.
+  function AttachToPlaybookModal({ open, url, siteId, notify, onClose }) {
+    const [playbooks, setPlaybooks] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [playbookId, setPlaybookId] = useState("");
+    const [note, setNote] = useState("");
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+      if (!open) return;
+      setNote(""); setSaving(false); setLoading(true);
+      api.get(`/ui/api/cameras/playbooks?site_id=${encodeURIComponent(siteId)}`)
+        .then((res) => {
+          const list = (res && res.playbooks) || [];
+          setPlaybooks(list);
+          setPlaybookId(list.length > 0 ? list[0].id : "");
+        })
+        .catch((e) => notify("Failed to load playbooks: " + ((e && e.message) || e), "error"))
+        .finally(() => setLoading(false));
+    }, [open, siteId]);
+
+    const attach = useCallback(async () => {
+      const token = tokenFromMediaURL(url);
+      if (!playbookId) { notify("Pick a playbook first", "error"); return; }
+      if (!token) { notify("Could not extract a media token from this evidence URL", "error"); return; }
+      setSaving(true);
+      try {
+        const res = await api.post("/ui/api/cameras/playbooks/media", { playbook_id: playbookId, token, note });
+        if (!res || res.ok === false) { notify((res && res.error) || "Attach failed", "error"); return; }
+        notify("Reference image attached to playbook", "success");
+        if (res.warning) notify(res.warning, "info");
+        onClose();
+      } catch (e) {
+        notify("Attach failed: " + ((e && e.message) || e), "error");
+      } finally { setSaving(false); }
+    }, [url, playbookId, note, notify, onClose]);
+
+    return (
+      <Modal
+        open={open}
+        onClose={onClose}
+        title="Attach to playbook"
+        description="Pins this evidence frame permanently as an operator-approved reference image for the playbook."
+        width={480}
+        footer={
+          <div className="cam-modal-footer">
+            <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+            <Button variant="primary" icon="pin" loading={saving} disabled={saving || loading || !playbookId} onClick={attach}>Attach</Button>
+          </div>
+        }
+      >
+        {loading ? (
+          <div className="cam-run-loading"><Spinner size={16} /><span className="muted">Loading playbooks…</span></div>
+        ) : playbooks.length === 0 ? (
+          <EmptyState icon="book" title="No playbooks yet" description="Create a playbook in the Knowledge tab first, then attach evidence to it." compact />
+        ) : (
+          <>
+            {url && <img className="cam-recapture-thumb" src={url} alt="evidence" />}
+            <Field label="Playbook">
+              <Select
+                options={playbooks.map((p) => ({ value: p.id, label: p.name }))}
+                value={playbookId}
+                onChange={(e) => setPlaybookId(e.target.value)}
+                disabled={saving}
+              />
+            </Field>
+            <Field label="Note" hint='What this image shows, e.g. "correct standby position — handle UP".'>
+              <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} disabled={saving} />
+            </Field>
+          </>
+        )}
+      </Modal>
+    );
+  }
+
+  // formatToolArgs renders an investigateArgs object (camera_ids/quality/from/to/
+  // count/mode/name/params/avatar_id/time, decoded server-side from JSON) as a
+  // short mono summary line — empty fields omitted.
   function formatToolArgs(args) {
     if (!args || typeof args !== "object") return "";
     const parts = [];
@@ -1600,11 +1709,22 @@
     if (args.quality) parts.push("quality: " + args.quality);
     if (args.from || args.to) parts.push("window: " + (args.from || "?") + " → " + (args.to || "?"));
     if (args.count) parts.push("count: " + args.count);
+    if (args.mode) parts.push("mode: " + args.mode);
+    if (args.name) parts.push("name: " + args.name);
+    if (args.avatar_id) parts.push("avatar: " + args.avatar_id);
+    if (args.time) parts.push("time: " + args.time);
+    if (args.params && typeof args.params === "object" && !Array.isArray(args.params)) {
+      const kv = Object.keys(args.params).map((k) => k + "=" + String(args.params[k])).join(" ");
+      if (kv) parts.push("params: " + kv);
+    }
     return parts.join(" · ");
   }
 
   const INVESTIGATE_TOOL_LABEL = {
     roster: "Roster", snapshot: "Snapshot", mosaic: "Mosaic", past_frames: "Past frames", past_clip: "Past clip",
+    contact_sheet: "Contact sheet", playbook: "Playbook", call_api: "API call",
+    avatars: "Avatars", avatar_info: "Avatar info", avatar_check: "Avatar check", avatar_find: "Avatar find",
+    annotate: "Annotate",
   };
 
   // InvestigateMessage renders one camera_investigation_messages row as a chat
@@ -1612,7 +1732,7 @@
   // tool call, an ask_operator question, or the final answer + evidence), tool
   // (the loop's own result summary + any media it fetched), system (a bound/
   // error notice from camStopInvestigation).
-  function InvestigateMessage({ m }) {
+  function InvestigateMessage({ m, onAttach }) {
     if (m.role === "operator") {
       return (
         <div className="cam-msg cam-msg-operator">
@@ -1640,7 +1760,7 @@
             </span>
             <p>{m.content}</p>
             {args && <span className="cam-msg-args mono muted subtle">{args}</span>}
-            <EvidenceGrid media={m.media} />
+            <EvidenceGrid media={m.media} onAttach={onAttach} />
           </div>
         </div>
       );
@@ -1660,7 +1780,7 @@
           </span>
           <p>{m.content}</p>
           {args && <span className="cam-msg-args mono muted subtle">{args}</span>}
-          {isAnswer && <EvidenceGrid media={m.media} />}
+          {isAnswer && <EvidenceGrid media={m.media} onAttach={onAttach} />}
         </div>
       </div>
     );
@@ -1672,7 +1792,7 @@
   // follow-ups: the server reopens it to "active" and, because a non-ask_operator
   // operator message starts a FRESH run, the follow-up gets a fresh budget and
   // actually advances (per handleCameraInvestigationReply / camCountInvestigateProgress).
-  function InvestigationThread({ investigation, messages, notify, onReplied }) {
+  function InvestigationThread({ investigation, messages, notify, onReplied, onAttach }) {
     const [replyText, setReplyText] = useState("");
     const [replying, setReplying] = useState(false);
     const invId = investigation.id;
@@ -1707,7 +1827,7 @@
         <div className="cam-msg-list">
           {messages.length === 0 ? (
             <div className="cam-run-loading"><Spinner size={16} /><span className="muted">Investigating…</span></div>
-          ) : messages.map((m) => <InvestigateMessage key={m.id} m={m} />)}
+          ) : messages.map((m) => <InvestigateMessage key={m.id} m={m} onAttach={onAttach} />)}
         </div>
 
         {working && (
@@ -1740,8 +1860,9 @@
     const [question, setQuestion] = useState("");
     const [asking, setAsking] = useState(false);
     const [selectedId, setSelectedId] = useState("");
+    const [attachUrl, setAttachUrl] = useState("");
 
-    useEffect(() => { setSelectedId(""); setQuestion(""); }, [site.id]);
+    useEffect(() => { setSelectedId(""); setQuestion(""); setAttachUrl(""); }, [site.id]);
 
     // Polls the selected investigation's full transcript regardless of status —
     // mirrors RunHistoryTab's runDetailLive — so a reply sent from another tab,
@@ -1822,10 +1943,516 @@
             ) : !investigation ? (
               <div className="cam-run-loading"><Spinner size={16} /><span className="muted">Loading…</span></div>
             ) : (
-              <InvestigationThread investigation={investigation} messages={messages} notify={notify} onReplied={onReplied} />
+              <InvestigationThread investigation={investigation} messages={messages} notify={notify} onReplied={onReplied} onAttach={setAttachUrl} />
             )}
           </Card>
         </div>
+
+        <AttachToPlaybookModal
+          open={!!attachUrl}
+          url={attachUrl}
+          siteId={site.id}
+          notify={notify}
+          onClose={() => setAttachUrl("")}
+        />
+      </div>
+    );
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     KNOWLEDGE — playbook library + external API tools (designs B5/C4)
+
+     Playbooks: /ui/api/cameras/playbooks[…] — operator-authored procedures
+     the AI fetches by name, plus pinned reference images attached from
+     investigation evidence. API tools: /ui/api/cameras/apitools[…] —
+     operator-configured HTTP lookups ({{param}} templates, Bearer secret
+     never echoed, has_secret only) with a live test drawer.
+     ───────────────────────────────────────────────────────────── */
+
+  // PlaybookMediaStrip shows a playbook's pinned reference images (thumbnail +
+  // note + per-item delete). Attaching happens from investigation evidence
+  // tiles ("Attach to playbook…"), not here.
+  function PlaybookMediaStrip({ playbookId, notify }) {
+    const [media, setMedia] = useState(null); // null = loading
+
+    const load = useCallback(() => {
+      api.get(`/ui/api/cameras/playbooks/media?playbook_id=${encodeURIComponent(playbookId)}`)
+        .then((res) => setMedia((res && res.media) || []))
+        .catch((e) => { setMedia([]); notify("Failed to load reference images: " + ((e && e.message) || e), "error"); });
+    }, [playbookId, notify]);
+
+    useEffect(() => { setMedia(null); load(); }, [playbookId]);
+
+    const remove = async (id) => {
+      try {
+        const res = await api.post("/ui/api/cameras/playbooks/media/delete", { id });
+        if (!res || res.ok === false) { notify((res && res.error) || "Delete failed", "error"); return; }
+        notify("Reference removed", "success");
+        load();
+      } catch (e) {
+        notify("Delete failed: " + ((e && e.message) || e), "error");
+      }
+    };
+
+    if (media === null) {
+      return <div className="cam-run-loading"><Spinner size={14} /><span className="muted">Loading references…</span></div>;
+    }
+    if (media.length === 0) {
+      return <p className="cfg-hint">No reference images yet — run a setup investigation and use "Attach to playbook…" on any evidence tile.</p>;
+    }
+    return (
+      <div className="cam-evidence-grid">
+        {media.map((m) => (
+          <div key={m.id} className="cam-evidence-item">
+            <img src={m.url || mediaURL(m.capture_token)} alt={m.note || "reference"} />
+            {m.note && <span className="cam-evidence-caption" title={m.note}>{m.note}</span>}
+            <Button size="sm" variant="ghost" icon="trash" onClick={() => remove(m.id)}>Remove</Button>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function PlaybookFormModal({ open, playbook, siteId, dvrs, notify, onClose, onSaved }) {
+    const [form, setForm] = useState({ name: "", when_to_use: "", instructions: "", dvr_id: "", enabled: true });
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+      if (!open) return;
+      setForm(playbook ? {
+        name: playbook.name || "", when_to_use: playbook.when_to_use || "",
+        instructions: playbook.instructions || "", dvr_id: playbook.dvr_id || "",
+        enabled: playbook.enabled !== false,
+      } : { name: "", when_to_use: "", instructions: "", dvr_id: "", enabled: true });
+    }, [open, playbook]);
+
+    const dvrOptions = [{ value: "", label: "Site-wide" }, ...dvrs.map((d) => ({ value: d.id, label: d.name || d.host }))];
+
+    const save = useCallback(async () => {
+      const name = form.name.trim();
+      if (!name) { notify("Name is required", "error"); return; }
+      setSaving(true);
+      try {
+        const body = { name, when_to_use: form.when_to_use, instructions: form.instructions, dvr_id: form.dvr_id, enabled: form.enabled };
+        let path;
+        if (playbook) { path = "/ui/api/cameras/playbooks/update"; body.id = playbook.id; }
+        else { path = "/ui/api/cameras/playbooks"; body.site_id = siteId; }
+        const res = await api.post(path, body);
+        if (!res || res.ok === false) { notify((res && res.error) || "Save failed", "error"); return; }
+        notify(playbook ? "Playbook updated" : "Playbook created", "success");
+        onSaved();
+      } catch (e) {
+        notify("Save failed: " + ((e && e.message) || e), "error");
+      } finally { setSaving(false); }
+    }, [form, playbook, siteId, notify, onSaved]);
+
+    return (
+      <Modal
+        open={open}
+        onClose={onClose}
+        title={playbook ? "Edit playbook" : "New playbook"}
+        width={640}
+        footer={
+          <div className="cam-modal-footer">
+            <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+            <Button variant="primary" icon="check" loading={saving} onClick={save}>{playbook ? "Save" : "Create playbook"}</Button>
+          </div>
+        }
+      >
+        <Field label="Name" hint="The exact name the AI calls this playbook by — short and unique, e.g. employee-workday.">
+          <Input mono value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="device-standby-check" disabled={saving} />
+        </Field>
+        <Field label="When to use" hint="Shown to the AI on every turn — keep it short.">
+          <Input value={form.when_to_use} onChange={(e) => setForm((f) => ({ ...f, when_to_use: e.target.value }))} placeholder="In room Y the device handle must point UP when in standby." disabled={saving} />
+        </Field>
+        <Field label="Instructions" hint="The full step-by-step procedure returned when the AI fetches this playbook.">
+          <Textarea rows={8} value={form.instructions} onChange={(e) => setForm((f) => ({ ...f, instructions: e.target.value }))} disabled={saving} />
+        </Field>
+        <Field label="Scope" hint="Site-wide, or hint that it belongs to one DVR's cameras.">
+          <Select options={dvrOptions} value={form.dvr_id} onChange={(e) => setForm((f) => ({ ...f, dvr_id: e.target.value }))} disabled={saving} />
+        </Field>
+        <Switch checked={form.enabled} onChange={(v) => setForm((f) => ({ ...f, enabled: v }))} label="Enabled" />
+        {playbook && (
+          <Field label="Reference images" hint="Operator-approved images the AI sees when it fetches this playbook.">
+            <PlaybookMediaStrip playbookId={playbook.id} notify={notify} />
+          </Field>
+        )}
+      </Modal>
+    );
+  }
+
+  // ApiToolTestDrawer runs the real substitution + SSRF-guarded call against a
+  // SAVED tool ({id, params} → {ok,status,response}) — an authoring aid.
+  function ApiToolTestDrawer({ tool, notify }) {
+    const [rows, setRows] = useState([{ k: "", v: "" }]);
+    const [busy, setBusy] = useState(false);
+    const [result, setResult] = useState(null);
+
+    useEffect(() => { setRows([{ k: "", v: "" }]); setResult(null); }, [tool && tool.id]);
+
+    const setRow = (i, key, val) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, [key]: val } : r)));
+    const addRow = () => setRows((rs) => [...rs, { k: "", v: "" }]);
+    const removeRow = (i) => setRows((rs) => (rs.length > 1 ? rs.filter((_, j) => j !== i) : rs));
+
+    const run = async () => {
+      const params = {};
+      rows.forEach((r) => { if (r.k.trim()) params[r.k.trim()] = r.v; });
+      setBusy(true); setResult(null);
+      try {
+        const res = await api.post("/ui/api/cameras/apitools/test", { id: tool.id, params }, { timeoutMs: 45000 });
+        setResult(res);
+        if (!res || res.ok === false) notify((res && res.error) || "Test failed", "error");
+      } catch (e) {
+        notify("Test failed: " + ((e && e.message) || e), "error");
+      } finally { setBusy(false); }
+    };
+
+    return (
+      <div className="cam-recapture-result">
+        <p className="cfg-hint">Fill the {"{{param}}"} placeholders and run the real request (secret applied server-side, response truncated).</p>
+        {rows.map((r, i) => (
+          <div key={i} className="cam-inline-fields">
+            <Input mono placeholder="param" value={r.k} onChange={(e) => setRow(i, "k", e.target.value)} disabled={busy} />
+            <Input mono placeholder="value" value={r.v} onChange={(e) => setRow(i, "v", e.target.value)} disabled={busy} />
+            <IconButton icon="x" label="Remove param" onClick={() => removeRow(i)} />
+          </div>
+        ))}
+        <div className="cam-wizard-actions">
+          <Button size="sm" variant="ghost" icon="plus" onClick={addRow} disabled={busy}>Add param</Button>
+          <Button size="sm" variant="primary" icon={busy ? undefined : "bolt"} loading={busy} onClick={run}>Run test</Button>
+        </div>
+        {result && (
+          <>
+            <div className="cam-event-meta">
+              <Badge tone={result.ok ? "success" : "danger"}>{result.ok ? "HTTP " + result.status : "failed"}</Badge>
+              {result.error && <span className="cam-hint-fail">{result.error}</span>}
+            </div>
+            {result.response != null && result.response !== "" && (
+              <CodeBlock code={String(result.response)} title="Response (truncated)" collapsible />
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  function ApiToolFormModal({ open, tool, siteId, notify, onClose, onSaved, initialTestOpen }) {
+    const blank = {
+      name: "", description: "", method: "GET", url_template: "", headers: "",
+      auth_secret: "", clear_secret: false, body_template: "",
+      request_instructions: "", response_instructions: "", enabled: true,
+    };
+    const [form, setForm] = useState(blank);
+    const [saving, setSaving] = useState(false);
+    const [testOpen, setTestOpen] = useState(false);
+
+    useEffect(() => {
+      if (!open) return;
+      setTestOpen(!!initialTestOpen);
+      setForm(tool ? {
+        name: tool.name || "", description: tool.description || "", method: tool.method || "GET",
+        url_template: tool.url_template || "", headers: tool.headers_json || tool.headers || "",
+        auth_secret: "", clear_secret: false, body_template: tool.body_template || "",
+        request_instructions: tool.request_instructions || "", response_instructions: tool.response_instructions || "",
+        enabled: tool.enabled !== false,
+      } : blank);
+    }, [open, tool, initialTestOpen]);
+
+    const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+    const save = useCallback(async () => {
+      const name = form.name.trim();
+      if (!name) { notify("Name is required", "error"); return; }
+      if (!form.url_template.trim()) { notify("URL template is required", "error"); return; }
+      setSaving(true);
+      try {
+        const body = {
+          name, description: form.description, method: form.method,
+          url_template: form.url_template.trim(), headers: form.headers,
+          auth_secret: form.auth_secret, body_template: form.body_template,
+          request_instructions: form.request_instructions, response_instructions: form.response_instructions,
+          enabled: form.enabled,
+        };
+        let path;
+        if (tool) {
+          path = "/ui/api/cameras/apitools/update";
+          body.id = tool.id;
+          if (form.clear_secret) body.clear_secret = true;
+        } else {
+          path = "/ui/api/cameras/apitools";
+          body.site_id = siteId;
+        }
+        const res = await api.post(path, body);
+        if (!res || res.ok === false) { notify((res && res.error) || "Save failed", "error"); return; }
+        notify(tool ? "API tool updated" : "API tool created", "success");
+        onSaved();
+      } catch (e) {
+        notify("Save failed: " + ((e && e.message) || e), "error");
+      } finally { setSaving(false); }
+    }, [form, tool, siteId, notify, onSaved]);
+
+    return (
+      <Modal
+        open={open}
+        onClose={onClose}
+        title={tool ? "Edit API tool" : "New API tool"}
+        width={640}
+        footer={
+          <div className="cam-modal-footer">
+            <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+            <Button variant="primary" icon="check" loading={saving} onClick={save}>{tool ? "Save" : "Create API tool"}</Button>
+          </div>
+        }
+      >
+        <Field label="Name" hint="The exact name the AI calls this tool by, e.g. attendance-check.">
+          <Input mono value={form.name} onChange={set("name")} disabled={saving} />
+        </Field>
+        <Field label="Description" hint="Shown to the AI in the catalog — what the lookup does.">
+          <Textarea rows={2} value={form.description} onChange={set("description")} placeholder="Checks the attendance system for whether an employee is clocked in or on break." disabled={saving} />
+        </Field>
+        <Field label="Method">
+          <Select options={[{ value: "GET", label: "GET" }, { value: "POST", label: "POST" }]} value={form.method} onChange={set("method")} disabled={saving} />
+        </Field>
+        <Field label="URL template" hint={"Use {{param}} placeholders in path/query only — the scheme and host must be literal."}>
+          <Input mono value={form.url_template} onChange={set("url_template")} placeholder="https://api.example.com/attendance?employee={{employee}}" disabled={saving} />
+        </Field>
+        <Field label="Headers (JSON)" hint='Static headers, e.g. {"X-Api-Key": "abc"}. "Authorization" is reserved for the secret.'>
+          <Textarea rows={2} value={form.headers} onChange={set("headers")} placeholder='{"Accept": "application/json"}' disabled={saving} />
+        </Field>
+        <Field label="Secret" hint="Sent as Authorization: Bearer — leave blank to keep the existing secret; encrypted at rest, never shown again.">
+          <PasswordField value={form.auth_secret} onChange={set("auth_secret")} placeholder={tool && tool.has_secret ? "Unchanged" : ""} disabled={saving} />
+        </Field>
+        {tool && tool.has_secret && (
+          <Checkbox
+            checked={form.clear_secret}
+            onChange={(v) => setForm((f) => ({ ...f, clear_secret: v }))}
+            label="Remove the stored secret"
+            disabled={saving}
+          />
+        )}
+        {form.method === "POST" && (
+          <Field label="Body template" hint={"POST body with {{param}} placeholders (values are JSON-escaped)."}>
+            <Textarea rows={3} value={form.body_template} onChange={set("body_template")} placeholder='{"employee": "{{employee}}"}' disabled={saving} />
+          </Field>
+        )}
+        <Field label="Request instructions" hint="Shown to the AI in the catalog — which params it must supply.">
+          <Textarea rows={2} value={form.request_instructions} onChange={set("request_instructions")} placeholder="params: employee (the employee id or full name as registered)" disabled={saving} />
+        </Field>
+        <Field label="Response instructions" hint="Folded into the tool result — how the AI should interpret the response.">
+          <Textarea rows={2} value={form.response_instructions} onChange={set("response_instructions")} disabled={saving} />
+        </Field>
+        <Switch checked={form.enabled} onChange={(v) => setForm((f) => ({ ...f, enabled: v }))} label="Enabled" />
+        {tool && (
+          <>
+            <div className="cam-wizard-actions">
+              <Button size="sm" variant="ghost" icon={testOpen ? "chevron-up" : "chevron-down"} onClick={() => setTestOpen((t) => !t)}>
+                {testOpen ? "Hide test" : "Test this tool"}
+              </Button>
+            </div>
+            {testOpen && <ApiToolTestDrawer tool={tool} notify={notify} />}
+          </>
+        )}
+      </Modal>
+    );
+  }
+
+  // toolHost extracts the literal host from a url_template for the table (the
+  // host may never contain {{placeholders}}, so this is safe to display).
+  function toolHost(t) {
+    const m = /^https?:\/\/([^\/?#]+)/i.exec(((t && t.url_template) || "").trim());
+    return m ? m[1] : "—";
+  }
+
+  function KnowledgeTab({ site, dvrs, notify }) {
+    const playbooksLive = useLive(`/ui/api/cameras/playbooks?site_id=${encodeURIComponent(site.id)}`, { interval: 8000, enabled: !!site.id });
+    const playbooks = (playbooksLive.data && playbooksLive.data.playbooks) || [];
+    const toolsLive = useLive(`/ui/api/cameras/apitools?site_id=${encodeURIComponent(site.id)}`, { interval: 8000, enabled: !!site.id });
+    const toolsData = toolsLive.data || {};
+    const apiTools = toolsData.tools || toolsData.apitools || toolsData.api_tools || [];
+
+    const dvrNameById = useMemo(() => {
+      const m = {};
+      dvrs.forEach((d) => { m[d.id] = d.name || d.host; });
+      return m;
+    }, [dvrs]);
+
+    const [pbFormOpen, setPbFormOpen] = useState(false);
+    const [pbEditing, setPbEditing] = useState(null);
+    const [pbDeleteId, setPbDeleteId] = useState("");
+    const [toolFormOpen, setToolFormOpen] = useState(false);
+    const [toolEditing, setToolEditing] = useState(null);
+    const [toolTestOpen, setToolTestOpen] = useState(false);
+    const [toolDeleteId, setToolDeleteId] = useState("");
+
+    // Toggles resend the row's full editable fields alongside the flipped
+    // enabled bit, so they are safe under both pointer-patch and full-replace
+    // update semantics server-side.
+    const togglePlaybook = async (p) => {
+      try {
+        const res = await api.post("/ui/api/cameras/playbooks/update", {
+          id: p.id, name: p.name, when_to_use: p.when_to_use || "", instructions: p.instructions || "",
+          dvr_id: p.dvr_id || "", enabled: !p.enabled,
+        });
+        if (!res || res.ok === false) { notify((res && res.error) || "Update failed", "error"); return; }
+        playbooksLive.refresh();
+      } catch (e) {
+        notify("Update failed: " + ((e && e.message) || e), "error");
+      }
+    };
+
+    const deletePlaybook = async () => {
+      try {
+        const res = await api.post("/ui/api/cameras/playbooks/delete", { id: pbDeleteId });
+        if (!res || res.ok === false) { notify((res && res.error) || "Delete failed", "error"); return; }
+        notify("Playbook deleted", "success");
+        setPbDeleteId("");
+        playbooksLive.refresh();
+      } catch (e) {
+        notify("Delete failed: " + ((e && e.message) || e), "error");
+      }
+    };
+
+    const toggleTool = async (t) => {
+      try {
+        const res = await api.post("/ui/api/cameras/apitools/update", {
+          id: t.id, name: t.name, description: t.description || "", method: t.method || "GET",
+          url_template: t.url_template || "", headers: t.headers_json || t.headers || "",
+          auth_secret: "", body_template: t.body_template || "",
+          request_instructions: t.request_instructions || "", response_instructions: t.response_instructions || "",
+          enabled: !t.enabled,
+        });
+        if (!res || res.ok === false) { notify((res && res.error) || "Update failed", "error"); return; }
+        toolsLive.refresh();
+      } catch (e) {
+        notify("Update failed: " + ((e && e.message) || e), "error");
+      }
+    };
+
+    const deleteTool = async () => {
+      try {
+        const res = await api.post("/ui/api/cameras/apitools/delete", { id: toolDeleteId });
+        if (!res || res.ok === false) { notify((res && res.error) || "Delete failed", "error"); return; }
+        notify("API tool deleted", "success");
+        setToolDeleteId("");
+        toolsLive.refresh();
+      } catch (e) {
+        notify("Delete failed: " + ((e && e.message) || e), "error");
+      }
+    };
+
+    return (
+      <div className="cam-tab-body">
+        <Card
+          title="Playbook library"
+          description="Operator-authored procedures the AI fetches by name. Each enabled playbook adds one line to every AI turn — keep the catalog tight."
+          actions={<Button size="sm" variant="primary" icon="plus" onClick={() => { setPbEditing(null); setPbFormOpen(true); }}>New playbook</Button>}
+          flush
+        >
+          {playbooks.length === 0 ? (
+            <EmptyState icon="book" title="No playbooks yet" description="Write a procedure once — the AI follows it every time the question matches." compact />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr><th>Name</th><th>When to use</th><th>Scope</th><th>References</th><th>Enabled</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {playbooks.map((p) => (
+                    <tr key={p.id}>
+                      <td className="mono">{p.name}</td>
+                      <td className="truncate cam-run-summary">{p.when_to_use || "—"}</td>
+                      <td>{p.dvr_id ? <Badge tone="neutral">{dvrNameById[p.dvr_id] || p.dvr_id}</Badge> : <Badge tone="accent">Site-wide</Badge>}</td>
+                      <td className="tnum">{p.media_count || 0}</td>
+                      <td><Switch checked={!!p.enabled} onChange={() => togglePlaybook(p)} /></td>
+                      <td className="cam-row-actions">
+                        <IconButton icon="edit" label="Edit playbook" onClick={() => { setPbEditing(p); setPbFormOpen(true); }} />
+                        <IconButton icon="trash" label="Delete playbook" onClick={() => setPbDeleteId(p.id)} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <Card
+          title="External API tools"
+          description="Operator-configured HTTP lookups the AI calls by name (attendance systems, registries…). Responses are text for reasoning — never citable evidence."
+          actions={<Button size="sm" variant="primary" icon="plus" onClick={() => { setToolEditing(null); setToolTestOpen(false); setToolFormOpen(true); }}>New API tool</Button>}
+          flush
+        >
+          {apiTools.length === 0 ? (
+            <EmptyState icon="globe" title="No API tools yet" description="Point the AI at an internal system — e.g. an attendance or booking API." compact />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr><th>Name</th><th>Method</th><th>Host</th><th>Secret</th><th>Enabled</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {apiTools.map((t) => (
+                    <tr key={t.id}>
+                      <td className="mono">{t.name}</td>
+                      <td><Badge tone="neutral">{t.method || "GET"}</Badge></td>
+                      <td className="mono">{toolHost(t)}</td>
+                      <td>{t.has_secret ? <Badge tone="success">secret set</Badge> : <span className="subtle">—</span>}</td>
+                      <td><Switch checked={!!t.enabled} onChange={() => toggleTool(t)} /></td>
+                      <td className="cam-row-actions">
+                        <Button size="sm" variant="ghost" icon="bolt" onClick={() => { setToolEditing(t); setToolTestOpen(true); setToolFormOpen(true); }}>Test</Button>
+                        <IconButton icon="edit" label="Edit API tool" onClick={() => { setToolEditing(t); setToolTestOpen(false); setToolFormOpen(true); }} />
+                        <IconButton icon="trash" label="Delete API tool" onClick={() => setToolDeleteId(t.id)} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <PlaybookFormModal
+          open={pbFormOpen}
+          playbook={pbEditing}
+          siteId={site.id}
+          dvrs={dvrs}
+          notify={notify}
+          onClose={() => setPbFormOpen(false)}
+          onSaved={() => { setPbFormOpen(false); playbooksLive.refresh(); }}
+        />
+        <ApiToolFormModal
+          open={toolFormOpen}
+          tool={toolEditing}
+          siteId={site.id}
+          notify={notify}
+          initialTestOpen={toolTestOpen}
+          onClose={() => setToolFormOpen(false)}
+          onSaved={() => { setToolFormOpen(false); toolsLive.refresh(); }}
+        />
+        <Modal
+          open={!!pbDeleteId}
+          onClose={() => setPbDeleteId("")}
+          title="Delete this playbook?"
+          description="Removes the procedure and detaches its reference images (they fall back to normal media retention)."
+          footer={
+            <div className="cam-modal-footer">
+              <Button variant="secondary" onClick={() => setPbDeleteId("")}>Cancel</Button>
+              <Button variant="danger" icon="trash" onClick={deletePlaybook}>Delete playbook</Button>
+            </div>
+          }
+        />
+        <Modal
+          open={!!toolDeleteId}
+          onClose={() => setToolDeleteId("")}
+          title="Delete this API tool?"
+          description="The AI immediately loses access to this lookup; the stored secret is deleted with it."
+          footer={
+            <div className="cam-modal-footer">
+              <Button variant="secondary" onClick={() => setToolDeleteId("")}>Cancel</Button>
+              <Button variant="danger" icon="trash" onClick={deleteTool}>Delete API tool</Button>
+            </div>
+          }
+        />
       </div>
     );
   }
@@ -1887,6 +2514,11 @@
     const investigations = (investigationsLive.data && investigationsLive.data.investigations) || [];
     const awaitingInvestigations = useMemo(() => investigations.filter((i) => i.status === "awaiting_operator"), [investigations]);
 
+    // Pending avatar candidates drive the Avatars tab badge; the tab body itself
+    // (window.AvatarsTab, screens-cameras-avatars.jsx) does its own polling.
+    const avatarsLive = useLive(`/ui/api/cameras/avatars?site_id=${encodeURIComponent(siteId)}`, { interval: 8000, enabled: !!siteId });
+    const pendingCandidates = (avatarsLive.data && avatarsLive.data.pending_candidates) || 0;
+
     const [activeTab, setActiveTab] = useState("setup");
     const [selectedWatchId, setSelectedWatchId] = useState("");
     const [selectedRunId, setSelectedRunId] = useState("");
@@ -1910,10 +2542,12 @@
       { id: "setup", label: "Cameras", icon: "server" },
       { id: "questions", label: "Questions", icon: "info", badge: openQuestions.length || undefined },
       { id: "investigate", label: "Ask AI", icon: "search", badge: awaitingInvestigations.length || undefined },
+      { id: "avatars", label: "Avatars", icon: "user", badge: pendingCandidates || undefined },
+      { id: "knowledge", label: "Knowledge", icon: "book" },
       { id: "watches", label: "Watches", icon: "activity" },
       { id: "runs", label: "Run history", icon: "clock" },
       { id: "diag", label: "Diagnostics", icon: "shield" },
-    ]), [openQuestions.length, awaitingInvestigations.length]);
+    ]), [openQuestions.length, awaitingInvestigations.length, pendingCandidates]);
 
     return (
       <div className="screen screen-cameras">
@@ -1955,6 +2589,12 @@
             )}
             {activeTab === "investigate" && (
               <InvestigateTab site={site} investigations={investigations} listRefresh={investigationsLive.refresh} notify={notify} />
+            )}
+            {activeTab === "avatars" && window.AvatarsTab && (
+              <window.AvatarsTab site={site} dvrs={dvrs} cameras={cameras} aliasOptions={aliasOptions} notify={notify} onChanged={avatarsLive.refresh} />
+            )}
+            {activeTab === "knowledge" && (
+              <KnowledgeTab site={site} dvrs={dvrs} notify={notify} />
             )}
             {activeTab === "watches" && (
               <WatchesTab

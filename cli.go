@@ -122,6 +122,7 @@ func runServe() error {
 	startCameraMonitor(cfg)             // start the DVR monitoring scheduler (guarded by CameraEnabled)
 	startCameraArchiver(cfg)            // start the S3 frame archiver (guarded by CameraArchiveEnabled + camS3Enabled)
 	startCameraInvestigationWorker(cfg) // run the durable Ask-AI investigation queue (guarded by CameraInvestigateWorkerEnabled)
+	startCameraAvatarScanWorker(cfg)    // run the durable avatar enrollment-scan queue (guarded by CameraAvatarScanWorkerEnabled)
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)
 	// Auto-provision the Codex token refresh timer (Linux root only). First

@@ -292,7 +292,14 @@ func runEscalationServer(ctx context.Context, cfg config, w watch, cams []camera
 	// the mosaic from just that subset. Always falls back to `active` (every
 	// escalation round downstream, e.g. full_images/clip fallback, still considers
 	// the full `active` set — only the round-0 mosaic composition is narrowed).
-	mosaicCams := camSelectMosaicCameras(cctx, cfg, runID, alias, w, active)
+	// Operator-authored site knowledge (site description + per-DVR instructions)
+	// is shown to the roster-first selector so its picks honor the layout rules.
+	// Built once per run; "" (no knowledge / site load failure) degrades cleanly.
+	siteCtx := ""
+	if site, serr := getCameraSite(db, w.SiteID); serr == nil {
+		siteCtx = camSiteContextBlock(site, dvrs)
+	}
+	mosaicCams := camSelectMosaicCameras(cctx, cfg, runID, alias, w, active, siteCtx)
 	mosaicPath, legend, mosaicToken, merr := camBuildRoundMosaic(cctx, cfg, db, runID, w.SiteID, mosaicCams, dvrByID, scratch)
 	if merr != nil {
 		return finalize(runResult{Status: "error", Suspicion: "none", RuleStatus: "not_met", Rounds: 0,
@@ -642,8 +649,23 @@ func camSampleAndPersistFrames(ctx context.Context, cfg config, db *sql.DB, runI
 // and returns the token used to serve it via the admin-gated /camera/media/ endpoint.
 // It handles both images (content type sniffed) and clips (video/mp4, kept by
 // extension). Mirrors camera_describe.go's persistSnapshotCapture but is general over
-// kind/quality/from/to.
+// kind/quality/from/to. Expiry is the standard cfg.CameraMediaRetention window —
+// callers that need a pinned (blank = never reaped) or custom deadline use
+// camPersistCaptureExpires directly.
 func camPersistCapture(db *sql.DB, cfg config, runID, siteID, cameraID, kind, quality, srcPath, ctHint string, width, height int, fromTS, toTS string) (string, error) {
+	var expires string
+	if ret := cfg.CameraMediaRetention; ret > 0 {
+		expires = time.Now().Add(ret).Format(time.RFC3339)
+	}
+	return camPersistCaptureExpires(db, cfg, runID, siteID, cameraID, kind, quality, srcPath, ctHint, width, height, fromTS, toTS, expires)
+}
+
+// camPersistCaptureExpires is camPersistCapture with an EXPLICIT expires_at:
+// "" = PINNED (never reaped — every reaper path filters on a non-blank expires_at);
+// otherwise an RFC3339 deadline (avatar candidates use now+CameraAvatarCandidateRetention).
+// Capture kinds in use: "avatar_ref" (pinned), "avatar_candidate" (retention
+// deadline), "annotated" (normal retention via camPersistCapture).
+func camPersistCaptureExpires(db *sql.DB, cfg config, runID, siteID, cameraID, kind, quality, srcPath, ctHint string, width, height int, fromTS, toTS, expiresAt string) (string, error) {
 	root := cameraMediaRoot(cfg)
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", fmt.Errorf("create media root: %w", err)
@@ -665,15 +687,11 @@ func camPersistCapture(db *sql.DB, cfg config, runID, siteID, cameraID, kind, qu
 	if fi, e := os.Stat(dest); e == nil {
 		size = fi.Size()
 	}
-	var expires string
-	if ret := cfg.CameraMediaRetention; ret > 0 {
-		expires = time.Now().Add(ret).Format(time.RFC3339)
-	}
 	row := camCapture{
 		SiteID: siteID, CameraID: cameraID, WatchRunID: runID,
 		Kind: kind, Quality: quality, Token: token, Path: dest,
 		ContentType: ct, Width: width, Height: height, Bytes: size,
-		FromTS: fromTS, ToTS: toTS, CreatedAt: nowRFC3339(), ExpiresAt: expires,
+		FromTS: fromTS, ToTS: toTS, CreatedAt: nowRFC3339(), ExpiresAt: expiresAt,
 	}
 	if _, err := insertCameraCapture(db, row); err != nil {
 		_ = os.Remove(dest) // don't leak an orphaned file with no row
@@ -717,16 +735,18 @@ func camRosterFirstMinCams() int {
 // is enabled and the watch has "many" active cameras (camRosterFirstMinCams). It
 // asks the model to pick the subset relevant to the watch's instruction from the
 // roster TEXT alone (no images — cheap), then filters `active` down to that subset.
+// siteContext is the operator-authored camSiteContextBlock ("" = none) shown to
+// the selector so its picks honor the operator's layout knowledge.
 // It ALWAYS falls back to returning `active` unchanged — feature disabled, watch
 // too small, the selection call errors, or the model selects nothing — so this is
 // purely additive and every non-opted-in watch behaves exactly as before. Every
 // attempt is camlog'd (op=escalate_roster_select) with the outcome and latency.
-func camSelectMosaicCameras(ctx context.Context, cfg config, runID, alias string, w watch, active []camera) []camera {
+func camSelectMosaicCameras(ctx context.Context, cfg config, runID, alias string, w watch, active []camera, siteContext string) []camera {
 	if !camRosterFirstEnabled() || len(active) <= camRosterFirstMinCams() {
 		return active
 	}
 	start := time.Now()
-	ids, err := camSelectCameras(ctx, cfg, alias, w.Instruction, active)
+	ids, err := camSelectCameras(ctx, cfg, alias, w.Instruction, siteContext, active)
 	fields := map[string]any{
 		"run_id": runID, "watch_id": w.ID, "cameras_total": len(active),
 		"latency_ms": time.Since(start).Milliseconds(),

@@ -66,17 +66,18 @@ func (q StreamQuality) String() string {
 // the lifetime of an operation (via decryptSecret); it must NEVER be logged or
 // serialized — build device URLs with url.UserPassword and log a masked variant.
 type CamDVR struct {
-	ID       string
-	SiteID   string
-	Name     string
-	Brand    string
-	Host     string
-	Port     int // RTSP port (default cfg.CameraDefaultRTSPPort)
-	HTTPPort int // HTTP/ISAPI/CGI port (default cfg.CameraDefaultHTTPPort)
-	Username string
-	Password string // plaintext, in-memory only — never log or store as-is
-	Timezone string // IANA tz used for playback time formatting (Dahua local time)
-	Enabled  bool
+	ID             string
+	SiteID         string
+	Name           string
+	Brand          string
+	Host           string
+	Port           int // RTSP port (default cfg.CameraDefaultRTSPPort)
+	HTTPPort       int // HTTP/ISAPI/CGI port (default cfg.CameraDefaultHTTPPort)
+	Username       string
+	Password       string // plaintext, in-memory only — never log or store as-is
+	Timezone       string // IANA tz used for playback time formatting (Dahua local time)
+	AIInstructions string // operator-authored site knowledge injected into every investigation (doors, rooms, movement rules)
+	Enabled        bool
 }
 
 // CamChannel is one discovered input channel on a DVR. Channel numbers come from
@@ -145,6 +146,7 @@ type camera struct {
 	Area              string
 	AIDescription     string
 	AILocation        string
+	Notes             string // operator-owned notes (ai_location is AI-owned and clobbered by re-describe)
 	Enabled           bool
 	DisabledReason    string // "", "black", "no-signal", "failed"
 	SnapshotCaptureID string

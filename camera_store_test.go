@@ -22,6 +22,15 @@ var camTestTables = []string{
 	"camera_questions",
 	"camera_captures",
 	"camera_events",
+	"camera_playbooks",
+	"camera_playbook_media",
+	"camera_api_tools",
+	"camera_avatars",
+	"camera_avatar_media",
+	"camera_avatar_scans",
+	"camera_avatar_candidates",
+	"camera_service_tokens",
+	"camera_site_callbacks",
 }
 
 func openCamTestDB(t *testing.T) *sql.DB {

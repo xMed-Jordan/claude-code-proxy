@@ -51,6 +51,7 @@ type camDVRView struct {
 	Username           string
 	PasswordPreview    string
 	Timezone           string
+	AIInstructions     string
 	ChannelsDiscovered int
 	Enabled            bool
 	LastDiscoveredAt   string
@@ -330,6 +331,141 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_ts ON camera_events(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_dvr ON camera_events(dvr_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_op ON camera_events(op, ok)`,
+		// ── Knowledge layer: operator-authored playbooks + external API tools
+		// (CRUD in camera_playbooks.go / camera_apitools.go; schema stays here).
+		`CREATE TABLE IF NOT EXISTS camera_playbooks (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			dvr_id TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			when_to_use TEXT NOT NULL DEFAULT '',
+			instructions TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_playbook_media (
+			id TEXT PRIMARY KEY,
+			playbook_id TEXT NOT NULL,
+			capture_token TEXT NOT NULL,
+			note TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_api_tools (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			method TEXT NOT NULL DEFAULT 'GET',
+			url_template TEXT NOT NULL DEFAULT '',
+			headers_json TEXT NOT NULL DEFAULT '',
+			auth_secret_enc TEXT NOT NULL DEFAULT '',
+			body_template TEXT NOT NULL DEFAULT '',
+			request_instructions TEXT NOT NULL DEFAULT '',
+			response_instructions TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_playbooks_site_name ON camera_playbooks(site_id, name)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_playbook_media_pb ON camera_playbook_media(playbook_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_playbook_media_token ON camera_playbook_media(capture_token)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_api_tools_site_name ON camera_api_tools(site_id, name)`,
+		// ── Avatars: registered people/vehicles/pets with approved reference imagery,
+		// enrollment scans, and operator-reviewed candidates (camera_avatars.go /
+		// camera_avatar_scan.go). Groups are avatars with is_group=1.
+		`CREATE TABLE IF NOT EXISTS camera_avatars (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			type TEXT NOT NULL DEFAULT 'human',
+			is_group INTEGER NOT NULL DEFAULT 0,
+			external_ref TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			dvr_ids TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			embedding BLOB,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_avatar_media (
+			id TEXT PRIMARY KEY,
+			avatar_id TEXT NOT NULL,
+			capture_id TEXT NOT NULL,
+			token TEXT NOT NULL,
+			camera_id TEXT NOT NULL DEFAULT '',
+			quality TEXT NOT NULL DEFAULT '',
+			frame_ts TEXT NOT NULL DEFAULT '',
+			bbox TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT 'scan',
+			note TEXT NOT NULL DEFAULT '',
+			match_confidence REAL NOT NULL DEFAULT 0,
+			embedding BLOB,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_avatar_scans (
+			id TEXT PRIMARY KEY,
+			avatar_id TEXT NOT NULL,
+			site_id TEXT NOT NULL,
+			camera_ids TEXT NOT NULL DEFAULT '',
+			from_ts TEXT NOT NULL,
+			to_ts TEXT NOT NULL,
+			alias TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'queued',
+			progress TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_avatar_candidates (
+			id TEXT PRIMARY KEY,
+			scan_id TEXT NOT NULL,
+			avatar_id TEXT NOT NULL,
+			camera_id TEXT NOT NULL,
+			frame_ts TEXT NOT NULL,
+			quality TEXT NOT NULL DEFAULT 'sub',
+			annotated_token TEXT NOT NULL DEFAULT '',
+			crop_token TEXT NOT NULL DEFAULT '',
+			bbox TEXT NOT NULL DEFAULT '',
+			match_kind TEXT NOT NULL DEFAULT 'vlm',
+			vlm_confidence REAL NOT NULL DEFAULT 0,
+			vlm_reason TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			assigned_avatar_id TEXT NOT NULL DEFAULT '',
+			note TEXT NOT NULL DEFAULT '',
+			reviewed_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatars_site ON camera_avatars(site_id, enabled)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_media_avatar ON camera_avatar_media(avatar_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_scans_status ON camera_avatar_scans(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_scans_avatar ON camera_avatar_scans(avatar_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_candidates_scan ON camera_avatar_candidates(scan_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_candidates_avatar ON camera_avatar_candidates(avatar_id, status)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_avatar_candidates_uniq ON camera_avatar_candidates(scan_id, camera_id, frame_ts)`,
+		// ── Service API for Connect: bearer tokens (stored hashed) + per-site settle
+		// webhooks (camera_serviceapi.go).
+		`CREATE TABLE IF NOT EXISTS camera_service_tokens (
+			id TEXT PRIMARY KEY,
+			scope TEXT NOT NULL,
+			site_id TEXT NOT NULL DEFAULT '',
+			label TEXT NOT NULL DEFAULT '',
+			token_hash TEXT NOT NULL,
+			token_preview TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			last_used_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_site_callbacks (
+			site_id TEXT PRIMARY KEY,
+			url TEXT NOT NULL,
+			secret_enc TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cam_svc_tokens_hash ON camera_service_tokens(token_hash, enabled)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -339,6 +475,15 @@ func migrateCameraDB(db *sql.DB) error {
 	// Additive column for databases created before the investigation media budget
 	// was tracked in device-fetch units (idempotent — a no-op once present).
 	if err := ensureSQLiteColumn(db, "camera_investigation_messages", "fetches", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Operator knowledge columns (knowledge layer): per-DVR AI instructions and
+	// per-camera operator notes. `cameras.ai_location` stays AI-owned (re-describe
+	// clobbers it, camera_describe.go), so operator text gets its own column.
+	if err := ensureSQLiteColumn(db, "camera_dvrs", "ai_instructions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(db, "cameras", "notes", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
@@ -425,10 +570,10 @@ func insertCameraDVR(db *sql.DB, cfg config, dvr CamDVR) (string, error) {
 	now := nowRFC3339()
 	_, err = db.Exec(`INSERT INTO camera_dvrs
 		(id, site_id, name, brand, host, port, http_port, username, password_enc, password_preview,
-		 timezone, channels_discovered, enabled, last_discovered_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?)`,
+		 timezone, ai_instructions, channels_discovered, enabled, last_discovered_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?)`,
 		dvr.ID, dvr.SiteID, dvr.Name, strings.ToLower(strings.TrimSpace(dvr.Brand)), dvr.Host, dvr.Port, dvr.HTTPPort,
-		dvr.Username, enc, maskSecret(dvr.Password), dvr.Timezone, boolToInt(dvr.Enabled), now, now)
+		dvr.Username, enc, maskSecret(dvr.Password), dvr.Timezone, dvr.AIInstructions, boolToInt(dvr.Enabled), now, now)
 	return dvr.ID, err
 }
 
@@ -437,9 +582,9 @@ func getCameraDVR(db *sql.DB, cfg config, id string) (CamDVR, error) {
 	var d CamDVR
 	var enc string
 	var enabled int
-	err := db.QueryRow(`SELECT id, site_id, name, brand, host, port, http_port, username, password_enc, timezone, enabled
+	err := db.QueryRow(`SELECT id, site_id, name, brand, host, port, http_port, username, password_enc, timezone, ai_instructions, enabled
 		FROM camera_dvrs WHERE id = ?`, id).
-		Scan(&d.ID, &d.SiteID, &d.Name, &d.Brand, &d.Host, &d.Port, &d.HTTPPort, &d.Username, &enc, &d.Timezone, &enabled)
+		Scan(&d.ID, &d.SiteID, &d.Name, &d.Brand, &d.Host, &d.Port, &d.HTTPPort, &d.Username, &enc, &d.Timezone, &d.AIInstructions, &enabled)
 	if err != nil {
 		return CamDVR{}, err
 	}
@@ -457,7 +602,7 @@ func listCameraDVRs(db *sql.DB, cfg config, siteID string) ([]CamDVR, error) {
 		rows *sql.Rows
 		err  error
 	)
-	const q = `SELECT id, site_id, name, brand, host, port, http_port, username, password_enc, timezone, enabled FROM camera_dvrs`
+	const q = `SELECT id, site_id, name, brand, host, port, http_port, username, password_enc, timezone, ai_instructions, enabled FROM camera_dvrs`
 	if strings.TrimSpace(siteID) == "" {
 		rows, err = db.Query(q + ` ORDER BY created_at DESC`)
 	} else {
@@ -473,7 +618,7 @@ func listCameraDVRs(db *sql.DB, cfg config, siteID string) ([]CamDVR, error) {
 		var enc string
 		var enabled int
 		if err := rows.Scan(&d.ID, &d.SiteID, &d.Name, &d.Brand, &d.Host, &d.Port, &d.HTTPPort,
-			&d.Username, &enc, &d.Timezone, &enabled); err != nil {
+			&d.Username, &enc, &d.Timezone, &d.AIInstructions, &enabled); err != nil {
 			return nil, err
 		}
 		d.Enabled = enabled != 0
@@ -487,7 +632,7 @@ func listCameraDVRs(db *sql.DB, cfg config, siteID string) ([]CamDVR, error) {
 
 // listCameraDVRViews returns credential-safe DVR views (preview only) for the UI.
 func listCameraDVRViews(db *sql.DB, siteID string) ([]camDVRView, error) {
-	const cols = `id, site_id, name, brand, host, port, http_port, username, password_preview, timezone, channels_discovered, enabled, last_discovered_at, created_at, updated_at`
+	const cols = `id, site_id, name, brand, host, port, http_port, username, password_preview, timezone, ai_instructions, channels_discovered, enabled, last_discovered_at, created_at, updated_at`
 	var (
 		rows *sql.Rows
 		err  error
@@ -506,7 +651,7 @@ func listCameraDVRViews(db *sql.DB, siteID string) ([]camDVRView, error) {
 		var v camDVRView
 		var enabled int
 		if err := rows.Scan(&v.ID, &v.SiteID, &v.Name, &v.Brand, &v.Host, &v.Port, &v.HTTPPort,
-			&v.Username, &v.PasswordPreview, &v.Timezone, &v.ChannelsDiscovered, &enabled,
+			&v.Username, &v.PasswordPreview, &v.Timezone, &v.AIInstructions, &v.ChannelsDiscovered, &enabled,
 			&v.LastDiscoveredAt, &v.CreatedAt, &v.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -527,15 +672,15 @@ func updateCameraDVR(db *sql.DB, cfg config, dvr CamDVR, changePassword bool) er
 			return err
 		}
 		_, err = db.Exec(`UPDATE camera_dvrs SET name = ?, brand = ?, host = ?, port = ?, http_port = ?,
-			username = ?, password_enc = ?, password_preview = ?, timezone = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+			username = ?, password_enc = ?, password_preview = ?, timezone = ?, ai_instructions = ?, enabled = ?, updated_at = ? WHERE id = ?`,
 			dvr.Name, strings.ToLower(strings.TrimSpace(dvr.Brand)), dvr.Host, dvr.Port, dvr.HTTPPort,
-			dvr.Username, enc, maskSecret(dvr.Password), dvr.Timezone, boolToInt(dvr.Enabled), now, dvr.ID)
+			dvr.Username, enc, maskSecret(dvr.Password), dvr.Timezone, dvr.AIInstructions, boolToInt(dvr.Enabled), now, dvr.ID)
 		return err
 	}
 	_, err := db.Exec(`UPDATE camera_dvrs SET name = ?, brand = ?, host = ?, port = ?, http_port = ?,
-		username = ?, timezone = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+		username = ?, timezone = ?, ai_instructions = ?, enabled = ?, updated_at = ? WHERE id = ?`,
 		dvr.Name, strings.ToLower(strings.TrimSpace(dvr.Brand)), dvr.Host, dvr.Port, dvr.HTTPPort,
-		dvr.Username, dvr.Timezone, boolToInt(dvr.Enabled), now, dvr.ID)
+		dvr.Username, dvr.Timezone, dvr.AIInstructions, boolToInt(dvr.Enabled), now, dvr.ID)
 	return err
 }
 
@@ -558,13 +703,13 @@ func deleteCameraDVR(db *sql.DB, id string) error {
 
 // ─────────────────────────── cameras ───────────────────────────
 
-const camCameraCols = `id, site_id, dvr_id, channel, name, area, ai_description, ai_location, enabled, disabled_reason, snapshot_capture_id, caps, created_at, updated_at`
+const camCameraCols = `id, site_id, dvr_id, channel, name, area, ai_description, ai_location, notes, enabled, disabled_reason, snapshot_capture_id, caps, created_at, updated_at`
 
 func scanCamera(s rowScanner) (camera, error) {
 	var c camera
 	var enabled int
 	err := s.Scan(&c.ID, &c.SiteID, &c.DVRID, &c.Channel, &c.Name, &c.Area, &c.AIDescription,
-		&c.AILocation, &enabled, &c.DisabledReason, &c.SnapshotCaptureID, &c.Caps, &c.CreatedAt, &c.UpdatedAt)
+		&c.AILocation, &c.Notes, &enabled, &c.DisabledReason, &c.SnapshotCaptureID, &c.Caps, &c.CreatedAt, &c.UpdatedAt)
 	c.Enabled = enabled != 0
 	return c, err
 }
@@ -575,9 +720,9 @@ func insertCamera(db *sql.DB, c camera) (string, error) {
 	}
 	now := nowRFC3339()
 	_, err := db.Exec(`INSERT INTO cameras
-		(id, site_id, dvr_id, channel, name, area, ai_description, ai_location, enabled, disabled_reason, snapshot_capture_id, caps, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.SiteID, c.DVRID, c.Channel, c.Name, c.Area, c.AIDescription, c.AILocation,
+		(id, site_id, dvr_id, channel, name, area, ai_description, ai_location, notes, enabled, disabled_reason, snapshot_capture_id, caps, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.SiteID, c.DVRID, c.Channel, c.Name, c.Area, c.AIDescription, c.AILocation, c.Notes,
 		boolToInt(c.Enabled), c.DisabledReason, c.SnapshotCaptureID, c.Caps, now, now)
 	return c.ID, err
 }
@@ -618,9 +763,9 @@ func findCameraByChannel(db *sql.DB, dvrID string, channel int) (camera, error) 
 }
 
 func updateCamera(db *sql.DB, c camera) error {
-	_, err := db.Exec(`UPDATE cameras SET name = ?, area = ?, ai_description = ?, ai_location = ?,
+	_, err := db.Exec(`UPDATE cameras SET name = ?, area = ?, ai_description = ?, ai_location = ?, notes = ?,
 		enabled = ?, disabled_reason = ?, snapshot_capture_id = ?, caps = ?, updated_at = ? WHERE id = ?`,
-		c.Name, c.Area, c.AIDescription, c.AILocation, boolToInt(c.Enabled), c.DisabledReason,
+		c.Name, c.Area, c.AIDescription, c.AILocation, c.Notes, boolToInt(c.Enabled), c.DisabledReason,
 		c.SnapshotCaptureID, c.Caps, nowRFC3339(), c.ID)
 	return err
 }
@@ -952,6 +1097,37 @@ func listCameraCaptures(db *sql.DB, watchRunID string) ([]camCapture, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// pinCameraCapture makes a served capture permanent: a blank expires_at is
+// exempt from every reaper path (deleteExpiredCameraCaptures / reapCameraMedia
+// filter on a non-blank expires_at, and handleCameraMedia serves a blank one
+// forever), so pinned reference imagery (playbook refs, approved avatar refs)
+// is never reaped. Undone by camReleaseCaptureIfUnreferenced (camera_playbooks.go).
+func pinCameraCapture(db *sql.DB, token string) error {
+	_, err := db.Exec(`UPDATE camera_captures SET expires_at = '' WHERE token = ?`, token)
+	return err
+}
+
+// camCaptureReferenced reports whether any pinned-reference row (playbook media
+// OR avatar media) still points at this capture token. Both features pin the
+// same camera_captures token namespace, so releasing/deleting a capture must
+// consult BOTH tables — otherwise a playbook detach un-pins an avatar reference,
+// or an avatar delete destroys a playbook reference's shared image. Fails safe
+// (returns true) on query error so a shared capture is never destroyed.
+func camCaptureReferenced(db *sql.DB, token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	var n int
+	err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM camera_playbook_media WHERE capture_token = ?) +
+		(SELECT COUNT(*) FROM camera_avatar_media WHERE token = ?)`, token, token).Scan(&n)
+	if err != nil {
+		return true
+	}
+	return n > 0
 }
 
 // deleteExpiredCameraCaptures removes capture rows whose expires_at has passed

@@ -218,6 +218,32 @@ type config struct {
 	CameraStreamMaxWorkers    int           // PROXY_CAM_STREAM_MAX_WORKERS — cap on concurrent persistent ffmpeg stream workers (default 64)
 	CameraStreamMainMode      string        // PROXY_CAM_STREAM_MAIN_MODE — "keyframe" (I-frames only, light) or "full" (full decode) for the main stream (default keyframe)
 	CameraStreamReconcile     time.Duration // PROXY_CAM_STREAM_RECONCILE — how often the supervisor reconciles workers with the camera list (default 30s)
+	// Face-recognition sidecar (faceapi/ FastAPI+insightface; Go client in
+	// camera_face.go). Localhost-only; embeddings stored as float32-LE BLOBs.
+	FaceAPIURL         string  // PROXY_FACE_API_URL — face-embedding sidecar base URL (default http://127.0.0.1:8799)
+	FaceEnabled        bool    // PROXY_FACE_ENABLED — use the face sidecar when reachable (default true)
+	FaceMatchThreshold float64 // PROXY_FACE_MATCH_THRESHOLD — cosine-similarity floor for a face match (default 0.40)
+	FaceMinScore       float64 // PROXY_FACE_MIN_SCORE — sidecar face-detection score floor (default 0.5)
+	// Avatar enrollment scans (camera_avatar_scan.go): a durable queue that scans
+	// the S3 frame archive for a registered avatar and proposes circled candidates
+	// for human review. Bounded per scan by frames/VLM calls/candidates/wall clock.
+	CameraAvatarScanWorkerEnabled  bool          // PROXY_CAM_AVATAR_SCAN_WORKER — run the durable avatar-scan queue (default true)
+	CameraAvatarScanConcurrency    int           // PROXY_CAM_AVATAR_SCAN_CONCURRENCY — parallel scans (default 1)
+	CameraAvatarScanTickInterval   time.Duration // PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL — queue poll cadence (default 5s)
+	CameraAvatarScanBudget         time.Duration // PROXY_CAM_AVATAR_SCAN_BUDGET — wall-clock cap per scan (default 1800s; camAvatarScanBudget hard-caps at 1h)
+	CameraAvatarScanAlias          string        // PROXY_CAM_AVATAR_SCAN_ALIAS — VLM alias for scans ("" → CameraInvestigateAlias)
+	CameraAvatarScanMaxFrames      int           // PROXY_CAM_AVATAR_SCAN_MAX_FRAMES — archive frames scanned per camera (default 600)
+	CameraAvatarScanBatch          int           // PROXY_CAM_AVATAR_SCAN_BATCH — candidate frames per VLM call (default 8)
+	CameraAvatarScanMaxVLM         int           // PROXY_CAM_AVATAR_SCAN_MAX_VLM — VLM calls per scan (default 40)
+	CameraAvatarScanMaxCandidates  int           // PROXY_CAM_AVATAR_SCAN_MAX_CANDIDATES — proposals per scan (default 60)
+	CameraAvatarMaxRefs            int           // PROXY_CAM_AVATAR_MAX_REFS — reference images per comparison (default 3)
+	CameraAvatarFindMaxVLM         int           // PROXY_CAM_AVATAR_FIND_MAX_VLM — VLM batches per avatar_find tool call (default 6)
+	CameraAvatarCandidateRetention time.Duration // PROXY_CAM_AVATAR_CANDIDATE_RETENTION — candidate media retention (default 168h)
+	// Camera service API for Connect (camera_serviceapi.go): bearer-token
+	// /api/cameras/* routes plus the per-site investigation-settle webhook.
+	CameraServiceRate          int           // PROXY_CAMERA_SERVICE_RATE — service-token requests/min (default 120; media fetches 5x)
+	CameraCallbackAllowPrivate bool          // PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE — allow settle webhooks to private IPs (local dev only; default false)
+	CameraCallbackTimeout      time.Duration // PROXY_CAMERA_CALLBACK_TIMEOUT — per-attempt settle-webhook timeout (default 20s)
 }
 
 type modelAliasConfig struct {
@@ -577,6 +603,7 @@ func newProxyMux(cfg config) *http.ServeMux {
 	mux.HandleFunc("/postman.json", handlePostmanCollection(cfg))
 	mux.HandleFunc("/antigravity/bridge", handleAntigravityBridge)
 	registerCameraRoutes(cfg, mux)
+	registerCameraServiceRoutes(cfg, mux) // Connect-facing bearer-token /api/cameras/* service API (camera_serviceapi.go)
 	mux.HandleFunc("/", handleUI)
 	return mux
 }
@@ -727,6 +754,28 @@ func loadConfig() config {
 		CameraStreamMaxWorkers:    parseIntDefault(getenv("PROXY_CAM_STREAM_MAX_WORKERS", "64"), 64),
 		CameraStreamMainMode:      strings.TrimSpace(getenv("PROXY_CAM_STREAM_MAIN_MODE", "keyframe")),
 		CameraStreamReconcile:     parseAgyTimeout(getenv("PROXY_CAM_STREAM_RECONCILE", "30")),
+
+		FaceAPIURL:         strings.TrimSpace(getenv("PROXY_FACE_API_URL", "http://127.0.0.1:8799")),
+		FaceEnabled:        envFlag("PROXY_FACE_ENABLED", true),
+		FaceMatchThreshold: camParseFloat(getenv("PROXY_FACE_MATCH_THRESHOLD", "0.40"), 0.40),
+		FaceMinScore:       camParseFloat(getenv("PROXY_FACE_MIN_SCORE", "0.5"), 0.5),
+
+		CameraAvatarScanWorkerEnabled:  envFlag("PROXY_CAM_AVATAR_SCAN_WORKER", true),
+		CameraAvatarScanConcurrency:    parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_CONCURRENCY", "1"), 1),
+		CameraAvatarScanTickInterval:   parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL", "5")),
+		CameraAvatarScanBudget:         parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_BUDGET", "1800")),
+		CameraAvatarScanAlias:          strings.TrimSpace(getenv("PROXY_CAM_AVATAR_SCAN_ALIAS", "")),
+		CameraAvatarScanMaxFrames:      parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_MAX_FRAMES", "600"), 600),
+		CameraAvatarScanBatch:          parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_BATCH", "8"), 8),
+		CameraAvatarScanMaxVLM:         parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_MAX_VLM", "40"), 40),
+		CameraAvatarScanMaxCandidates:  parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_MAX_CANDIDATES", "60"), 60),
+		CameraAvatarMaxRefs:            parseIntDefault(getenv("PROXY_CAM_AVATAR_MAX_REFS", "3"), 3),
+		CameraAvatarFindMaxVLM:         parseIntDefault(getenv("PROXY_CAM_AVATAR_FIND_MAX_VLM", "6"), 6),
+		CameraAvatarCandidateRetention: parseAgyTimeout(getenv("PROXY_CAM_AVATAR_CANDIDATE_RETENTION", "604800")), // 168h
+
+		CameraServiceRate:          parseIntDefault(getenv("PROXY_CAMERA_SERVICE_RATE", "120"), 120),
+		CameraCallbackAllowPrivate: envFlag("PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE", false),
+		CameraCallbackTimeout:      parseAgyTimeout(getenv("PROXY_CAMERA_CALLBACK_TIMEOUT", "20")),
 	}
 }
 

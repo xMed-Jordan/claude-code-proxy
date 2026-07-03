@@ -15,8 +15,10 @@ package main
 //
 //  2. THE INVESTIGATION LOOP (runInvestigation + the four HTTP handlers): an
 //     operator asks a freeform question about a site; the server drives a bounded
-//     ReAct loop over camera TOOLS (roster / snapshot / mosaic / past_frames /
-//     past_clip), going back and forth across time, optionally pausing to ask the
+//     ReAct loop over camera TOOLS (roster / snapshot / mosaic / contact_sheet /
+//     past_frames / past_clip, the knowledge tools playbook / call_api, and the
+//     avatar tools avatars / avatar_info / avatar_check / avatar_find / annotate),
+//     going back and forth across time, optionally pausing to ask the
 //     operator, and finally answering with cited evidence. Each turn the model
 //     emits ONE JSON action (investigateAction). The loop, NOT the model, executes
 //     the tools and feeds results (images + text) back — so a text-only backend
@@ -66,8 +68,10 @@ import (
 // emits. Its nested Action carries the actual command:
 //
 //	{"thought":"...","action":{"type":"call_tool|ask_operator|answer",
-//	  "tool":"roster|snapshot|mosaic|past_frames|past_clip",
-//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6},
+//	  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate",
+//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,
+//	    "name":"<playbook or api tool>","params":{"key":"value"},
+//	    "avatar_id":"...","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},
 //	  "question":"...(ask_operator)","answer":"...(final narrative)",
 //	  "evidence":[{"media_url":"...","caption":"..."}]}}
 type investigateAction struct {
@@ -91,12 +95,17 @@ type investigateCommand struct {
 // uses camera_ids + quality; past_frames adds count). Count uses the tolerant
 // flexInt decoder so a text model emitting "6" is still accepted.
 type investigateArgs struct {
-	CameraIDs []string `json:"camera_ids"`
-	Quality   string   `json:"quality"` // sub | main
-	From      string   `json:"from"`    // RFC3339 absolute time (DVR timezone honored by the loop)
-	To        string   `json:"to"`      // RFC3339 absolute time
-	Count     flexInt  `json:"count"`   // desired still count for past_frames
-	Mode      string   `json:"mode"`    // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
+	CameraIDs []string        `json:"camera_ids"`
+	Quality   string          `json:"quality"`   // sub | main
+	From      string          `json:"from"`      // RFC3339 absolute time (DVR timezone honored by the loop)
+	To        string          `json:"to"`        // RFC3339 absolute time
+	Count     flexInt         `json:"count"`     // desired still count for past_frames
+	Mode      string          `json:"mode"`      // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
+	Name      string          `json:"name"`      // playbook / call_api: the catalog entry to invoke (exact name)
+	Params    map[string]any  `json:"params"`    // call_api: {{placeholder}} values (stringified tolerantly)
+	AvatarID  string          `json:"avatar_id"` // avatar_info / avatar_check / avatar_find: the avatar to inspect/match
+	Time      string          `json:"time"`      // avatar_check / annotate: RFC3339 archive instant
+	BBox      json.RawMessage `json:"bbox"`      // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
 }
 
 // evidenceItem is one media artifact cited in a final answer: a served
@@ -108,15 +117,15 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
 // camBuildRoster renders the enabled cameras of a site as a plain-text roster the
 // model reads to choose which cameras to inspect. One line per enabled camera:
-// "- <id> — <name> [<area>]: <ai_description>" (name/area/description omitted when
-// blank). Disabled cameras are skipped so the model never targets a camera the
-// loop can't capture.
+// "- <id> — <name> [<area>]: <ai_description> | location: <ai_location> | operator notes: <notes>"
+// (name/area/description/location/notes omitted when blank). Disabled cameras are
+// skipped so the model never targets a camera the loop can't capture.
 func camBuildRoster(cams []camera) string {
 	var b strings.Builder
 	n := 0
@@ -140,10 +149,53 @@ func camBuildRoster(cams []camera) string {
 			b.WriteString(": ")
 			b.WriteString(d)
 		}
+		if loc := strings.TrimSpace(c.AILocation); loc != "" {
+			b.WriteString(" | location: ")
+			b.WriteString(loc)
+		}
+		if notes := strings.TrimSpace(c.Notes); notes != "" {
+			b.WriteString(" | operator notes: ")
+			b.WriteString(notes)
+		}
 		b.WriteString("\n")
 	}
 	if n == 0 {
 		return "(no enabled cameras)"
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// camSiteContextBlock renders the operator-authored knowledge shared by the
+// investigation system prompt and the roster-first selector: the site's
+// description plus one paragraph per DVR with non-blank AIInstructions (the
+// `[DVR "<name-or-id>"]` prefix is omitted when the site has exactly one DVR).
+// Returns "" when nothing is set, so callers can skip the section entirely.
+func camSiteContextBlock(site camSite, dvrs []CamDVR) string {
+	var b strings.Builder
+	if desc := strings.TrimSpace(site.Description); desc != "" {
+		b.WriteString("SITE PROFILE (operator-authored — trust this over your own guesses):\n")
+		b.WriteString(desc)
+		b.WriteString("\n")
+	}
+	var instr strings.Builder
+	for _, d := range dvrs {
+		text := strings.TrimSpace(d.AIInstructions)
+		if text == "" {
+			continue
+		}
+		if len(dvrs) > 1 {
+			fmt.Fprintf(&instr, "[DVR %q] %s\n", firstNonEmpty(strings.TrimSpace(d.Name), d.ID), text)
+		} else {
+			instr.WriteString(text)
+			instr.WriteString("\n")
+		}
+	}
+	if instr.Len() > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("OPERATOR INSTRUCTIONS (authoritative facts about this site's layout and rules):\n")
+		b.WriteString(instr.String())
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -157,11 +209,13 @@ type camSelection struct {
 // camSelectCameras is the roster-first selector: it shows the model the site roster
 // as TEXT (NO images) plus the task, and asks it to return
 // {"camera_ids":[...],"reason":"..."} — the subset of cameras worth pulling imagery
-// from. The reply is parsed with the shared JSON extractor and filtered down to ids
+// from. siteContext is the operator-authored camSiteContextBlock ("" = none),
+// prepended so selections honor the operator's layout knowledge. The reply is
+// parsed with the shared JSON extractor and filtered down to ids
 // that actually exist (enabled) in the roster, de-duplicated and order-preserving.
 // An empty result is valid (the model judged no camera relevant); the caller
 // decides how to proceed.
-func camSelectCameras(ctx context.Context, cfg config, alias, task string, cams []camera) ([]string, error) {
+func camSelectCameras(ctx context.Context, cfg config, alias, task, siteContext string, cams []camera) ([]string, error) {
 	allowed := make(map[string]bool, len(cams))
 	for _, c := range cams {
 		if c.Enabled {
@@ -176,6 +230,11 @@ func camSelectCameras(ctx context.Context, cfg config, alias, task string, cams 
 		`{"camera_ids":["<id>"],"reason":"..."}`
 
 	var b strings.Builder
+	if sc := strings.TrimSpace(siteContext); sc != "" {
+		b.WriteString("SITE CONTEXT:\n")
+		b.WriteString(sc)
+		b.WriteString("\n\n")
+	}
 	b.WriteString("CAMERA ROSTER (id — name [area]: description):\n")
 	b.WriteString(camBuildRoster(cams))
 	b.WriteString("\n\nTASK:\n")
@@ -264,11 +323,16 @@ func camInvestigateBudget(cfg config) time.Duration {
 // ─────────────────────────────── system prompt ───────────────────────────────
 
 // camInvestigateSystemPrompt builds the loop's per-call system prompt: the
-// investigator role, the current time in the site's DVR timezone (so the model
-// can construct absolute RFC3339 windows), the camera roster (reused from
-// camBuildRoster — the roster-first contract), the tool list + JSON contract,
-// and the investigation protocol.
-func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock time.Time, dvrClockOK bool, tzName string) string {
+// investigator role, the operator-authored site context (camSiteContextBlock),
+// the current time in the site's DVR timezone (so the model can construct
+// absolute RFC3339 windows), the camera roster (reused from camBuildRoster —
+// the roster-first contract), the operational-playbook and external-API-tool
+// catalogs (only when the site has any), the tool list + ACTIONS + JSON
+// contract, and the investigation protocol. The avatar tool lines/strategy are
+// emitted only when the site has enabled avatars.
+func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
+	playbooks []camPlaybook, apiTools []camAPITool, avatars []camAvatar,
+	now, dvrClock time.Time, dvrClockOK bool, tzName string) string {
 	var b strings.Builder
 	b.WriteString("You are a security investigator for a physical premises")
 	if n := strings.TrimSpace(site.Name); n != "" {
@@ -279,6 +343,12 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString(". An operator has asked you a freeform question about what happened on camera. You investigate by ")
 	b.WriteString("calling TOOLS that the loop executes for you — you never fetch media yourself, only request it, and every ")
 	b.WriteString("tool result (images and/or text) is shown to you on your NEXT turn.\n\n")
+
+	// Operator-authored knowledge: site profile + per-DVR instructions.
+	if block := camSiteContextBlock(site, dvrs); block != "" {
+		b.WriteString(block)
+		b.WriteString("\n\n")
+	}
 
 	fmt.Fprintf(&b, "CURRENT TIME (real / operator now): %s — today is %s, timezone %s.\n",
 		now.Format(time.RFC3339), now.Format("Monday 2 January 2006"), tzName)
@@ -305,17 +375,69 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString(camBuildRoster(active))
 	b.WriteString("\n\n")
 
+	// Operational playbooks catalog — one line per enabled playbook (full text
+	// only via the playbook tool), emitted only when the site has any.
+	if len(playbooks) > 0 {
+		dvrByID := make(map[string]CamDVR, len(dvrs))
+		for _, d := range dvrs {
+			dvrByID[d.ID] = d
+		}
+		b.WriteString("OPERATIONAL PLAYBOOKS (operator-authored procedures — name — when to use):\n")
+		if cat := camPlaybookCatalog(playbooks, dvrByID); cat != "" {
+			b.WriteString(cat)
+			b.WriteString("\n")
+		}
+		b.WriteString("When the operator's question matches a playbook, call tool \"playbook\" with args.name set to the EXACT\n")
+		b.WriteString("name FIRST — it returns the full step-by-step instructions and any operator-approved reference images.\n")
+		b.WriteString("Never improvise a procedure the catalog already covers.\n\n")
+	}
+
+	// External API tools catalog — emitted only when the site has any.
+	if len(apiTools) > 0 {
+		b.WriteString("EXTERNAL API TOOLS (operator-configured HTTP lookups — name — what it does):\n")
+		if cat := camAPIToolCatalog(apiTools); cat != "" {
+			b.WriteString(cat)
+			b.WriteString("\n")
+		}
+		b.WriteString("Call tool \"call_api\" with args.name and args.params. The response is TEXT for your reasoning —\n")
+		b.WriteString("you cannot cite API responses or their URLs as evidence; cite camera media instead.\n\n")
+	}
+
+	hasAvatars := len(avatars) > 0
+
 	b.WriteString("TOOLS you may call (action.tool):\n")
 	b.WriteString("- roster: re-read the camera roster above as text (no images; use this to double-check exact camera ids).\n")
 	b.WriteString("- snapshot: args.camera_ids (required), args.quality \"sub\"|\"main\" (see QUALITY below; default main) — a fresh CURRENT still per camera.\n")
-	b.WriteString("- mosaic: args.camera_ids (optional, default = every enabled camera) — one low-res grid of CURRENT sub-stream stills.\n")
+	b.WriteString("- mosaic: args.camera_ids (optional, default = every enabled camera) — one low-res grid of CURRENT sub-stream stills (always sub quality; args.quality is ignored).\n")
 	b.WriteString("- contact_sheet: args.camera_ids (ONE id), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (default sub), args.mode \"motion\"|\"interval\" — scans that ONE camera's 1-fps archive across the window and returns a SINGLE numbered composite image plus a \"cell=time\" map (one image instead of hundreds). CHOOSE THE MODE from the camera's roster description:\n")
 	b.WriteString("    * mode \"motion\" (default) DROPS static frames, keeping only moments the scene CHANGED — use for a DOOR/gate/entrance/exit or any mostly-still view: count who entered/passed and when.\n")
 	b.WriteString("    * mode \"interval\" is a uniform time-lapse (no motion filter) — use for a BUSY area where people are always moving (reception, waiting room, office) so motion filtering would keep everything and help nothing: count how many people are present over time and see when it was empty.\n")
 	b.WriteString("  Then past_frames the specific numbered cells (quality \"main\") to confirm/read detail. Frames of the same person seconds apart are ONE entry, not several.\n")
 	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use to SEE a window directly, or to zoom into the exact times a contact_sheet flagged.\n")
-	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n\n")
+	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
+	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS) — returns that procedure's full\n")
+	b.WriteString("  instructions plus operator-approved reference images (shown to you next turn). Costs no media budget.\n")
+	b.WriteString("- call_api: args.name (EXACT name from EXTERNAL API TOOLS), args.params {\"key\":\"value\"} — the loop\n")
+	b.WriteString("  performs the operator-configured HTTP request with your params substituted and shows you the text\n")
+	b.WriteString("  response next turn. Costs no media budget.\n")
+	if hasAvatars {
+		b.WriteString("- avatars: (no args) — list the KNOWN AVATARS registered for this site (people/vehicles/pets: id, name, type, description). Use FIRST whenever the question names a specific person (\"employee X\", \"the owner\", \"Dr. Ahmad\").\n")
+		b.WriteString("- avatar_info: args.avatar_id — that avatar's full description plus its approved reference images (you SEE them next turn). Always look at the references before judging any frame.\n")
+		b.WriteString("- avatar_check: args.avatar_id, args.camera_ids (ONE id), args.time (RFC3339) — pulls the archived frame at that instant and runs a focused identity comparison against the avatar's references; returns the verdict (present/confidence/reason) and, on a match, an ANNOTATED evidence frame with the person circled.\n")
+		b.WriteString("- avatar_find: args.avatar_id, args.camera_ids (ONE id), args.from + args.to (RFC3339) — scans that ONE camera's 1-fps archive across the window (motion-filtered) and compares each active moment against the avatar; returns sighting times with confidence plus an annotated sheet. THE tool for \"what did X do today\": call it per relevant camera, then confirm pivotal moments with avatar_check.\n")
+		b.WriteString("- annotate: args.camera_ids (ONE id), args.time (RFC3339), args.bbox = {\"x0\",\"y0\",\"x1\",\"y1\"} on a 0-1000 grid (top-left origin) — mints an evidence frame with an ellipse drawn around your box so the operator sees exactly WHO you mean. Annotate the person you cite before answering.\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("ACTIONS (action.type — exactly one per turn):\n")
+	b.WriteString("- call_tool: run ONE of the TOOLS above; you see its result next turn.\n")
+	b.WriteString("- ask_operator: pause and ask the operator action.question — ONLY for information no tool or playbook can provide.\n")
+	b.WriteString("- answer: finish with action.answer plus action.evidence citing exact media_url values from TOOL RESULT lines.\n\n")
+
 	b.WriteString("STRATEGY for counting people/occupancy over a time window: (1) use the ROSTER descriptions to pick the ONE relevant camera AND to judge whether it is a DOOR (mostly still) or a BUSY area (constant movement); (2) contact_sheet that camera with mode \"motion\" for a door or mode \"interval\" for a busy area; (3) read the numbered sheet, count DISTINCT people, and past_frames specific cells for detail/time. Do NOT blindly past_frames a wide multi-camera window — it is slow and misses people.\n\n")
+	if hasAvatars {
+		b.WriteString("STRATEGY for tracking a NAMED person across a day: (1) avatars → find their id; (2) avatar_info to study their references; (3) from the roster pick the entry/exit cameras and their usual areas; (4) avatar_find each such camera across the window to collect sightings; (5) avatar_check the pivotal ones (arrival, departure, anything unusual); (6) answer with a chronological timeline citing the annotated frames.\n\n")
+	}
 
 	b.WriteString("QUALITY (args.quality) — choose per request:\n")
 	b.WriteString("- \"main\" = full-resolution: use when FINE DETAIL matters — reading text/labels/signage, checking cleanliness or condition, or identifying small objects, faces, or license plates.\n")
@@ -323,6 +445,9 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString("- Default to \"sub\" unless the task needs fine detail; switch to \"main\" only when it does.\n\n")
 
 	b.WriteString("PROTOCOL:\n")
+	if len(playbooks) > 0 {
+		b.WriteString("- Playbook-first: if an OPERATIONAL PLAYBOOK matches the task, fetch it with the playbook tool before pulling any imagery, and follow its steps.\n")
+	}
 	b.WriteString("- Roster-first: read the roster above and pick the SMALLEST set of cameras worth pulling imagery from before fetching anything.\n")
 	b.WriteString("- Investigate step by step: snapshot/mosaic for \"right now\", past_frames/past_clip for \"what happened at/around <time>\".\n")
 	b.WriteString("- Use ask_operator ONLY when you genuinely need information only the operator has (an exact time, a name, which entrance, etc).\n")
@@ -332,7 +457,7 @@ func camInvestigateSystemPrompt(site camSite, active []camera, now, dvrClock tim
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|ask_operator|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6},`)
+	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
@@ -560,9 +685,13 @@ func camCountInvestigateProgress(msgs []camInvestigationMessage) (turns, mediaUs
 // resets the cumulative budget on a non-ask_operator operator message) rather than
 // instantly re-tripping the same cumulative turn cap and re-stopping. Still
 // re-openable: handleCameraInvestigationReply reopens anything that isn't "closed".
-func camStopInvestigation(db *sql.DB, invID, note string) error {
+// Every exhausted transition (incl. the panic-terminalize path, which funnels
+// through here) fires the settle webhook so Connect learns the run ended.
+func camStopInvestigation(db *sql.DB, cfg config, invID, note string) error {
 	camAppendInvestigateMessage(db, invID, "system", note, "", "", 0, nil)
-	return setCameraInvestigationStatus(db, invID, "exhausted")
+	err := setCameraInvestigationStatus(db, invID, "exhausted")
+	go camNotifyInvestigationSettled(cfg, invID, "exhausted")
+	return err
 }
 
 // camCollectMintedMedia returns the /camera/media/<token> URLs the loop's tools
@@ -678,8 +807,10 @@ type investigateToolResult struct {
 
 // camExecuteInvestigateTool dispatches one call_tool action to its
 // implementation. tool is assumed already normalized by parseInvestigateAction
-// (one of investigateToolNames); the default case is defensive.
-func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int) investigateToolResult {
+// (one of investigateToolNames); the default case is defensive. alias is the
+// run's analysis alias, threaded to the tools that make their own VLM sub-calls
+// (avatar_check / avatar_find).
+func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int) investigateToolResult {
 	switch tool {
 	case "roster":
 		return investigateToolResult{Summary: "Camera roster:\n" + camBuildRoster(active)}
@@ -693,6 +824,20 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 		return camToolPastFrames(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "past_clip":
 		return camToolPastClip(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
+	case "playbook":
+		return camToolPlaybook(ctx, cfg, db, r, site, args, scratch)
+	case "call_api":
+		return camToolCallAPI(ctx, cfg, db, site, args)
+	case "avatars":
+		return camToolAvatars(db, site, active)
+	case "avatar_info":
+		return camToolAvatarInfo(cfg, db, site, args, scratch)
+	case "avatar_check":
+		return camToolAvatarCheck(ctx, cfg, db, r, site, alias, args, camByID, dvrByID, allowed, scratch, mediaLeft)
+	case "avatar_find":
+		return camToolAvatarFind(ctx, cfg, db, r, site, alias, args, camByID, dvrByID, allowed, scratch, mediaLeft)
+	case "annotate":
+		return camToolAnnotate(ctx, cfg, db, r, site, args, camByID, allowed, scratch)
 	default:
 		return investigateToolResult{Summary: fmt.Sprintf("unknown tool %q — no action taken.", tool)}
 	}
@@ -1201,7 +1346,12 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			dvrClock, dvrClockOK = t.In(loc), true
 		}
 	}
-	sys := camInvestigateSystemPrompt(site, active, srvNow, dvrClock, dvrClockOK, tzName)
+	// Operator knowledge + avatar registry, loaded ONCE per run (enabled rows
+	// only) — the prompt catalogs and the avatar tool gating both key off these.
+	playbooks, _ := listCameraPlaybooks(db, inv.SiteID, true)
+	apiTools, _ := listCameraAPITools(db, inv.SiteID, true)
+	avatars, _ := listCameraAvatars(db, inv.SiteID, false)
+	sys := camInvestigateSystemPrompt(site, dvrs, active, playbooks, apiTools, avatars, srvNow, dvrClock, dvrClockOK, tzName)
 
 	maxTurns := camInvestigateMaxTurns(cfg)
 	maxMedia := camInvestigateMaxMedia(cfg)
@@ -1229,11 +1379,11 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	for {
 		if cctx.Err() != nil {
 			camlog("warn", "investigate_budget", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
-			return camStopInvestigation(db, invID, "Investigation stopped: time budget exhausted before reaching a final answer.")
+			return camStopInvestigation(db, cfg, invID, "Investigation stopped: time budget exhausted before reaching a final answer.")
 		}
 		if turnsSoFar >= maxTurns {
 			camlog("warn", "investigate_max_turns", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
-			return camStopInvestigation(db, invID, "Investigation stopped: reached the maximum number of turns before a final answer.")
+			return camStopInvestigation(db, cfg, invID, "Investigation stopped: reached the maximum number of turns before a final answer.")
 		}
 
 		userText := camInvestigateTranscriptText(msgs) + "\n\nReply with ONLY the JSON action object now."
@@ -1245,7 +1395,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 				"investigation_id": invID, "turn": turnsSoFar, "ok": false, "error": aerr.Error(),
 				"repair_used": repaired, "latency_ms": latency,
 			})
-			return camStopInvestigation(db, invID, "Investigation stopped due to an analysis error: "+aerr.Error())
+			return camStopInvestigation(db, cfg, invID, "Investigation stopped due to an analysis error: "+aerr.Error())
 		}
 		camlog("info", "investigate_turn", map[string]any{
 			"investigation_id": invID, "turn": turnsSoFar, "ok": true, "action": act.Action.Type,
@@ -1267,6 +1417,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			if serr := setCameraInvestigationStatus(db, invID, "answered"); serr != nil {
 				return serr
 			}
+			go camNotifyInvestigationSettled(cfg, invID, "answered") // settle webhook (camera_serviceapi.go)
 			camlog("info", "investigate_done", map[string]any{
 				"investigation_id": invID, "status": "answered", "turns": turnsSoFar + 1, "latency_ms": time.Since(start).Milliseconds(),
 			})
@@ -1278,6 +1429,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			if serr := setCameraInvestigationStatus(db, invID, "awaiting_operator"); serr != nil {
 				return serr
 			}
+			go camNotifyInvestigationSettled(cfg, invID, "awaiting_operator") // settle webhook (camera_serviceapi.go)
 			camlog("info", "investigate_done", map[string]any{
 				"investigation_id": invID, "status": "awaiting_operator", "turns": turnsSoFar + 1, "latency_ms": time.Since(start).Milliseconds(),
 			})
@@ -1296,7 +1448,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			if mediaLeft <= 0 {
 				tr = investigateToolResult{Summary: "Media fetch budget for this investigation is exhausted — answer with the evidence already gathered, or ask the operator."}
 			} else {
-				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
+				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, alias, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
 			}
 			mediaUsed += tr.Fetches
 			camlog("info", "investigate_tool", map[string]any{
@@ -1449,7 +1601,7 @@ func camConsiderInvestigation(cfg config, db *sql.DB, inv camInvestigation) {
 // eventually requeues the still-"running" row, so nothing strands permanently.
 func camTerminalizeInvestigation(cfg config, id, note string) {
 	if db, err := openProxyDB(cfg); err == nil {
-		_ = camStopInvestigation(db, id, note)
+		_ = camStopInvestigation(db, cfg, id, note)
 		db.Close()
 	}
 }
@@ -1466,7 +1618,7 @@ func camRunInvestigationInline(db *sql.DB, cfg config, r *http.Request, id strin
 	}
 	if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
 		camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
-		_ = camStopInvestigation(db, id, "Investigation could not start: "+rerr.Error())
+		_ = camStopInvestigation(db, cfg, id, "Investigation could not start: "+rerr.Error())
 	}
 }
 
