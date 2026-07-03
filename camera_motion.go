@@ -31,6 +31,7 @@ package main
 // SSRF-guarded camPostSignedCallback.
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"database/sql"
@@ -39,7 +40,6 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
@@ -365,7 +365,7 @@ func camMotionRunOnce(ctx context.Context, cfg config, dvr CamDVR) error {
 
 	events := make(chan hikEventAlert, 16)
 	errc := make(chan error, 1)
-	go camMotionReadLoop(ctx, multipart.NewReader(resp.Body, boundary), events, errc)
+	go camMotionReadLoop(ctx, bufio.NewReaderSize(resp.Body, 16384), boundary, events, errc)
 
 	sweep := time.NewTicker(camMotionSweepInterval)
 	defer sweep.Stop()
@@ -383,20 +383,60 @@ func camMotionRunOnce(ctx context.Context, cfg config, dvr CamDVR) error {
 	}
 }
 
-// camMotionReadLoop reads multipart parts off the alert stream, decodes each as an
-// <EventNotificationAlert>, and forwards the decoded alerts on events. It reports
-// the terminating read error on errc (buffered) so the run loop can reconnect;
-// undecodable/heartbeat parts are skipped.
-func camMotionReadLoop(ctx context.Context, mr *multipart.Reader, events chan<- hikEventAlert, errc chan<- error) {
+// camMotionReadLoop reads the alert stream and forwards each decoded
+// <EventNotificationAlert> on events, reporting the terminating read error on
+// errc (buffered) so the run loop can reconnect. Undecodable/heartbeat parts are
+// skipped.
+//
+// It does NOT use mime/multipart. Hikvision's alertStream frames each part by an
+// explicit Content-Length and terminates the body with a bare LF immediately
+// before the next "--boundary" — there is NO CRLF before the boundary, which the
+// stdlib multipart.Reader strictly requires, so NextPart() would block forever
+// reading the first "part" and never yield an event (observed live: 0 events, no
+// error, connection healthy). So we parse manually: find a boundary line, read
+// the part's headers (capturing Content-Length), then read EXACTLY that many body
+// bytes. This is the standard way to consume a Hik alertStream.
+func camMotionReadLoop(ctx context.Context, br *bufio.Reader, boundary string, events chan<- hikEventAlert, errc chan<- error) {
+	delim := "--" + boundary
 	for {
-		part, err := mr.NextPart()
+		// Advance to the next boundary delimiter line, skipping any preamble.
+		line, err := br.ReadString('\n')
 		if err != nil {
 			errc <- err
 			return
 		}
-		data, rerr := io.ReadAll(io.LimitReader(part, 1<<20))
-		part.Close()
-		if rerr != nil {
+		line = strings.TrimRight(line, "\r\n")
+		if !strings.HasPrefix(line, delim) {
+			continue
+		}
+		if strings.HasPrefix(line, delim+"--") { // closing delimiter ends the stream
+			errc <- io.EOF
+			return
+		}
+		// Part headers until a blank line; capture Content-Length.
+		contentLength := -1
+		for {
+			h, herr := br.ReadString('\n')
+			if herr != nil {
+				errc <- herr
+				return
+			}
+			h = strings.TrimRight(h, "\r\n")
+			if h == "" {
+				break
+			}
+			if v, ok := camMotionHeaderValue(h, "Content-Length"); ok {
+				contentLength = atoiDefault(strings.TrimSpace(v), -1)
+			}
+		}
+		// Hik always sends Content-Length; a missing/oversized one is a framing
+		// desync we can't safely recover in-band — reconnect instead of guessing.
+		if contentLength < 0 || contentLength > 1<<20 {
+			errc <- fmt.Errorf("alertStream part bad Content-Length %d", contentLength)
+			return
+		}
+		data := make([]byte, contentLength)
+		if _, rerr := io.ReadFull(br, data); rerr != nil {
 			errc <- rerr
 			return
 		}
@@ -408,6 +448,19 @@ func camMotionReadLoop(ctx context.Context, mr *multipart.Reader, events chan<- 
 			}
 		}
 	}
+}
+
+// camMotionHeaderValue returns the value of a "Name: value" part header when its
+// name case-insensitively equals name.
+func camMotionHeaderValue(line, name string) (string, bool) {
+	idx := strings.IndexByte(line, ':')
+	if idx < 0 {
+		return "", false
+	}
+	if !strings.EqualFold(strings.TrimSpace(line[:idx]), name) {
+		return "", false
+	}
+	return strings.TrimSpace(line[idx+1:]), true
 }
 
 // camMotionHandleEvent applies one alert to the episode map: an active heartbeat

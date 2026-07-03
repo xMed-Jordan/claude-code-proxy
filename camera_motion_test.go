@@ -5,7 +5,10 @@ package main
 // investigate tool's formatting, and the motion store CRUD + retention prune.
 
 import (
+	"bufio"
+	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +69,66 @@ func TestCamMotionParseAlertGarbage(t *testing.T) {
 	a, _ := camMotionParseAlert([]byte(`<EventNotificationAlert><channelID>2</channelID></EventNotificationAlert>`))
 	if got := camMotionEventType(a); got != "motion" {
 		t.Fatalf("blank eventType default = %q, want motion", got)
+	}
+}
+
+// TestCamMotionReadLoopHikFraming feeds the EXACT Hikvision alertStream framing
+// (Content-Length-delimited parts, body terminated by a bare LF immediately before
+// the next --boundary, NO CRLF before the boundary) through camMotionReadLoop and
+// asserts every part is decoded. This is the framing the stdlib multipart.Reader
+// chokes on (it blocks forever on NextPart), so it is the regression guard for the
+// manual parser — captured verbatim from the live amman DVR.
+func TestCamMotionReadLoopHikFraming(t *testing.T) {
+	boundary := "boundary"
+	mkPart := func(body string) string {
+		return "--" + boundary + "\r\n" +
+			"Content-Type: application/xml; charset=\"UTF-8\"\r\n" +
+			fmt.Sprintf("Content-Length: %d\r\n", len(body)) +
+			"\r\n" + body
+	}
+	// Namespaced root + \n line endings + trailing \n inside Content-Length — as the
+	// real DVR sends. channelID present on the VMD part; videoloss is the keepalive.
+	vmd := "<EventNotificationAlert version=\"2.0\" xmlns=\"http://www.isapi.org/ver20/XMLSchema\">\n" +
+		"<dynChannelID>3</dynChannelID>\n<channelID>3</channelID>\n" +
+		"<eventType>VMD</eventType>\n<eventState>active</eventState>\n</EventNotificationAlert>\n"
+	loss := "<EventNotificationAlert version=\"2.0\" xmlns=\"http://www.isapi.org/ver20/XMLSchema\">\n" +
+		"<channelID>0</channelID>\n<eventType>videoloss</eventType>\n<eventState>inactive</eventState>\n</EventNotificationAlert>\n"
+	stream := mkPart(vmd) + mkPart(loss) + "--" + boundary + "--\r\n"
+
+	events := make(chan hikEventAlert, 8)
+	errc := make(chan error, 1)
+	go camMotionReadLoop(context.Background(), bufio.NewReader(strings.NewReader(stream)), boundary, events, errc)
+
+	var got []hikEventAlert
+	deadline := time.After(2 * time.Second)
+	done := false
+	for !done {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		case <-errc:
+			done = true
+		case <-deadline:
+			t.Fatal("timeout: readLoop did not terminate on the closing boundary")
+		}
+	}
+	for drain := true; drain; {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		default:
+			drain = false
+		}
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 decoded alerts, got %d: %+v", len(got), got)
+	}
+	if got[0].EventType != "VMD" || got[0].EventState != "active" || camMotionChannel(got[0]) != 3 {
+		t.Fatalf("VMD part decoded wrong: %+v (channel=%d)", got[0], camMotionChannel(got[0]))
+	}
+	if got[1].EventType != "videoloss" || got[1].EventState != "inactive" {
+		t.Fatalf("videoloss part decoded wrong: %+v", got[1])
 	}
 }
 
