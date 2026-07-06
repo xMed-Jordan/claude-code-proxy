@@ -123,10 +123,12 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 // never has a code path that could leak it.
 
 func siteJSON(s camSite) map[string]any {
+	pol := camParseSitePolicy(s.PolicyJSON)
 	return map[string]any{
 		"id": s.ID, "name": s.Name, "description": s.Description,
 		"analysis_alias": s.AnalysisAlias, "analysis_status": s.AnalysisStatus,
 		"last_analyzed_at": s.LastAnalyzedAt, "analysis": camDecodeJSON(s.AnalysisJSON),
+		"policy": camSitePolicyResponseJSON(pol), "role_vocabulary": camRoleVocabularyJSON(pol),
 		"created_at": s.CreatedAt, "updated_at": s.UpdatedAt,
 	}
 }
@@ -311,10 +313,11 @@ func handleCameraSiteUpdate(cfg config) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			ID            string `json:"id"`
-			Name          string `json:"name"`
-			Description   string `json:"description"`
-			AnalysisAlias string `json:"analysis_alias"`
+			ID            string         `json:"id"`
+			Name          string         `json:"name"`
+			Description   string         `json:"description"`
+			AnalysisAlias string         `json:"analysis_alias"`
+			Policy        *camSitePolicy `json:"policy"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -339,9 +342,23 @@ func handleCameraSiteUpdate(cfg config) http.HandlerFunc {
 		site.Name = strings.TrimSpace(firstNonEmpty(body.Name, site.Name))
 		site.Description = body.Description
 		site.AnalysisAlias = strings.TrimSpace(body.AnalysisAlias)
+		// Validate the policy BEFORE any write so a 400 never leaves a partial
+		// update behind (name/description persisted, policy rejected).
+		if body.Policy != nil {
+			if problem := camNormalizeSitePolicy(body.Policy); problem != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": problem})
+				return
+			}
+		}
 		if err := updateCameraSite(db, site); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
+		}
+		if body.Policy != nil {
+			if err := updateCameraSitePolicy(db, id, camSitePolicyJSON(*body.Policy)); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
 		}
 		camlog("info", "site_update", map[string]any{"site_id": id})
 		site, _ = getCameraSite(db, id)

@@ -617,7 +617,10 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/avatars/update", noStore(requireCameraService(cfg, "site", handleSvcAvatarUpdate(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/delete", noStore(requireCameraService(cfg, "site", handleSvcAvatarDelete(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/photos", noStore(requireCameraService(cfg, "site", handleSvcAvatarPhotos(cfg))))
+	mux.HandleFunc("/api/cameras/avatars/media", noStore(requireCameraService(cfg, "site", handleSvcAvatarMedia(cfg))))
+	mux.HandleFunc("/api/cameras/avatars/media/delete", noStore(requireCameraService(cfg, "site", handleSvcAvatarMediaDelete(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/scan", noStore(requireCameraService(cfg, "site", handleSvcAvatarScan(cfg))))
+	mux.HandleFunc("/api/cameras/avatars/scans", noStore(requireCameraService(cfg, "site", handleSvcAvatarScans(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/candidates", noStore(requireCameraService(cfg, "site", handleSvcAvatarCandidates(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/candidates/review", noStore(requireCameraService(cfg, "site", handleSvcAvatarCandidateReview(cfg))))
 	mux.HandleFunc("/api/cameras/playbooks", noStore(requireCameraService(cfg, "site", handleSvcPlaybooks(cfg))))
@@ -688,6 +691,15 @@ func camSvcAvatar(db *sql.DB, w http.ResponseWriter, id, siteID string) (camAvat
 		return camAvatar{}, false
 	}
 	return av, true
+}
+
+// camSvcSitePolicy loads a site's decoded role-vocabulary policy.
+func camSvcSitePolicy(db *sql.DB, siteID string) (camSitePolicy, error) {
+	site, err := getCameraSite(db, siteID)
+	if err != nil {
+		return camSitePolicy{}, err
+	}
+	return camParseSitePolicy(site.PolicyJSON), nil
 }
 
 // camSvcPlaybook loads a playbook and enforces sc-site ownership.
@@ -843,8 +855,11 @@ func handleSvcUsage(cfg config) camSvcHandler {
 // (insertCameraDVR, runCameraDiscovery, insertCameraInvestigation, avatar/
 // playbook store funcs, ...).
 
-// handleSvcSite serves GET (siteJSON incl. analysis) / POST {description?,
-// analysis_alias?} partial update on /api/cameras/site.
+// handleSvcSite serves GET (siteJSON incl. analysis, policy and the resolved
+// role_vocabulary) / POST {description?, analysis_alias?, policy?} partial
+// update on /api/cameras/site. policy carries the per-site custom person-role
+// labels ({custom_roles:[{slug,label,description}], notes}) — descriptive
+// vocabulary only, validated by camNormalizeSitePolicy.
 func handleSvcSite(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		db := camSvcOpenDB(cfg, w)
@@ -862,8 +877,9 @@ func handleSvcSite(cfg config) camSvcHandler {
 			writeJSON(w, http.StatusOK, map[string]any{"site": siteJSON(site)})
 		case http.MethodPost:
 			var body struct {
-				Description   *string `json:"description"`
-				AnalysisAlias *string `json:"analysis_alias"`
+				Description   *string        `json:"description"`
+				AnalysisAlias *string        `json:"analysis_alias"`
+				Policy        *camSitePolicy `json:"policy"`
 			}
 			if !camSvcDecode(w, r, &body) {
 				return
@@ -874,9 +890,23 @@ func handleSvcSite(cfg config) camSvcHandler {
 			if body.AnalysisAlias != nil {
 				site.AnalysisAlias = strings.TrimSpace(*body.AnalysisAlias)
 			}
+			// Validate the policy BEFORE any write so a 400 never leaves a partial
+			// update behind (description persisted, policy rejected).
+			if body.Policy != nil {
+				if problem := camNormalizeSitePolicy(body.Policy); problem != "" {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": problem})
+					return
+				}
+			}
 			if err := updateCameraSite(db, site); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
+			}
+			if body.Policy != nil {
+				if err := updateCameraSitePolicy(db, sc.SiteID, camSitePolicyJSON(*body.Policy)); err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+					return
+				}
 			}
 			camlog("info", "svc_site_update", map[string]any{"site_id": sc.SiteID})
 			site, _ = getCameraSite(db, sc.SiteID)
@@ -1486,7 +1516,19 @@ func svcAvatarJSON(db *sql.DB, a camAvatar) map[string]any {
 		"id": a.ID, "site_id": a.SiteID, "name": a.Name, "type": a.Type, "is_group": a.IsGroup,
 		"external_ref": a.ExternalRef, "description": a.Description,
 		"dvr_ids": camParseIDArray(a.DVRIDs), "enabled": a.Enabled, "ref_count": refCount,
-		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
+		"has_embedding": len(a.Embedding) > 0,
+		// Confirmed role (user-owned; role != "" ⇔ operator confirmed) + the AI's
+		// suggestion/profile (advisory only — Connect must never automate on it).
+		"role":                      a.Role,
+		"role_note":                 a.RoleNote,
+		"role_confirmed_at":         a.RoleConfirmedAt,
+		"suggested_role":            a.SuggestedRole,
+		"suggested_role_confidence": a.SuggestedRoleConfidence,
+		"profile":                   camDecodeJSON(a.ProfileJSON),
+		"profile_status":            a.ProfileStatus,
+		"profile_updated_at":        a.ProfileUpdatedAt,
+		"profile_error":             a.ProfileError,
+		"created_at":                a.CreatedAt, "updated_at": a.UpdatedAt,
 	}
 }
 
@@ -1520,6 +1562,8 @@ func handleSvcAvatars(cfg config) camSvcHandler {
 				ExternalRef string   `json:"external_ref"`
 				Description string   `json:"description"`
 				DVRIDs      []string `json:"dvr_ids"`
+				Role        string   `json:"role"`
+				RoleNote    string   `json:"role_note"`
 			}
 			if !camSvcDecode(w, r, &body) {
 				return
@@ -1538,10 +1582,23 @@ func handleSvcAvatars(cfg config) camSvcHandler {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "type must be human, vehicle or pet"})
 				return
 			}
+			role := strings.ToLower(strings.TrimSpace(body.Role))
+			if role != "" {
+				pol, perr := camSvcSitePolicy(db, sc.SiteID)
+				if perr != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+					return
+				}
+				if !camValidateRole(pol, role) {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown role " + camQuote(role) + " for this site"})
+					return
+				}
+			}
 			id, err := insertCameraAvatar(db, camAvatar{
 				SiteID: sc.SiteID, Name: name, Type: typ,
 				IsGroup: body.IsGroup, ExternalRef: strings.TrimSpace(body.ExternalRef),
 				Description: strings.TrimSpace(body.Description), DVRIDs: dvrIDs, Enabled: true,
+				Role: role, RoleNote: strings.TrimSpace(body.RoleNote),
 			})
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -1571,6 +1628,8 @@ func handleSvcAvatarUpdate(cfg config) camSvcHandler {
 			Description *string   `json:"description"`
 			DVRIDs      *[]string `json:"dvr_ids"`
 			Enabled     *bool     `json:"enabled"`
+			Role        *string   `json:"role"`
+			RoleNote    *string   `json:"role_note"`
 		}
 		if !camSvcDecode(w, r, &body) {
 			return
@@ -1613,10 +1672,43 @@ func handleSvcAvatarUpdate(cfg config) camSvcHandler {
 		if body.Enabled != nil {
 			av.Enabled = *body.Enabled
 		}
+		// Validate the role BEFORE any write so a 400 never leaves a partial
+		// update behind (descriptive fields persisted, role rejected).
+		role := ""
+		if body.Role != nil {
+			role = strings.ToLower(strings.TrimSpace(*body.Role))
+			pol, perr := camSvcSitePolicy(db, sc.SiteID)
+			if perr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+				return
+			}
+			if !camValidateRole(pol, role) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown role " + camQuote(role) + " for this site"})
+				return
+			}
+		}
 		if err := updateCameraAvatar(db, av); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		// Role writes go through the dedicated setter (stamps role_confirmed_at) —
+		// an operator decision from Connect, validated against the site vocabulary.
+		if body.Role != nil {
+			note := av.RoleNote
+			if body.RoleNote != nil {
+				note = strings.TrimSpace(*body.RoleNote)
+			}
+			if err := setCameraAvatarRole(db, av.ID, role, note); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		} else if body.RoleNote != nil {
+			if err := setCameraAvatarRoleNote(db, av.ID, strings.TrimSpace(*body.RoleNote)); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+		av, _ = getCameraAvatar(db, av.ID)
 		camlog("info", "svc_avatar_update", map[string]any{"avatar_id": av.ID, "site_id": sc.SiteID})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "avatar": svcAvatarJSON(db, av)})
 	}
@@ -1759,6 +1851,115 @@ func handleSvcAvatarPhotos(cfg config) camSvcHandler {
 	}
 }
 
+// handleSvcAvatarMedia serves GET /api/cameras/avatars/media?avatar_id= →
+// {media:[...]} — the avatar's approved reference photos (service parity with
+// the admin /ui/api/cameras/avatars/media route), site-confined.
+func handleSvcAvatarMedia(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		avatarID := strings.TrimSpace(r.URL.Query().Get("avatar_id"))
+		if avatarID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "avatar_id is required"})
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		av, ok := camSvcAvatar(db, w, avatarID, sc.SiteID)
+		if !ok {
+			return
+		}
+		media, err := listAvatarMedia(db, av.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		out := make([]map[string]any, 0, len(media))
+		for _, m := range media {
+			out = append(out, cameraAvatarMediaJSON(cfg, r, m))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"media": out})
+	}
+}
+
+// handleSvcAvatarMediaDelete serves POST /api/cameras/avatars/media/delete {id}
+// — removes one reference photo (row + pinned capture + file) and recomputes
+// the centroid. Ownership is checked media → avatar → site.
+func handleSvcAvatarMediaDelete(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if !camSvcDecode(w, r, &body) {
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		m, gerr := getAvatarMedia(db, strings.TrimSpace(body.ID))
+		if gerr != nil {
+			camSvcNotFound(w)
+			return
+		}
+		if _, ok := camSvcAvatar(db, w, m.AvatarID, sc.SiteID); !ok {
+			return
+		}
+		if err := deleteAvatarMedia(db, cfg, m.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		camlog("info", "svc_avatar_media_delete", map[string]any{"media_id": m.ID, "avatar_id": m.AvatarID, "site_id": sc.SiteID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}
+}
+
+// handleSvcAvatarScans serves GET /api/cameras/avatars/scans?avatar_id= →
+// {scans:[...]} — enrollment-scan history (status/progress/error), site-confined.
+// Without avatar_id it lists the whole site's scans.
+func handleSvcAvatarScans(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		avatarID := strings.TrimSpace(r.URL.Query().Get("avatar_id"))
+		if avatarID != "" {
+			if _, ok := camSvcAvatar(db, w, avatarID, sc.SiteID); !ok {
+				return
+			}
+		}
+		// listCameraAvatarScans filters by avatar OR site (either/or): the avatar
+		// branch is safe because camSvcAvatar above already enforced site ownership;
+		// the empty-avatar branch scopes by sc.SiteID.
+		scans, err := listCameraAvatarScans(db, avatarID, sc.SiteID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		out := make([]map[string]any, 0, len(scans))
+		for _, s := range scans {
+			out = append(out, cameraAvatarScanJSON(s))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"scans": out})
+	}
+}
+
 // handleSvcAvatarScan serves POST /api/cameras/avatars/scan {avatar_id,
 // camera_ids?, from?, to?} → {ok, id} (defaults to the last 24h window).
 func handleSvcAvatarScan(cfg config) camSvcHandler {
@@ -1833,7 +2034,8 @@ func handleSvcAvatarScan(cfg config) camSvcHandler {
 }
 
 // handleSvcAvatarCandidates serves GET /api/cameras/avatars/candidates
-// ?avatar_id=&status= → {candidates:[...]}.
+// ?avatar_id=&scan_id=&status= → {candidates:[...]}. scan_id scopes the review
+// to one enrollment scan (either filter alone works; both AND together).
 func handleSvcAvatarCandidates(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		if r.Method != http.MethodGet {
@@ -1841,8 +2043,9 @@ func handleSvcAvatarCandidates(cfg config) camSvcHandler {
 			return
 		}
 		avatarID := strings.TrimSpace(r.URL.Query().Get("avatar_id"))
-		if avatarID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "avatar_id is required"})
+		scanID := strings.TrimSpace(r.URL.Query().Get("scan_id"))
+		if avatarID == "" && scanID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "avatar_id or scan_id is required"})
 			return
 		}
 		db := camSvcOpenDB(cfg, w)
@@ -1850,11 +2053,19 @@ func handleSvcAvatarCandidates(cfg config) camSvcHandler {
 			return
 		}
 		defer db.Close()
-		av, ok := camSvcAvatar(db, w, avatarID, sc.SiteID)
-		if !ok {
-			return
+		if avatarID != "" {
+			if _, ok := camSvcAvatar(db, w, avatarID, sc.SiteID); !ok {
+				return
+			}
 		}
-		cands, lerr := listCameraAvatarCandidates(db, "", av.ID, strings.TrimSpace(r.URL.Query().Get("status")))
+		if scanID != "" {
+			scan, serr := getCameraAvatarScan(db, scanID)
+			if serr != nil || scan.SiteID != sc.SiteID {
+				camSvcNotFound(w)
+				return
+			}
+		}
+		cands, lerr := listCameraAvatarCandidates(db, scanID, avatarID, strings.TrimSpace(r.URL.Query().Get("status")))
 		if lerr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": lerr.Error()})
 			return
@@ -1917,16 +2128,19 @@ func handleSvcAvatarCandidateReview(cfg config) camSvcHandler {
 			camSvcNotFound(w)
 			return
 		}
+		// Ownership FIRST: a foreign candidate id must get the identical 404 before
+		// any state-dependent response — answering "already reviewed" for another
+		// site's candidate would be an existence/status oracle.
+		av, ok := camSvcAvatar(db, w, cand.AvatarID, sc.SiteID)
+		if !ok {
+			return
+		}
 		// At-least-once delivery from Connect means this POST can be replayed;
 		// without this guard a retry pins the crop again and inserts a duplicate
 		// avatar_media row sharing one capture (later deletion of either breaks the
 		// survivor). Mirror the admin handler's fast-fail on already-reviewed rows.
 		if cand.Status != "pending" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "candidate already reviewed (" + cand.Status + ")"})
-			return
-		}
-		av, ok := camSvcAvatar(db, w, cand.AvatarID, sc.SiteID)
-		if !ok {
 			return
 		}
 		note := strings.TrimSpace(body.Notes)
@@ -1950,35 +2164,30 @@ func handleSvcAvatarCandidateReview(cfg config) camSvcHandler {
 			}
 			target, assigned = gav, gav.ID
 		}
-		capRow, cerr := getCameraCaptureByToken(db, cand.CropToken)
-		if cerr != nil {
-			// The 7-day candidate media already expired; the admin UI can re-fetch the
-			// frame from S3 — the service API asks for a fresh scan instead.
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "candidate media has expired — run a new scan and review again"})
-			return
-		}
-		if perr := pinCameraCapture(db, cand.CropToken); perr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+		// Acquire the crop as a PINNED capture — re-hydrating an expired crop from
+		// the S3 frame archive exactly like the admin handler (shared helper) instead
+		// of failing the review with "run a new scan".
+		capRow, cropBytes, aerr := camCandidatePinnedCrop(r.Context(), cfg, db, cand, sc.SiteID)
+		if aerr != nil {
+			writeJSON(w, camCropErrStatus(aerr), map[string]any{"error": aerr.Error()})
 			return
 		}
 		var emb []byte
 		if camFaceEnabled(cfg) && target.Type == "human" {
-			if raw, rerr := os.ReadFile(capRow.Path); rerr == nil {
-				if faces, ferr := camFaceDetect(r.Context(), cfg, raw); ferr == nil {
-					best := -1
-					for i, f := range faces {
-						if f.Score >= cfg.FaceMinScore && (best < 0 || f.Score > faces[best].Score) {
-							best = i
-						}
+			if faces, ferr := camFaceDetect(r.Context(), cfg, cropBytes); ferr == nil {
+				best := -1
+				for i, f := range faces {
+					if f.Score >= cfg.FaceMinScore && (best < 0 || f.Score > faces[best].Score) {
+						best = i
 					}
-					if best >= 0 {
-						emb = camEmbeddingBlob(faces[best].Embedding)
-					}
+				}
+				if best >= 0 {
+					emb = camEmbeddingBlob(faces[best].Embedding)
 				}
 			}
 		}
 		if _, ierr := insertAvatarMedia(db, camAvatarMedia{
-			AvatarID: target.ID, CaptureID: capRow.ID, Token: cand.CropToken,
+			AvatarID: target.ID, CaptureID: capRow.ID, Token: capRow.Token,
 			CameraID: cand.CameraID, Quality: cand.Quality, FrameTS: cand.FrameTS, BBox: cand.BBox,
 			Source: "scan", Note: note, MatchConfidence: cand.VLMConfidence, Embedding: emb,
 		}); ierr != nil {

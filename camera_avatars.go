@@ -32,6 +32,13 @@ import (
 const camAvatarUploadMax = 16 << 20
 
 // camAvatar is an in-memory view of a camera_avatars row.
+//
+// Role provenance is STRUCTURAL: the confirmed trio (Role/RoleNote/
+// RoleConfirmedAt) is written only by setCameraAvatarRole (operator decisions
+// arriving through the role-update handlers); the suggested/profile fields are
+// written only by the profile builder (camera_profile.go). Neither path can
+// touch the other's columns, so role != "" always means the operator confirmed
+// it — an AI hypothesis can never masquerade as a label.
 type camAvatar struct {
 	ID          string
 	SiteID      string
@@ -43,8 +50,22 @@ type camAvatar struct {
 	DVRIDs      string // JSON array of camera_dvrs.id; '' or '[]' = all DVRs in site
 	Enabled     bool
 	Embedding   []byte // face-embedding centroid (float32 LE), nil when none
-	CreatedAt   string
-	UpdatedAt   string
+
+	// USER-owned (setCameraAvatarRole only): the confirmed role label.
+	Role            string // canonical slug from the site vocabulary (camera_roles.go); "" = unlabeled
+	RoleNote        string // operator note about the assignment
+	RoleConfirmedAt string // stamped on every role write (including clearing)
+
+	// AI-owned (profile builder only): the person profile + role hypothesis.
+	SuggestedRole           string  // vocabulary slug or "unknown"; NEVER drives behavior
+	SuggestedRoleConfidence float64 // 0..1
+	ProfileJSON             string  // full profile object incl. role_hypothesis evidence
+	ProfileUpdatedAt        string
+	ProfileStatus           string // "" | queued | running | ready | error
+	ProfileError            string
+
+	CreatedAt string
+	UpdatedAt string
 }
 
 // camAvatarMedia is one approved reference artifact for an avatar (a PINNED
@@ -67,13 +88,17 @@ type camAvatarMedia struct {
 
 // ─────────────────────────── CRUD ───────────────────────────
 
-const camAvatarCols = `id, site_id, name, type, is_group, external_ref, description, dvr_ids, enabled, embedding, created_at, updated_at`
+const camAvatarCols = `id, site_id, name, type, is_group, external_ref, description, dvr_ids, enabled, embedding,
+	role, role_note, role_confirmed_at, suggested_role, suggested_role_confidence,
+	profile_json, profile_updated_at, profile_status, profile_error, created_at, updated_at`
 
 func scanAvatar(s rowScanner) (camAvatar, error) {
 	var a camAvatar
 	var isGroup, enabled int
 	err := s.Scan(&a.ID, &a.SiteID, &a.Name, &a.Type, &isGroup, &a.ExternalRef,
-		&a.Description, &a.DVRIDs, &enabled, &a.Embedding, &a.CreatedAt, &a.UpdatedAt)
+		&a.Description, &a.DVRIDs, &enabled, &a.Embedding,
+		&a.Role, &a.RoleNote, &a.RoleConfirmedAt, &a.SuggestedRole, &a.SuggestedRoleConfidence,
+		&a.ProfileJSON, &a.ProfileUpdatedAt, &a.ProfileStatus, &a.ProfileError, &a.CreatedAt, &a.UpdatedAt)
 	a.IsGroup = isGroup != 0
 	a.Enabled = enabled != 0
 	return a, err
@@ -93,11 +118,18 @@ func insertCameraAvatar(db *sql.DB, a camAvatar) (string, error) {
 	if a.UpdatedAt == "" {
 		a.UpdatedAt = now
 	}
+	// A role provided at creation is an operator decision (create handlers
+	// validate it against the site vocabulary) — stamp the confirmation.
+	if a.Role != "" && a.RoleConfirmedAt == "" {
+		a.RoleConfirmedAt = now
+	}
 	_, err := db.Exec(`INSERT INTO camera_avatars
-		(id, site_id, name, type, is_group, external_ref, description, dvr_ids, enabled, embedding, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, site_id, name, type, is_group, external_ref, description, dvr_ids, enabled, embedding,
+		 role, role_note, role_confirmed_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.SiteID, a.Name, a.Type, boolToInt(a.IsGroup), a.ExternalRef,
-		a.Description, a.DVRIDs, boolToInt(a.Enabled), a.Embedding, a.CreatedAt, a.UpdatedAt)
+		a.Description, a.DVRIDs, boolToInt(a.Enabled), a.Embedding,
+		a.Role, a.RoleNote, a.RoleConfirmedAt, a.CreatedAt, a.UpdatedAt)
 	return a.ID, err
 }
 
@@ -128,15 +160,39 @@ func listCameraAvatars(db *sql.DB, siteID string, includeDisabled bool) ([]camAv
 	return out, rows.Err()
 }
 
-// updateCameraAvatar rewrites the operator-owned fields. The embedding column
-// is deliberately NOT touched here — recomputeAvatarCentroid owns it, so a
-// stale in-memory row can never clobber a freshly recomputed centroid.
+// updateCameraAvatar rewrites the operator-owned descriptive fields. The
+// embedding column is deliberately NOT touched here — recomputeAvatarCentroid
+// owns it, so a stale in-memory row can never clobber a freshly recomputed
+// centroid. Role and profile columns are likewise excluded: setCameraAvatarRole
+// owns the confirmed-role trio and the profile builder owns the AI columns.
 func updateCameraAvatar(db *sql.DB, a camAvatar) error {
 	_, err := db.Exec(`UPDATE camera_avatars
 		SET name = ?, type = ?, is_group = ?, external_ref = ?, description = ?, dvr_ids = ?, enabled = ?, updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.Type, boolToInt(a.IsGroup), a.ExternalRef, a.Description,
 		a.DVRIDs, boolToInt(a.Enabled), nowRFC3339(), a.ID)
+	return err
+}
+
+// setCameraAvatarRole is the ONLY write path for the confirmed role trio —
+// operator decisions arriving through the role-update handlers. Every write
+// (including clearing to "") stamps role_confirmed_at, so the column always
+// answers "when did a human last decide this?". Callers validate the slug
+// against the site vocabulary first (camValidateRole).
+func setCameraAvatarRole(db *sql.DB, avatarID, role, note string) error {
+	now := nowRFC3339()
+	_, err := db.Exec(`UPDATE camera_avatars
+		SET role = ?, role_note = ?, role_confirmed_at = ?, updated_at = ?
+		WHERE id = ?`,
+		role, note, now, now, avatarID)
+	return err
+}
+
+// setCameraAvatarRoleNote updates only the operator's role note (no
+// re-confirmation stamp — the label itself didn't change).
+func setCameraAvatarRoleNote(db *sql.DB, avatarID, note string) error {
+	_, err := db.Exec(`UPDATE camera_avatars SET role_note = ?, updated_at = ? WHERE id = ?`,
+		note, nowRFC3339(), avatarID)
 	return err
 }
 
@@ -448,8 +504,18 @@ func cameraAvatarJSON(a camAvatar, refCount int) map[string]any {
 		"enabled":       a.Enabled,
 		"ref_count":     refCount,
 		"has_embedding": len(a.Embedding) > 0,
-		"created_at":    a.CreatedAt,
-		"updated_at":    a.UpdatedAt,
+		// Confirmed role (user-owned) + AI suggestion (never authoritative).
+		"role":                      a.Role,
+		"role_note":                 a.RoleNote,
+		"role_confirmed_at":         a.RoleConfirmedAt,
+		"suggested_role":            a.SuggestedRole,
+		"suggested_role_confidence": a.SuggestedRoleConfidence,
+		"profile":                   camDecodeJSON(a.ProfileJSON),
+		"profile_status":            a.ProfileStatus,
+		"profile_updated_at":        a.ProfileUpdatedAt,
+		"profile_error":             a.ProfileError,
+		"created_at":                a.CreatedAt,
+		"updated_at":                a.UpdatedAt,
 	}
 }
 
@@ -645,6 +711,8 @@ func handleCameraAvatars(cfg config) http.HandlerFunc {
 				Description string   `json:"description"`
 				DVRIDs      []string `json:"dvr_ids"`
 				Enabled     *bool    `json:"enabled"`
+				Role        string   `json:"role"`
+				RoleNote    string   `json:"role_note"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -660,8 +728,14 @@ func handleCameraAvatars(cfg config) http.HandlerFunc {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "type must be human, vehicle, or pet"})
 				return
 			}
-			if _, err := getCameraSite(db, siteID); err != nil {
+			site, serr := getCameraSite(db, siteID)
+			if serr != nil {
 				writeJSON(w, http.StatusNotFound, map[string]any{"error": "site not found"})
+				return
+			}
+			role := strings.ToLower(strings.TrimSpace(body.Role))
+			if !camValidateRole(camParseSitePolicy(site.PolicyJSON), role) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown role " + camQuote(role) + " for this site"})
 				return
 			}
 			enabled := true
@@ -672,6 +746,7 @@ func handleCameraAvatars(cfg config) http.HandlerFunc {
 				SiteID: siteID, Name: name, Type: typ, IsGroup: body.IsGroup,
 				ExternalRef: strings.TrimSpace(body.ExternalRef), Description: body.Description,
 				DVRIDs: camAvatarDVRIDsJSON(body.DVRIDs), Enabled: enabled,
+				Role: role, RoleNote: strings.TrimSpace(body.RoleNote),
 			})
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -702,6 +777,8 @@ func handleCameraAvatarUpdate(cfg config) http.HandlerFunc {
 			Description *string  `json:"description"`
 			DVRIDs      []string `json:"dvr_ids"`
 			Enabled     *bool    `json:"enabled"`
+			Role        *string  `json:"role"`
+			RoleNote    *string  `json:"role_note"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -749,9 +826,41 @@ func handleCameraAvatarUpdate(cfg config) http.HandlerFunc {
 		if body.Enabled != nil {
 			a.Enabled = *body.Enabled
 		}
+		// Validate the role BEFORE any write so a 400 never leaves a partial
+		// update behind (descriptive fields persisted, role rejected).
+		role := ""
+		if body.Role != nil {
+			role = strings.ToLower(strings.TrimSpace(*body.Role))
+			site, serr := getCameraSite(db, a.SiteID)
+			if serr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+				return
+			}
+			if !camValidateRole(camParseSitePolicy(site.PolicyJSON), role) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown role " + camQuote(role) + " for this site"})
+				return
+			}
+		}
 		if err := updateCameraAvatar(db, a); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
+		}
+		// Role writes go through the dedicated setter (stamps role_confirmed_at) —
+		// an operator decision, validated against the site's vocabulary.
+		if body.Role != nil {
+			note := a.RoleNote
+			if body.RoleNote != nil {
+				note = strings.TrimSpace(*body.RoleNote)
+			}
+			if err := setCameraAvatarRole(db, a.ID, role, note); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		} else if body.RoleNote != nil {
+			if err := setCameraAvatarRoleNote(db, a.ID, strings.TrimSpace(*body.RoleNote)); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
 		}
 		camlog("info", "avatar_update", map[string]any{"avatar_id": id})
 		a, _ = getCameraAvatar(db, id)
@@ -1104,6 +1213,90 @@ func handleCameraAvatarCandidates(cfg config) http.HandlerFunc {
 	}
 }
 
+// camCropHTTPError carries the HTTP status a review handler should return when
+// a candidate crop could not be acquired (default 500 for plain errors).
+type camCropHTTPError struct {
+	status int
+	msg    string
+}
+
+func (e *camCropHTTPError) Error() string { return e.msg }
+
+// camCropErrStatus maps a camCandidatePinnedCrop error to its HTTP status.
+func camCropErrStatus(err error) int {
+	var he *camCropHTTPError
+	if errors.As(err, &he) {
+		return he.status
+	}
+	return http.StatusInternalServerError
+}
+
+// camCandidatePinnedCrop acquires a candidate's crop as a PINNED capture: it
+// pins the candidate's crop capture if it (row + file) still exists, else
+// re-fetches the archived frame from S3 by (camera_id, quality, frame_ts),
+// re-crops with the stored bbox, and mints a fresh pinned capture. Shared by
+// the admin and service review handlers so an expired crop is re-hydrated on
+// BOTH paths instead of failing the review.
+func camCandidatePinnedCrop(ctx context.Context, cfg config, db *sql.DB, cand camAvatarCandidate, siteID string) (camCapture, []byte, error) {
+	var (
+		capRow    camCapture
+		cropBytes []byte
+	)
+	if existing, cerr := getCameraCaptureByToken(db, cand.CropToken); cerr == nil && strings.TrimSpace(cand.CropToken) != "" {
+		if b, rerr := os.ReadFile(existing.Path); rerr == nil {
+			cropBytes = b
+			capRow = existing
+		}
+	}
+	if capRow.ID != "" {
+		if err := pinCameraCapture(db, cand.CropToken); err != nil {
+			return camCapture{}, nil, err
+		}
+		return capRow, cropBytes, nil
+	}
+	if !camS3Enabled(cfg) {
+		return camCapture{}, nil, &camCropHTTPError{http.StatusNotFound, "candidate media expired and the S3 frame archive is not configured"}
+	}
+	ts, perr := time.Parse(time.RFC3339, cand.FrameTS)
+	if perr != nil {
+		return camCapture{}, nil, &camCropHTTPError{http.StatusInternalServerError, "candidate has an unparseable frame_ts: " + cand.FrameTS}
+	}
+	frame, ferr := s3GetObject(ctx, cfg, camS3FrameKey(cand.CameraID, firstNonEmpty(cand.Quality, "sub"), ts))
+	if ferr != nil {
+		if errors.Is(ferr, errS3NotFound) {
+			return camCapture{}, nil, &camCropHTTPError{http.StatusNotFound, "archived frame no longer available"}
+		}
+		return camCapture{}, nil, &camCropHTTPError{http.StatusBadGateway, "fetch archived frame: " + ferr.Error()}
+	}
+	cropBytes = frame
+	if bb, ok := camParseBBox(json.RawMessage(cand.BBox)); ok {
+		if crop, _, _, cerr := camCropJPEG(frame, bb, 15); cerr == nil {
+			cropBytes = crop
+		} else {
+			camlog("warn", "avatar_candidate_recrop", map[string]any{"candidate_id": cand.ID, "ok": false, "error": cerr.Error()})
+		}
+	}
+	scratch, serr := os.MkdirTemp("", "camavatar-")
+	if serr != nil {
+		return camCapture{}, nil, serr
+	}
+	defer os.RemoveAll(scratch)
+	tmp := filepath.Join(scratch, "crop.jpg")
+	if err := os.WriteFile(tmp, cropBytes, 0o600); err != nil {
+		return camCapture{}, nil, err
+	}
+	wpx, hpx := imageDimensions(tmp)
+	token, perr2 := camPersistCaptureExpires(db, cfg, "", siteID, cand.CameraID, "avatar_ref", cand.Quality, tmp, "image/jpeg", wpx, hpx, cand.FrameTS, "", "")
+	if perr2 != nil {
+		return camCapture{}, nil, perr2
+	}
+	capRow, gerr := getCameraCaptureByToken(db, token)
+	if gerr != nil {
+		return camCapture{}, nil, gerr
+	}
+	return capRow, cropBytes, nil
+}
+
 // handleCameraAvatarCandidateReview serves POST /ui/api/cameras/avatars/candidates/review:
 // {id, action:"approve"|"reject"|"group", group_avatar_id?, note?} — approve pins
 // the crop (re-fetching the frame from S3 by (camera_id, quality, frame_ts) +
@@ -1175,73 +1368,10 @@ func handleCameraAvatarCandidateReview(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "avatar not found"})
 			return
 		}
-		// Acquire the crop as a PINNED capture: pin the candidate's crop capture if
-		// it (row + file) still exists, else re-fetch the archived frame from S3 by
-		// (camera_id, quality, frame_ts), re-crop with the stored bbox, and mint a
-		// fresh pinned capture.
-		var (
-			capRow    camCapture
-			cropBytes []byte
-		)
-		if existing, cerr := getCameraCaptureByToken(db, cand.CropToken); cerr == nil && strings.TrimSpace(cand.CropToken) != "" {
-			if b, rerr := os.ReadFile(existing.Path); rerr == nil {
-				cropBytes = b
-				capRow = existing
-			}
-		}
-		if capRow.ID != "" {
-			if err := pinCameraCapture(db, cand.CropToken); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
-		} else {
-			if !camS3Enabled(cfg) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "candidate media expired and the S3 frame archive is not configured"})
-				return
-			}
-			ts, perr := time.Parse(time.RFC3339, cand.FrameTS)
-			if perr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "candidate has an unparseable frame_ts: " + cand.FrameTS})
-				return
-			}
-			frame, ferr := s3GetObject(r.Context(), cfg, camS3FrameKey(cand.CameraID, firstNonEmpty(cand.Quality, "sub"), ts))
-			if ferr != nil {
-				if errors.Is(ferr, errS3NotFound) {
-					writeJSON(w, http.StatusNotFound, map[string]any{"error": "archived frame no longer available"})
-					return
-				}
-				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "fetch archived frame: " + ferr.Error()})
-				return
-			}
-			cropBytes = frame
-			if bb, ok := camParseBBox(json.RawMessage(cand.BBox)); ok {
-				if crop, _, _, cerr := camCropJPEG(frame, bb, 15); cerr == nil {
-					cropBytes = crop
-				} else {
-					camlog("warn", "avatar_candidate_recrop", map[string]any{"candidate_id": id, "ok": false, "error": cerr.Error()})
-				}
-			}
-			scratch, serr := os.MkdirTemp("", "camavatar-")
-			if serr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
-				return
-			}
-			defer os.RemoveAll(scratch)
-			tmp := filepath.Join(scratch, "crop.jpg")
-			if err := os.WriteFile(tmp, cropBytes, 0o600); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
-			wpx, hpx := imageDimensions(tmp)
-			token, perr2 := camPersistCaptureExpires(db, cfg, "", target.SiteID, cand.CameraID, "avatar_ref", cand.Quality, tmp, "image/jpeg", wpx, hpx, cand.FrameTS, "", "")
-			if perr2 != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr2.Error()})
-				return
-			}
-			if capRow, err = getCameraCaptureByToken(db, token); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
+		capRow, cropBytes, aerr := camCandidatePinnedCrop(r.Context(), cfg, db, cand, target.SiteID)
+		if aerr != nil {
+			writeJSON(w, camCropErrStatus(aerr), map[string]any{"error": aerr.Error()})
+			return
 		}
 		emb := camAvatarBestFaceEmbedding(r.Context(), cfg, cropBytes)
 		mediaID, merr := insertAvatarMedia(db, camAvatarMedia{

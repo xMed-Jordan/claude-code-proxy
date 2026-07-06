@@ -33,6 +33,7 @@ type camSite struct {
 	AnalysisJSON   string
 	AnalysisStatus string // "", "pending", "running", "done", "error"
 	LastAnalyzedAt string
+	PolicyJSON     string // per-site person-role vocabulary + notes (camera_roles.go); descriptive only
 	CreatedAt      string
 	UpdatedAt      string
 }
@@ -491,6 +492,68 @@ func migrateCameraDB(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_motion_events_site ON camera_motion_events(site_id, camera_id, started_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_motion_arm_uniq ON camera_motion_arm(site_id, camera_id)`,
+		// ── Person-identity layer (Person Identity v2 plan). Landed INERT ahead of
+		// the continuous-identification engine (R2) and unknown clustering (R4) so
+		// later phases are pure additive code. NEUTRALITY INVARIANT: these tables
+		// hold observations and user-assigned labels only — no severity/threat/alert
+		// semantics may ever be added here (see camera_neutrality_test.go).
+		//
+		// camera_sightings — one row per presence INTERVAL (modeled on
+		// camera_motion_events episodes): who (avatar, cluster, or an unresolved
+		// embedding), where (camera + area snapshot), when. best_crop_token is an
+		// EPHEMERAL camera_captures token (reaped hourly) — embedding +
+		// best_frame_ts + best_bbox keep every sighting re-hydratable from the S3
+		// frame archive; roles are NEVER stored here (they resolve by JOIN against
+		// camera_avatars at query time so re-labeling applies retroactively).
+		`CREATE TABLE IF NOT EXISTS camera_sightings (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			camera_id TEXT NOT NULL,
+			subject_kind TEXT NOT NULL DEFAULT '',
+			avatar_id TEXT NOT NULL DEFAULT '',
+			cluster_id TEXT NOT NULL DEFAULT '',
+			area TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			ended_at TEXT NOT NULL DEFAULT '',
+			last_seen_at TEXT NOT NULL DEFAULT '',
+			frame_count INTEGER NOT NULL DEFAULT 1,
+			best_score REAL NOT NULL DEFAULT 0,
+			best_frame_ts TEXT NOT NULL DEFAULT '',
+			best_bbox TEXT NOT NULL DEFAULT '',
+			best_quality TEXT NOT NULL DEFAULT 'sub',
+			best_crop_token TEXT NOT NULL DEFAULT '',
+			embedding BLOB,
+			created_at TEXT NOT NULL
+		)`,
+		// camera_sighting_clusters — recurring unknown faces grouped by embedding
+		// similarity (exact centroid = normalize(sum_embedding/member_count)). No
+		// confirmed-role column exists here BY DESIGN: a role is confirmed only at
+		// promotion, onto the new avatar row.
+		`CREATE TABLE IF NOT EXISTS camera_sighting_clusters (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'provisional',
+			member_count INTEGER NOT NULL DEFAULT 0,
+			window_count INTEGER NOT NULL DEFAULT 0,
+			sum_embedding BLOB,
+			centroid BLOB,
+			first_seen_at TEXT NOT NULL DEFAULT '',
+			last_seen_at TEXT NOT NULL DEFAULT '',
+			best_crop_token TEXT NOT NULL DEFAULT '',
+			best_score REAL NOT NULL DEFAULT 0,
+			suggested_role TEXT NOT NULL DEFAULT '',
+			suggested_role_confidence REAL NOT NULL DEFAULT 0,
+			profile_json TEXT NOT NULL DEFAULT '',
+			profile_updated_at TEXT NOT NULL DEFAULT '',
+			promoted_avatar_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_site ON camera_sightings(site_id, started_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_avatar ON camera_sightings(avatar_id, started_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_cluster ON camera_sightings(cluster_id, started_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_camera ON camera_sightings(camera_id, started_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_sighting_clusters_site ON camera_sighting_clusters(site_id, status)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -516,6 +579,30 @@ func migrateCameraDB(db *sql.DB) error {
 	if err := ensureSQLiteColumn(db, "camera_captures", "s3_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	// Person-identity layer (Person Identity v2 plan): per-site role vocabulary +
+	// per-avatar role/profile columns. The confirmed role trio is USER-owned
+	// (written only by the role-update handlers, which stamp role_confirmed_at);
+	// the suggested/profile columns are AI-owned (written only by the profile
+	// builder, camera_profile.go). Disjoint write paths make provenance
+	// structural: role != '' ⇔ the operator confirmed it.
+	if err := ensureSQLiteColumn(db, "camera_sites", "policy_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	for _, col := range [][2]string{
+		{"role", "TEXT NOT NULL DEFAULT ''"},
+		{"role_note", "TEXT NOT NULL DEFAULT ''"},
+		{"role_confirmed_at", "TEXT NOT NULL DEFAULT ''"},
+		{"suggested_role", "TEXT NOT NULL DEFAULT ''"},
+		{"suggested_role_confidence", "REAL NOT NULL DEFAULT 0"},
+		{"profile_json", "TEXT NOT NULL DEFAULT ''"},
+		{"profile_updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"profile_status", "TEXT NOT NULL DEFAULT ''"},
+		{"profile_error", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureSQLiteColumn(db, "camera_avatars", col[0], col[1]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -529,20 +616,20 @@ func insertCameraSite(db *sql.DB, s camSite) (string, error) {
 	}
 	now := nowRFC3339()
 	_, err := db.Exec(`INSERT INTO camera_sites
-		(id, name, description, analysis_alias, analysis_json, analysis_status, last_analyzed_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.Name, s.Description, s.AnalysisAlias, s.AnalysisJSON, s.AnalysisStatus, s.LastAnalyzedAt, now, now)
+		(id, name, description, analysis_alias, analysis_json, analysis_status, last_analyzed_at, policy_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.ID, s.Name, s.Description, s.AnalysisAlias, s.AnalysisJSON, s.AnalysisStatus, s.LastAnalyzedAt, s.PolicyJSON, now, now)
 	return s.ID, err
 }
 
 func scanCameraSite(s rowScanner) (camSite, error) {
 	var v camSite
 	err := s.Scan(&v.ID, &v.Name, &v.Description, &v.AnalysisAlias, &v.AnalysisJSON,
-		&v.AnalysisStatus, &v.LastAnalyzedAt, &v.CreatedAt, &v.UpdatedAt)
+		&v.AnalysisStatus, &v.LastAnalyzedAt, &v.PolicyJSON, &v.CreatedAt, &v.UpdatedAt)
 	return v, err
 }
 
-const camSiteCols = `id, name, description, analysis_alias, analysis_json, analysis_status, last_analyzed_at, created_at, updated_at`
+const camSiteCols = `id, name, description, analysis_alias, analysis_json, analysis_status, last_analyzed_at, policy_json, created_at, updated_at`
 
 func getCameraSite(db *sql.DB, id string) (camSite, error) {
 	return scanCameraSite(db.QueryRow(`SELECT `+camSiteCols+` FROM camera_sites WHERE id = ?`, id))
@@ -568,6 +655,14 @@ func listCameraSites(db *sql.DB) ([]camSite, error) {
 func updateCameraSite(db *sql.DB, s camSite) error {
 	_, err := db.Exec(`UPDATE camera_sites SET name = ?, description = ?, analysis_alias = ?, updated_at = ? WHERE id = ?`,
 		s.Name, s.Description, s.AnalysisAlias, nowRFC3339(), s.ID)
+	return err
+}
+
+// updateCameraSitePolicy writes ONLY policy_json (dedicated setter so unrelated
+// site updates can never clobber the role vocabulary with a stale row).
+func updateCameraSitePolicy(db *sql.DB, id, policyJSON string) error {
+	_, err := db.Exec(`UPDATE camera_sites SET policy_json = ?, updated_at = ? WHERE id = ?`,
+		policyJSON, nowRFC3339(), id)
 	return err
 }
 
