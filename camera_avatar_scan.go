@@ -573,6 +573,7 @@ type avScanRun struct {
 	maxCand   int
 	faceMin   float64
 	retention time.Duration
+	persisted map[string]bool // cam.ID|frameTS already minted — keeps incremental + final persistence idempotent
 }
 
 func (r *avScanRun) saveProgress() {
@@ -927,15 +928,21 @@ func (r *avScanRun) scanCamera(ctx context.Context, cam camera, loc *time.Locati
 				r.prog.Note = "face engine unavailable — used appearance matching"
 			}
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "note": "face engine unavailable — used appearance matching"})
-			sightings, stop = r.vlmScan(ctx, cam, survivors, loc, &fatal)
+			// Persist the face sightings gathered before the sidecar died; the VLM
+			// fallback then persists its own matches incrementally.
+			r.persistSightings(cam, sightings, &stop)
+			_, stop = r.vlmScan(ctx, cam, survivors, loc, &fatal)
+			return stop, fatal.err
 		}
-	} else {
-		sightings, stop = r.vlmScan(ctx, cam, survivors, loc, &fatal)
+		// Persist whatever was matched even when the backend died mid-camera.
+		r.persistSightings(cam, sightings, &stop)
+		return stop, fatal.err
 	}
-
-	// Persist whatever was matched even when the backend died mid-camera, THEN
-	// bubble the fatal error up (partial evidence beats none).
-	r.persistSightings(cam, sightings, &stop)
+	// VLM path: candidates are persisted incrementally (per batch) inside vlmScan
+	// so they surface in the UI as they're found — a slow analysis backend no
+	// longer means a blank screen for minutes — and partial evidence survives a
+	// mid-camera backend failure.
+	_, stop = r.vlmScan(ctx, cam, survivors, loc, &fatal)
 	return stop, fatal.err
 }
 
@@ -950,11 +957,21 @@ func (r *avScanRun) persistSightings(cam camera, sightings []avScanSighting, sto
 	if len(sightings) == 0 {
 		return
 	}
+	if r.persisted == nil {
+		r.persisted = map[string]bool{}
+	}
 	keys := make([]avSightingKey, len(sightings))
 	for i, s := range sightings {
 		keys[i] = avSightingKey{T: s.T, Conf: s.Conf}
 	}
 	for _, idx := range avScanClusterSightings(keys, avScanClusterGap) {
+		// Idempotency across the incremental per-batch flushes and the final
+		// per-camera pass: a keeper already minted (keyed by frame instant) is
+		// never re-persisted, so we neither orphan capture blobs nor double-count.
+		pk := cam.ID + "|" + sightings[idx].T.UTC().Format(time.RFC3339)
+		if r.persisted[pk] {
+			continue
+		}
 		if r.maxCand > 0 && r.prog.Candidates >= r.maxCand {
 			if *stop == "" {
 				*stop = "candidate budget exhausted"
@@ -966,8 +983,10 @@ func (r *avScanRun) persistSightings(cam camera, sightings []avScanSighting, sto
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "candidate_ok": false, "error": perr.Error()})
 			continue
 		}
+		r.persisted[pk] = true
 		if inserted {
 			r.prog.Candidates++
+			r.saveProgress() // surface each new candidate to the live UI immediately
 		}
 	}
 }
@@ -1029,6 +1048,78 @@ func (r *avScanRun) faceScan(ctx context.Context, cam camera, survivors []avScan
 	return
 }
 
+// expandFaceToPerson grows a detected FACE box into an approximate head-and-upper-
+// body region (CCTV subjects are usually seated or waist-occluded, so we stay to
+// head+torso rather than guess full-body), clamped to the frame. It turns an
+// accurate face detection into a sensible person crop for the review artifacts.
+func expandFaceToPerson(face image.Rectangle, w, h int) image.Rectangle {
+	face = face.Canon()
+	fw, fh := face.Dx(), face.Dy()
+	if fw <= 0 || fh <= 0 {
+		return face.Intersect(image.Rect(0, 0, w, h))
+	}
+	cx := (face.Min.X + face.Max.X) / 2
+	r := image.Rect(
+		cx-(fw*8)/5,         // ~1.6× face width to each side (shoulders)
+		face.Min.Y-(fh*3)/5, // a little headroom above the crown
+		cx+(fw*8)/5,
+		face.Max.Y+(fh*9)/2, // ~4.5 face-heights of torso below the chin
+	).Intersect(image.Rect(0, 0, w, h))
+	if r.Empty() {
+		return face.Intersect(image.Rect(0, 0, w, h))
+	}
+	return r
+}
+
+// detectPersonBox localizes a VLM appearance match on a REAL detected face rather
+// than the model's (frequently hallucinated) bbox — the VLM is unreliable at pixel
+// coordinates and routinely boxes furniture. It runs the face sidecar and returns
+// a head+upper-body box (in camBBox 0..1000 space) around the best face: the one
+// nearest the VLM's bbox hint when several are present, else the highest-scoring.
+// found=false means the sidecar answered but saw no face; a non-nil error means the
+// sidecar itself was unavailable (callers fall back to the VLM bbox so a dead
+// sidecar never silently drops matches).
+func (r *avScanRun) detectPersonBox(ctx context.Context, frame []byte, hint *camBBox) (camBBox, bool, error) {
+	if !camFaceEnabled(r.cfg) {
+		return camBBox{}, false, errors.New("face sidecar disabled")
+	}
+	icfg, _, derr := image.DecodeConfig(bytes.NewReader(frame))
+	if derr != nil {
+		return camBBox{}, false, derr
+	}
+	faces, ferr := camFaceDetect(ctx, r.cfg, frame)
+	if ferr != nil {
+		return camBBox{}, false, ferr
+	}
+	if len(faces) == 0 {
+		return camBBox{}, false, nil
+	}
+	best := faces[0]
+	if hint != nil {
+		// hint is 0..1000-normalized; project its centre to pixels and pick the
+		// nearest detected face — the VLM is roughly right about the region even
+		// when its exact box is wrong.
+		hx := (hint.X0 + hint.X1) * icfg.Width / 2000
+		hy := (hint.Y0 + hint.Y1) * icfg.Height / 2000
+		bestD := int64(-1)
+		for _, f := range faces {
+			cx := (f.BBox.Min.X + f.BBox.Max.X) / 2
+			cy := (f.BBox.Min.Y + f.BBox.Max.Y) / 2
+			dx, dy := int64(cx-hx), int64(cy-hy)
+			if d := dx*dx + dy*dy; bestD < 0 || d < bestD {
+				bestD, best = d, f
+			}
+		}
+	} else {
+		for _, f := range faces {
+			if f.Score > best.Score {
+				best = f
+			}
+		}
+	}
+	return camBBoxFromPixels(expandFaceToPerson(best.BBox, icfg.Width, icfg.Height), icfg.Width, icfg.Height), true, nil
+}
+
 // vlmScan is the appearance-matching path: motion survivors batched
 // cfg.CameraAvatarScanBatch per analyzeWithAlias call, each call carrying the
 // newest reference images plus the batch frames and a frame→time legend.
@@ -1040,6 +1131,9 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 	}
 	sys := camAvatarScanSystemPrompt(r.av, len(r.refPaths) > 0, w, h)
 	header := fmt.Sprintf("TARGET: %s (%s). DESCRIPTION: %s", r.av.Name, avScanType(r.av), strings.TrimSpace(r.av.Description))
+	// Human avatars get their box from real face detection (accurate); non-human
+	// avatars (vehicle/pet — no face) keep the VLM's proposed box.
+	faceLoc := r.av.Type == "human" && camFaceEnabled(r.cfg)
 
 	consec := 0
 	for bstart := 0; bstart < len(survivors); bstart += r.batch {
@@ -1094,19 +1188,49 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "parse_ok": false, "error": perr.Error()})
 			continue
 		}
+		var batch []avScanSighting
 		for _, m := range matches {
 			fi := int(m.Frame)
 			if fi < 1 || fi > len(frames) || m.Confidence < avScanVLMConfMin {
 				continue
 			}
+			// Prefer the higher-res MAIN frame at this instant for face detection
+			// and the review artifacts; fall back to the sub bytes already in hand.
+			frameData, frameQ := frames[fi-1].data, "sub"
+			if b, gerr := s3GetObject(ctx, r.cfg, camS3FrameKey(cam.ID, "main", frames[fi-1].t)); gerr == nil {
+				frameData, frameQ = b, "main"
+			}
 			s := avScanSighting{
-				T: frames[fi-1].t, Conf: m.Confidence, Frame: frames[fi-1].data,
-				Quality: "sub", Kind: "vlm", Reason: strings.TrimSpace(m.Reason),
+				T: frames[fi-1].t, Conf: m.Confidence, Frame: frameData,
+				Quality: frameQ, Kind: "vlm", Reason: strings.TrimSpace(m.Reason),
 			}
+			var hint *camBBox
 			if bb, ok := camParseBBox(m.BBox); ok {
-				s.BBox, s.HasBBox = bb, true
+				hint = &bb
 			}
+			if faceLoc {
+				// Localize on a REAL detected face, not the VLM's bbox. The VLM box
+				// is only a tie-break hint among faces, or a fallback if the sidecar
+				// is down. Sidecar up but no face here → no box (whole frame, never
+				// a false circle on furniture).
+				if box, found, detErr := r.detectPersonBox(ctx, frameData, hint); detErr != nil {
+					if hint != nil {
+						s.BBox, s.HasBBox = *hint, true
+					}
+				} else if found {
+					s.BBox, s.HasBBox = box, true
+				}
+			} else if hint != nil {
+				s.BBox, s.HasBBox = *hint, true
+			}
+			batch = append(batch, s)
 			sightings = append(sightings, s)
+		}
+		// Flush this batch's matches immediately so candidates surface in the UI as
+		// they're found rather than only when the whole (possibly slow) camera ends.
+		r.persistSightings(cam, batch, &stop)
+		if stop != "" {
+			return
 		}
 	}
 	return
