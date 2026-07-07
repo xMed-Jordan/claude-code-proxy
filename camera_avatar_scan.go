@@ -709,7 +709,10 @@ func runAvatarScan(ctx context.Context, cfg config, scanID string) error {
 	// to scratch as ref_N so analyzeWithAlias labels them "ref_N"), and EVERY
 	// embedded reference (+ the cached centroid) for the face path.
 	refs, _ := listAvatarMedia(db, av.ID)
-	sort.Slice(refs, func(a, b int) bool { return refs[a].CreatedAt > refs[b].CreatedAt })
+	// Diversity-ordered, not newest-first: a small attachment cap should cover
+	// distinct cameras and spread across time (camOrderRefsForAttachment) —
+	// embeddings below still come from EVERY row regardless of this order.
+	refs = camOrderRefsForAttachment(refs)
 	maxRefs := cfg.CameraAvatarMaxRefs
 	if maxRefs <= 0 {
 		maxRefs = 3

@@ -275,3 +275,69 @@ func TestCamToolAnnotateInvalidBBox(t *testing.T) {
 		t.Errorf("annotate invalid-time summary = %q", res.Summary)
 	}
 }
+
+// ─────────────────────── camOrderRefsForAttachment ───────────────────────
+
+// TestCamOrderRefsForAttachment covers the diversity ordering that decides
+// WHICH few reference images ride along on VLM calls: uploads lead, every
+// distinct camera is covered before any repeats, and repeat picks within one
+// camera spread across time instead of clustering on near-duplicate frames.
+func TestCamOrderRefsForAttachment(t *testing.T) {
+	m := func(id, camID, source, frameTS, createdAt string) camAvatarMedia {
+		return camAvatarMedia{ID: id, CameraID: camID, Source: source, FrameTS: frameTS, CreatedAt: createdAt}
+	}
+	media := []camAvatarMedia{
+		// camera A: three frames seconds apart (a bulk-approved scan burst) + one much older
+		m("a-new", "camA", "scan", "2026-07-07T10:00:30Z", "2026-07-07T10:00:30Z"),
+		m("a-mid", "camA", "scan", "2026-07-07T10:00:20Z", "2026-07-07T10:00:20Z"),
+		m("a-old", "camA", "scan", "2026-07-01T08:00:00Z", "2026-07-01T08:00:00Z"),
+		m("a-mid2", "camA", "scan", "2026-07-07T10:00:10Z", "2026-07-07T10:00:10Z"),
+		m("b-1", "camB", "scan", "2026-07-06T12:00:00Z", "2026-07-06T12:00:00Z"),
+		m("c-1", "camC", "scan", "2026-07-05T09:00:00Z", "2026-07-05T09:00:00Z"),
+		m("up-1", "", "upload", "", "2026-06-01T00:00:00Z"),
+	}
+	out := camOrderRefsForAttachment(media)
+	if len(out) != len(media) {
+		t.Fatalf("len = %d, want %d", len(out), len(media))
+	}
+	ids := make([]string, len(out))
+	for i, r := range out {
+		ids[i] = r.ID
+	}
+	// First pick is the operator upload despite being the oldest row.
+	if ids[0] != "up-1" {
+		t.Errorf("first = %q, want the upload (got order %v)", ids[0], ids)
+	}
+	// The first four picks cover all four buckets (upload + 3 cameras).
+	seen := map[string]bool{}
+	for _, r := range out[:4] {
+		key := r.CameraID
+		if r.Source == "upload" {
+			key = "upload"
+		}
+		if seen[key] {
+			t.Fatalf("bucket %q repeated inside the first four picks (%v)", key, ids)
+		}
+		seen[key] = true
+	}
+	// Camera A's first pick is its newest frame; its SECOND pick is the
+	// time-distant old frame, not the 10-seconds-later near-duplicate.
+	firstA, secondA := "", ""
+	for _, r := range out {
+		if r.CameraID != "camA" {
+			continue
+		}
+		if firstA == "" {
+			firstA = r.ID
+		} else if secondA == "" {
+			secondA = r.ID
+			break
+		}
+	}
+	if firstA != "a-new" {
+		t.Errorf("camA first pick = %q, want a-new", firstA)
+	}
+	if secondA != "a-old" {
+		t.Errorf("camA second pick = %q, want the time-distant a-old (near-duplicates must not cluster)", secondA)
+	}
+}

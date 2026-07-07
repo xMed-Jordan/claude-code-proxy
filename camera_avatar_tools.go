@@ -975,7 +975,90 @@ func avToolRefs(db *sql.DB, avatarID string) ([]camAvatarMedia, error) {
 // avToolRefPaths resolves up to max newest refs to their pinned local files
 // (rows whose capture row or on-disk file is missing are skipped), returning
 // the paths plus the media rows they belong to, in matching order.
+// camOrderRefsForAttachment orders an avatar's reference media for VLM
+// attachment so a small cap (CameraAvatarMaxRefs) carries maximal signal:
+// operator uploads first (curated, usually the clearest shots), then greedy
+// rounds that cover every distinct source camera before repeating any, and
+// within one camera the picks spread across time (maximin distance from the
+// instants already chosen) instead of clustering on one scan's back-to-back
+// near-duplicate frames. Recency breaks ties. More approved photos therefore
+// improve WHICH few images are attached — never how many.
+func camOrderRefsForAttachment(media []camAvatarMedia) []camAvatarMedia {
+	if len(media) <= 2 {
+		return media
+	}
+	sorted := append([]camAvatarMedia(nil), media...)
+	sort.SliceStable(sorted, func(a, b int) bool { return sorted[a].CreatedAt > sorted[b].CreatedAt })
+
+	type refBucket struct {
+		items  []camAvatarMedia // newest first
+		picked []int64          // unix instants already chosen from this bucket
+	}
+	keyOf := func(m camAvatarMedia) string {
+		if m.Source == "upload" || strings.TrimSpace(m.CameraID) == "" {
+			return "\x00upload"
+		}
+		return m.CameraID
+	}
+	when := func(m camAvatarMedia) int64 {
+		for _, s := range []string{m.FrameTS, m.CreatedAt} {
+			if t, err := time.Parse(time.RFC3339, strings.TrimSpace(s)); err == nil {
+				return t.Unix()
+			}
+		}
+		return 0
+	}
+
+	var order []string
+	buckets := map[string]*refBucket{}
+	for _, m := range sorted {
+		k := keyOf(m)
+		if buckets[k] == nil {
+			buckets[k] = &refBucket{}
+			order = append(order, k)
+		}
+		buckets[k].items = append(buckets[k].items, m)
+	}
+	// Uploads lead; camera buckets keep their newest-first discovery order.
+	sort.SliceStable(order, func(a, b int) bool { return order[a] == "\x00upload" && order[b] != "\x00upload" })
+
+	out := make([]camAvatarMedia, 0, len(sorted))
+	for len(out) < len(sorted) {
+		for _, k := range order {
+			b := buckets[k]
+			if len(b.items) == 0 {
+				continue
+			}
+			best, bestGap := 0, int64(-1)
+			if len(b.picked) > 0 {
+				for i, m := range b.items {
+					gap := int64(1) << 62
+					w := when(m)
+					for _, p := range b.picked {
+						d := w - p
+						if d < 0 {
+							d = -d
+						}
+						if d < gap {
+							gap = d
+						}
+					}
+					if gap > bestGap {
+						best, bestGap = i, gap
+					}
+				}
+			}
+			m := b.items[best]
+			b.items = append(b.items[:best], b.items[best+1:]...)
+			b.picked = append(b.picked, when(m))
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func avToolRefPaths(db *sql.DB, media []camAvatarMedia, max int) ([]string, []camAvatarMedia) {
+	media = camOrderRefsForAttachment(media)
 	var (
 		paths []string
 		used  []camAvatarMedia
