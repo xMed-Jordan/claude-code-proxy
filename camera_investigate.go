@@ -573,6 +573,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 		"Small windows: never contact_sheet more than ~45 minutes in one call — split the window and go where the motion is.",
 		"Identity discipline: the same person seconds apart is ONE entry; never NAME a person without avatar_check confirmation or an operator description you can actually SEE matching.",
 		"Evidence anchoring: every factual claim in your answer needs an annotated frame or a clip with its exact timestamp — annotate the person/object you cite.",
+		"Partial coverage is NOT absence: when avatar_find/contact_sheet warns of sampling limits or an early stop, missing sightings only mean the person was not CHECKED there — never report a break, departure, or absence from a sighting gap alone; verify the claimed gap directly with past_frames or a narrowed contact_sheet first.",
 		"Honest limits: when resolution or coverage cannot answer (phone screens, small text, unmapped areas), say so plainly, state WHICH camera/quality would be needed, and answer what IS visible.",
 	)
 	for i, p := range principles {
@@ -612,6 +613,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}` + subtasksArg + `},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
+	b.WriteString("\nThe answer field is the ONLY text the operator reads: it must carry the COMPLETE final answer, written in the operator's language — never your plan or reasoning, never empty.")
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
 	return b.String()
 }
@@ -621,14 +623,22 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 // camInvestigateActionTypes is the set of valid investigateCommand.Type values.
 var camInvestigateActionTypes = map[string]bool{"call_tool": true, "ask_operator": true, "answer": true}
 
+// errInvestigateEmptyAnswer flags an "answer" action whose answer text is blank:
+// the model put its plan in thought and nothing in the operator-facing field
+// (gemini-flash does this under load). Surfaced as an error — with the parsed
+// action still returned — so the caller can run a targeted repair round instead
+// of silently shipping the thought (often English planning prose, no evidence)
+// to the operator as the final answer.
+var errInvestigateEmptyAnswer = errors.New("answer action with empty answer text")
+
 // parseInvestigateAction extracts and decodes one investigateAction from a
 // model's raw text, then normalizes it so a garbled reply can never crash or
 // stall the loop: an unrecognized action type falls back to "call_tool roster"
 // (cheap, no device I/O, gives the model another turn to recover) rather than
 // silently ending the investigation; an unrecognized tool name for an otherwise
 // valid call_tool also falls back to "roster"; an "answer" with no answer text
-// falls back to the turn's thought (or a generic notice) so the transcript is
-// never blank.
+// returns errInvestigateEmptyAnswer ALONGSIDE the parsed action so the caller
+// can repair once and still fall back to the thought as a last resort.
 func parseInvestigateAction(raw string) (investigateAction, error) {
 	obj, ok := extractFirstJSONObject(raw)
 	if !ok {
@@ -655,20 +665,28 @@ func parseInvestigateAction(raw string) (investigateAction, error) {
 		act.Action.Tool = tool
 	case "answer":
 		if strings.TrimSpace(act.Action.Answer) == "" {
-			act.Action.Answer = firstNonEmpty(strings.TrimSpace(act.Thought), "The investigation could not produce a conclusive answer.")
+			return act, errInvestigateEmptyAnswer
 		}
 	}
 	return act, nil
 }
 
+// camInvestigateAnalyzeFn is the analysis entrypoint camAnalyzeInvestigateAction
+// uses — a package var so tests can script the model's replies (mirrors the
+// injectable camResilientAnalyzeWith seam one level down).
+var camInvestigateAnalyzeFn = camResilientAnalyze
+
 // camAnalyzeInvestigateAction runs one investigation turn through the resilient
 // analysis ladder (camResilientAnalyze — retry/failover/timeout-raise) and parses
 // the single JSON action, doing exactly ONE repair round on a parse failure —
-// mirrors camAnalyzeDecision (camera_escalate.go). The returned attempts trail
-// merges both analysis rounds so the caller can note a multi-attempt success in
-// the transcript.
+// mirrors camAnalyzeDecision (camera_escalate.go). An "answer" with an empty
+// answer field gets a TARGETED repair (the operator never reads the thought);
+// only if the repair also comes back empty (or dies on infrastructure) does the
+// thought get promoted to the answer as a last resort. The returned attempts
+// trail merges both analysis rounds so the caller can note a multi-attempt
+// success in the transcript.
 func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, user string, images []string) (investigateAction, string, bool, []camAnalyzeAttempt, error) {
-	raw, attempts, err := camResilientAnalyze(ctx, cfg, alias, sys, user, images)
+	raw, attempts, err := camInvestigateAnalyzeFn(ctx, cfg, alias, sys, user, images)
 	if err != nil {
 		return investigateAction{}, raw, false, attempts, err
 	}
@@ -680,13 +698,35 @@ func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, us
 
 	repair := user + "\n\nYour previous reply could not be parsed. Reply with ONLY the single JSON object " +
 		"described above — no prose, no markdown fences, nothing else."
-	raw2, attempts2, err2 := camResilientAnalyze(ctx, cfg, alias, sys, repair, images)
+	if errors.Is(perr, errInvestigateEmptyAnswer) {
+		repair = user + "\n\nYour previous reply chose action \"answer\" but left the answer field EMPTY. " +
+			"The operator NEVER reads your thought — only the answer field. Reply with ONLY the single JSON object again: " +
+			"put the COMPLETE final answer in the answer field, written in the operator's language, " +
+			"and cite the supporting frames in evidence[] by copying their exact media_url values."
+	}
+	raw2, attempts2, err2 := camInvestigateAnalyzeFn(ctx, cfg, alias, sys, repair, images)
 	attempts = append(attempts, attempts2...)
 	if err2 != nil {
+		if errors.Is(perr, errInvestigateEmptyAnswer) {
+			// The model DID answer (just with an empty answer field) and the repair
+			// round died on infrastructure. Settling with the thought beats burning
+			// a whole pass on an analysis error at the finish line.
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": err2.Error(), "fallback": "thought_as_answer"})
+			act.Action.Answer = firstNonEmpty(strings.TrimSpace(act.Thought), "The investigation could not produce a conclusive answer.")
+			return act, raw, true, attempts, nil
+		}
 		return investigateAction{}, raw2, true, attempts, err2
 	}
 	act2, perr2 := parseInvestigateAction(raw2)
 	if perr2 != nil {
+		if errors.Is(perr2, errInvestigateEmptyAnswer) {
+			// Two empty answers in a row: settle with the thought (or a generic
+			// notice) rather than erroring the pass at the finish line — the old
+			// silent fallback, demoted to a last resort behind the repair round.
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "thought_as_answer"})
+			act2.Action.Answer = firstNonEmpty(strings.TrimSpace(act2.Thought), "The investigation could not produce a conclusive answer.")
+			return act2, raw2, true, attempts, nil
+		}
 		camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error()})
 		return investigateAction{}, raw2, true, attempts, fmt.Errorf("could not parse investigation action JSON after repair: %w", perr2)
 	}

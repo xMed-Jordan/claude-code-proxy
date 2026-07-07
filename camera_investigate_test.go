@@ -17,8 +17,11 @@ package main
 //     reused from camera_store_test.go).
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -295,31 +298,110 @@ func TestParseInvestigateActionToolNameCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TestParseInvestigateActionAnswerFallsBackToThought covers the "answer" repair:
-// a blank action.answer falls back to the turn's thought so the transcript is
-// never left with a blank final message.
-func TestParseInvestigateActionAnswerFallsBackToThought(t *testing.T) {
+// TestParseInvestigateActionEmptyAnswerSentinel covers the "answer" contract: a
+// blank action.answer is a REPAIRABLE error (errInvestigateEmptyAnswer), with
+// the parsed action still returned so the caller can fall back to the thought
+// as a last resort. The silent thought-promotion used to happen here and shipped
+// English planning prose to the operator (live regression, inv_a-Cj3qkbj8tT-RZn).
+func TestParseInvestigateActionEmptyAnswerSentinel(t *testing.T) {
 	raw := `{"thought":"nothing suspicious found in the footage","action":{"type":"answer"}}`
 	act, err := parseInvestigateAction(raw)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, errInvestigateEmptyAnswer) {
+		t.Fatalf("err = %v, want errInvestigateEmptyAnswer", err)
 	}
-	if act.Action.Answer != "nothing suspicious found in the footage" {
-		t.Errorf("answer = %q, want fallback to thought", act.Action.Answer)
+	if act.Action.Answer != "" {
+		t.Errorf("answer = %q, want empty (fallback is the caller's decision)", act.Action.Answer)
+	}
+	if act.Thought != "nothing suspicious found in the footage" {
+		t.Errorf("thought = %q, want preserved for the caller's fallback", act.Thought)
 	}
 }
 
-// TestParseInvestigateActionAnswerFallsBackToGenericNotice covers the case where
-// BOTH answer and thought are blank: a generic non-empty notice must be used so
-// downstream consumers never see an empty final message.
-func TestParseInvestigateActionAnswerFallsBackToGenericNotice(t *testing.T) {
-	raw := `{"action":{"type":"answer"}}`
-	act, err := parseInvestigateAction(raw)
+// TestAnalyzeInvestigateActionEmptyAnswerRepaired covers the repair round: the
+// first reply answers with an empty answer field, the targeted repair prompt is
+// issued (it must name the empty answer field, not the generic parse text), and
+// the second reply's real answer is used.
+func TestAnalyzeInvestigateActionEmptyAnswerRepaired(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	var prompts []string
+	replies := []string{
+		`{"thought":"plan in english","action":{"type":"answer"}}`,
+		`{"thought":"plan in english","action":{"type":"answer","answer":"الإجابة النهائية"}}`,
+	}
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		prompts = append(prompts, user)
+		r := replies[0]
+		replies = replies[1:]
+		return r, nil, nil
+	}
+	act, _, repaired, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !repaired {
+		t.Errorf("repaired = false, want true")
+	}
+	if act.Action.Answer != "الإجابة النهائية" {
+		t.Errorf("answer = %q, want the repaired reply's answer", act.Action.Answer)
+	}
+	if len(prompts) != 2 || !strings.Contains(prompts[1], "left the answer field EMPTY") {
+		t.Errorf("repair prompt missing the targeted empty-answer instruction: %q", prompts[len(prompts)-1])
+	}
+}
+
+// TestAnalyzeInvestigateActionEmptyAnswerTwiceFallsBack covers the last resort:
+// two empty answers in a row promote the (second) thought to the answer instead
+// of erroring the pass at the finish line; blank thought yields the generic
+// notice so downstream consumers never see an empty final message.
+func TestAnalyzeInvestigateActionEmptyAnswerTwiceFallsBack(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		return `{"thought":"still just a plan","action":{"type":"answer"}}`, nil, nil
+	}
+	act, _, _, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if act.Action.Answer != "still just a plan" {
+		t.Errorf("answer = %q, want thought promoted as last resort", act.Action.Answer)
+	}
+
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		return `{"action":{"type":"answer"}}`, nil, nil
+	}
+	act, _, _, _, err = camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if act.Action.Answer == "" {
-		t.Errorf("answer = %q, want a non-empty generic fallback", act.Action.Answer)
+		t.Errorf("answer empty, want the generic non-empty fallback")
+	}
+}
+
+// TestAnalyzeInvestigateActionEmptyAnswerRepairInfraFailure covers the repair
+// round dying on infrastructure (timeout) after an empty answer: the FIRST
+// reply's thought is promoted instead of surfacing an analysis error that would
+// burn a whole pass at the finish line.
+func TestAnalyzeInvestigateActionEmptyAnswerRepairInfraFailure(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"found her at 13:36","action":{"type":"answer"}}`, nil, nil
+		}
+		return "", nil, errors.New("agy timed out after 600s")
+	}
+	act, _, _, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (want thought fallback, not pass error)", err)
+	}
+	if act.Action.Answer != "found her at 13:36" {
+		t.Errorf("answer = %q, want first reply's thought", act.Action.Answer)
 	}
 }
 
