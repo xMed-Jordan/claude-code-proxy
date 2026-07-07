@@ -1726,6 +1726,15 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 		"turns_so_far": turnsSoFar, "media_used": mediaUsed, "max_turns": maxTurns, "max_media": maxMedia,
 	})
 
+	// Opt-in live-progress stream (nil unless the site's callback set stream_progress).
+	// Nil-safe throughout; a deferred forced flush guarantees any buffered "media"
+	// event ships before the run's settle webhook, on EVERY exit path.
+	prog := newCamProgressNotifier(cfg, db, inv, r)
+	defer prog.Flush(true)
+	if turnsSoFar == 0 {
+		prog.Start(inv.Question) // one-time "started" event (carries the view_url)
+	}
+
 	var lastImages []string
 	for {
 		if cctx.Err() != nil {
@@ -1839,6 +1848,8 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			toolMsg := camAppendInvestigateMessage(db, invID, "tool", tr.Summary, act.Action.Tool, toolArgsJSON, tr.Fetches, tr.Media)
 			msgs = append(msgs, toolMsg)
 			lastImages = attached
+			// Stream this tool's operator-facing media (key tools only; coalesced).
+			prog.ObserveMedia(invID, act.Action.Tool, tr.Media)
 		}
 	}
 }
@@ -2024,10 +2035,12 @@ func camRunInvestigationInline(db *sql.DB, cfg config, r *http.Request, id strin
 // response is built as an explicit snake_case map here (camDecodeJSON is
 // camerahttp.go's best-effort stored-JSON-column decoder, reused as-is).
 
-func investigationJSON(inv camInvestigation) map[string]any {
+func investigationJSON(cfg config, r *http.Request, inv camInvestigation) map[string]any {
 	return map[string]any{
 		"id": inv.ID, "site_id": inv.SiteID, "title": inv.Title, "question": inv.Question,
-		"alias": inv.Alias, "status": inv.Status, "created_at": inv.CreatedAt, "updated_at": inv.UpdatedAt,
+		"alias": inv.Alias, "status": inv.Status, "parent_id": inv.ParentID,
+		"view_url":   camInvestigationViewURL(cfg, r, inv),
+		"created_at": inv.CreatedAt, "updated_at": inv.UpdatedAt,
 	}
 }
 
@@ -2123,7 +2136,7 @@ func handleCameraInvestigationStart(cfg config) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "id": inv.ID, "status": inv.Status,
-			"investigation": investigationJSON(inv), "messages": investigateMessagesJSON(msgs),
+			"investigation": investigationJSON(cfg, r, inv), "messages": investigateMessagesJSON(msgs),
 		})
 	}
 }
@@ -2198,7 +2211,7 @@ func handleCameraInvestigationReply(cfg config) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "id": outInv.ID, "status": outInv.Status,
-			"investigation": investigationJSON(outInv), "messages": investigateMessagesJSON(msgs),
+			"investigation": investigationJSON(cfg, r, outInv), "messages": investigateMessagesJSON(msgs),
 		})
 	}
 }
@@ -2225,7 +2238,7 @@ func handleCameraInvestigationList(cfg config) http.HandlerFunc {
 		}
 		out := make([]map[string]any, 0, len(invs))
 		for _, inv := range invs {
-			out = append(out, investigationJSON(inv))
+			out = append(out, investigationJSON(cfg, r, inv))
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"investigations": out})
 	}
@@ -2254,6 +2267,29 @@ func handleCameraInvestigationGet(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "investigation not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"investigation": investigationJSON(inv), "messages": investigateMessagesJSON(msgs)})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"investigation": investigationJSON(cfg, r, inv), "messages": investigateMessagesJSON(msgs),
+			"children": camInvestigationChildrenJSON(cfg, r, db, inv.ID),
+		})
 	}
+}
+
+// camInvestigationChildrenJSON returns a lead run's delegated sub-investigations,
+// each as {investigation, messages}, in fan-out order — so the admin transcript
+// view can render the nested child timelines a delegate turn produced. Returns nil
+// (omitted-friendly) when the run delegated nothing.
+func camInvestigationChildrenJSON(cfg config, r *http.Request, db *sql.DB, parentID string) []map[string]any {
+	children, err := listCameraInvestigationChildren(db, parentID)
+	if err != nil || len(children) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(children))
+	for _, ch := range children {
+		cmsgs, _ := listCameraInvestigationMessages(db, ch.ID)
+		out = append(out, map[string]any{
+			"investigation": investigationJSON(cfg, r, ch),
+			"messages":      investigateMessagesJSON(cmsgs),
+		})
+	}
+	return out
 }

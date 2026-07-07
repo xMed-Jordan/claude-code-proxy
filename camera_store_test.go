@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // camTestTables lists every table migrateCameraDB is documented to create, so a
@@ -159,5 +160,136 @@ func TestMigrateCameraDBIdempotentOnReopenedConnection(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("camera_sites count = %d, want 1 (data must survive a reopen+re-migrate)", n)
+	}
+}
+
+// ─────────────────── WS3/WS4 parent/child + view_token store ───────────────────
+
+// TestCameraInvestigationParentChildQueries covers the delegation store surface:
+// insert auto-mints a distinct view_token; site lists exclude children; the child
+// list returns them in fan-out (created_at) order; and the view-token lookup
+// resolves a real token but never the empty default.
+func TestCameraInvestigationParentChildQueries(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	parentID, err := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", Question: "lead", Status: "running"})
+	if err != nil {
+		t.Fatalf("insert parent: %v", err)
+	}
+	parent, _ := getCameraInvestigation(db, parentID)
+	if parent.ViewToken == "" || parent.ParentID != "" {
+		t.Fatalf("parent row = %+v, want a minted view_token and empty parent_id", parent)
+	}
+	// Two children, inserted oldest-first (their created_at ordering is what the
+	// child list must preserve).
+	c1, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", ParentID: parentID, Question: "sub A", Status: "running", CreatedAt: "2026-07-02T10:00:00Z"})
+	c2, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", ParentID: parentID, Question: "sub B", Status: "running", CreatedAt: "2026-07-02T10:00:05Z"})
+
+	// A distinct view_token per row (never shared) is what keeps one page's link
+	// from authorizing another's media.
+	ch1, _ := getCameraInvestigation(db, c1)
+	if ch1.ViewToken == "" || ch1.ViewToken == parent.ViewToken {
+		t.Errorf("child view_token = %q, want a distinct non-empty token", ch1.ViewToken)
+	}
+
+	// Site listing shows only the top-level run.
+	top, err := listCameraInvestigations(db, "site_1")
+	if err != nil {
+		t.Fatalf("listCameraInvestigations: %v", err)
+	}
+	if len(top) != 1 || top[0].ID != parentID {
+		t.Fatalf("site list = %+v, want only the parent", top)
+	}
+
+	// Child list is the two children in fan-out order.
+	kids, err := listCameraInvestigationChildren(db, parentID)
+	if err != nil {
+		t.Fatalf("listCameraInvestigationChildren: %v", err)
+	}
+	if len(kids) != 2 || kids[0].ID != c1 || kids[1].ID != c2 {
+		t.Fatalf("child list = %+v, want [c1 c2] in creation order", kids)
+	}
+
+	// View-token lookup resolves a real token but never the empty string.
+	got, err := getCameraInvestigationByViewToken(db, parent.ViewToken)
+	if err != nil || got.ID != parentID {
+		t.Errorf("view-token lookup = %+v %v, want the parent", got, err)
+	}
+	if _, err := getCameraInvestigationByViewToken(db, ""); err == nil {
+		t.Error("empty view_token must never resolve a row")
+	}
+}
+
+// TestRequeueExcludesChildrenAndTerminalizesOrphans verifies the crash-recovery
+// contract: a stranded top-level run requeues, but an orphaned running child is
+// terminalized to exhausted (never requeued — no worker can claim a child), and the
+// stale-reaper likewise leaves children alone.
+func TestRequeueExcludesChildrenAndTerminalizesOrphans(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	parentID, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "s", Status: "running"})
+	childID, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "s", ParentID: parentID, Status: "running"})
+
+	n, err := requeueRunningCameraInvestigations(db)
+	if err != nil {
+		t.Fatalf("requeueRunning: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("requeued top-level count = %d, want 1 (child must not count)", n)
+	}
+	if p, _ := getCameraInvestigation(db, parentID); p.Status != "queued" {
+		t.Errorf("parent status = %q, want queued", p.Status)
+	}
+	if c, _ := getCameraInvestigation(db, childID); c.Status != "exhausted" {
+		t.Errorf("orphan child status = %q, want exhausted", c.Status)
+	}
+
+	// Stale reaper: a long-idle running CHILD is out of scope (its parent's
+	// WaitGroup owns it), so with only a child left running nothing requeues.
+	child2ID, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "s", ParentID: parentID, Status: "running", UpdatedAt: "2000-01-01T00:00:00Z"})
+	m, err := requeueStaleRunningCameraInvestigations(db, time.Hour)
+	if err != nil {
+		t.Fatalf("requeueStaleRunning: %v", err)
+	}
+	if m != 0 {
+		t.Errorf("stale requeue count = %d, want 0 (children excluded)", m)
+	}
+	if c, _ := getCameraInvestigation(db, child2ID); c.Status != "running" {
+		t.Errorf("stale child status = %q, want running (untouched by the reaper)", c.Status)
+	}
+}
+
+// TestBackfillCameraInvestigationViewTokens confirms every pre-WS4 row (blank
+// view_token) gets a distinct non-empty token, and that a re-run is a no-op.
+func TestBackfillCameraInvestigationViewTokens(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	// Simulate legacy rows written before view_token existed.
+	for _, id := range []string{"inv_a", "inv_b"} {
+		if _, err := db.Exec(`INSERT INTO camera_investigations (id, site_id, status, view_token, created_at, updated_at)
+			VALUES (?, 's', 'answered', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, id); err != nil {
+			t.Fatalf("seed legacy row %s: %v", id, err)
+		}
+	}
+	if err := backfillCameraInvestigationViewTokens(db); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	a, _ := getCameraInvestigation(db, "inv_a")
+	b, _ := getCameraInvestigation(db, "inv_b")
+	if a.ViewToken == "" || b.ViewToken == "" || a.ViewToken == b.ViewToken {
+		t.Errorf("view_tokens = %q / %q, want two distinct non-empty tokens", a.ViewToken, b.ViewToken)
+	}
+	// Re-run must not churn the already-assigned tokens.
+	if err := backfillCameraInvestigationViewTokens(db); err != nil {
+		t.Fatalf("backfill re-run: %v", err)
+	}
+	if a2, _ := getCameraInvestigation(db, "inv_a"); a2.ViewToken != a.ViewToken {
+		t.Errorf("re-run changed a token: %q -> %q", a.ViewToken, a2.ViewToken)
 	}
 }

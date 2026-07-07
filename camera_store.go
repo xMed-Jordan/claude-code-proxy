@@ -129,6 +129,8 @@ type camInvestigation struct {
 	Question  string
 	Alias     string
 	Status    string // active | awaiting_operator | answered | exhausted | closed
+	ParentID  string // "" for a top-level run; a parent investigation id for a delegated sub-investigation (WS3)
+	ViewToken string // capability token for the public read-only timeline page (/camera/investigations/<view_token>)
 	CreatedAt string
 	UpdatedAt string
 }
@@ -623,6 +625,64 @@ func migrateCameraDB(db *sql.DB) error {
 		{"profile_error", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := ensureSQLiteColumn(db, "camera_avatars", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+	// Sub-agent delegation + live timeline (WS3/WS4). parent_id links a delegated
+	// sub-investigation to its lead run ('' = top-level); view_token is the
+	// capability id for the public read-only timeline page. stream_progress opts a
+	// site's callback into the coalesced progress webhook (default 0 → existing
+	// Connect callbacks see zero new traffic until they opt in).
+	if err := ensureSQLiteColumn(db, "camera_investigations", "parent_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(db, "camera_investigations", "view_token", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(db, "camera_site_callbacks", "stream_progress", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Index created AFTER the column exists (the stmts block above ran before
+	// parent_id was added), so a pre-WS3 database still gets the child lookup index.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_camera_investigations_parent ON camera_investigations(parent_id)`); err != nil {
+		return err
+	}
+	// Backfill: every pre-WS4 investigation needs a distinct view_token so its
+	// timeline page can be linked. One fresh token per row (a shared default would
+	// let one page's link authorize another's media). Idempotent — a re-run finds
+	// no blank tokens left.
+	if err := backfillCameraInvestigationViewTokens(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// backfillCameraInvestigationViewTokens assigns a fresh capability token to every
+// camera_investigations row still carrying the empty default (rows created before
+// view_token existed). Each row gets its own randToken(16) — never a shared value
+// — because a view_token is what authorizes the public timeline page and its
+// media, so two rows sharing one would cross-authorize each other's evidence.
+func backfillCameraInvestigationViewTokens(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id FROM camera_investigations WHERE view_token = ''`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if serr := rows.Scan(&id); serr != nil {
+			rows.Close()
+			return serr
+		}
+		ids = append(ids, id)
+	}
+	if cerr := rows.Err(); cerr != nil {
+		rows.Close()
+		return cerr
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE camera_investigations SET view_token = ? WHERE id = ? AND view_token = ''`, randToken(16), id); err != nil {
 			return err
 		}
 	}
@@ -1550,11 +1610,11 @@ func pruneCameraEvents(db *sql.DB, olderThan string) (int64, error) {
 
 // ─────────────────────────── camera_investigations ───────────────────────────
 
-const camInvestigationCols = `id, site_id, title, question, alias, status, created_at, updated_at`
+const camInvestigationCols = `id, site_id, title, question, alias, status, parent_id, view_token, created_at, updated_at`
 
 func scanInvestigation(s rowScanner) (camInvestigation, error) {
 	var v camInvestigation
-	err := s.Scan(&v.ID, &v.SiteID, &v.Title, &v.Question, &v.Alias, &v.Status, &v.CreatedAt, &v.UpdatedAt)
+	err := s.Scan(&v.ID, &v.SiteID, &v.Title, &v.Question, &v.Alias, &v.Status, &v.ParentID, &v.ViewToken, &v.CreatedAt, &v.UpdatedAt)
 	return v, err
 }
 
@@ -1565,6 +1625,11 @@ func insertCameraInvestigation(db *sql.DB, inv camInvestigation) (string, error)
 	if inv.Status == "" {
 		inv.Status = "active"
 	}
+	// Every row owns a distinct view_token so its public timeline page (and the
+	// media that page authorizes) is scoped to exactly one investigation.
+	if inv.ViewToken == "" {
+		inv.ViewToken = randToken(16)
+	}
 	now := nowRFC3339()
 	if inv.CreatedAt == "" {
 		inv.CreatedAt = now
@@ -1573,9 +1638,9 @@ func insertCameraInvestigation(db *sql.DB, inv camInvestigation) (string, error)
 		inv.UpdatedAt = now
 	}
 	_, err := db.Exec(`INSERT INTO camera_investigations
-		(id, site_id, title, question, alias, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		inv.ID, inv.SiteID, inv.Title, inv.Question, inv.Alias, inv.Status, inv.CreatedAt, inv.UpdatedAt)
+		(id, site_id, title, question, alias, status, parent_id, view_token, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		inv.ID, inv.SiteID, inv.Title, inv.Question, inv.Alias, inv.Status, inv.ParentID, inv.ViewToken, inv.CreatedAt, inv.UpdatedAt)
 	return inv.ID, err
 }
 
@@ -1583,18 +1648,53 @@ func getCameraInvestigation(db *sql.DB, id string) (camInvestigation, error) {
 	return scanInvestigation(db.QueryRow(`SELECT `+camInvestigationCols+` FROM camera_investigations WHERE id = ?`, id))
 }
 
-// listCameraInvestigations lists a site's investigations newest-first; siteID==""
-// lists every site's investigations.
+// getCameraInvestigationByViewToken resolves the top-level (or child) investigation
+// a public timeline page belongs to. The `view_token != ”` guard is defensive: a
+// bare-default token must never match, so a caller can't pass "" to escalate into
+// the first un-backfilled row.
+func getCameraInvestigationByViewToken(db *sql.DB, token string) (camInvestigation, error) {
+	return scanInvestigation(db.QueryRow(`SELECT `+camInvestigationCols+
+		` FROM camera_investigations WHERE view_token = ? AND view_token != ''`, token))
+}
+
+// listCameraInvestigations lists a site's TOP-LEVEL investigations newest-first
+// (siteID=="" spans every site). Delegated sub-investigations (parent_id != ”)
+// are excluded — they surface only nested under their lead run's transcript, never
+// as standalone rows in a site's list.
 func listCameraInvestigations(db *sql.DB, siteID string) ([]camInvestigation, error) {
 	var (
 		rows *sql.Rows
 		err  error
 	)
 	if strings.TrimSpace(siteID) == "" {
-		rows, err = db.Query(`SELECT ` + camInvestigationCols + ` FROM camera_investigations ORDER BY updated_at DESC`)
+		rows, err = db.Query(`SELECT ` + camInvestigationCols + ` FROM camera_investigations WHERE parent_id = '' ORDER BY updated_at DESC`)
 	} else {
-		rows, err = db.Query(`SELECT `+camInvestigationCols+` FROM camera_investigations WHERE site_id = ? ORDER BY updated_at DESC`, siteID)
+		rows, err = db.Query(`SELECT `+camInvestigationCols+` FROM camera_investigations WHERE site_id = ? AND parent_id = '' ORDER BY updated_at DESC`, siteID)
 	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camInvestigation
+	for rows.Next() {
+		v, err := scanInvestigation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// listCameraInvestigationChildren returns a lead run's delegated sub-investigations
+// in creation order (the order they were fanned out), for the timeline page's
+// collapsible child sections and the admin get response.
+func listCameraInvestigationChildren(db *sql.DB, parentID string) ([]camInvestigation, error) {
+	if strings.TrimSpace(parentID) == "" {
+		return nil, nil
+	}
+	rows, err := db.Query(`SELECT `+camInvestigationCols+
+		` FROM camera_investigations WHERE parent_id = ? ORDER BY created_at ASC`, parentID)
 	if err != nil {
 		return nil, err
 	}
@@ -1681,13 +1781,24 @@ func listQueuedCameraInvestigations(db *sql.DB) ([]camInvestigation, error) {
 // recomputes turn/media budgets — so at most the single in-flight turn is lost.
 // Returns how many were reset; run once at worker startup, before the ticker.
 func requeueRunningCameraInvestigations(db *sql.DB) (int64, error) {
-	// Also catch legacy "active" rows: the pre-queue build set that status while a
+	// Only TOP-LEVEL rows requeue: a delegated sub-investigation (parent_id != '')
+	// runs in-process inside its lead run's delegate turn, NEVER via the queue, so
+	// flipping one to "queued" would strand it (no worker claims children). Also
+	// catch legacy "active" rows: the pre-queue build set that status while a
 	// synchronous run was in flight, so after upgrading such a row is orphaned too
 	// (the new code never writes "active"). Resumable, so re-running is safe.
 	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
-		WHERE status IN ('running', 'active')`, nowRFC3339())
+		WHERE status IN ('running', 'active') AND parent_id = ''`, nowRFC3339())
 	if err != nil {
 		return 0, err
+	}
+	// An orphaned running CHILD (its lead run's goroutine died with the process)
+	// can't be resumed on its own — the parent's delegate turn owns the WaitGroup
+	// — so terminalize it to "exhausted" instead of requeuing. The parent, once
+	// requeued and re-run, re-delegates fresh children.
+	if _, cerr := db.Exec(`UPDATE camera_investigations SET status = 'exhausted', updated_at = ?
+		WHERE status IN ('running', 'active') AND parent_id != ''`, nowRFC3339()); cerr != nil {
+		return 0, cerr
 	}
 	return res.RowsAffected()
 }
@@ -1700,8 +1811,10 @@ func requeueRunningCameraInvestigations(db *sql.DB) (int64, error) {
 // stuck-"running" case without waiting for a process restart. Returns how many.
 func requeueStaleRunningCameraInvestigations(db *sql.DB, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-olderThan).Format(time.RFC3339)
+	// Top-level rows only (parent_id = ''): a delegated child is bounded by its
+	// parent's budget and its lead run's WaitGroup, never the queue's stale reaper.
 	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
-		WHERE status = 'running' AND updated_at < ?`, nowRFC3339(), cutoff)
+		WHERE status = 'running' AND parent_id = '' AND updated_at < ?`, nowRFC3339(), cutoff)
 	if err != nil {
 		return 0, err
 	}

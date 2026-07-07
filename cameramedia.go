@@ -139,10 +139,49 @@ func cameraEventRetention(cfg config) time.Duration {
 
 // ─────────────────────────────── serving ───────────────────────────────
 
-// handleCameraMedia serves a captured artifact (snapshot/mosaic/clip/frame) by
-// its capability token. Registered admin-gated by registerCameraRoutes.
-func handleCameraMedia(cfg config) http.HandlerFunc {
+// camServeCapture is the shared serve body behind all three /camera/media gates —
+// admin (handleCameraMedia), service (handleSvcMedia), and the public timeline
+// page (handleCameraMediaGated ?v=). Each gate does its OWN authorization first,
+// then hands a validated token here; this only enforces existence, expiry, and the
+// path-escape guard before streaming the bytes. The 404 style differs per gate
+// (admin/view: http.NotFound HTML; service: camSvcNotFound JSON), so the caller
+// supplies notFound.
+func camServeCapture(w http.ResponseWriter, r *http.Request, cfg config, db *sql.DB, token string, notFound func()) {
 	root := cameraMediaRoot(cfg)
+	cap, cerr := getCameraCaptureByToken(db, token)
+	if cerr != nil {
+		notFound()
+		return
+	}
+	if cap.ExpiresAt != "" && cap.ExpiresAt <= nowRFC3339() {
+		notFound()
+		return
+	}
+	full := cap.Path
+	if rel, rerr := filepath.Rel(root, full); rerr != nil || strings.HasPrefix(rel, "..") {
+		camlog("error", "media_serve", map[string]any{"ok": false, "error": "capture path escapes media root", "token": token})
+		notFound()
+		return
+	}
+	fi, serr := os.Stat(full)
+	if serr != nil || fi.IsDir() {
+		notFound()
+		return
+	}
+	ct := strings.TrimSpace(cap.ContentType)
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	http.ServeFile(w, r, full)
+}
+
+// handleCameraMedia serves a captured artifact (snapshot/mosaic/clip/frame) by
+// its capability token. This is the ADMIN gate — registered wrapped in requireAdmin
+// by handleCameraMediaGated (a ?v= request takes the public view-token path instead).
+func handleCameraMedia(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -159,34 +198,7 @@ func handleCameraMedia(cfg config) http.HandlerFunc {
 			return
 		}
 		defer db.Close()
-		cap, cerr := getCameraCaptureByToken(db, token)
-		if cerr != nil {
-			http.NotFound(w, r)
-			return
-		}
-		if cap.ExpiresAt != "" && cap.ExpiresAt <= nowRFC3339() {
-			http.NotFound(w, r)
-			return
-		}
-		full := cap.Path
-		if rel, rerr := filepath.Rel(root, full); rerr != nil || strings.HasPrefix(rel, "..") {
-			camlog("error", "media_serve", map[string]any{"ok": false, "error": "capture path escapes media root", "token": token})
-			http.NotFound(w, r)
-			return
-		}
-		fi, serr := os.Stat(full)
-		if serr != nil || fi.IsDir() {
-			http.NotFound(w, r)
-			return
-		}
-		ct := strings.TrimSpace(cap.ContentType)
-		if ct == "" {
-			ct = "application/octet-stream"
-		}
-		w.Header().Set("Content-Type", ct)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "private, max-age=3600")
-		http.ServeFile(w, r, full)
+		camServeCapture(w, r, cfg, db, token, func() { http.NotFound(w, r) })
 	}
 }
 

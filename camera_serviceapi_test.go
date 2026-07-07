@@ -452,7 +452,7 @@ func TestCamServiceProvisionFlow(t *testing.T) {
 
 func TestCamSettlePayload(t *testing.T) {
 	cfg := config{PublicURL: "https://proxy.example"}
-	inv := camInvestigation{ID: "inv_1", SiteID: "site_1", Status: "answered"}
+	inv := camInvestigation{ID: "inv_1", SiteID: "site_1", Status: "answered", ViewToken: "vtok1"}
 	at := time.Date(2026, 7, 2, 14, 32, 11, 0, time.UTC)
 
 	mediaJSON := mustJSON([]evidenceItem{
@@ -481,6 +481,9 @@ func TestCamSettlePayload(t *testing.T) {
 	}
 	if p["at"] != "2026-07-02T14:32:11Z" {
 		t.Errorf("at = %v", p["at"])
+	}
+	if p["view_url"] != "https://proxy.example/camera/investigations/vtok1" {
+		t.Errorf("view_url = %v, want the public timeline URL", p["view_url"])
 	}
 	ev, _ := p["evidence"].([]map[string]any)
 	if len(ev) != 1 {

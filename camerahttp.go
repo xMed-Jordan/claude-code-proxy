@@ -117,7 +117,15 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/ui/api/cameras/service-tokens", noStore(requireAdmin(cfg, handleCameraServiceTokens(cfg))))
 	mux.HandleFunc("/ui/api/cameras/service-tokens/revoke", noStore(requireAdmin(cfg, handleCameraServiceTokenRevoke(cfg))))
 
-	mux.HandleFunc("/camera/media/", noStore(requireAdmin(cfg, handleCameraMedia(cfg))))
+	// Media serving. The gate branches on ?v=<view_token>: a public timeline-page
+	// fetch (authorized against the investigation's minted media) vs. the default
+	// admin session (handleCameraMediaGated → requireAdmin(handleCameraMedia)).
+	mux.HandleFunc("/camera/media/", noStore(handleCameraMediaGated(cfg)))
+
+	// Public, no-admin-session live investigation timeline page + its state.json
+	// poll (camera_investigate_view.go). Rate-limited per view-token and per IP;
+	// the shell is a static const so an unknown token leaks nothing.
+	mux.HandleFunc("/camera/investigations/", noStore(handleCameraInvestigationView(cfg)))
 }
 
 // ─────────────────────────────── JSON row mappers ───────────────────────────────

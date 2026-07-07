@@ -66,12 +66,13 @@ type camServiceToken struct {
 // camSiteCallback is an in-memory view of a camera_site_callbacks row (one
 // settle-webhook registration per site; secret_enc via encryptSecret).
 type camSiteCallback struct {
-	SiteID    string
-	URL       string
-	SecretEnc string
-	Enabled   bool
-	CreatedAt string
-	UpdatedAt string
+	SiteID         string
+	URL            string
+	SecretEnc      string
+	Enabled        bool
+	StreamProgress bool // opt-in: also deliver the coalesced camera_investigation_progress webhook (default off)
+	CreatedAt      string
+	UpdatedAt      string
 }
 
 // camSvcCtx is the authenticated identity requireCameraService passes to every
@@ -193,17 +194,19 @@ func revokeCameraServiceTokensForSite(db *sql.DB, siteID string) error {
 
 func getCameraSiteCallback(db *sql.DB, siteID string) (camSiteCallback, error) {
 	var cb camSiteCallback
-	var enabled int
-	err := db.QueryRow(`SELECT site_id, url, secret_enc, enabled, created_at, updated_at
+	var enabled, streamProgress int
+	err := db.QueryRow(`SELECT site_id, url, secret_enc, enabled, stream_progress, created_at, updated_at
 		FROM camera_site_callbacks WHERE site_id = ?`, siteID).
-		Scan(&cb.SiteID, &cb.URL, &cb.SecretEnc, &enabled, &cb.CreatedAt, &cb.UpdatedAt)
+		Scan(&cb.SiteID, &cb.URL, &cb.SecretEnc, &enabled, &streamProgress, &cb.CreatedAt, &cb.UpdatedAt)
 	cb.Enabled = enabled != 0
+	cb.StreamProgress = streamProgress != 0
 	return cb, err
 }
 
 // setCameraSiteCallback upserts a site's settle-webhook registration (secret is
 // plaintext here; encryptSecret'd into secret_enc; "" keeps the existing secret).
-func setCameraSiteCallback(db *sql.DB, cfg config, siteID, rawURL, secret string) error {
+// streamProgress opts the site into the coalesced progress webhook.
+func setCameraSiteCallback(db *sql.DB, cfg config, siteID, rawURL, secret string, streamProgress bool) error {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return errors.New("url is required")
@@ -220,14 +223,18 @@ func setCameraSiteCallback(db *sql.DB, cfg config, siteID, rawURL, secret string
 		}
 		secretEnc = enc
 	}
+	sp := 0
+	if streamProgress {
+		sp = 1
+	}
 	now := nowRFC3339()
 	if gerr != nil { // no row yet
-		_, err := db.Exec(`INSERT INTO camera_site_callbacks (site_id, url, secret_enc, enabled, created_at, updated_at)
-			VALUES (?, ?, ?, 1, ?, ?)`, siteID, rawURL, secretEnc, now, now)
+		_, err := db.Exec(`INSERT INTO camera_site_callbacks (site_id, url, secret_enc, enabled, stream_progress, created_at, updated_at)
+			VALUES (?, ?, ?, 1, ?, ?, ?)`, siteID, rawURL, secretEnc, sp, now, now)
 		return err
 	}
-	_, err := db.Exec(`UPDATE camera_site_callbacks SET url = ?, secret_enc = ?, enabled = 1, updated_at = ? WHERE site_id = ?`,
-		rawURL, secretEnc, now, siteID)
+	_, err := db.Exec(`UPDATE camera_site_callbacks SET url = ?, secret_enc = ?, enabled = 1, stream_progress = ?, updated_at = ? WHERE site_id = ?`,
+		rawURL, secretEnc, sp, now, siteID)
 	return err
 }
 
@@ -312,6 +319,7 @@ func camSettlePayload(cfg config, inv camInvestigation, msgs []camInvestigationM
 		"answer":           answer,
 		"turns":            turns,
 		"evidence":         evidence,
+		"view_url":         camInvestigationViewURL(cfg, nil, inv),
 		"at":               at.UTC().Format(time.RFC3339),
 	}
 	if status == "awaiting_operator" && question != "" {
@@ -384,6 +392,14 @@ func camMergeFields(base, extra map[string]any) map[string]any {
 // retry ladder sleeps inline), decrypting nothing itself — the secret is derived
 // here from cb.SecretEnc.
 func camPostSignedCallback(cfg config, cb camSiteCallback, body []byte, logOp string, logFields map[string]any) {
+	camPostSignedCallbackDelays(cfg, cb, body, camCallbackRetryDelays, logOp, logFields)
+}
+
+// camPostSignedCallbackDelays is camPostSignedCallback with a caller-chosen retry
+// ladder. The settle webhook uses the reliable {0,30s,5m} ladder (camPostSignedCallback);
+// the best-effort progress stream uses a short {0,15s} ladder (camProgressRetryDelays)
+// so a slow/unreachable Connect never wedges a delivery goroutine for minutes.
+func camPostSignedCallbackDelays(cfg config, cb camSiteCallback, body []byte, delays []time.Duration, logOp string, logFields map[string]any) {
 	secret := ""
 	if strings.TrimSpace(cb.SecretEnc) != "" {
 		if s, derr := decryptSecret(cfg, cb.SecretEnc); derr == nil {
@@ -406,7 +422,7 @@ func camPostSignedCallback(cfg config, cb camSiteCallback, body []byte, logOp st
 	}
 	client.Timeout = timeout
 
-	for i, delay := range camCallbackRetryDelays {
+	for i, delay := range delays {
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -841,7 +857,7 @@ func handleSvcUsage(cfg config) camSvcHandler {
 			_ = db.QueryRow(`SELECT COUNT(*) FROM camera_dvrs WHERE site_id = ?`, s.ID).Scan(&dvrs)
 			_ = db.QueryRow(`SELECT COUNT(*) FROM cameras WHERE site_id = ?`, s.ID).Scan(&cams)
 			_ = db.QueryRow(`SELECT COUNT(*) FROM camera_investigations
-				WHERE site_id = ? AND status IN ('queued','running','awaiting_operator')`, s.ID).Scan(&open)
+				WHERE site_id = ? AND parent_id = '' AND status IN ('queued','running','awaiting_operator')`, s.ID).Scan(&open)
 			out = append(out, map[string]any{
 				"site_id": s.ID, "name": s.Name, "dvr_count": dvrs,
 				"camera_count": cams, "open_investigations": open,
@@ -1371,7 +1387,7 @@ func handleSvcInvestigations(cfg config) camSvcHandler {
 			}
 			out := make([]map[string]any, 0, len(invs))
 			for _, inv := range invs {
-				out = append(out, investigationJSON(inv))
+				out = append(out, investigationJSON(cfg, r, inv))
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"investigations": out})
 		case http.MethodPost:
@@ -1408,7 +1424,9 @@ func handleSvcInvestigations(cfg config) camSvcHandler {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": gerr.Error()})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": inv.ID, "status": inv.Status})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "id": inv.ID, "status": inv.Status, "view_url": camInvestigationViewURL(cfg, r, inv),
+			})
 		default:
 			camSvcMethodNotAllowed(w)
 		}
@@ -1440,7 +1458,7 @@ func handleSvcInvestigationGet(cfg config) camSvcHandler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"investigation": investigationJSON(inv), "messages": svcInvestigateMessagesJSON(msgs),
+			"investigation": investigationJSON(cfg, r, inv), "messages": svcInvestigateMessagesJSON(msgs),
 		})
 	}
 }
@@ -2538,7 +2556,6 @@ func handleSvcPlaybookDelete(cfg config) camSvcHandler {
 // ownership check. Rate-limited at 5x the base rate. /camera/media/ stays
 // admin-gated; Connect downloads and re-hosts bytes.
 func handleSvcMedia(cfg config) camSvcHandler {
-	root := cameraMediaRoot(cfg)
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			camSvcMethodNotAllowed(w)
@@ -2554,34 +2571,14 @@ func handleSvcMedia(cfg config) camSvcHandler {
 			return
 		}
 		defer db.Close()
+		// Ownership gate: the token's capture must belong to the caller's site.
+		// camServeCapture re-checks existence/expiry/path before streaming.
 		cap, cerr := getCameraCaptureByToken(db, token)
 		if cerr != nil || cap.SiteID != sc.SiteID {
 			camSvcNotFound(w)
 			return
 		}
-		if cap.ExpiresAt != "" && cap.ExpiresAt <= nowRFC3339() {
-			camSvcNotFound(w)
-			return
-		}
-		full := cap.Path
-		if rel, rerr := filepath.Rel(root, full); rerr != nil || strings.HasPrefix(rel, "..") {
-			camlog("error", "svc_media_serve", map[string]any{"ok": false, "error": "capture path escapes media root", "token": token})
-			camSvcNotFound(w)
-			return
-		}
-		fi, serr := os.Stat(full)
-		if serr != nil || fi.IsDir() {
-			camSvcNotFound(w)
-			return
-		}
-		ct := strings.TrimSpace(cap.ContentType)
-		if ct == "" {
-			ct = "application/octet-stream"
-		}
-		w.Header().Set("Content-Type", ct)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "private, max-age=3600")
-		http.ServeFile(w, r, full)
+		camServeCapture(w, r, cfg, db, token, func() { camSvcNotFound(w) })
 	}
 }
 
@@ -2599,24 +2596,35 @@ func handleSvcCallback(cfg config) camSvcHandler {
 		case http.MethodGet:
 			cb, err := getCameraSiteCallback(db, sc.SiteID)
 			if err != nil {
-				writeJSON(w, http.StatusOK, map[string]any{"url": "", "has_secret": false})
+				writeJSON(w, http.StatusOK, map[string]any{"url": "", "has_secret": false, "stream_progress": false})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"url": cb.URL, "has_secret": strings.TrimSpace(cb.SecretEnc) != ""})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"url": cb.URL, "has_secret": strings.TrimSpace(cb.SecretEnc) != "", "stream_progress": cb.StreamProgress,
+			})
 		case http.MethodPost:
 			var body struct {
-				URL    string `json:"url"`
-				Secret string `json:"secret"`
+				URL            string `json:"url"`
+				Secret         string `json:"secret"`
+				StreamProgress *bool  `json:"stream_progress"`
 			}
 			if !camSvcDecode(w, r, &body) {
 				return
 			}
-			if err := setCameraSiteCallback(db, cfg, sc.SiteID, body.URL, body.Secret); err != nil {
+			// stream_progress is sticky: an omitted field keeps the current opt-in
+			// state so a plain url/secret update never silently disables streaming.
+			existing, _ := getCameraSiteCallback(db, sc.SiteID)
+			streamProgress := existing.StreamProgress
+			if body.StreamProgress != nil {
+				streamProgress = *body.StreamProgress
+			}
+			if err := setCameraSiteCallback(db, cfg, sc.SiteID, body.URL, body.Secret, streamProgress); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
 			camlog("info", "svc_callback_register", map[string]any{
-				"site_id": sc.SiteID, "url": strings.TrimSpace(body.URL), "secret_set": strings.TrimSpace(body.Secret) != "",
+				"site_id": sc.SiteID, "url": strings.TrimSpace(body.URL),
+				"secret_set": strings.TrimSpace(body.Secret) != "", "stream_progress": streamProgress,
 			})
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
