@@ -1209,16 +1209,16 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 				hint = &bb
 			}
 			if faceLoc {
-				// Localize on a REAL detected face, not the VLM's bbox. The VLM box
-				// is only a tie-break hint among faces, or a fallback if the sidecar
-				// is down. Sidecar up but no face here → no box (whole frame, never
-				// a false circle on furniture).
-				if box, found, detErr := r.detectPersonBox(ctx, frameData, hint); detErr != nil {
-					if hint != nil {
-						s.BBox, s.HasBBox = *hint, true
-					}
-				} else if found {
+				// Localize on a REAL detected face when one exists — the VLM box is
+				// then only a tie-break hint among faces. But when the sidecar finds
+				// NO face (target far away, back turned), the VLM's own box is still
+				// the only thing that tells the reviewer WHICH person was matched —
+				// an imprecise box on the right person beats an unmarked frame with
+				// several people in it, so the hint is used rather than discarded.
+				if box, found, detErr := r.detectPersonBox(ctx, frameData, hint); detErr == nil && found {
 					s.BBox, s.HasBBox = box, true
+				} else if hint != nil {
+					s.BBox, s.HasBBox = *hint, true
 				}
 			} else if hint != nil {
 				s.BBox, s.HasBBox = *hint, true
@@ -1381,6 +1381,7 @@ func camAvatarScanSystemPrompt(av camAvatar, hasRefs bool, w, h int) string {
 	b.WriteString(camBBoxConvention(w, h))
 	b.WriteString("\n\nReply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"matches":[{"frame":3,"confidence":0.82,"bbox":{"x0":412,"y0":180,"x1":530,"y1":690},"reason":"male, white coat, entering via the staff door as described"}]}`)
+	b.WriteString("\nEvery match MUST include bbox — a box around THE matched " + typ + " in that frame (whole " + typ + ", not just the face). The reviewer sees your box to know WHICH one you mean; when several people are visible, a match without a box is unusable.")
 	b.WriteString("\nInclude ONLY frames where the target is plausibly present (confidence ≥ 0.4); omit all others. If none match: {\"matches\":[]}.")
 	return b.String()
 }
