@@ -116,6 +116,21 @@ type investigateArgs struct {
 	BBox      json.RawMessage `json:"bbox"`       // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
 	EventType string          `json:"event_type"` // motion_search: optional exact event-type filter (VMD | linedetection | …)
 	Layout    string          `json:"layout"`     // evidence_export: "sequential" | "grid" | "separate" (default separate)
+
+	Subtasks []investigateSubtask `json:"subtasks"` // delegate: one entry per PARALLEL sub-investigation to fan out (WS3)
+}
+
+// investigateSubtask is one delegated sub-investigation the model requests through
+// the `delegate` tool: a self-contained question scoped to a set of cameras and a
+// time window, run by a restricted sub-investigator loop that sees NOTHING of the
+// parent conversation. tools_allowed (optional) can only NARROW the sub-agent's
+// toolset, never widen it past camSubagentAllowedTools.
+type investigateSubtask struct {
+	Question  string   `json:"question"`
+	CameraIDs []string `json:"camera_ids"`
+	From      string   `json:"from"`          // RFC3339 window start (DVR clock, like the parent tools)
+	To        string   `json:"to"`            // RFC3339 window end
+	Tools     []string `json:"tools_allowed"` // optional subset of camSubagentAllowedTools; empty = the full sub-agent ceiling
 }
 
 // evidenceItem is one media artifact cited in a final answer: a served
@@ -127,7 +142,7 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate", "evidence_export"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate", "evidence_export", "delegate"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
@@ -400,6 +415,34 @@ func camCapImages(paths []string, max int) []string {
 
 // ─────────────────────────────── system prompt ───────────────────────────────
 
+// camPromptTimeBlock writes the shared clock preamble both the lead-investigator
+// and the sub-investigator prompts need: the real "operator now", the DVR recording
+// clock (with its skew when it drifts ≥45s so windows line up with footage), and the
+// absolute-RFC3339 instruction. Factored so the two prompts can never disagree on how
+// the model is told to express "from"/"to".
+func camPromptTimeBlock(b *strings.Builder, now, dvrClock time.Time, dvrClockOK bool, tzName string) {
+	fmt.Fprintf(b, "CURRENT TIME (real / operator now): %s — today is %s, timezone %s.\n",
+		now.Format(time.RFC3339), now.Format("Monday 2 January 2006"), tzName)
+	if dvrClockOK {
+		skew := dvrClock.Sub(now)
+		mag := skew
+		if mag < 0 {
+			mag = -mag
+		}
+		if mag >= 45*time.Second {
+			dir := "AHEAD of"
+			if skew < 0 {
+				dir = "BEHIND"
+			}
+			fmt.Fprintf(b, "DVR CLOCK: %s — the DVR stamps its RECORDINGS with this clock, which is currently ~%s %s the real time. When you request past_frames/past_clip, express \"from\"/\"to\" against the DVR CLOCK so the window lines up with the recordings.\n",
+				dvrClock.Format(time.RFC3339), mag.Round(time.Second), dir)
+		} else {
+			fmt.Fprintf(b, "DVR CLOCK: %s (in sync with real time).\n", dvrClock.Format(time.RFC3339))
+		}
+	}
+	b.WriteString("Use RFC3339 timestamps with this exact UTC offset for every \"from\"/\"to\" argument; e.g. \"yesterday at 15:00\" = yesterday's date at 15:00 with this offset.\n\n")
+}
+
 // camInvestigateSystemPrompt builds the loop's per-call system prompt: the
 // investigator role, the operator-authored site context (camSiteContextBlock),
 // the current time in the site's DVR timezone (so the model can construct
@@ -408,9 +451,13 @@ func camCapImages(paths []string, max int) []string {
 // catalogs (only when the site has any), the tool list + ACTIONS + JSON
 // contract, and the investigation protocol. The avatar tool lines/strategy are
 // emitted only when the site has enabled avatars.
+// subagentMax > 0 enables the delegate sub-agent fan-out surface (the tool line,
+// the fan-out CORE PRINCIPLE, and the OUTPUT enum entry): the prompt advertises
+// delegation only when the deployment can actually execute it (camSubagentMax(cfg)),
+// so PROXY_CAMERA_SUBAGENT_MAX=0 keeps the prompt from naming a tool that would refuse.
 func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	playbooks []camPlaybook, apiTools []camAPITool, avatars []camAvatar,
-	now, dvrClock time.Time, dvrClockOK bool, tzName string) string {
+	now, dvrClock time.Time, dvrClockOK bool, tzName string, subagentMax int) string {
 	var b strings.Builder
 	b.WriteString("You are a security investigator for a physical premises")
 	if n := strings.TrimSpace(site.Name); n != "" {
@@ -428,26 +475,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 		b.WriteString("\n\n")
 	}
 
-	fmt.Fprintf(&b, "CURRENT TIME (real / operator now): %s — today is %s, timezone %s.\n",
-		now.Format(time.RFC3339), now.Format("Monday 2 January 2006"), tzName)
-	if dvrClockOK {
-		skew := dvrClock.Sub(now)
-		mag := skew
-		if mag < 0 {
-			mag = -mag
-		}
-		if mag >= 45*time.Second {
-			dir := "AHEAD of"
-			if skew < 0 {
-				dir = "BEHIND"
-			}
-			fmt.Fprintf(&b, "DVR CLOCK: %s — the DVR stamps its RECORDINGS with this clock, which is currently ~%s %s the real time. When you request past_frames/past_clip, express \"from\"/\"to\" against the DVR CLOCK so the window lines up with the recordings.\n",
-				dvrClock.Format(time.RFC3339), mag.Round(time.Second), dir)
-		} else {
-			fmt.Fprintf(&b, "DVR CLOCK: %s (in sync with real time).\n", dvrClock.Format(time.RFC3339))
-		}
-	}
-	b.WriteString("Use RFC3339 timestamps with this exact UTC offset for every \"from\"/\"to\" argument; e.g. \"yesterday at 15:00\" = yesterday's date at 15:00 with this offset.\n\n")
+	camPromptTimeBlock(&b, now, dvrClock, dvrClockOK, tzName)
 
 	b.WriteString("CAMERA ROSTER (id — name [area]: description):\n")
 	b.WriteString(camBuildRoster(active))
@@ -505,6 +533,9 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
 	b.WriteString("- evidence_export: args.camera_ids (one OR MORE), args.from + args.to (RFC3339 — may span up to 60 minutes, NOT limited to the 300s clip cap), args.layout \"sequential\"|\"grid\"|\"separate\", args.quality — queues a BACKGROUND evidence-video export across those cameras; permanent public video link(s) are delivered to the operator automatically when ready. Returns IMMEDIATELY — do NOT wait for it or re-check it; keep investigating / answer normally. Costs no media budget.\n")
 	b.WriteString("- motion_search: args.camera_ids (optional, default = all cameras), args.from + args.to (RFC3339, required), args.event_type (optional exact type) — queries the DVR MOTION LOG and returns the exact times motion/line-cross/intrusion episodes occurred, WITHOUT pulling any footage (costs no media budget). Use FIRST to find WHEN activity happened, then past_frames/contact_sheet/avatar_check those exact windows — don't brute-scan.\n")
+	if subagentMax > 0 {
+		fmt.Fprintf(&b, "- delegate: args.subtasks = [{\"question\":\"...\",\"camera_ids\":[\"<id>\"],\"from\":\"RFC3339\",\"to\":\"RFC3339\",\"tools_allowed\":[\"<tool>\"]}] (max %d) — fans each subtask out to a PARALLEL sub-investigator with its own turn budget. Each sub-agent scans its OWN cameras/window and reports a verdict plus key evidence; their evidence media_urls appear in the TOOL RESULT and are citable in YOUR final answer. Subtasks must be INDEPENDENT and self-contained — a sub-agent sees NOTHING of this conversation, cannot ask the operator, and cannot delegate further. Costs 1 turn; the sub-agents' device fetches spend YOUR media budget. Use it for long windows or many cameras (3+ independent scans → ONE delegate call), not for a single quick check you can do yourself.\n", subagentMax)
+	}
 	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS or INVESTIGATION METHODS) — returns that\n")
 	b.WriteString("  procedure's full instructions plus any operator-approved reference images (shown to you next turn). Costs no media budget.\n")
 	b.WriteString("- call_api: args.name (EXACT name from EXTERNAL API TOOLS), args.params {\"key\":\"value\"} — the loop\n")
@@ -535,7 +566,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 		"Wide→close escalation: LOCATE on wide cameras at sub quality, then VERIFY fine detail on the closest close-up camera at main quality — pick that close-up from the roster before judging any detail.",
 		"Topology handoff: to follow someone across the site, use the roster areas — corridors and doorways are chokepoints; hand off camera to camera in time order.",
 	}
-	if camDelegateToolEnabled {
+	if subagentMax > 0 {
 		principles = append(principles, "Fan out with delegate for long windows or many cameras — 3+ independent scans become ONE delegate call.")
 	}
 	principles = append(principles,
@@ -570,7 +601,15 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|ask_operator|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate|evidence_export","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
+	// The delegate tool + its subtasks arg appear in the OUTPUT contract only when the
+	// deployment enabled fan-out, matching the TOOLS/PRINCIPLES gate above.
+	toolEnum := "roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate|evidence_export"
+	subtasksArg := ""
+	if subagentMax > 0 {
+		toolEnum += "|delegate"
+		subtasksArg = `,"subtasks":[{"question":"...","camera_ids":["<id>"],"from":"RFC3339","to":"RFC3339"}]`
+	}
+	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}` + subtasksArg + `},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
@@ -984,10 +1023,14 @@ type investigateToolResult struct {
 // implementation. tool is assumed already normalized by parseInvestigateAction
 // (one of investigateToolNames); the default case is defensive. alias is the
 // run's analysis alias, threaded to the tools that make their own VLM sub-calls
-// (avatar_check / avatar_find). invID is the running investigation's id, threaded
-// to tools that enqueue durable side-jobs owned by this investigation
-// (evidence_export).
-func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias, invID, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int) investigateToolResult {
+// (avatar_check / avatar_find). inv is the running investigation, threaded to
+// tools that own durable side-work under it: evidence_export (uses inv.ID) and
+// delegate (spawns child investigations with parent_id=inv.ID). prog is the
+// optional live-progress notifier — only delegate forwards it (so its children's
+// media joins the stream); every other tool ignores it. The SAME dispatcher runs
+// both the lead loop and each sub-investigator loop (camRunSubagentLoop), so a
+// child reuses every tool implementation with its own scoped camera/media limits.
+func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias string, inv camInvestigation, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int, prog *camProgressNotifier) investigateToolResult {
 	switch tool {
 	case "roster":
 		return investigateToolResult{Summary: "Camera roster:\n" + camBuildRoster(active)}
@@ -1018,7 +1061,9 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 	case "annotate":
 		return camToolAnnotate(ctx, cfg, db, r, site, args, camByID, allowed, scratch)
 	case "evidence_export":
-		return camToolEvidenceExport(cfg, db, site, invID, args, allowed)
+		return camToolEvidenceExport(cfg, db, site, inv.ID, args, allowed)
+	case "delegate":
+		return camToolDelegate(ctx, cfg, db, r, site, alias, inv, args, camByID, dvrByID, allowed, active, scratch, mediaLeft, prog)
 	default:
 		return investigateToolResult{Summary: fmt.Sprintf("unknown tool %q — no action taken.", tool)}
 	}
@@ -1702,7 +1747,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	playbooks, _ := listCameraPlaybooks(db, inv.SiteID, true)
 	apiTools, _ := listCameraAPITools(db, inv.SiteID, true)
 	avatars, _ := listCameraAvatars(db, inv.SiteID, false)
-	sys := camInvestigateSystemPrompt(site, dvrs, active, playbooks, apiTools, avatars, srvNow, dvrClock, dvrClockOK, tzName)
+	sys := camInvestigateSystemPrompt(site, dvrs, active, playbooks, apiTools, avatars, srvNow, dvrClock, dvrClockOK, tzName, camSubagentMax(cfg))
 
 	maxTurns := camInvestigateMaxTurns(cfg)
 	maxMedia := camInvestigateMaxMedia(cfg)
@@ -1828,7 +1873,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			if mediaLeft <= 0 {
 				tr = investigateToolResult{Summary: "Media fetch budget for this investigation is exhausted — answer with the evidence already gathered, or ask the operator."}
 			} else {
-				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, alias, invID, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
+				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, alias, inv, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft, prog)
 			}
 			mediaUsed += tr.Fetches
 			camlog("info", "investigate_tool", map[string]any{
@@ -1897,7 +1942,12 @@ func startCameraInvestigationWorker(cfg config) {
 		conc = 1
 	}
 	camInvestigateSem = make(chan struct{}, conc)
-	camlog("info", "investigate_worker_start", map[string]any{"tick_ms": interval.Milliseconds(), "concurrency": conc})
+	// Global ceiling on concurrent sub-investigators across ALL delegate turns, so a
+	// burst of fan-outs can't oversubscribe the box. Left nil when the worker is off,
+	// which camSubagentAcquire treats as "no limit" (inline drains still delegate).
+	subConc := camSubagentConcurrency(cfg)
+	camSubagentSem = make(chan struct{}, subConc)
+	camlog("info", "investigate_worker_start", map[string]any{"tick_ms": interval.Milliseconds(), "concurrency": conc, "subagent_concurrency": subConc})
 
 	go func() {
 		time.Sleep(camStartupJitter(interval))

@@ -203,6 +203,14 @@ type config struct {
 	CameraInvestigateFailoverCSV string        // PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES — comma list of fallback vision aliases tried after the primary
 	CameraInvestigateMaxRequeues int           // PROXY_CAMERA_INVESTIGATE_MAX_AUTO_REQUEUES — consecutive zero-progress self-requeues before "exhausted" (default 5, clamp 1..20)
 	CameraAnalyzeMaxImages       int           // PROXY_CAMERA_ANALYZE_MAX_IMAGES — images attached per analysis call (default 8, clamp 1..24)
+	// Sub-agent delegation (camera_investigate_subagent.go): the `delegate` tool fans a
+	// lead investigation out to parallel, restricted sub-investigators (child rows under
+	// parent_id) run in-process inside the parent's delegate turn — never via the queue.
+	CameraSubagentMax         int           // PROXY_CAMERA_SUBAGENT_MAX — max subtasks per delegate call (default 4, clamp 0..8; 0 disables delegation)
+	CameraSubagentConcurrency int           // PROXY_CAMERA_SUBAGENT_CONCURRENCY — global ceiling on parallel sub-investigators (default 3)
+	CameraSubagentMaxTurns    int           // PROXY_CAMERA_SUBAGENT_MAX_TURNS — per-child agentic turn cap (default 6, clamp 1..12)
+	CameraSubagentMaxMedia    int           // PROXY_CAMERA_SUBAGENT_MAX_MEDIA — per-child device-fetch ceiling (default 10)
+	CameraSubagentBudget      time.Duration // PROXY_CAMERA_SUBAGENT_BUDGET — per-child wall-clock cap, derived under the parent deadline (default 600s)
 	// Camera frame archive → S3-compatible object storage (Hetzner). The archiver
 	// (camera_archive.go) writes one JPEG per second per camera per quality; the
 	// investigate read-through (camera_investigate.go) serves past frames from here.
@@ -774,6 +782,12 @@ func loadConfig() config {
 		CameraInvestigateFailoverCSV: strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES", "")),
 		CameraInvestigateMaxRequeues: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_AUTO_REQUEUES", "5"), 5),
 		CameraAnalyzeMaxImages:       parseIntDefault(getenv("PROXY_CAMERA_ANALYZE_MAX_IMAGES", "8"), 8),
+
+		CameraSubagentMax:         parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX", "4"), 4),
+		CameraSubagentConcurrency: parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_CONCURRENCY", "3"), 3),
+		CameraSubagentMaxTurns:    parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX_TURNS", "6"), 6),
+		CameraSubagentMaxMedia:    parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX_MEDIA", "10"), 10),
+		CameraSubagentBudget:      parseAgyTimeout(getenv("PROXY_CAMERA_SUBAGENT_BUDGET", "600")),
 
 		CameraS3Endpoint:          strings.TrimSpace(getenv("PROXY_CAM_S3_ENDPOINT", "hel1.your-objectstorage.com")),
 		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams")),

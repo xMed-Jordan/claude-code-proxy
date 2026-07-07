@@ -125,7 +125,7 @@ func TestCamInvestigateSystemPromptStrategies(t *testing.T) {
 	prompt := camInvestigateSystemPrompt(
 		camSite{Name: "Test Clinic"}, nil, active,
 		nil, nil, nil,
-		time.Now(), time.Time{}, false, "UTC",
+		time.Now(), time.Time{}, false, "UTC", 0,
 	)
 	// The methods catalog is always present, even with no operator playbooks.
 	if !strings.Contains(prompt, "INVESTIGATION METHODS (built-in, environment-agnostic") {
@@ -143,13 +143,9 @@ func TestCamInvestigateSystemPromptStrategies(t *testing.T) {
 			t.Errorf("prompt missing core principle keyword %q", kw)
 		}
 	}
-	// The delegate principle is gated off until WS3 ships the delegate tool, so the
-	// prompt must not advertise a tool the loop cannot execute.
-	if camDelegateToolEnabled {
-		if !strings.Contains(prompt, "Fan out with delegate") {
-			t.Error("delegate principle should be present when the tool is enabled")
-		}
-	} else if strings.Contains(prompt, "delegate") {
-		t.Error("delegate must not appear in the prompt while the tool is disabled")
+	// With subagentMax == 0 the delegate surface is gated off, so the prompt must not
+	// advertise a tool the loop would refuse (WS3 exercises the enabled path).
+	if strings.Contains(prompt, "delegate") {
+		t.Error("delegate must not appear in the prompt when sub-agent delegation is disabled")
 	}
 }

@@ -28,12 +28,6 @@ import (
 // role for operator playbooks.
 const camStrategyWhenToUseMax = 110
 
-// camDelegateToolEnabled gates the delegate-fan-out core principle: the delegate
-// tool ships in a later workstream (WS3 sub-agent delegation). Until it exists the
-// prompt must NOT advertise a tool the loop cannot execute, so the principle is
-// suppressed. Flip to true when the delegate tool lands.
-const camDelegateToolEnabled = false
-
 // camStrategy is one built-in investigation method: a model-facing name (prefixed
 // "how-to: "), a one-liner shown in the catalog, and the full procedure returned by
 // the playbook tool. Mirrors the operator-facing camPlaybook shape minus DB fields.
