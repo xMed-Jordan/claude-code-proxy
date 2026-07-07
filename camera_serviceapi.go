@@ -682,6 +682,27 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/callback", noStore(requireCameraService(cfg, "site", handleSvcCallback(cfg))))
 	mux.HandleFunc("/api/cameras/motion/arm", noStore(requireCameraService(cfg, "site", handleSvcMotionArm(cfg))))
 	mux.HandleFunc("/api/cameras/motion/events", noStore(requireCameraService(cfg, "site", handleSvcMotionEvents(cfg))))
+
+	// Parity group D — setup questions (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/questions", noStore(requireCameraService(cfg, "site", handleSvcQuestions(cfg))))
+	mux.HandleFunc("/api/cameras/questions/answer", noStore(requireCameraService(cfg, "site", handleSvcQuestionAnswer(cfg))))
+	mux.HandleFunc("/api/cameras/questions/dismiss", noStore(requireCameraService(cfg, "site", handleSvcQuestionDismiss(cfg))))
+
+	// Parity group E — watches, runs, captures (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/watches", noStore(requireCameraService(cfg, "site", handleSvcWatches(cfg))))
+	mux.HandleFunc("/api/cameras/watches/update", noStore(requireCameraService(cfg, "site", handleSvcWatchUpdate(cfg))))
+	mux.HandleFunc("/api/cameras/watches/delete", noStore(requireCameraService(cfg, "site", handleSvcWatchDelete(cfg))))
+	mux.HandleFunc("/api/cameras/watches/toggle", noStore(requireCameraService(cfg, "site", handleSvcWatchToggle(cfg))))
+	mux.HandleFunc("/api/cameras/watches/run", noStore(requireCameraService(cfg, "site", handleSvcWatchRun(cfg))))
+	mux.HandleFunc("/api/cameras/runs", noStore(requireCameraService(cfg, "site", handleSvcRuns(cfg))))
+	mux.HandleFunc("/api/cameras/runs/get", noStore(requireCameraService(cfg, "site", handleSvcRunGet(cfg))))
+	mux.HandleFunc("/api/cameras/captures", noStore(requireCameraService(cfg, "site", handleSvcCaptures(cfg))))
+
+	// Parity group C — API tools (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/apitools", noStore(requireCameraService(cfg, "site", handleSvcAPITools(cfg))))
+	mux.HandleFunc("/api/cameras/apitools/update", noStore(requireCameraService(cfg, "site", handleSvcAPIToolUpdate(cfg))))
+	mux.HandleFunc("/api/cameras/apitools/delete", noStore(requireCameraService(cfg, "site", handleSvcAPIToolDelete(cfg))))
+	mux.HandleFunc("/api/cameras/apitools/test", noStore(requireCameraService(cfg, "site", handleSvcAPIToolTest(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────

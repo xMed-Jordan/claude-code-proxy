@@ -1337,6 +1337,43 @@ func listCameraCaptures(db *sql.DB, watchRunID string) ([]camCapture, error) {
 	return out, rows.Err()
 }
 
+// listCameraCapturesBySite lists a site's captures newest-first — the service
+// API's site-wide recent-captures browser (the admin listCameraCaptures is
+// run-scoped). Captures carry site_id directly, so no join is needed. Optional
+// runID / cameraID narrow the result; both are already confined to the site by
+// the site_id predicate, so a foreign id simply yields no rows.
+func listCameraCapturesBySite(db *sql.DB, siteID, runID, cameraID string, limit int) ([]camCapture, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	q := `SELECT ` + camCaptureCols + ` FROM camera_captures WHERE site_id = ?`
+	args := []any{siteID}
+	if r := strings.TrimSpace(runID); r != "" {
+		q += ` AND watch_run_id = ?`
+		args = append(args, r)
+	}
+	if c := strings.TrimSpace(cameraID); c != "" {
+		q += ` AND camera_id = ?`
+		args = append(args, c)
+	}
+	q += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camCapture
+	for rows.Next() {
+		c, err := scanCapture(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // pinCameraCapture makes a served capture permanent: a blank expires_at is
 // exempt from every reaper path (deleteExpiredCameraCaptures / reapCameraMedia
 // filter on a non-blank expires_at, and handleCameraMedia serves a blank one
