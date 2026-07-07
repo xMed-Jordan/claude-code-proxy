@@ -1815,6 +1815,26 @@ func requeueCameraInvestigationFromRun(db *sql.DB, id string) (bool, error) {
 	return n == 1, nil
 }
 
+// cancelCameraInvestigation atomically closes a settled/queued investigation via a
+// compare-and-swap over the cancellable states (queued/awaiting_operator/answered/
+// exhausted), returning true only when THIS caller performed the close. 'running' is
+// deliberately excluded — the CAS never touches a row a worker owns, so cancelling a
+// live pass is out of scope — and 'closed' is excluded so a concurrent close is a lost
+// race (RowsAffected==0), not a double-close. Mirrors claimCameraInvestigation /
+// requeueCameraInvestigationFromRun.
+func cancelCameraInvestigation(db *sql.DB, id string) (bool, error) {
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'closed', updated_at = ?
+		WHERE id = ? AND status IN ('queued','awaiting_operator','answered','exhausted')`, nowRFC3339(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // listQueuedCameraInvestigations returns investigations awaiting a worker claim
 // (status='queued'), oldest-activity first so the queue is fair/FIFO.
 func listQueuedCameraInvestigations(db *sql.DB) ([]camInvestigation, error) {

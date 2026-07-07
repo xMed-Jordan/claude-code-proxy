@@ -1269,3 +1269,98 @@ func handleSvcPlaybookMediaDelete(cfg config) camSvcHandler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
+
+// ─────────────────────────── group G — site analyze ───────────────────────────
+// Mirrors handleCameraSiteAnalyze (camerahttp.go). The site is the token's own
+// (sc.SiteID), so there's no body id to decode; startSiteAnalysis flips the status
+// to "running" synchronously and runs the describe pass in the background. The
+// companion site-name update lives on handleSvcSite (POST {name?}) in
+// camera_serviceapi.go, next to the description/policy fields.
+
+// handleSvcSiteAnalyze serves POST /api/cameras/site/analyze {} →
+// {ok:true, started} (started=false when an analysis for this site is already
+// running) or {ok:false, error} when it can't start.
+func handleSvcSiteAnalyze(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		started, err := startSiteAnalysis(cfg, sc.SiteID)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		camlog("info", "svc_site_analyze", map[string]any{"site_id": sc.SiteID, "started": started})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started})
+	}
+}
+
+// ─────────────────────────── group I — investigation cancel ───────────────────────────
+// Closes a queued/settled investigation. Only the cancellable states
+// (queued/awaiting_operator/answered/exhausted) can be closed; a `running` pass is
+// refused ({ok:false}) — cooperative cancel of a live pass is deliberately out of
+// scope, and the CAS in cancelCameraInvestigation never touches a row a worker owns.
+// A won CAS means no worker will claim it (claimCameraInvestigation only claims from
+// 'queued') and the reply paths already refuse to reopen a `closed` row, so closing
+// is safe without cooperating with any live goroutine. NO settle webhook is fired.
+
+// handleSvcInvestigationCancel serves POST /api/cameras/investigations/cancel {id}.
+// Already-closed → {ok:true, status:"closed"} (idempotent); running →
+// {ok:false, error}; a successful close appends a system transcript note and returns
+// {ok:true, status:"closed"}. A cross-site (or missing) id is the uniform 404.
+func handleSvcInvestigationCancel(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if !camSvcDecode(w, r, &body) {
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		inv, gerr := getCameraInvestigation(db, strings.TrimSpace(body.ID))
+		if gerr != nil || inv.SiteID != sc.SiteID {
+			camSvcNotFound(w)
+			return
+		}
+		switch inv.Status {
+		case "closed":
+			// Idempotent: already in the terminal state the caller wants.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "closed"})
+			return
+		case "running":
+			// A worker owns the row; cooperative cancel of a live pass is out of scope.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is running — try again when it pauses"})
+			return
+		}
+		won, cerr := cancelCameraInvestigation(db, inv.ID)
+		if cerr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": cerr.Error()})
+			return
+		}
+		if !won {
+			// A concurrent transition (worker claim, operator reply, another cancel) moved
+			// the row out of the cancellable set between our read and the CAS — re-read and
+			// report the status that actually won, so the caller sees the true state.
+			cur, rerr := getCameraInvestigation(db, inv.ID)
+			if rerr != nil {
+				camSvcNotFound(w)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": cur.Status})
+			return
+		}
+		// Won the CAS: record why it closed (no settle webhook — cancel is not a settle).
+		camAppendInvestigateMessage(db, inv.ID, "system", "closed by service API", "", "", 0, nil)
+		camlog("info", "svc_investigate_cancel", map[string]any{"investigation_id": inv.ID, "site_id": sc.SiteID, "prev_status": inv.Status})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "closed"})
+	}
+}

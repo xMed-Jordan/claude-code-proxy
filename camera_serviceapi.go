@@ -715,6 +715,13 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	// Parity group B — playbook reference media (camera_serviceapi_parity.go).
 	mux.HandleFunc("/api/cameras/playbooks/media", noStore(requireCameraService(cfg, "site", handleSvcPlaybookMedia(cfg))))
 	mux.HandleFunc("/api/cameras/playbooks/media/delete", noStore(requireCameraService(cfg, "site", handleSvcPlaybookMediaDelete(cfg))))
+
+	// Parity group G — site analyze (camera_serviceapi_parity.go); the site-name
+	// update rides on handleSvcSite (POST {name?}) above.
+	mux.HandleFunc("/api/cameras/site/analyze", noStore(requireCameraService(cfg, "site", handleSvcSiteAnalyze(cfg))))
+
+	// Parity group I — investigation cancel (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/investigations/cancel", noStore(requireCameraService(cfg, "site", handleSvcInvestigationCancel(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────
@@ -941,7 +948,7 @@ func handleSvcUsage(cfg config) camSvcHandler {
 // playbook store funcs, ...).
 
 // handleSvcSite serves GET (siteJSON incl. analysis, policy and the resolved
-// role_vocabulary) / POST {description?, analysis_alias?, policy?} partial
+// role_vocabulary) / POST {name?, description?, analysis_alias?, policy?} partial
 // update on /api/cameras/site. policy carries the per-site custom person-role
 // labels ({custom_roles:[{slug,label,description}], notes}) — descriptive
 // vocabulary only, validated by camNormalizeSitePolicy.
@@ -962,12 +969,24 @@ func handleSvcSite(cfg config) camSvcHandler {
 			writeJSON(w, http.StatusOK, map[string]any{"site": siteJSON(site)})
 		case http.MethodPost:
 			var body struct {
+				Name          *string        `json:"name"`
 				Description   *string        `json:"description"`
 				AnalysisAlias *string        `json:"analysis_alias"`
 				Policy        *camSitePolicy `json:"policy"`
 			}
 			if !camSvcDecode(w, r, &body) {
 				return
+			}
+			// Name: present + non-blank renames the site; an explicit blank is a 400 (a
+			// site must always have a name). Checked before any write so a rejected name
+			// never leaves a partial update behind (same discipline as the policy check).
+			if body.Name != nil {
+				n := strings.TrimSpace(*body.Name)
+				if n == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name cannot be empty"})
+					return
+				}
+				site.Name = n
 			}
 			if body.Description != nil {
 				site.Description = strings.TrimSpace(*body.Description)
@@ -1501,8 +1520,11 @@ func handleSvcInvestigations(cfg config) camSvcHandler {
 }
 
 // handleSvcInvestigationGet serves GET /api/cameras/investigations/get?id= →
-// {investigation, messages}; media items additionally carry a bare `token`
-// field for machine fetch via /api/cameras/media/{token}.
+// {investigation, messages, children}; media items (on the top-level messages and
+// on each child's) additionally carry a bare `token` field for machine fetch via
+// /api/cameras/media/{token}. children mirrors the admin get: a lead run's
+// delegated sub-investigations (same-site by construction), each {investigation,
+// messages}, serialized with the token-augmenting svcInvestigateMessagesJSON.
 func handleSvcInvestigationGet(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		if r.Method != http.MethodGet {
@@ -1526,6 +1548,7 @@ func handleSvcInvestigationGet(cfg config) camSvcHandler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"investigation": investigationJSON(cfg, r, inv), "messages": svcInvestigateMessagesJSON(msgs),
+			"children": camInvestigationChildrenJSON(cfg, r, db, inv.ID, svcInvestigateMessagesJSON),
 		})
 	}
 }
