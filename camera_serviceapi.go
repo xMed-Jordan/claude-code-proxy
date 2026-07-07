@@ -1667,15 +1667,19 @@ func camExportReadyPayload(ex camExport, at time.Time) map[string]any {
 	return map[string]any{
 		"event":     "camera_export_ready",
 		"export_id": ex.ID,
-		"site_id":   ex.SiteID,
-		"status":    ex.Status,
-		"layout":    ex.Layout,
-		"from":      ex.FromTS,
-		"to":        ex.ToTS,
-		"links":     links,
-		"gaps":      gaps,
-		"error":     ex.Error,
-		"at":        at.UTC().Format(time.RFC3339),
+		// investigation_id ties an investigation-initiated export back to the
+		// conversation Connect tracked for that investigation ("" when the export
+		// was requested directly through the service API).
+		"investigation_id": ex.InvestigationID,
+		"site_id":          ex.SiteID,
+		"status":           ex.Status,
+		"layout":           ex.Layout,
+		"from":             ex.FromTS,
+		"to":               ex.ToTS,
+		"links":            links,
+		"gaps":             gaps,
+		"error":            ex.Error,
+		"at":               at.UTC().Format(time.RFC3339),
 	}
 }
 
