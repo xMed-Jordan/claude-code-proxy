@@ -157,7 +157,7 @@ func handleCameraEvents(cfg config) http.HandlerFunc {
 			return
 		}
 		defer db.Close()
-		events, eerr := listCameraEventsFiltered(db, dvrID, op, okFilter, limit)
+		events, eerr := listCameraEventsFiltered(db, "", dvrID, op, okFilter, limit)
 		if eerr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": eerr.Error()})
 			return
@@ -172,7 +172,13 @@ func handleCameraEvents(cfg config) http.HandlerFunc {
 // cases the WP11 baseline needed; the Diagnostics panel needs arbitrary
 // combinations, so this builds the WHERE clause dynamically instead of
 // stacking a third/fourth near-duplicate fixed helper there.
-func listCameraEventsFiltered(db *sql.DB, dvrID, op string, ok *bool, limit int) ([]camEvent, error) {
+//
+// camera_events has no site_id column, so a non-empty siteID restricts the
+// result to events whose dvr/camera/watch/run belongs to that site (via
+// subqueries). Events referencing nothing site-owned — or global rows — stay
+// invisible to a site token; that's intended. The admin caller passes "" for
+// the unfiltered view.
+func listCameraEventsFiltered(db *sql.DB, siteID, dvrID, op string, ok *bool, limit int) ([]camEvent, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -183,6 +189,13 @@ func listCameraEventsFiltered(db *sql.DB, dvrID, op string, ok *bool, limit int)
 		clauses []string
 		args    []any
 	)
+	if siteID != "" {
+		clauses = append(clauses, `(dvr_id IN (SELECT id FROM camera_dvrs WHERE site_id = ?)
+			OR camera_id IN (SELECT id FROM cameras WHERE site_id = ?)
+			OR watch_id IN (SELECT id FROM camera_watches WHERE site_id = ?)
+			OR run_id IN (SELECT id FROM camera_watch_runs WHERE site_id = ?))`)
+		args = append(args, siteID, siteID, siteID, siteID)
+	}
 	if dvrID != "" {
 		clauses = append(clauses, "dvr_id = ?")
 		args = append(args, dvrID)

@@ -1184,6 +1184,29 @@ func listCameraWatchRuns(db *sql.DB, watchID string, limit int) ([]camWatchRun, 
 	return out, rows.Err()
 }
 
+// listCameraWatchRunsBySite lists a site's watch runs newest-first, across every
+// watch — the service API's site-wide run browser (the admin listCameraWatchRuns
+// is per-watch or global). Runs carry site_id directly, so no join is needed.
+func listCameraWatchRunsBySite(db *sql.DB, siteID string, limit int) ([]camWatchRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.Query(`SELECT `+camRunCols+` FROM camera_watch_runs WHERE site_id = ? ORDER BY started_at DESC LIMIT ?`, siteID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camWatchRun
+	for rows.Next() {
+		r, err := scanWatchRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ─────────────────────────── camera_questions ───────────────────────────
 
 const camQuestionCols = `id, site_id, analysis_run_id, camera_ids, question, answer, status, asked_at, answered_at`

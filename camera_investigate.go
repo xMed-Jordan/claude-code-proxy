@@ -2336,16 +2336,18 @@ func handleCameraInvestigationGet(cfg config) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"investigation": investigationJSON(cfg, r, inv), "messages": investigateMessagesJSON(msgs),
-			"children": camInvestigationChildrenJSON(cfg, r, db, inv.ID),
+			"children": camInvestigationChildrenJSON(cfg, r, db, inv.ID, investigateMessagesJSON),
 		})
 	}
 }
 
 // camInvestigationChildrenJSON returns a lead run's delegated sub-investigations,
-// each as {investigation, messages}, in fan-out order — so the admin transcript
-// view can render the nested child timelines a delegate turn produced. Returns nil
-// (omitted-friendly) when the run delegated nothing.
-func camInvestigationChildrenJSON(cfg config, r *http.Request, db *sql.DB, parentID string) []map[string]any {
+// each as {investigation, messages}, in fan-out order — so the transcript view
+// can render the nested child timelines a delegate turn produced. Returns nil
+// (omitted-friendly) when the run delegated nothing. msgMapper controls how each
+// child's messages are serialized: the admin caller passes investigateMessagesJSON;
+// the service API passes svcInvestigateMessagesJSON so child media carry bare tokens.
+func camInvestigationChildrenJSON(cfg config, r *http.Request, db *sql.DB, parentID string, msgMapper func([]camInvestigationMessage) []map[string]any) []map[string]any {
 	children, err := listCameraInvestigationChildren(db, parentID)
 	if err != nil || len(children) == 0 {
 		return nil
@@ -2355,7 +2357,7 @@ func camInvestigationChildrenJSON(cfg config, r *http.Request, db *sql.DB, paren
 		cmsgs, _ := listCameraInvestigationMessages(db, ch.ID)
 		out = append(out, map[string]any{
 			"investigation": investigationJSON(cfg, r, ch),
-			"messages":      investigateMessagesJSON(cmsgs),
+			"messages":      msgMapper(cmsgs),
 		})
 	}
 	return out
