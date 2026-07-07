@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -132,6 +133,92 @@ func s3PutObjectPublic(ctx context.Context, cfg config, key string, body []byte,
 // camS3PublicURL is the anonymous, virtual-hosted URL of a public-read object.
 func camS3PublicURL(cfg config, key string) string {
 	return "https://" + s3Host(cfg) + "/" + s3EscapePath(key)
+}
+
+// camS3ExportKey is the object key for one evidence-export output file:
+// <prefix>exports/<site>/<export_id>/<name> where name already carries the
+// .mp4 extension (e.g. "grid.mp4", "01_<cameraID>.mp4"). Mirrors camS3ClipKey's
+// use of the initCameras-captured prefix.
+func camS3ExportKey(siteID, exportID, name string) string {
+	return cameraCfg.CameraS3Prefix + "exports/" + siteID + "/" + exportID + "/" + name
+}
+
+// s3UploadHTTPClient is the streaming-upload sibling of s3HTTPClient: same
+// verified-TLS transport, but with NO client-level Timeout. A multi-hundred-MB
+// evidence export can take minutes and the 20s whole-request cap on s3HTTPClient
+// would kill it; s3PutObjectPublicFile instead bounds each upload with a
+// size-scaled request context (the authoritative deadline).
+var s3UploadHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+}
+
+// s3PutObjectPublicFile streams a file from disk to S3 under a public-read canned
+// ACL and returns its public URL. Unlike s3PutObjectPublic it never buffers the
+// whole object in memory: it hashes the file once (SigV4 requires the payload
+// hash up front), rewinds, then hands the same *os.File as the request body with
+// an explicit ContentLength (S3 rejects chunked transfer encoding). The per-
+// request deadline scales at ~1s/MB, clamped to [2m, 20m], so a large upload is
+// not killed by a fixed timeout while a stuck one still cannot hang forever.
+func s3PutObjectPublicFile(ctx context.Context, cfg config, key, path, contentType string) (string, error) {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open export file: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat export file: %w", err)
+	}
+	size := fi.Size()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hash export file: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind export file: %w", err)
+	}
+	payloadHash := hex.EncodeToString(h.Sum(nil))
+
+	deadline := time.Duration(size/(1<<20)) * time.Second
+	if deadline < 2*time.Minute {
+		deadline = 2 * time.Minute
+	}
+	if deadline > 20*time.Minute {
+		deadline = 20 * time.Minute
+	}
+	cctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	rawURL := "https://" + s3Host(cfg) + "/" + s3EscapePath(key)
+	req, err := http.NewRequestWithContext(cctx, http.MethodPut, rawURL, f)
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = size // definite length — never chunked
+	req.Header.Set("Content-Type", contentType)
+	s3SignRequest(cfg, req, payloadHash, time.Now(), true)
+
+	resp, err := s3UploadHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("s3 upload %s: %w", key, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		io.Copy(io.Discard, resp.Body)
+		return camS3PublicURL(cfg, key), nil
+	}
+	return "", s3RespError("PUT(file)", key, resp)
 }
 
 // camS3ClipKey is the object key for an evidence clip:

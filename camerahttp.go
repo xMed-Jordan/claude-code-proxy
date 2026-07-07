@@ -71,6 +71,10 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/ui/api/cameras/investigations/reply", noStore(requireAdmin(cfg, handleCameraInvestigationReply(cfg))))
 	mux.HandleFunc("/ui/api/cameras/investigations/get", noStore(requireAdmin(cfg, handleCameraInvestigationGet(cfg))))
 
+	// Multi-camera evidence-video exports (camera_export.go): enqueue/list/get.
+	mux.HandleFunc("/ui/api/cameras/exports", noStore(requireAdmin(cfg, handleCameraExports(cfg))))
+	mux.HandleFunc("/ui/api/cameras/exports/get", noStore(requireAdmin(cfg, handleCameraExportGet(cfg))))
+
 	mux.HandleFunc("/ui/api/cameras/runs", noStore(requireAdmin(cfg, handleCameraRuns(cfg))))
 	mux.HandleFunc("/ui/api/cameras/runs/get", noStore(requireAdmin(cfg, handleCameraRunGet(cfg))))
 	mux.HandleFunc("/ui/api/cameras/captures", noStore(requireAdmin(cfg, handleCameraCaptures(cfg))))

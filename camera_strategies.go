@@ -224,14 +224,12 @@ Examples:
 	{
 		Name:      "how-to: package evidence for the operator",
 		WhenToUse: `wrapping up ANY investigation, or "send me the video"`,
-		// TODO(WS5): once the evidence_export tool ships, add it here as the mode
-		// for LONG windows / multi-camera compilations (sequential/grid/separate)
-		// delivered as permanent links; today only annotate + past_clip exist.
 		Instructions: `Goal: deliver proof the operator can act on — one evidence item per claim.
 
 Choose the right artifact:
 - annotate — circle the person/object in a SINGLE frame. Best for WHO/WHERE claims ("this is the person at 14:03").
-- past_clip — a continuous recording (up to ~5 minutes) of ONE camera. Best for ACTIONS the operator should watch unfold (the taking, the interaction, the arrival).
+- past_clip — a continuous recording (up to ~5 minutes) of ONE camera. Best for a SHORT ACTION the operator should watch unfold (the taking, the interaction, the arrival).
+- evidence_export — a BACKGROUND render of a LONG window (up to 60 minutes) and/or MULTIPLE cameras into permanent video link(s). Use it when the operator asks for "the full video", or the proof spans more than one camera or more than ~5 minutes. Pick the layout: "separate" (one video per camera — the safe default, keeps each camera's own on-screen clock), "sequential" (all cameras stitched back-to-back into one timeline), or "grid" (all cameras side-by-side in one synchronized wall). It returns immediately and the links reach the operator automatically — queue it, then finish the investigation and answer normally; do NOT wait for it.
 
 Rules:
 - Every factual claim in the answer needs its OWN evidence item with the exact timestamp.
@@ -241,7 +239,9 @@ Rules:
 Examples:
 - "Who took the phone?" — annotate the person plus past_clip the taking moment.
 - "Did the cleaner finish?" — one annotated frame per completed/missed task.
-- "What happened at the counter?" — past_clip the full interaction.`,
+- "What happened at the counter?" — past_clip the full interaction.
+- "Send me the full footage of the back entrance from 2 to 3pm" — evidence_export that camera over the hour, layout "separate".
+- "Give me everything the three lobby cameras saw during the incident" — evidence_export all three, layout "grid".`,
 	},
 }
 

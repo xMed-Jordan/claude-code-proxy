@@ -247,6 +247,23 @@ type config struct {
 	CameraAvatarMaxRefs            int           // PROXY_CAM_AVATAR_MAX_REFS — reference images per comparison (default 3)
 	CameraAvatarFindMaxVLM         int           // PROXY_CAM_AVATAR_FIND_MAX_VLM — VLM batches per avatar_find tool call (default 6)
 	CameraAvatarCandidateRetention time.Duration // PROXY_CAM_AVATAR_CANDIDATE_RETENTION — candidate media retention (default 168h)
+	// Multi-camera evidence video export (camera_export.go): a durable job queue
+	// that stitches recorded footage across cameras into sequential/grid/separate
+	// MP4s with camera+timestamp overlays and hands out permanent public S3 links.
+	CameraExportWorkerEnabled bool          // PROXY_CAM_EXPORT_WORKER — run the durable export queue (default true)
+	CameraExportConcurrency   int           // PROXY_CAM_EXPORT_CONCURRENCY — parallel exports (default 1)
+	CameraExportTickInterval  time.Duration // PROXY_CAM_EXPORT_TICK_INTERVAL — queue poll cadence (default 5s)
+	CameraExportMaxSeconds    int           // PROXY_CAM_EXPORT_MAX_SECONDS — export window cap (default 3600; camExportMaxSeconds hard-caps at 4h) — NOT the 300s clip cap
+	CameraExportMaxCameras    int           // PROXY_CAM_EXPORT_MAX_CAMERAS — cameras per export (default 6; grid hard-caps at 9)
+	CameraExportHeight        int           // PROXY_CAM_EXPORT_HEIGHT — normalized output height for sequential/separate (default 720)
+	CameraExportGridTileW     int           // PROXY_CAM_EXPORT_GRID_TILE_W — grid pane width (default 640)
+	CameraExportGridTileH     int           // PROXY_CAM_EXPORT_GRID_TILE_H — grid pane height (default 360)
+	CameraExportFPS           int           // PROXY_CAM_EXPORT_FPS — normalized output frame rate (default 15)
+	CameraExportCRF           int           // PROXY_CAM_EXPORT_CRF — libx264 quality (default 26)
+	CameraExportMaxBytes      int64         // PROXY_CAM_EXPORT_MAX_BYTES — ffmpeg -fs cap on the final encode (default 2GB)
+	CameraExportBudget        time.Duration // PROXY_CAM_EXPORT_BUDGET — wall-clock cap per export (default 7200s; camExportBudget hard-caps at 4h)
+	CameraExportFont          string        // PROXY_CAM_EXPORT_FONT — drawtext font file ("" → probe common Linux paths → skip the overlay)
+	CameraExportTmp           string        // PROXY_CAM_EXPORT_TMP — durable scratch root ("" → cameraMediaRoot(cfg)/export-tmp)
 	// Camera service API for Connect (camera_serviceapi.go): bearer-token
 	// /api/cameras/* routes plus the per-site investigation-settle webhook.
 	CameraServiceRate          int           // PROXY_CAMERA_SERVICE_RATE — service-token requests/min (default 120; media fetches 5x)
@@ -793,6 +810,21 @@ func loadConfig() config {
 		CameraAvatarMaxRefs:            parseIntDefault(getenv("PROXY_CAM_AVATAR_MAX_REFS", "3"), 3),
 		CameraAvatarFindMaxVLM:         parseIntDefault(getenv("PROXY_CAM_AVATAR_FIND_MAX_VLM", "6"), 6),
 		CameraAvatarCandidateRetention: parseAgyTimeout(getenv("PROXY_CAM_AVATAR_CANDIDATE_RETENTION", "604800")), // 168h
+
+		CameraExportWorkerEnabled: envFlag("PROXY_CAM_EXPORT_WORKER", true),
+		CameraExportConcurrency:   parseIntDefault(getenv("PROXY_CAM_EXPORT_CONCURRENCY", "1"), 1),
+		CameraExportTickInterval:  parseAgyTimeout(getenv("PROXY_CAM_EXPORT_TICK_INTERVAL", "5")),
+		CameraExportMaxSeconds:    parseIntDefault(getenv("PROXY_CAM_EXPORT_MAX_SECONDS", "3600"), 3600),
+		CameraExportMaxCameras:    parseIntDefault(getenv("PROXY_CAM_EXPORT_MAX_CAMERAS", "6"), 6),
+		CameraExportHeight:        parseIntDefault(getenv("PROXY_CAM_EXPORT_HEIGHT", "720"), 720),
+		CameraExportGridTileW:     parseIntDefault(getenv("PROXY_CAM_EXPORT_GRID_TILE_W", "640"), 640),
+		CameraExportGridTileH:     parseIntDefault(getenv("PROXY_CAM_EXPORT_GRID_TILE_H", "360"), 360),
+		CameraExportFPS:           parseIntDefault(getenv("PROXY_CAM_EXPORT_FPS", "15"), 15),
+		CameraExportCRF:           parseIntDefault(getenv("PROXY_CAM_EXPORT_CRF", "26"), 26),
+		CameraExportMaxBytes:      parseByteSize(getenv("PROXY_CAM_EXPORT_MAX_BYTES", "2GB"), 2<<30),
+		CameraExportBudget:        parseAgyTimeout(getenv("PROXY_CAM_EXPORT_BUDGET", "7200")),
+		CameraExportFont:          strings.TrimSpace(getenv("PROXY_CAM_EXPORT_FONT", "")),
+		CameraExportTmp:           strings.TrimSpace(getenv("PROXY_CAM_EXPORT_TMP", "")),
 
 		CameraServiceRate:          parseIntDefault(getenv("PROXY_CAMERA_SERVICE_RATE", "120"), 120),
 		CameraCallbackAllowPrivate: envFlag("PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE", false),

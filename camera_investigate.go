@@ -115,6 +115,7 @@ type investigateArgs struct {
 	Time      string          `json:"time"`       // avatar_check / annotate: RFC3339 archive instant
 	BBox      json.RawMessage `json:"bbox"`       // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
 	EventType string          `json:"event_type"` // motion_search: optional exact event-type filter (VMD | linedetection | …)
+	Layout    string          `json:"layout"`     // evidence_export: "sequential" | "grid" | "separate" (default separate)
 }
 
 // evidenceItem is one media artifact cited in a final answer: a served
@@ -126,7 +127,7 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate", "evidence_export"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
@@ -502,6 +503,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("  Then past_frames the specific numbered cells (quality \"main\") to confirm/read detail. Frames of the same person seconds apart are ONE entry, not several.\n")
 	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use to SEE a window directly, or to zoom into the exact times a contact_sheet flagged.\n")
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
+	b.WriteString("- evidence_export: args.camera_ids (one OR MORE), args.from + args.to (RFC3339 — may span up to 60 minutes, NOT limited to the 300s clip cap), args.layout \"sequential\"|\"grid\"|\"separate\", args.quality — queues a BACKGROUND evidence-video export across those cameras; permanent public video link(s) are delivered to the operator automatically when ready. Returns IMMEDIATELY — do NOT wait for it or re-check it; keep investigating / answer normally. Costs no media budget.\n")
 	b.WriteString("- motion_search: args.camera_ids (optional, default = all cameras), args.from + args.to (RFC3339, required), args.event_type (optional exact type) — queries the DVR MOTION LOG and returns the exact times motion/line-cross/intrusion episodes occurred, WITHOUT pulling any footage (costs no media budget). Use FIRST to find WHEN activity happened, then past_frames/contact_sheet/avatar_check those exact windows — don't brute-scan.\n")
 	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS or INVESTIGATION METHODS) — returns that\n")
 	b.WriteString("  procedure's full instructions plus any operator-approved reference images (shown to you next turn). Costs no media budget.\n")
@@ -568,7 +570,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|ask_operator|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
+	b.WriteString(`  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate|evidence_export","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids from the roster above. Reply with ONLY the JSON object.")
@@ -982,8 +984,10 @@ type investigateToolResult struct {
 // implementation. tool is assumed already normalized by parseInvestigateAction
 // (one of investigateToolNames); the default case is defensive. alias is the
 // run's analysis alias, threaded to the tools that make their own VLM sub-calls
-// (avatar_check / avatar_find).
-func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int) investigateToolResult {
+// (avatar_check / avatar_find). invID is the running investigation's id, threaded
+// to tools that enqueue durable side-jobs owned by this investigation
+// (evidence_export).
+func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias, invID, tool string, args investigateArgs, camByID map[string]camera, dvrByID map[string]CamDVR, allowed map[string]bool, active []camera, scratch string, mediaLeft int) investigateToolResult {
 	switch tool {
 	case "roster":
 		return investigateToolResult{Summary: "Camera roster:\n" + camBuildRoster(active)}
@@ -1013,6 +1017,8 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 		return camToolAvatarFind(ctx, cfg, db, r, site, alias, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "annotate":
 		return camToolAnnotate(ctx, cfg, db, r, site, args, camByID, allowed, scratch)
+	case "evidence_export":
+		return camToolEvidenceExport(cfg, db, site, invID, args, allowed)
 	default:
 		return investigateToolResult{Summary: fmt.Sprintf("unknown tool %q — no action taken.", tool)}
 	}
@@ -1813,7 +1819,7 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			if mediaLeft <= 0 {
 				tr = investigateToolResult{Summary: "Media fetch budget for this investigation is exhausted — answer with the evidence already gathered, or ask the operator."}
 			} else {
-				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, alias, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
+				tr = camExecuteInvestigateTool(cctx, cfg, db, r, site, alias, invID, act.Action.Tool, args, camByID, dvrByID, allowed, active, scratch, mediaLeft)
 			}
 			mediaUsed += tr.Fetches
 			camlog("info", "investigate_tool", map[string]any{

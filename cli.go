@@ -123,6 +123,7 @@ func runServe() error {
 	startCameraArchiver(cfg)            // start the S3 frame archiver (guarded by CameraArchiveEnabled + camS3Enabled)
 	startCameraInvestigationWorker(cfg) // run the durable Ask-AI investigation queue (guarded by CameraInvestigateWorkerEnabled)
 	startCameraAvatarScanWorker(cfg)    // run the durable avatar enrollment-scan queue (guarded by CameraAvatarScanWorkerEnabled)
+	startCameraExportWorker(cfg)        // run the durable multi-camera evidence-video export queue (guarded by CameraExportWorkerEnabled)
 	startCameraMotionListeners(cfg)     // run the DVR motion-alert listeners + history pruner (guarded by CameraMotionEnabled)
 	proxyEnabled.Store(true)
 	startAutoUpdateWatcher(cfg)

@@ -613,6 +613,8 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/investigations", noStore(requireCameraService(cfg, "site", handleSvcInvestigations(cfg))))
 	mux.HandleFunc("/api/cameras/investigations/get", noStore(requireCameraService(cfg, "site", handleSvcInvestigationGet(cfg))))
 	mux.HandleFunc("/api/cameras/investigations/reply", noStore(requireCameraService(cfg, "site", handleSvcInvestigationReply(cfg))))
+	mux.HandleFunc("/api/cameras/exports", noStore(requireCameraService(cfg, "site", handleSvcExports(cfg))))
+	mux.HandleFunc("/api/cameras/exports/get", noStore(requireCameraService(cfg, "site", handleSvcExportGet(cfg))))
 	mux.HandleFunc("/api/cameras/avatars", noStore(requireCameraService(cfg, "site", handleSvcAvatars(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/update", noStore(requireCameraService(cfg, "site", handleSvcAvatarUpdate(cfg))))
 	mux.HandleFunc("/api/cameras/avatars/delete", noStore(requireCameraService(cfg, "site", handleSvcAvatarDelete(cfg))))
@@ -1503,6 +1505,156 @@ func handleSvcInvestigationReply(cfg config) camSvcHandler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": out.ID, "status": out.Status})
 	}
+}
+
+// ─────────────────────────── evidence exports ───────────────────────────
+
+// handleSvcExports serves /api/cameras/exports (site scope): GET lists this
+// site's exports newest-first; POST {camera_ids, from, to, layout?, quality?}
+// enqueues a durable multi-camera evidence-video export and returns the queued
+// row. Mirrors handleSvcAvatarScan's shape; the heavy validation lives in the
+// shared camExportCreateFromBody core.
+func handleSvcExports(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		switch r.Method {
+		case http.MethodGet:
+			exports, lerr := listCameraExports(db, sc.SiteID)
+			if lerr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": lerr.Error()})
+				return
+			}
+			if limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit"))); limit > 0 && len(exports) > limit {
+				exports = exports[:limit]
+			}
+			out := make([]map[string]any, 0, len(exports))
+			for _, ex := range exports {
+				out = append(out, cameraExportJSON(cfg, r, ex))
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"exports": out})
+		case http.MethodPost:
+			var body struct {
+				CameraIDs []string `json:"camera_ids"`
+				From      string   `json:"from"`
+				To        string   `json:"to"`
+				Layout    string   `json:"layout"`
+				Quality   string   `json:"quality"`
+			}
+			if !camSvcDecode(w, r, &body) {
+				return
+			}
+			ex, cerr := camExportCreateFromBody(cfg, db, sc.SiteID, body.CameraIDs, body.From, body.To, body.Layout, body.Quality)
+			if cerr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": cerr.Error()})
+				return
+			}
+			camlog("info", "svc_export_create", map[string]any{"export_id": ex.ID, "site_id": sc.SiteID, "layout": ex.Layout})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "export": cameraExportJSON(cfg, r, ex)})
+		default:
+			camSvcMethodNotAllowed(w)
+		}
+	}
+}
+
+// handleSvcExportGet serves GET /api/cameras/exports/get?id= → {export} (404 on
+// a cross-site id, uniform with every other site-scoped lookup).
+func handleSvcExportGet(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if id == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id is required"})
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		ex, gerr := getCameraExport(db, id)
+		if gerr != nil || ex.SiteID != sc.SiteID {
+			camSvcNotFound(w)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"export": cameraExportJSON(cfg, r, ex)})
+	}
+}
+
+// camExportReadyPayload builds the camera_export_ready webhook body from an
+// export row — pure over its input so it is unit-testable. links is one entry per
+// produced MP4 (permanent url + caption + bytes); gaps flattens the per-camera
+// download gaps from the progress checkpoint so the operator learns exactly which
+// windows had no recording.
+func camExportReadyPayload(ex camExport, at time.Time) map[string]any {
+	outs := camExportParseOutputs(ex.Outputs)
+	links := make([]map[string]any, 0, len(outs))
+	for _, o := range outs {
+		links = append(links, map[string]any{
+			"camera_id": o.CameraID, "label": o.Label, "url": o.S3URL,
+			"caption": o.Caption, "bytes": o.Bytes, "content_type": o.ContentType,
+		})
+	}
+	prog := camExportParseProgress(ex.Progress)
+	gaps := make([]map[string]any, 0)
+	for camID, cp := range prog.Cameras {
+		if cp == nil {
+			continue
+		}
+		for _, g := range cp.Gaps {
+			gf, gt, _ := strings.Cut(g, "/")
+			gaps = append(gaps, map[string]any{"camera_id": camID, "from": gf, "to": gt})
+		}
+	}
+	return map[string]any{
+		"event":     "camera_export_ready",
+		"export_id": ex.ID,
+		"site_id":   ex.SiteID,
+		"status":    ex.Status,
+		"layout":    ex.Layout,
+		"from":      ex.FromTS,
+		"to":        ex.ToTS,
+		"links":     links,
+		"gaps":      gaps,
+		"error":     ex.Error,
+		"at":        at.UTC().Format(time.RFC3339),
+	}
+}
+
+// camNotifyExportReady delivers the camera_export_ready webhook for a terminal
+// export (done | failed) to the site's registered callback, with retries. Always
+// spawned `go ...`; a site with no callback is a cheap no-op.
+func camNotifyExportReady(cfg config, exportID string) {
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		camlog("warn", "export_callback", map[string]any{"export_id": exportID, "ok": false, "error": err.Error()})
+		return
+	}
+	ex, gerr := getCameraExport(db, exportID)
+	if gerr != nil {
+		db.Close()
+		camlog("warn", "export_callback", map[string]any{"export_id": exportID, "ok": false, "error": gerr.Error()})
+		return
+	}
+	cb, cerr := getCameraSiteCallback(db, ex.SiteID)
+	db.Close()
+	if cerr != nil || !cb.Enabled || strings.TrimSpace(cb.URL) == "" {
+		return // no registered callback — cheap no-op
+	}
+	body, merr := json.Marshal(camExportReadyPayload(ex, time.Now()))
+	if merr != nil {
+		camlog("error", "export_callback", map[string]any{"export_id": exportID, "ok": false, "error": merr.Error()})
+		return
+	}
+	camPostSignedCallback(cfg, cb, body, "export_callback", map[string]any{
+		"export_id": exportID, "site_id": ex.SiteID, "status": ex.Status,
+	})
 }
 
 // ─────────────────────────── avatars ───────────────────────────

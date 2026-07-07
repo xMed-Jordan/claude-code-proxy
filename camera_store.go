@@ -445,6 +445,29 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_candidates_scan ON camera_avatar_candidates(scan_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_avatar_candidates_avatar ON camera_avatar_candidates(avatar_id, status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_avatar_candidates_uniq ON camera_avatar_candidates(scan_id, camera_id, frame_ts)`,
+		// ── Multi-camera evidence video export (camera_export.go): a durable job
+		// queue (cloned from the avatar-scan queue's shape) that stitches recorded
+		// footage across cameras into sequential/grid/separate MP4s and delivers
+		// permanent public S3 links. progress/outputs are JSON checkpoints so a
+		// crash-requeued run resumes past finished chunks.
+		`CREATE TABLE IF NOT EXISTS camera_exports (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			investigation_id TEXT NOT NULL DEFAULT '',
+			camera_ids TEXT NOT NULL,
+			from_ts TEXT NOT NULL,
+			to_ts TEXT NOT NULL,
+			layout TEXT NOT NULL DEFAULT 'separate',
+			quality TEXT NOT NULL DEFAULT 'main',
+			status TEXT NOT NULL DEFAULT 'queued',
+			progress TEXT NOT NULL DEFAULT '',
+			outputs TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_exports_site ON camera_exports(site_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_exports_status ON camera_exports(status)`,
 		// ── Service API for Connect: bearer tokens (stored hashed) + per-site settle
 		// webhooks (camera_serviceapi.go).
 		`CREATE TABLE IF NOT EXISTS camera_service_tokens (
