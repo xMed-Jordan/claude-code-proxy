@@ -819,6 +819,12 @@ func (r *camExportRun) fail(msg string, start time.Time) error {
 	r.prog.Note = strings.TrimSpace(strings.TrimPrefix(r.prog.Note+"; "+msg, "; "))
 	r.saveProgress()
 	_ = setCameraExportStatus(r.db, r.ex.ID, "failed", msg)
+	// Reclaim the scratch dir on the TERMINAL-fail path exactly as finish() does on
+	// success. "failed" is terminal (the reaper only re-runs "running" rows), so this
+	// run never resumes and the jobdir — up to several GB of downloaded/normalized
+	// footage — would otherwise linger until camExportSweepOrphans' 48h cutoff, letting
+	// repeated failures (e.g. bad S3 creds surfacing only at upload) fill the disk.
+	_ = os.RemoveAll(r.jobdir)
 	camlog("error", "export", map[string]any{
 		"export_id": r.ex.ID, "status": "failed", "error": msg, "latency_ms": time.Since(start).Milliseconds(),
 	})
@@ -1083,8 +1089,25 @@ func (r *camExportRun) finish(ctx context.Context, outputs []camExportOutput, st
 	if err := setCameraExportOutputs(r.db, r.ex.ID, mustJSON(final)); err != nil {
 		return r.fail("record outputs: "+err.Error(), start)
 	}
-	if err := setCameraExportStatus(r.db, r.ex.ID, "done", ""); err != nil {
-		return err // leave "running"; the reaper re-runs (idempotent — S3 objects overwrite)
+	// The run has fully SUCCEEDED here — outputs persisted, every file uploaded to S3.
+	// Only the terminal status write remains, so a transient failure must NOT be
+	// reported as a failed export: propagating the error makes camConsiderExport call
+	// camTerminalizeExport, which sets status="failed" while the payload still carries
+	// the valid permanent S3 links (a self-contradictory camera_export_ready webhook).
+	// Retry briefly, then leave the row "running" and return nil so the stale-running
+	// reaper re-runs idempotently (S3 objects overwrite) instead of terminalizing.
+	var derr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if derr = setCameraExportStatus(r.db, r.ex.ID, "done", ""); derr == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if derr != nil {
+		camlog("error", "export", map[string]any{
+			"export_id": r.ex.ID, "status": "done_write_failed", "error": derr.Error(),
+		})
+		return nil // leave "running"; the reaper re-runs (idempotent — S3 objects overwrite)
 	}
 	_ = os.RemoveAll(r.jobdir)
 

@@ -509,6 +509,22 @@ var camSvcRL = struct {
 	buckets map[string]*camSvcBucket
 }{buckets: map[string]*camSvcBucket{}}
 
+// camSvcRLMaxBuckets caps the rate-limiter map. The PUBLIC view/media routes key it
+// on unauthenticated, caller-supplied tokens (camera_investigate_view.go), so without
+// a ceiling an attacker spraying unique tokens — each still inserted even while being
+// 429'd — grows the map without bound until the process OOMs. When the map reaches
+// this size a new key first reaps idle (fully-refilled, hence stateless) buckets; if
+// that frees nothing the new key is DENIED rather than inserted, so the map can never
+// exceed the bound. Denying an unknown key just means "rate limited" — the safe
+// failure mode under an active flood. The legitimate footprint (authenticated service
+// tokens + a bucket per active view/IP) stays far below this.
+const camSvcRLMaxBuckets = 50000
+
+// camSvcRLIdle is how long a bucket must be untouched to be reap-eligible: a bucket
+// refills to full within a minute, after which it holds no rate-limiting state and is
+// indistinguishable from never having existed, so dropping it is free.
+const camSvcRLIdle = 2 * time.Minute
+
 // camSvcRateAllow spends one request from key's bucket (refill perMin/minute,
 // cap perMin). perMin <= 0 disables limiting.
 func camSvcRateAllow(key string, perMin float64) bool {
@@ -520,6 +536,13 @@ func camSvcRateAllow(key string, perMin float64) bool {
 	defer camSvcRL.Unlock()
 	b, ok := camSvcRL.buckets[key]
 	if !ok {
+		// Bound the map before inserting a possibly attacker-chosen key.
+		if len(camSvcRL.buckets) >= camSvcRLMaxBuckets {
+			camSvcRLReapLocked(now)
+			if len(camSvcRL.buckets) >= camSvcRLMaxBuckets {
+				return false // full of live buckets → fail safe (rate limited)
+			}
+		}
 		b = &camSvcBucket{tokens: perMin, last: now}
 		camSvcRL.buckets[key] = b
 	}
@@ -533,6 +556,17 @@ func camSvcRateAllow(key string, perMin float64) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// camSvcRLReapLocked drops every bucket idle for at least camSvcRLIdle (fully
+// refilled, so stateless). Caller holds the lock. O(n), but only runs when the map is
+// already at its cap, so its cost is amortized against the flood that grew it there.
+func camSvcRLReapLocked(now time.Time) {
+	for k, b := range camSvcRL.buckets {
+		if now.Sub(b.last) >= camSvcRLIdle {
+			delete(camSvcRL.buckets, k)
+		}
+	}
 }
 
 var camSvcLastUsed = struct {

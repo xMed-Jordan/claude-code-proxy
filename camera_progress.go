@@ -225,16 +225,27 @@ func (n *camProgressNotifier) flushLocked() {
 	n.pending = nil
 	n.lastSent = time.Now()
 
-	var evidence []map[string]any
-	if db, err := openProxyDB(n.cfg); err == nil {
-		evidence = camProgressEvidence(n.cfg, db, items, camProgressEvidenceMax)
-		db.Close()
-	} else {
-		evidence = camProgressEvidence(n.cfg, nil, items, camProgressEvidenceMax)
-	}
-	p := n.basePayload("media")
-	p["evidence"] = evidence
-	n.deliver(p)
+	// Enrich + deliver OFF the mutex. camProgressEvidence opens a DB handle and issues
+	// up to camProgressEvidenceMax capture point-reads, each of which can wait on
+	// busy_timeout (seconds) under write contention. Holding n.mu across that would
+	// stall the lead loop AND every sub-investigator — the delegate threads the SAME
+	// notifier to all of them, so up to CameraSubagentConcurrency children plus the
+	// lead all serialize on n.mu. The buffer swap above already made this flush's work
+	// self-contained (basePayload reads only fields fixed at construction), so the
+	// heavy part is safe to run detached; deliver() dispatches the POST on its own
+	// goroutine as before.
+	go func() {
+		var evidence []map[string]any
+		if db, err := openProxyDB(n.cfg); err == nil {
+			evidence = camProgressEvidence(n.cfg, db, items, camProgressEvidenceMax)
+			db.Close()
+		} else {
+			evidence = camProgressEvidence(n.cfg, nil, items, camProgressEvidenceMax)
+		}
+		p := n.basePayload("media")
+		p["evidence"] = evidence
+		n.deliver(p)
+	}()
 }
 
 // camProgressEvidence maps buffered media items to settle-shaped evidence entries

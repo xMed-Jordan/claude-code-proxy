@@ -1841,17 +1841,29 @@ func appendCameraInvestigationMessage(db *sql.DB, m camInvestigationMessage) (st
 	if m.CreatedAt == "" {
 		m.CreatedAt = nowRFC3339()
 	}
-	if m.Seq <= 0 {
-		var maxSeq sql.NullInt64
-		_ = db.QueryRow(`SELECT MAX(seq) FROM camera_investigation_messages WHERE investigation_id = ?`, m.InvestigationID).Scan(&maxSeq)
-		m.Seq = int(maxSeq.Int64) + 1
-	}
-	_, err := db.Exec(`INSERT INTO camera_investigation_messages
-		(id, investigation_id, seq, role, content, tool_name, tool_args, media_json, fetches, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.InvestigationID, m.Seq, m.Role, m.Content, m.ToolName, m.ToolArgs, m.MediaJSON, m.Fetches, m.CreatedAt)
-	if err != nil {
-		return "", err
+	if m.Seq > 0 {
+		// Caller pinned an explicit seq — insert it verbatim.
+		if _, err := db.Exec(`INSERT INTO camera_investigation_messages
+			(id, investigation_id, seq, role, content, tool_name, tool_args, media_json, fetches, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.ID, m.InvestigationID, m.Seq, m.Role, m.Content, m.ToolName, m.ToolArgs, m.MediaJSON, m.Fetches, m.CreatedAt); err != nil {
+			return "", err
+		}
+	} else {
+		// Auto-assign the next seq ATOMICALLY by folding MAX(seq)+1 into the INSERT so
+		// the read and the write execute inside one write-locked statement. A separate
+		// `SELECT MAX(seq)` then `INSERT` races two writers into a DUPLICATE seq under
+		// WAL — the live run loop and a detached evidence_export goroutine append to the
+		// same transcript through separate *sql.DB handles, and only the INSERTs (not the
+		// MAX reads) serialize. SQLite runs one writer at a time, so a single INSERT…SELECT
+		// sees every prior committed row and cannot collide.
+		if _, err := db.Exec(`INSERT INTO camera_investigation_messages
+			(id, investigation_id, seq, role, content, tool_name, tool_args, media_json, fetches, created_at)
+			SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?
+			FROM camera_investigation_messages WHERE investigation_id = ?`,
+			m.ID, m.InvestigationID, m.Role, m.Content, m.ToolName, m.ToolArgs, m.MediaJSON, m.Fetches, m.CreatedAt, m.InvestigationID); err != nil {
+			return "", err
+		}
 	}
 	_, _ = db.Exec(`UPDATE camera_investigations SET updated_at = ? WHERE id = ?`, nowRFC3339(), m.InvestigationID)
 	return m.ID, nil

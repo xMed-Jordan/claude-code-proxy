@@ -83,7 +83,10 @@ func handleCameraInvestigationView(cfg config) http.HandlerFunc {
 			return
 		}
 		ip := clientIP(r)
-		if !camSvcRateAllow("view:"+token, camViewPageRatePerMin) || !camSvcRateAllow("viewip:"+ip, camViewPageRatePerMin) {
+		// Per-IP FIRST: clientIP is the real TCP peer (unspoofable), so a flooding IP
+		// is 429'd before the `||` ever evaluates the token bucket — that short-circuit
+		// keeps an attacker's unique-token spray from minting a fresh bucket per request.
+		if !camSvcRateAllow("viewip:"+ip, camViewPageRatePerMin) || !camSvcRateAllow("view:"+token, camViewPageRatePerMin) {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -143,7 +146,9 @@ func camServeViewMedia(cfg config, w http.ResponseWriter, r *http.Request, viewT
 		return
 	}
 	ip := clientIP(r)
-	if !camSvcRateAllow("viewmedia:"+viewToken, camViewMediaRatePerMin) || !camSvcRateAllow("viewmediaip:"+ip, camViewMediaRatePerMin) {
+	// Per-IP FIRST so a flooding IP short-circuits before the token bucket is touched
+	// (see handleCameraInvestigationView) — bounds attacker-controlled map growth.
+	if !camSvcRateAllow("viewmediaip:"+ip, camViewMediaRatePerMin) || !camSvcRateAllow("viewmedia:"+viewToken, camViewMediaRatePerMin) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}

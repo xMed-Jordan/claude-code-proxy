@@ -1776,7 +1776,13 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	// event ships before the run's settle webhook, on EVERY exit path.
 	prog := newCamProgressNotifier(cfg, db, inv, r)
 	defer prog.Flush(true)
-	if turnsSoFar == 0 {
+	// Fire the one-time "started" event only on a genuinely fresh start. turnsSoFar==0
+	// alone is NOT that signal: a pass that fails on its very first analysis call
+	// persists no "ai" row (only a budget-free auto_requeue note), so a resumed pass
+	// still reconstructs turnsSoFar==0 and would re-announce on every never-die requeue.
+	// A prior auto_requeue in the transcript proves this run already started, so also
+	// require a zero requeue streak (reset by any real "ai" turn or operator reply).
+	if turnsSoFar == 0 && camCountAutoRequeues(msgs) == 0 {
 		prog.Start(inv.Question) // one-time "started" event (carries the view_url)
 	}
 
@@ -2058,12 +2064,23 @@ func camTerminalizeInvestigation(cfg config, id, note string) {
 // It LOOP-DRAINS the never-die self-requeues: camDeferInvestigation flips a stuck
 // pass back to "queued" (running→queued) rather than terminalizing, so with no
 // background worker to re-claim it, we must re-claim and re-run here or the row
-// would strand in "queued". Bounded by the same auto-requeue cap the loop enforces
-// (plus one slot for the final terminal pass); the status check ends the drain the
-// moment the run reaches any non-queued state (answered / awaiting_operator /
-// exhausted), so the streak cap inside camDeferInvestigation is the real limiter.
+// would strand in "queued". The status check ends the drain the moment the run
+// reaches any non-queued state (answered / awaiting_operator / exhausted).
+//
+// The iteration cap must match the run's TRUE terminal bound, not the auto-requeue
+// streak cap: a budget-limited pass that made real progress persists an "ai" turn,
+// which RESETS the zero-progress streak (camCountAutoRequeues) every time, so the
+// streak never trips and camDeferInvestigation keeps requeuing. What actually ends
+// such a run is the cumulative turn cap inside runInvestigation. So a legitimately
+// progressing multi-pass investigation needs up to maxTurns progressing passes
+// (each adds ≥1 "ai" turn, capped by maxTurns) plus maxAutoRequeues zero-progress
+// passes before it terminalizes; bound the drain by that sum (+1 for the final
+// terminal pass). Capping at maxAutoRequeues alone would exit with the row still
+// "queued" and, with the worker disabled, nothing left to re-claim it — a permanent
+// "queued" zombie that never settles and rejects every operator follow-up.
 func camRunInvestigationInline(db *sql.DB, cfg config, r *http.Request, id string) {
-	for i := 0; i <= camInvestigateMaxAutoRequeues(cfg); i++ {
+	maxPasses := camInvestigateMaxTurns(cfg) + camInvestigateMaxAutoRequeues(cfg) + 1
+	for i := 0; i < maxPasses; i++ {
 		claimed, cerr := claimCameraInvestigation(db, id)
 		if cerr != nil || !claimed {
 			return // never queued, already terminal, or the worker won the claim
