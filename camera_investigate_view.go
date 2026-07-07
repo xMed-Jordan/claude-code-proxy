@@ -355,6 +355,29 @@ const camInvestigationViewHTML = `<!doctype html>
   #foot { margin-top: 24px; color: #7d8590; font-size: 13px; text-align: center; }
   .spin { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #58a6ff; margin-right: 6px; animation: pulse 1.2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  .media-click { position: relative; cursor: zoom-in; }
+  .media-click:hover { border-color: #388bfd; }
+  .play-badge {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 34px; color: #fff; text-shadow: 0 1px 10px #000; pointer-events: none;
+  }
+  #lb { position: fixed; inset: 0; z-index: 50; background: rgba(4,8,14,.93); display: flex; flex-direction: column; }
+  #lb[hidden] { display: none; }
+  #lb-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 14px; }
+  #lb-stage img, #lb-stage video { max-width: 100%; max-height: 100%; border-radius: 8px; box-shadow: 0 8px 40px rgba(0,0,0,.6); }
+  .lb-btn {
+    position: absolute; z-index: 51; width: 42px; height: 42px; border-radius: 999px;
+    background: #161b22cc; border: 1px solid #30363d; color: #e6edf3; font-size: 22px;
+    line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  }
+  .lb-btn:hover { background: #21262d; border-color: #388bfd; }
+  #lb-close { top: 12px; right: 12px; }
+  #lb-prev { left: 10px; top: 50%; transform: translateY(-50%); }
+  #lb-next { right: 10px; top: 50%; transform: translateY(-50%); }
+  #lb-bar { padding: 8px 60px 18px; text-align: center; color: #adbac7; font-size: 13px; }
+  #lb-count { color: #7d8590; margin-right: 10px; }
+  #lb-open { color: #58a6ff; margin-left: 10px; text-decoration: none; }
+  #lb-open:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -367,6 +390,13 @@ const camInvestigationViewHTML = `<!doctype html>
   <main id="transcript"></main>
   <section id="children"></section>
   <div id="foot"></div>
+</div>
+<div id="lb" hidden>
+  <button class="lb-btn" id="lb-close" aria-label="Close">&#10005;</button>
+  <button class="lb-btn" id="lb-prev" aria-label="Previous">&#8249;</button>
+  <div id="lb-stage"></div>
+  <button class="lb-btn" id="lb-next" aria-label="Next">&#8250;</button>
+  <div id="lb-bar"><span id="lb-count"></span><span id="lb-cap"></span><a id="lb-open" target="_blank" rel="noopener">open file &#8599;</a></div>
 </div>
 <script>
 (function () {
@@ -401,6 +431,10 @@ const camInvestigationViewHTML = `<!doctype html>
     return "System";
   }
 
+  // Every non-expired media tile joins the page-wide gallery (parent + children,
+  // DOM order) so the viewer can step through the whole investigation's evidence.
+  var gallery = [];
+
   function makeMedia(m) {
     var box = document.createElement("div");
     box.className = "media";
@@ -412,10 +446,13 @@ const camInvestigationViewHTML = `<!doctype html>
       return box;
     }
     var ct = m.content_type || "";
+    var isVideo = ct.indexOf("video/") === 0;
     var node;
-    if (ct.indexOf("video/") === 0) {
+    if (isVideo) {
+      // The tile shows the first frame; playback happens in the viewer where
+      // there is room for it — a play badge signals the click.
       node = document.createElement("video");
-      node.controls = true; node.preload = "metadata";
+      node.preload = "metadata"; node.muted = true; node.playsInline = true;
     } else {
       node = document.createElement("img");
       node.loading = "lazy"; node.alt = m.caption || "evidence";
@@ -426,16 +463,84 @@ const camInvestigationViewHTML = `<!doctype html>
       ph.className = "media-expired";
       ph.textContent = "evidence unavailable";
       if (node.parentNode) node.parentNode.replaceChild(ph, node);
+      box.className = "media";
     });
     box.appendChild(node);
+    if (isVideo) {
+      var play = document.createElement("div");
+      play.className = "play-badge";
+      play.textContent = "▶";
+      box.appendChild(play);
+    }
     if (m.caption) {
       var cap = document.createElement("div");
       cap.className = "cap";
       cap.textContent = m.caption;
       box.appendChild(cap);
     }
+    var idx = gallery.length;
+    gallery.push({ url: m.url, content_type: ct, caption: m.caption || "" });
+    box.className = "media media-click";
+    box.addEventListener("click", function () { lbShow(idx); });
     return box;
   }
+
+  // ── Media viewer (lightbox) ──
+  var lbIndex = -1;
+  var lbEl = {
+    root: document.getElementById("lb"),
+    stage: document.getElementById("lb-stage"),
+    cap: document.getElementById("lb-cap"),
+    count: document.getElementById("lb-count"),
+    open: document.getElementById("lb-open"),
+    close: document.getElementById("lb-close"),
+    prev: document.getElementById("lb-prev"),
+    next: document.getElementById("lb-next")
+  };
+
+  function lbShow(i) {
+    if (!gallery.length) return;
+    lbIndex = ((i % gallery.length) + gallery.length) % gallery.length;
+    var m = gallery[lbIndex];
+    lbEl.stage.textContent = "";
+    var node;
+    if ((m.content_type || "").indexOf("video/") === 0) {
+      node = document.createElement("video");
+      node.controls = true; node.autoplay = true; node.playsInline = true;
+    } else {
+      node = document.createElement("img");
+      node.alt = m.caption || "evidence";
+    }
+    node.src = m.url;
+    lbEl.stage.appendChild(node);
+    lbEl.cap.textContent = m.caption;
+    lbEl.count.textContent = (lbIndex + 1) + " / " + gallery.length;
+    lbEl.open.href = m.url;
+    lbEl.prev.style.display = gallery.length > 1 ? "" : "none";
+    lbEl.next.style.display = gallery.length > 1 ? "" : "none";
+    lbEl.root.hidden = false;
+    document.body.style.overflow = "hidden";
+  }
+
+  function lbClose() {
+    lbEl.root.hidden = true;
+    lbEl.stage.textContent = ""; // detaches any playing video
+    document.body.style.overflow = "";
+    lbIndex = -1;
+  }
+
+  lbEl.close.addEventListener("click", lbClose);
+  lbEl.prev.addEventListener("click", function () { lbShow(lbIndex - 1); });
+  lbEl.next.addEventListener("click", function () { lbShow(lbIndex + 1); });
+  lbEl.root.addEventListener("click", function (e) {
+    if (e.target === lbEl.root || e.target === lbEl.stage) lbClose();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (lbEl.root.hidden) return;
+    if (e.key === "Escape") lbClose();
+    else if (e.key === "ArrowLeft") lbShow(lbIndex - 1);
+    else if (e.key === "ArrowRight") lbShow(lbIndex + 1);
+  });
 
   function makeTurn(t) {
     var row = document.createElement("div");
@@ -496,11 +601,15 @@ const camInvestigationViewHTML = `<!doctype html>
   }
 
   function render(state) {
+    // Rebuild the gallery alongside the DOM: the transcript is append-only, so
+    // indexes already handed to open tiles (and the open viewer) stay valid.
+    gallery = [];
     el.site.textContent = state.site_name || "";
     el.question.textContent = state.question || "Investigation";
     badge(el.status, state.status);
     renderTurns(el.transcript, state.turns);
     renderChildren(state.children);
+    if (lbIndex >= 0) lbEl.count.textContent = (lbIndex + 1) + " / " + gallery.length;
   }
 
   function schedule(status) {
