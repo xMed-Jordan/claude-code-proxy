@@ -15,11 +15,16 @@ package main
 // equivalents except the deliberate deltas noted in the doc.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -858,5 +863,409 @@ func handleSvcAPIToolTest(cfg config) camSvcHandler {
 			"tool_id": t.ID, "tool": t.Name, "site_id": sc.SiteID, "host": host, "status": status, "latency_ms": latency, "resp_bytes": len(respBody),
 		})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status, "response": respBody})
+	}
+}
+
+// ─────────────────────────── group A — on-demand clip ───────────────────────────
+// Mirrors handleCameraClip (camerahttp.go): a live clip (Seconds from now) when
+// From/To are blank, otherwise a past-playback clip for [From,To]. site_id comes
+// from the token via the camSvcCamera gate; a getCameraDVR miss collapses to the
+// uniform camSvcNotFound. The response augments the admin shape with a bare
+// media_token like handleSvcSnapshot so Connect can machine-fetch the clip via
+// GET /api/cameras/media/{token} without parsing the URL.
+
+// handleSvcClip serves POST /api/cameras/clip {id, quality?, seconds?, from?, to?} →
+// {ok:true, media_token, url, content_type:"video/mp4", bytes} (or {ok:false,error}
+// on a disabled DVR / no recording / capture failure; 400 on a bad RFC3339 window;
+// 404 for a cross-site id).
+func handleSvcClip(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		var body struct {
+			ID      string `json:"id"`
+			Quality string `json:"quality"`
+			Seconds int    `json:"seconds"` // live clip length when From/To are empty
+			From    string `json:"from"`    // RFC3339 — playback window start
+			To      string `json:"to"`      // RFC3339 — playback window end
+		}
+		if !camSvcDecode(w, r, &body) {
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		cam, ok := camSvcCamera(db, w, body.ID, sc.SiteID)
+		if !ok {
+			return
+		}
+		dvr, derr := getCameraDVR(db, cfg, cam.DVRID)
+		if derr != nil {
+			camSvcNotFound(w)
+			return
+		}
+		if !dvr.Enabled {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "dvr is disabled"})
+			return
+		}
+		q := StreamMain
+		if strings.EqualFold(strings.TrimSpace(body.Quality), "sub") {
+			q = StreamSub
+		}
+
+		scratch, serr := os.MkdirTemp("", "camsvcclip-")
+		if serr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+			return
+		}
+		defer os.RemoveAll(scratch)
+		dest := filepath.Join(scratch, "clip.mp4")
+
+		ctx, cancel := context.WithTimeout(r.Context(), camClipRequestTimeout(cfg))
+		defer cancel()
+
+		var (
+			res          captureResult
+			cerr         error
+			fromTS, toTS string
+		)
+		fromRaw, toRaw := strings.TrimSpace(body.From), strings.TrimSpace(body.To)
+		if fromRaw != "" || toRaw != "" {
+			from, ferr := time.Parse(time.RFC3339, fromRaw)
+			to, terr := time.Parse(time.RFC3339, toRaw)
+			if ferr != nil || terr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from/to must be RFC3339 timestamps"})
+				return
+			}
+			fromTS, toTS = from.Format(time.RFC3339), to.Format(time.RFC3339)
+			res, cerr = capturePlaybackClip(ctx, cfg, dvr, cam.Channel, q, from, to, dest)
+		} else {
+			res, cerr = captureLiveClip(ctx, cfg, dvr, cam.Channel, q, body.Seconds, dest)
+		}
+		if cerr != nil {
+			if errors.Is(cerr, errNoRecording) {
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "no recording found in that time window"})
+				return
+			}
+			// capturePlaybackClip/captureLiveClip already camlog'd the masked command + full ffmpeg stderr.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": cerr.Error()})
+			return
+		}
+		token, perr := camPersistCapture(db, cfg, "", cam.SiteID, cam.ID, "clip", q.String(), res.Path, "video/mp4", 0, 0, fromTS, toTS)
+		if perr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "media_token": token, "url": camMediaURL(cfg, r, token),
+			"content_type": "video/mp4", "bytes": res.Bytes,
+		})
+	}
+}
+
+// ─────────────────────────── group F — diagnostics ───────────────────────────
+// Mirrors handleCameraHealth / handleCameraEvents / handleCameraRecapture
+// (camera_diag.go), scoped to sc.SiteID. Health drops the ffmpeg/ffprobe `bin`
+// absolute-path fields (server-local paths don't belong in a tenant response);
+// events runs through the site-filtered listCameraEventsFiltered; recapture
+// gates the camera, then hands off to the same handler-agnostic snapshot/clip
+// funcs the admin path uses so the reproduction (and its masked-command
+// diagnostic block) is byte-identical.
+
+// handleSvcHealth serves GET /api/cameras/health → ffmpeg/ffprobe presence+version
+// (no `bin` paths) plus this site's per-DVR reachability summary.
+func handleSvcHealth(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		ffmpegOK, ffmpegVer, ffprobeOK, ffprobeVer := cameraBinaryStatus(cfg)
+		dvrs, derr := listCameraDVRViews(db, sc.SiteID)
+		if derr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": derr.Error()})
+			return
+		}
+		out := make([]map[string]any, 0, len(dvrs))
+		for _, d := range dvrs {
+			out = append(out, camDVRHealthJSON(db, d))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": cfg.CameraEnabled,
+			// Deliberate delta vs handleCameraHealth: the `bin` absolute paths are
+			// omitted — server-local filesystem paths don't belong in a tenant response.
+			"ffmpeg":  map[string]any{"ok": ffmpegOK, "version": ffmpegVer},
+			"ffprobe": map[string]any{"ok": ffprobeOK, "version": ffprobeVer},
+			"dvrs":    out,
+		})
+	}
+}
+
+// handleSvcEvents serves GET /api/cameras/events?limit=&dvr_id=&op=&ok= → the
+// site-filtered diagnostics trail (events referencing nothing site-owned are
+// invisible). A dvr_id, when given, is gated through camSvcDVR first (uniform 404).
+func handleSvcEvents(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodGet {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		q := r.URL.Query()
+		limit := parseIntDefault(q.Get("limit"), 100)
+		dvrID := strings.TrimSpace(q.Get("dvr_id"))
+		op := strings.TrimSpace(q.Get("op"))
+		var okFilter *bool
+		if raw := strings.TrimSpace(q.Get("ok")); raw != "" {
+			b, perr := strconv.ParseBool(raw)
+			if perr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "ok must be true or false"})
+				return
+			}
+			okFilter = &b
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		if dvrID != "" {
+			dvr, ok := camSvcDVR(db, cfg, w, dvrID, sc.SiteID)
+			if !ok {
+				return
+			}
+			dvrID = dvr.ID
+		}
+		events, eerr := listCameraEventsFiltered(db, sc.SiteID, dvrID, op, okFilter, limit)
+		if eerr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": eerr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": camEventsJSON(events)})
+	}
+}
+
+// handleSvcRecapture serves POST /api/cameras/recapture — re-run a single
+// snapshot/clip capture for one owned camera and return the masked command +
+// full ffmpeg stderr + (on success) the capture token/URL. Decodes the same body
+// as handleCameraRecapture, gates the camera through camSvcCamera, then hands off
+// to the shared handleCameraRecaptureSnapshot/handleCameraRecaptureClip so the
+// response (incl. the diagnostic block) is identical to the admin path.
+func handleSvcRecapture(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		var body struct {
+			CameraID string `json:"camera_id"`
+			Kind     string `json:"kind"`    // "snapshot" (default) | "clip"
+			Quality  string `json:"quality"` // "main" (default) | "sub"
+			Seconds  int    `json:"seconds"` // live clip length when Kind=="clip" and From/To are blank
+			From     string `json:"from"`    // RFC3339 — playback window start (clip only)
+			To       string `json:"to"`      // RFC3339 — playback window end (clip only)
+		}
+		if !camSvcDecode(w, r, &body) {
+			return
+		}
+		kind := strings.ToLower(strings.TrimSpace(body.Kind))
+		if kind == "" {
+			kind = "snapshot"
+		}
+		if kind != "snapshot" && kind != "clip" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "kind must be snapshot or clip"})
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		cam, ok := camSvcCamera(db, w, body.CameraID, sc.SiteID)
+		if !ok {
+			return
+		}
+		dvr, derr := getCameraDVR(db, cfg, cam.DVRID)
+		if derr != nil {
+			camSvcNotFound(w)
+			return
+		}
+		if !dvr.Enabled {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "dvr is disabled"})
+			return
+		}
+		q := StreamMain
+		if strings.EqualFold(strings.TrimSpace(body.Quality), "sub") {
+			q = StreamSub
+		}
+		scratch, serr := os.MkdirTemp("", "camsvcrecap-")
+		if serr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+			return
+		}
+		defer os.RemoveAll(scratch)
+		if kind == "clip" {
+			handleCameraRecaptureClip(w, r, cfg, db, cam, dvr, q, scratch, body.Seconds, body.From, body.To)
+			return
+		}
+		handleCameraRecaptureSnapshot(w, r, cfg, db, cam, dvr, q, scratch)
+	}
+}
+
+// ─────────────────────────── group B — playbook reference media ───────────────────────────
+// Mirrors handleCameraPlaybookMedia / handleCameraPlaybookMediaDelete
+// (camera_playbooks.go). Every path is gated through camSvcPlaybook so a
+// cross-site playbook resolves to the uniform 404. The attach path adds a
+// service-only cpt.SiteID == sc.SiteID check that returns the IDENTICAL 400 body
+// as a missing/expired capture, so a cross-site capture token can't be probed.
+
+// handleSvcPlaybookMedia serves GET (list) / POST (attach) on
+// /api/cameras/playbooks/media, both gated by camSvcPlaybook.
+func handleSvcPlaybookMedia(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		switch r.Method {
+		case http.MethodGet:
+			pbID := strings.TrimSpace(r.URL.Query().Get("playbook_id"))
+			if pbID == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "playbook_id is required"})
+				return
+			}
+			pb, ok := camSvcPlaybook(db, w, pbID, sc.SiteID)
+			if !ok {
+				return
+			}
+			rowsM, lerr := listCameraPlaybookMedia(db, pb.ID)
+			if lerr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": lerr.Error()})
+				return
+			}
+			out := make([]map[string]any, 0, len(rowsM))
+			for _, m := range rowsM {
+				ct := ""
+				if cpt, cerr := getCameraCaptureByToken(db, m.CaptureToken); cerr == nil {
+					ct = cpt.ContentType
+				}
+				out = append(out, cameraPlaybookMediaJSON(cfg, r, m, ct))
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"media": out})
+		case http.MethodPost:
+			var body struct {
+				PlaybookID string `json:"playbook_id"`
+				Token      string `json:"token"`
+				Note       string `json:"note"`
+			}
+			if !camSvcDecode(w, r, &body) {
+				return
+			}
+			pbID := strings.TrimSpace(body.PlaybookID)
+			token := strings.TrimSpace(body.Token)
+			if pbID == "" || token == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "playbook_id and token are required"})
+				return
+			}
+			pb, ok := camSvcPlaybook(db, w, pbID, sc.SiteID)
+			if !ok {
+				return
+			}
+			// Attach validation: the capture row must exist, its file must still be
+			// on disk, it must not be expired, AND it must belong to this site. A
+			// cross-site token returns the IDENTICAL body as missing/expired so the
+			// token namespace can't be probed for existence across sites.
+			const unavailable = "capture no longer available — re-run the setup investigation"
+			cpt, cerr := getCameraCaptureByToken(db, token)
+			if cerr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+				return
+			}
+			if _, serr := os.Stat(cpt.Path); serr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+				return
+			}
+			if cpt.ExpiresAt != "" && cpt.ExpiresAt <= nowRFC3339() {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+				return
+			}
+			if cpt.SiteID != sc.SiteID {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+				return
+			}
+			if perr := pinCameraCapture(db, token); perr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+				return
+			}
+			m := camPlaybookMedia{
+				PlaybookID:   pb.ID,
+				CaptureToken: token,
+				Note:         strings.TrimSpace(body.Note),
+				CreatedAt:    nowRFC3339(),
+			}
+			id, ierr := insertCameraPlaybookMedia(db, m)
+			if ierr != nil {
+				// Undo the pin we just took if the row could not be recorded.
+				camReleaseCaptureIfUnreferenced(db, cfg, token)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": ierr.Error()})
+				return
+			}
+			m.ID = id
+			camlog("info", "svc_playbook_media_attach", map[string]any{"playbook_id": pb.ID, "media_id": id, "site_id": sc.SiteID, "kind": cpt.Kind})
+			resp := map[string]any{"ok": true, "media": cameraPlaybookMediaJSON(cfg, r, m, cpt.ContentType)}
+			if cfg.CameraMediaDir == "" {
+				resp["warning"] = "PROXY_CAM_MEDIA_DIR is not set — reference images live in a temp directory"
+			}
+			writeJSON(w, http.StatusOK, resp)
+		default:
+			camSvcMethodNotAllowed(w)
+		}
+	}
+}
+
+// handleSvcPlaybookMediaDelete serves POST /api/cameras/playbooks/media/delete
+// {id} → {ok}. Ownership runs through the parent playbook (camSvcPlaybook), so a
+// media row on another site's playbook is a uniform 404.
+func handleSvcPlaybookMediaDelete(cfg config) camSvcHandler {
+	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
+		if r.Method != http.MethodPost {
+			camSvcMethodNotAllowed(w)
+			return
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if !camSvcDecode(w, r, &body) {
+			return
+		}
+		db := camSvcOpenDB(cfg, w)
+		if db == nil {
+			return
+		}
+		defer db.Close()
+		m, gerr := getCameraPlaybookMedia(db, strings.TrimSpace(body.ID))
+		if gerr != nil {
+			camSvcNotFound(w)
+			return
+		}
+		if _, ok := camSvcPlaybook(db, w, m.PlaybookID, sc.SiteID); !ok {
+			return
+		}
+		if derr := deleteCameraPlaybookMedia(db, m.ID); derr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": derr.Error()})
+			return
+		}
+		camReleaseCaptureIfUnreferenced(db, cfg, m.CaptureToken)
+		camlog("info", "svc_playbook_media_delete", map[string]any{"playbook_id": m.PlaybookID, "media_id": m.ID, "site_id": sc.SiteID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }

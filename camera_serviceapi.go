@@ -703,6 +703,18 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/apitools/update", noStore(requireCameraService(cfg, "site", handleSvcAPIToolUpdate(cfg))))
 	mux.HandleFunc("/api/cameras/apitools/delete", noStore(requireCameraService(cfg, "site", handleSvcAPIToolDelete(cfg))))
 	mux.HandleFunc("/api/cameras/apitools/test", noStore(requireCameraService(cfg, "site", handleSvcAPIToolTest(cfg))))
+
+	// Parity group A — on-demand clip (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/clip", noStore(requireCameraService(cfg, "site", handleSvcClip(cfg))))
+
+	// Parity group F — diagnostics (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/health", noStore(requireCameraService(cfg, "site", handleSvcHealth(cfg))))
+	mux.HandleFunc("/api/cameras/events", noStore(requireCameraService(cfg, "site", handleSvcEvents(cfg))))
+	mux.HandleFunc("/api/cameras/recapture", noStore(requireCameraService(cfg, "site", handleSvcRecapture(cfg))))
+
+	// Parity group B — playbook reference media (camera_serviceapi_parity.go).
+	mux.HandleFunc("/api/cameras/playbooks/media", noStore(requireCameraService(cfg, "site", handleSvcPlaybookMedia(cfg))))
+	mux.HandleFunc("/api/cameras/playbooks/media/delete", noStore(requireCameraService(cfg, "site", handleSvcPlaybookMediaDelete(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────
