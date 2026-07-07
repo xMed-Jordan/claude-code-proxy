@@ -1611,6 +1611,27 @@ func claimCameraInvestigation(db *sql.DB, id string) (bool, error) {
 	return n == 1, nil
 }
 
+// requeueCameraInvestigationFromRun atomically returns a still-running investigation
+// to "queued" so the worker (or the inline drain) re-claims and RESUMES it — the
+// never-die counterpart to a terminal camStopInvestigation, driven by
+// camDeferInvestigation when a pass runs out of budget or hits an analysis wall. It
+// is a compare-and-swap (mirrors claimCameraInvestigation): the flip lands only
+// while the row is genuinely "running", so a lost race with the stale-reaper or a
+// concurrent terminal write can never double-transition it. Returns true only when
+// THIS caller performed the flip.
+func requeueCameraInvestigationFromRun(db *sql.DB, id string) (bool, error) {
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
+		WHERE id = ? AND status = 'running'`, nowRFC3339(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // listQueuedCameraInvestigations returns investigations awaiting a worker claim
 // (status='queued'), oldest-activity first so the queue is fair/FIFO.
 func listQueuedCameraInvestigations(db *sql.DB) ([]camInvestigation, error) {

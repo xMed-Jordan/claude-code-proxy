@@ -17,8 +17,10 @@ package main
 //     reused from camera_store_test.go).
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // ─────────────────────── camBuildRoster ───────────────────────
@@ -537,5 +539,224 @@ func TestMigrateCameraDBInvestigationTablesIdempotent(t *testing.T) {
 		if cnt != 1 {
 			t.Errorf("index %q count = %d, want exactly 1 after triple migration", idx, cnt)
 		}
+	}
+}
+
+// ─────────────────────── never-die loop bounds / clamps ───────────────────────
+
+func TestCamInvestigateBoundsClamps(t *testing.T) {
+	// Turn cap: default 12, clamped to 1..60 (raised from 30 for the never-die loop).
+	if got := camInvestigateMaxTurns(config{}); got != 12 {
+		t.Errorf("maxTurns default = %d, want 12", got)
+	}
+	if got := camInvestigateMaxTurns(config{CameraInvestigateMaxTurns: 999}); got != 60 {
+		t.Errorf("maxTurns clamp = %d, want 60", got)
+	}
+	// Budget ceiling raised 1h → 4h.
+	if got := camInvestigateBudget(config{CameraInvestigateBudget: 10 * time.Hour}); got != 4*time.Hour {
+		t.Errorf("budget ceiling = %v, want 4h", got)
+	}
+	// Auto-requeue cap: default 5, clamp 1..20.
+	if got := camInvestigateMaxAutoRequeues(config{}); got != 5 {
+		t.Errorf("maxAutoRequeues default = %d, want 5", got)
+	}
+	if got := camInvestigateMaxAutoRequeues(config{CameraInvestigateMaxRequeues: 999}); got != 20 {
+		t.Errorf("maxAutoRequeues clamp-high = %d, want 20", got)
+	}
+	if got := camInvestigateMaxAutoRequeues(config{CameraInvestigateMaxRequeues: -3}); got != 5 {
+		t.Errorf("maxAutoRequeues clamp-low = %d, want 5 (default)", got)
+	}
+	// Image cap: default 8, clamp 1..24.
+	if got := camAnalyzeMaxImages(config{}); got != 8 {
+		t.Errorf("maxImages default = %d, want 8", got)
+	}
+	if got := camAnalyzeMaxImages(config{CameraAnalyzeMaxImages: 999}); got != 24 {
+		t.Errorf("maxImages clamp = %d, want 24", got)
+	}
+}
+
+// ─────────────────────── never-die: image cap downsample ───────────────────────
+
+func TestCamCapImages(t *testing.T) {
+	mk := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = string(rune('a' + i))
+		}
+		return out
+	}
+	// Under the cap: returned unchanged (same backing slice).
+	in := mk(5)
+	if got := camCapImages(in, 8); !reflect.DeepEqual(got, in) {
+		t.Errorf("under-cap = %v, want unchanged %v", got, in)
+	}
+	if got := camCapImages(in, 5); !reflect.DeepEqual(got, in) {
+		t.Errorf("exactly-cap = %v, want unchanged", got)
+	}
+	// Over the cap: endpoints kept, monotonic, exactly `max` items, no repeats.
+	got := camCapImages(mk(24), 8)
+	if len(got) != 8 {
+		t.Fatalf("len = %d, want 8", len(got))
+	}
+	if got[0] != "a" || got[7] != string(rune('a'+23)) {
+		t.Errorf("endpoints = %q..%q, want first+last kept", got[0], got[7])
+	}
+	seen := map[string]bool{}
+	for _, v := range got {
+		if seen[v] {
+			t.Errorf("duplicate frame %q in %v", v, got)
+		}
+		seen[v] = true
+	}
+	// max==1 keeps a single (most-recent) frame.
+	if got := camCapImages(mk(10), 1); len(got) != 1 || got[0] != string(rune('a'+9)) {
+		t.Errorf("max==1 = %v, want single last frame", got)
+	}
+	// max<=0 is a no-op passthrough.
+	if got := camCapImages(in, 0); !reflect.DeepEqual(got, in) {
+		t.Errorf("max<=0 = %v, want unchanged", got)
+	}
+}
+
+// ─────────────────────── never-die: auto-requeue streak counting ───────────────────────
+
+func TestCamCountAutoRequeues(t *testing.T) {
+	sysReq := camInvestigationMessage{Role: "system", ToolName: "auto_requeue"}
+	sysRetry := camInvestigationMessage{Role: "system", ToolName: "analysis_retry"}
+	ai := camInvestigationMessage{Role: "ai", ToolName: "roster"}
+	op := camInvestigationMessage{Role: "operator"}
+	tool := camInvestigationMessage{Role: "tool", ToolName: "roster"}
+
+	cases := []struct {
+		name string
+		msgs []camInvestigationMessage
+		want int
+	}{
+		{"none", []camInvestigationMessage{op, ai, tool}, 0},
+		{"three_in_a_row", []camInvestigationMessage{sysReq, sysReq, sysReq}, 3},
+		{"ai_turn_resets", []camInvestigationMessage{sysReq, sysReq, ai, sysReq}, 1},
+		{"operator_reply_resets", []camInvestigationMessage{sysReq, op, sysReq}, 1},
+		{"analysis_retry_never_counts", []camInvestigationMessage{sysRetry, sysReq, sysRetry}, 1},
+		{"tool_row_does_not_reset", []camInvestigationMessage{sysReq, tool, sysReq}, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := camCountAutoRequeues(c.msgs); got != c.want {
+				t.Errorf("streak = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestCamCountInvestigateProgressIgnoresSystemNotes guards the invariant the
+// never-die breadcrumbs (analysis_retry / auto_requeue system rows) rely on:
+// system rows are budget-free, so appending them can never burn a turn or a media
+// fetch against the loop's cumulative caps.
+func TestCamCountInvestigateProgressIgnoresSystemNotes(t *testing.T) {
+	msgs := []camInvestigationMessage{
+		{Role: "operator", Content: "q"},
+		{Role: "system", ToolName: "analysis_retry", Content: "retried"},
+		{Role: "ai", ToolName: "past_frames", Content: "looking"},
+		{Role: "tool", ToolName: "past_frames", Fetches: 3},
+		{Role: "system", ToolName: "auto_requeue", Content: "resuming"},
+		{Role: "system", Content: "some other note"},
+	}
+	turns, media := camCountInvestigateProgress(msgs)
+	if turns != 1 || media != 3 {
+		t.Errorf("progress = (turns=%d, media=%d), want (1, 3) — system rows must not count", turns, media)
+	}
+}
+
+// ─────────────────────── never-die: CAS requeue + defer ───────────────────────
+
+func TestRequeueCameraInvestigationFromRun(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	id, err := insertCameraInvestigation(db, camInvestigation{SiteID: "s1", Question: "q", Status: "running"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// running → queued flips exactly once.
+	ok, err := requeueCameraInvestigationFromRun(db, id)
+	if err != nil || !ok {
+		t.Fatalf("first requeue = (%v, %v), want (true, nil)", ok, err)
+	}
+	inv, _ := getCameraInvestigation(db, id)
+	if inv.Status != "queued" {
+		t.Fatalf("status after requeue = %q, want queued", inv.Status)
+	}
+	// Now that it is queued, the CAS is a no-op (not running).
+	if ok, err := requeueCameraInvestigationFromRun(db, id); err != nil || ok {
+		t.Fatalf("requeue from queued = (%v, %v), want (false, nil)", ok, err)
+	}
+	// And from a terminal state.
+	if err := setCameraInvestigationStatus(db, id, "exhausted"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+	if ok, err := requeueCameraInvestigationFromRun(db, id); err != nil || ok {
+		t.Fatalf("requeue from exhausted = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+func TestCamDeferInvestigation(t *testing.T) {
+	// cfg.DBPath matches the test DB so the terminal path's async settle callback
+	// (camStopInvestigation spawns camNotifyInvestigationSettled) reuses this file
+	// instead of creating a stray one; open via openProxyDB so the sync handle and
+	// the async goroutine share the same WAL/busy-timeout DSN. Cap the streak at 2.
+	cfg := config{DBPath: filepath.Join(t.TempDir(), ".proxy.db"), CameraInvestigateMaxRequeues: 2}
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+
+	newRunning := func() string {
+		id, err := insertCameraInvestigation(db, camInvestigation{SiteID: "s1", Question: "q", Status: "running"})
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		return id
+	}
+
+	// Below the cap (streak 0+1=1 ≤ 2): appends an auto_requeue note and flips to queued.
+	id := newRunning()
+	if err := camDeferInvestigation(db, cfg, id, "budget exhausted.", nil); err != nil {
+		t.Fatalf("defer below cap: %v", err)
+	}
+	inv, _ := getCameraInvestigation(db, id)
+	if inv.Status != "queued" {
+		t.Errorf("status = %q, want queued (below cap)", inv.Status)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, id)
+	if n := camCountAutoRequeues(msgs); n != 1 {
+		t.Errorf("auto_requeue streak = %d, want 1", n)
+	}
+
+	// At the cap: with a transcript already carrying 2 auto_requeue rows, the next
+	// deferral (streak 2+1=3 > 2) terminalizes to exhausted with a give-up note.
+	id2 := newRunning()
+	priorStreak := []camInvestigationMessage{
+		{Role: "system", ToolName: "auto_requeue"},
+		{Role: "system", ToolName: "auto_requeue"},
+	}
+	if err := camDeferInvestigation(db, cfg, id2, "analysis failed.", priorStreak); err != nil {
+		t.Fatalf("defer at cap: %v", err)
+	}
+	inv2, _ := getCameraInvestigation(db, id2)
+	if inv2.Status != "exhausted" {
+		t.Errorf("status = %q, want exhausted (at cap)", inv2.Status)
+	}
+	msgs2, _ := listCameraInvestigationMessages(db, id2)
+	if len(msgs2) == 0 {
+		t.Fatalf("expected a give-up system note")
+	}
+	last := msgs2[len(msgs2)-1]
+	if last.Role != "system" || last.ToolName == "auto_requeue" {
+		t.Errorf("last note = %+v, want a terminal (non-auto_requeue) system row", last)
 	}
 }

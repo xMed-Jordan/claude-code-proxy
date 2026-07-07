@@ -245,7 +245,9 @@ func camToolAvatarCheck(ctx context.Context, cfg config, db *sql.DB, r *http.Req
 
 	tsLabel := ft.In(loc).Format(time.RFC3339)
 	sys, user := camAvatarCheckPrompt(av, nRefs, camDisplayName(c), tsLabel, fw, fh)
-	out, aerr := analyzeWithAlias(ctx, cfg, alias, sys, user, attach)
+	// Resilient analysis (retry/failover/timeout-raise); the existing summary carries
+	// any failure text, so the per-attempt trail is discarded here.
+	out, _, aerr := camResilientAnalyze(ctx, cfg, alias, sys, user, attach)
 	if aerr != nil {
 		return investigateToolResult{Summary: "avatar_check: comparison analysis failed: " + aerr.Error(), Fetches: 2}
 	}
@@ -498,7 +500,9 @@ func camToolAvatarFind(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 			fw, fh := avToolImageDims(batch[0].data)
 			sys := camAvatarScanSystemPrompt(av, len(refCopies) > 0, fw, fh)
 			user := avFindUserText(av, len(refCopies), lines)
-			out, aerr := analyzeWithAlias(ctx, cfg, alias, sys, user, attach)
+			// Resilient analysis (retry/failover/timeout-raise); the per-attempt trail
+			// is discarded — analysisErr below already surfaces any terminal failure.
+			out, _, aerr := camResilientAnalyze(ctx, cfg, alias, sys, user, attach)
 			vlmCalls++
 			if aerr != nil {
 				analysisErr = aerr.Error()

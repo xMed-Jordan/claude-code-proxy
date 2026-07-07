@@ -28,20 +28,27 @@ package main
 // tool-action JSON contract. WP1 (this commit) fills runInvestigation and the
 // four HTTP handlers with the real agentic loop.
 //
-// BOUNDS: max turns (PROXY_CAMERA_INVESTIGATE_MAX_TURNS, default 12, hard cap 30),
+// BOUNDS: max turns (PROXY_CAMERA_INVESTIGATE_MAX_TURNS, default 12, hard cap 60),
 // max media fetches (PROXY_CAMERA_INVESTIGATE_MAX_MEDIA, default 30, counted in
 // DVR device fetches), and a wall-clock budget (PROXY_CAMERA_INVESTIGATE_BUDGET,
-// default 360s) applied as a context deadline for THIS call only — time spent
-// paused on ask_operator waiting for the operator never counts against it. Turn/
-// media counts are cumulative within a single RUN, reconstructed from the persisted
-// transcript each call (camCountInvestigateProgress). A run pauses only on
+// default 1800s, hard cap 4h) applied as a context deadline for ONE PASS only —
+// time spent paused on ask_operator waiting for the operator never counts against
+// it. Turn/media counts are cumulative within a single RUN, reconstructed from the
+// persisted transcript each call (camCountInvestigateProgress). A run pauses only on
 // ask_operator; resuming that pause carries the budget over (so a model can't reset
 // it by looping on ask_operator), while a genuinely new operator-initiated question
-// after the run terminated (answer / bound / error) begins a fresh, independently
+// after the run terminated (answer / bound / give-up) begins a fresh, independently
 // bounded run — human-gated, never model-driven, so it still can't run unbounded.
-// The loop NEVER calls the model again once a bound is hit; it stops gracefully
-// with a system note and status "exhausted". Every turn/tool call is camlog'd
-// (op=investigate_turn / investigate_tool) with latency, tool, and parse ok/fail.
+//
+// NEVER-DIE: an analysis error or an exhausted per-PASS budget does NOT terminalize
+// the run — it drops a budget-free system note and self-requeues (running→queued)
+// for a fresh pass (camDeferInvestigation), so the operator never has to resume it
+// by hand. That is bounded by PROXY_CAMERA_INVESTIGATE_MAX_AUTO_REQUEUES consecutive
+// zero-progress requeues AND by the cumulative turn cap (which persists via the
+// transcript across passes); only the turn/media cap or that requeue give-up marks a
+// run "exhausted", and only a terminal transition fires the settle webhook (never a
+// requeue). Every turn/tool call is camlog'd (op=investigate_turn / investigate_tool)
+// with latency, tool, and parse ok/fail.
 //
 // RUN MODEL: synchronous per HTTP request, capped by the bounds above — POST
 // /investigations and /investigations/reply both drive the loop to completion
@@ -55,6 +62,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -285,15 +293,18 @@ func parseCameraSelection(raw string, allowed map[string]bool) (ids []string, re
 
 // ─────────────────────────────── loop bounds ───────────────────────────────
 
-// camInvestigateMaxTurns resolves the per-model-call turn cap, clamped to 1..30
-// so a misconfigured override can never make the loop unbounded.
+// camInvestigateMaxTurns resolves the per-model-call turn cap, clamped to 1..60
+// so a misconfigured override can never make the loop unbounded. Raised from 30
+// for the never-die loop: budget/analysis self-requeues RESUME the same run, so
+// the cumulative turn count — the real terminal bound across passes — needs more
+// headroom before it legitimately stops the investigation.
 func camInvestigateMaxTurns(cfg config) int {
 	n := cfg.CameraInvestigateMaxTurns
 	if n <= 0 {
 		n = 12
 	}
-	if n > 30 {
-		n = 30
+	if n > 60 {
+		n = 60
 	}
 	return n
 }
@@ -308,17 +319,82 @@ func camInvestigateMaxMedia(cfg config) int {
 }
 
 // camInvestigateBudget resolves the wall-clock budget for ONE runInvestigation
-// call (applied as a context deadline) — time spent paused on ask_operator
-// between calls never counts against it.
+// PASS (applied as a context deadline) — time spent paused on ask_operator
+// between calls never counts against it, and a pass that exhausts this budget
+// self-requeues for a FRESH pass rather than terminalizing (camDeferInvestigation).
+// The ceiling therefore bounds a single pass, not the whole investigation; the
+// stale-running reaper cutoff (camInvestigationTick) is derived from it and so
+// tracks the raised ceiling automatically.
 func camInvestigateBudget(cfg config) time.Duration {
 	d := cfg.CameraInvestigateBudget
 	if d <= 0 {
 		d = 30 * time.Minute // detached background run — no human is blocked on it
 	}
-	if d > time.Hour {
-		d = time.Hour // hard ceiling for a single detached run
+	if d > 4*time.Hour {
+		d = 4 * time.Hour // hard ceiling for a single detached pass
 	}
 	return d
+}
+
+// camInvestigateMaxAutoRequeues resolves how many CONSECUTIVE zero-progress
+// self-requeues the never-die loop attempts before giving up and marking the run
+// "exhausted", clamped to 1..20: a misconfigured override can neither disable the
+// safety valve (a run stuck failing every pass would cycle forever) nor let it run
+// away. The streak is counted from the transcript (camCountAutoRequeues) and reset
+// by any genuine progress, so this bounds only a genuinely stuck run.
+func camInvestigateMaxAutoRequeues(cfg config) int {
+	n := cfg.CameraInvestigateMaxRequeues
+	if n <= 0 {
+		n = 5
+	}
+	if n > 20 {
+		n = 20
+	}
+	return n
+}
+
+// camAnalyzeMaxImages resolves how many images a single analysis call may carry,
+// clamped to 1..24. Smaller batches keep each vision turn inside its per-attempt
+// timeout; the loop still LISTS every capture as evidence, it only thins the model
+// attachment to an evenly-spaced subset (camCapImages).
+func camAnalyzeMaxImages(cfg config) int {
+	n := cfg.CameraAnalyzeMaxImages
+	if n <= 0 {
+		n = 8
+	}
+	if n > 24 {
+		n = 24
+	}
+	return n
+}
+
+// camCapImages downsamples paths to at most max entries, evenly spaced and always
+// keeping the window ENDPOINTS (first and last — where change is most visible for
+// a before/after comparison). Indices are monotonic so time order is preserved and
+// no frame repeats. A slice already within the cap (or max<=0) is returned as-is;
+// max==1 keeps the single most-recent frame.
+func camCapImages(paths []string, max int) []string {
+	if max <= 0 || len(paths) <= max {
+		return paths
+	}
+	if max == 1 {
+		return paths[len(paths)-1:]
+	}
+	out := make([]string, 0, max)
+	last := len(paths) - 1
+	prev := -1
+	for i := 0; i < max; i++ {
+		idx := int(math.Round(float64(i) * float64(last) / float64(max-1)))
+		if idx <= prev {
+			idx = prev + 1 // force strictly-increasing indices (rounding can collide)
+		}
+		if idx > last {
+			idx = last
+		}
+		out = append(out, paths[idx])
+		prev = idx
+	}
+	return out
 }
 
 // ─────────────────────────────── system prompt ───────────────────────────────
@@ -512,32 +588,36 @@ func parseInvestigateAction(raw string) (investigateAction, error) {
 	return act, nil
 }
 
-// camAnalyzeInvestigateAction runs one investigation turn through analyzeWithAlias
-// and parses the single JSON action, doing exactly ONE repair round on a parse
-// failure — mirrors camAnalyzeDecision (camera_escalate.go).
-func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, user string, images []string) (investigateAction, string, bool, error) {
-	raw, err := analyzeWithAlias(ctx, cfg, alias, sys, user, images)
+// camAnalyzeInvestigateAction runs one investigation turn through the resilient
+// analysis ladder (camResilientAnalyze — retry/failover/timeout-raise) and parses
+// the single JSON action, doing exactly ONE repair round on a parse failure —
+// mirrors camAnalyzeDecision (camera_escalate.go). The returned attempts trail
+// merges both analysis rounds so the caller can note a multi-attempt success in
+// the transcript.
+func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, user string, images []string) (investigateAction, string, bool, []camAnalyzeAttempt, error) {
+	raw, attempts, err := camResilientAnalyze(ctx, cfg, alias, sys, user, images)
 	if err != nil {
-		return investigateAction{}, raw, false, err
+		return investigateAction{}, raw, false, attempts, err
 	}
 	act, perr := parseInvestigateAction(raw)
 	if perr == nil {
-		return act, raw, false, nil
+		return act, raw, false, attempts, nil
 	}
 	camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 1, "error": perr.Error()})
 
 	repair := user + "\n\nYour previous reply could not be parsed. Reply with ONLY the single JSON object " +
 		"described above — no prose, no markdown fences, nothing else."
-	raw2, err2 := analyzeWithAlias(ctx, cfg, alias, sys, repair, images)
+	raw2, attempts2, err2 := camResilientAnalyze(ctx, cfg, alias, sys, repair, images)
+	attempts = append(attempts, attempts2...)
 	if err2 != nil {
-		return investigateAction{}, raw2, true, err2
+		return investigateAction{}, raw2, true, attempts, err2
 	}
 	act2, perr2 := parseInvestigateAction(raw2)
 	if perr2 != nil {
 		camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error()})
-		return investigateAction{}, raw2, true, fmt.Errorf("could not parse investigation action JSON after repair: %w", perr2)
+		return investigateAction{}, raw2, true, attempts, fmt.Errorf("could not parse investigation action JSON after repair: %w", perr2)
 	}
-	return act2, raw2, true, nil
+	return act2, raw2, true, attempts, nil
 }
 
 // ─────────────────────────────── transcript ───────────────────────────────
@@ -680,21 +760,79 @@ func camCountInvestigateProgress(msgs []camInvestigationMessage) (turns, mediaUs
 	return turns, mediaUsed
 }
 
+// camCountAutoRequeues returns the CURRENT consecutive self-requeue streak from
+// the transcript: a system row with tool_name="auto_requeue" increments it, and
+// ANY genuine progress since — a model "ai" turn or an "operator" reply — resets
+// it to zero. This is what bounds the never-die loop (camDeferInvestigation)
+// without a schema column: N requeues in a row with no model turn or operator
+// input between them means the pass keeps failing before it does anything useful
+// and the run must terminalize, while a single good turn earns the budget back.
+// Other system rows (e.g. tool_name="analysis_retry") never count.
+func camCountAutoRequeues(msgs []camInvestigationMessage) int {
+	streak := 0
+	for _, m := range msgs {
+		switch m.Role {
+		case "system":
+			if strings.TrimSpace(m.ToolName) == "auto_requeue" {
+				streak++
+			}
+		case "ai", "operator":
+			streak = 0
+		}
+	}
+	return streak
+}
+
 // camStopInvestigation persists a system note explaining why the loop ended
-// without a model-produced answer (a turn/media/time bound, or an unrecoverable
-// analysis error) and marks the investigation terminal as "exhausted" — a status
-// distinct from a clean model "answer" so the UI can label it honestly and so a
-// later operator follow-up is treated as a fresh run (camCountInvestigateProgress
+// without a model-produced answer (a turn/media bound, the auto-requeue give-up,
+// or a setup failure) and marks the investigation terminal as "exhausted" — a
+// status distinct from a clean model "answer" so the UI can label it honestly and
+// so a later operator follow-up is treated as a fresh run (camCountInvestigateProgress
 // resets the cumulative budget on a non-ask_operator operator message) rather than
-// instantly re-tripping the same cumulative turn cap and re-stopping. Still
-// re-openable: handleCameraInvestigationReply reopens anything that isn't "closed".
-// Every exhausted transition (incl. the panic-terminalize path, which funnels
-// through here) fires the settle webhook so Connect learns the run ended.
+// instantly re-tripping the same cumulative turn cap and re-stopping. NOTE: a plain
+// analysis error or an exhausted per-pass budget no longer funnels here — those
+// self-requeue via camDeferInvestigation and only reach this terminal path once the
+// requeue streak is exhausted. Still re-openable: handleCameraInvestigationReply
+// reopens anything that isn't "closed". Every exhausted transition (incl. the
+// panic-terminalize path, which funnels through here) fires the settle webhook so
+// Connect learns the run ended.
 func camStopInvestigation(db *sql.DB, cfg config, invID, note string) error {
 	camAppendInvestigateMessage(db, invID, "system", note, "", "", 0, nil)
 	err := setCameraInvestigationStatus(db, invID, "exhausted")
 	go camNotifyInvestigationSettled(cfg, invID, "exhausted")
 	return err
+}
+
+// camDeferInvestigation is the never-die alternative to camStopInvestigation: a
+// pass that ran out of time or hit an analysis wall does NOT terminalize the run —
+// it drops a budget-free system note and flips the row back to "queued"
+// (running→queued CAS) so the worker re-claims and RESUMES it, carrying the
+// turn/media budget forward through the transcript. It gives up and terminalizes
+// (via camStopInvestigation) ONLY after camInvestigateMaxAutoRequeues consecutive
+// zero-progress requeues — the streak counted from the transcript
+// (camCountAutoRequeues), reset by any model turn or operator reply — so a genuinely
+// stuck run still ends. No settle webhook fires on a requeue: Connect only ever sees
+// the ONE settle event when the run finally terminalizes (answer / ask_operator /
+// give-up), never a running→queued flip. A lost CAS (requeued==false) means a
+// concurrent terminal write or the stale-reaper already moved the row — best-effort
+// by design, nothing strands (the reaper recovers a stuck "running" row anyway).
+func camDeferInvestigation(db *sql.DB, cfg config, invID, note string, msgs []camInvestigationMessage) error {
+	maxRequeues := camInvestigateMaxAutoRequeues(cfg)
+	streak := camCountAutoRequeues(msgs) + 1 // +1 counts THIS deferral
+	if streak > maxRequeues {
+		return camStopInvestigation(db, cfg, invID,
+			note+fmt.Sprintf(" Auto-resume gave up after %d consecutive attempts without progress.", maxRequeues))
+	}
+	camAppendInvestigateMessage(db, invID, "system",
+		note+fmt.Sprintf(" Auto-resuming (attempt %d of %d).", streak, maxRequeues), "auto_requeue", "", 0, nil)
+	requeued, err := requeueCameraInvestigationFromRun(db, invID)
+	camlog("info", "investigate_requeue", map[string]any{
+		"investigation_id": invID, "streak": streak, "cap": maxRequeues, "requeued": requeued,
+	})
+	if err != nil {
+		return fmt.Errorf("requeue investigation: %w", err)
+	}
+	return nil
 }
 
 // camCollectMintedMedia returns the /camera/media/<token> URLs the loop's tools
@@ -1003,6 +1141,14 @@ func camToolPastFrames(ctx context.Context, cfg config, db *sql.DB, r *http.Requ
 	}
 	if max := camMosaicMax(cfg); len(ids) > max {
 		ids = ids[:max]
+	}
+	// Multi-camera pulls multiply frames fast (count is PER camera). Scale the
+	// per-camera count down so the whole batch still fits the analysis image cap,
+	// but never below 2 frames/camera — one frame can't show a change over time.
+	if len(ids) > 1 {
+		if perCam := camAnalyzeMaxImages(cfg) / len(ids); perCam >= 2 && count > perCam {
+			count = perCam
+		}
 	}
 	q := StreamSub
 	if strings.EqualFold(strings.TrimSpace(args.Quality), "main") {
@@ -1545,24 +1691,44 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	var lastImages []string
 	for {
 		if cctx.Err() != nil {
+			// NEVER-DIE: a per-pass budget exhaustion self-requeues for a fresh pass
+			// instead of terminalizing (bounded by the requeue streak + turn cap).
 			camlog("warn", "investigate_budget", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
-			return camStopInvestigation(db, cfg, invID, "Investigation stopped: time budget exhausted before reaching a final answer.")
+			return camDeferInvestigation(db, cfg, invID, "Time budget for this pass was exhausted before a final answer.", msgs)
 		}
 		if turnsSoFar >= maxTurns {
+			// Cumulative turn cap is the true terminal bound across passes — stays
+			// "exhausted" (operator-gated: a follow-up begins a fresh, bounded run).
 			camlog("warn", "investigate_max_turns", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
 			return camStopInvestigation(db, cfg, invID, "Investigation stopped: reached the maximum number of turns before a final answer.")
 		}
 
 		userText := camInvestigateTranscriptText(msgs) + "\n\nReply with ONLY the JSON action object now."
 		tstart := time.Now()
-		act, raw, repaired, aerr := camAnalyzeInvestigateAction(cctx, cfg, alias, sys, userText, lastImages)
+		act, raw, repaired, attempts, aerr := camAnalyzeInvestigateAction(cctx, cfg, alias, sys, userText, lastImages)
 		latency := time.Since(tstart).Milliseconds()
 		if aerr != nil {
 			camlog("error", "investigate_turn", map[string]any{
 				"investigation_id": invID, "turn": turnsSoFar, "ok": false, "error": aerr.Error(),
 				"repair_used": repaired, "latency_ms": latency,
 			})
-			return camStopInvestigation(db, cfg, invID, "Investigation stopped due to an analysis error: "+aerr.Error())
+			// NEVER-DIE: an analysis wall self-requeues rather than terminalizing. If
+			// the run's OWN budget died mid-analysis, defer it as a budget pass so the
+			// note reads honestly; either way camDeferInvestigation caps the streak.
+			if cctx.Err() != nil {
+				return camDeferInvestigation(db, cfg, invID, "Time budget for this pass was exhausted before a final answer.", msgs)
+			}
+			return camDeferInvestigation(db, cfg, invID, "Analysis failed after all retries ("+truncateString(aerr.Error(), 200)+").", msgs)
+		}
+		// A multi-attempt success (a retry or a failover kicked in) leaves a
+		// budget-free breadcrumb so the operator/UI can see the run self-healed —
+		// camCountInvestigateProgress ignores system rows, so this costs no budget.
+		if camAnalyzeRetried(attempts) {
+			last := attempts[len(attempts)-1]
+			rm := camAppendInvestigateMessage(db, invID, "system",
+				fmt.Sprintf("Analysis retried: succeeded on %s after %d attempt(s).", last.Alias, len(attempts)),
+				"analysis_retry", "", 0, nil)
+			msgs = append(msgs, rm)
 		}
 		camlog("info", "investigate_turn", map[string]any{
 			"investigation_id": invID, "turn": turnsSoFar, "ok": true, "action": act.Action.Type,
@@ -1622,9 +1788,19 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 				"investigation_id": invID, "tool": act.Action.Tool, "fetches": tr.Fetches,
 				"media_used": mediaUsed, "images": len(tr.Images), "latency_ms": time.Since(ttStart).Milliseconds(),
 			})
+			// Cap the images ATTACHED to the next analysis call so one vision turn
+			// stays inside its per-attempt timeout — an evenly-spaced downsample that
+			// keeps the window endpoints. Every capture is still LISTED as evidence in
+			// tr.Media/Summary; only the model attachment is thinned, with a note so
+			// the model knows to narrow the window if it needs the frames in between.
+			attached := tr.Images
+			if maxImg := camAnalyzeMaxImages(cfg); len(tr.Images) > maxImg {
+				attached = camCapImages(tr.Images, maxImg)
+				tr.Summary += fmt.Sprintf(" (Attaching %d of %d images, evenly spaced — every capture is still listed as evidence above; re-run on a narrower window to see the rest.)", len(attached), len(tr.Images))
+			}
 			toolMsg := camAppendInvestigateMessage(db, invID, "tool", tr.Summary, act.Action.Tool, toolArgsJSON, tr.Fetches, tr.Media)
 			msgs = append(msgs, toolMsg)
-			lastImages = tr.Images
+			lastImages = attached
 		}
 	}
 }
@@ -1779,13 +1955,29 @@ func camTerminalizeInvestigation(cfg config, id, note string) {
 // synchronous behavior instead of stranding rows in "queued". It claims the row
 // (queued→running) first (a no-op if the worker somehow already grabbed it) and runs
 // with the live request r, so media URLs resolve even without PROXY_PUBLIC_URL.
+//
+// It LOOP-DRAINS the never-die self-requeues: camDeferInvestigation flips a stuck
+// pass back to "queued" (running→queued) rather than terminalizing, so with no
+// background worker to re-claim it, we must re-claim and re-run here or the row
+// would strand in "queued". Bounded by the same auto-requeue cap the loop enforces
+// (plus one slot for the final terminal pass); the status check ends the drain the
+// moment the run reaches any non-queued state (answered / awaiting_operator /
+// exhausted), so the streak cap inside camDeferInvestigation is the real limiter.
 func camRunInvestigationInline(db *sql.DB, cfg config, r *http.Request, id string) {
-	if claimed, cerr := claimCameraInvestigation(db, id); cerr != nil || !claimed {
-		return
-	}
-	if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
-		camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
-		_ = camStopInvestigation(db, cfg, id, "Investigation could not start: "+rerr.Error())
+	for i := 0; i <= camInvestigateMaxAutoRequeues(cfg); i++ {
+		claimed, cerr := claimCameraInvestigation(db, id)
+		if cerr != nil || !claimed {
+			return // never queued, already terminal, or the worker won the claim
+		}
+		if rerr := runInvestigation(r.Context(), cfg, r, id); rerr != nil {
+			camlog("error", "investigate_run", map[string]any{"investigation_id": id, "ok": false, "error": rerr.Error()})
+			_ = camStopInvestigation(db, cfg, id, "Investigation could not start: "+rerr.Error())
+			return
+		}
+		inv, gerr := getCameraInvestigation(db, id)
+		if gerr != nil || inv.Status != "queued" {
+			return // reached a terminal / paused state — nothing left to drain
+		}
 	}
 }
 

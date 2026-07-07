@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ─────────────────────── extractFirstJSONObject ───────────────────────
@@ -328,4 +333,154 @@ func TestCamPerImageBudget(t *testing.T) {
 	if got := camPerImageBudget(100000); got != 64*1024 {
 		t.Errorf("budget(100000) = %d, want floor 65536", got)
 	}
+}
+
+// ─────────────────────── never-die analysis: classifier ───────────────────────
+
+func TestCamClassifyAnalyzeErr(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want camAnalyzeErrClass
+	}{
+		{"agy_timeout", context.Background(), errors.New("agy analysis failed: agy timed out after 300s"), camErrRetryable},
+		{"claude_timeout", context.Background(), errors.New("claude analysis failed: timed out after 180s"), camErrRetryable},
+		{"produced_no_output", context.Background(), errors.New("agyj produced no output"), camErrRetryable},
+		{"returned_no_text", context.Background(), errors.New("agy returned no text"), camErrRetryable},
+		{"overloaded_529", context.Background(), errors.New("api error: 529 overloaded"), camErrRetryable},
+		{"rate_limit_429", context.Background(), errors.New("http 429 too many requests"), camErrRetryable},
+		{"conn_reset", context.Background(), errors.New("read tcp: connection reset by peer"), camErrRetryable},
+		{"vision_unsupported", context.Background(), fmt.Errorf("%w: no images inlined", errCameraVisionUnsupported), camErrSkipAlias},
+		{"analysis_backend", context.Background(), fmt.Errorf("%w: backend off", errCameraAnalysisBackend), camErrSkipAlias},
+		{"cancelled_beats_retryable", cancelled, errors.New("timed out after 5s"), camErrCancelled},
+		{"permanent_random", context.Background(), errors.New("bad request: invalid model alias"), camErrPermanent},
+		{"nil_defensive", context.Background(), nil, camErrPermanent},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := camClassifyAnalyzeErr(c.ctx, c.err); got != c.want {
+				t.Errorf("class = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestCamInvestigateFailoverAliases(t *testing.T) {
+	if got := camInvestigateFailoverAliases(config{}); len(got) != 0 {
+		t.Errorf("unset = %v, want empty", got)
+	}
+	got := camInvestigateFailoverAliases(config{CameraInvestigateFailoverCSV: " claude-sonnet-5 , , gemini-3.5-flash , "})
+	if !reflect.DeepEqual(got, []string{"claude-sonnet-5", "gemini-3.5-flash"}) {
+		t.Errorf("parsed = %v", got)
+	}
+	if got := camDedupAliases("primary", []string{"primary", "backup", "backup"}); !reflect.DeepEqual(got, []string{"primary", "backup"}) {
+		t.Errorf("dedup = %v, want [primary backup]", got)
+	}
+	if got := camAnalyzeTimeout(config{}); got != 600*time.Second {
+		t.Errorf("default analyze timeout = %v, want 600s", got)
+	}
+}
+
+// ─────────────────────── never-die analysis: resilient ladder ───────────────────────
+
+func TestCamResilientAnalyzeFailover(t *testing.T) {
+	// (a) one transient failure then success on the SAME alias; assert the injected
+	// analyze receives the timeout-raised cfg clone.
+	t.Run("retry_same_alias", func(t *testing.T) {
+		calls := 0
+		var gotCfg config
+		fake := func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, error) {
+			calls++
+			gotCfg = cfg
+			if calls == 1 {
+				return "", errors.New("agy timed out after 5s")
+			}
+			return "OK:" + alias, nil
+		}
+		out, attempts, err := camResilientAnalyzeWith(context.Background(), config{}, "primary", "s", "u", nil, fake)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if out != "OK:primary" {
+			t.Errorf("out = %q, want OK:primary", out)
+		}
+		if calls != 2 || len(attempts) != 2 {
+			t.Fatalf("calls=%d attempts=%d, want 2/2", calls, len(attempts))
+		}
+		if attempts[0].Err == "" || attempts[1].Err != "" {
+			t.Errorf("attempt errs = %q / %q, want (failed, ok)", attempts[0].Err, attempts[1].Err)
+		}
+		floor := 600 * time.Second
+		if gotCfg.AgyTimeout != floor || gotCfg.AgyMediaTimeout != floor || gotCfg.ClaudeTimeout != floor {
+			t.Errorf("raised clone = agy=%v media=%v claude=%v, want all %v", gotCfg.AgyTimeout, gotCfg.AgyMediaTimeout, gotCfg.ClaudeTimeout, floor)
+		}
+	})
+
+	// (b) vision-unsupported on the primary jumps STRAIGHT to the failover alias —
+	// no wasted same-alias retry.
+	t.Run("skip_alias_to_failover", func(t *testing.T) {
+		calls := 0
+		fake := func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, error) {
+			calls++
+			if alias == "primary" {
+				return "", fmt.Errorf("%w: codex has no vision", errCameraVisionUnsupported)
+			}
+			return "OK:" + alias, nil
+		}
+		cfg := config{CameraInvestigateFailoverCSV: "backup"}
+		out, attempts, err := camResilientAnalyzeWith(context.Background(), cfg, "primary", "s", "u", nil, fake)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if out != "OK:backup" || calls != 2 {
+			t.Errorf("out=%q calls=%d, want OK:backup / 2 (primary tried once, no retry)", out, calls)
+		}
+		if len(attempts) != 2 || attempts[0].Alias != "primary" || attempts[1].Alias != "backup" {
+			t.Errorf("attempts = %+v", attempts)
+		}
+	})
+
+	// (c) every rung fails (retryable) → wrapped error naming the attempt/alias counts.
+	t.Run("all_fail_wrapped", func(t *testing.T) {
+		fake := func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, error) {
+			return "", errors.New("service unavailable")
+		}
+		cfg := config{CameraInvestigateFailoverCSV: "backup"}
+		out, attempts, err := camResilientAnalyzeWith(context.Background(), cfg, "primary", "s", "u", nil, fake)
+		if err == nil {
+			t.Fatalf("err = nil, want wrapped failure")
+		}
+		if out != "" {
+			t.Errorf("out = %q, want empty", out)
+		}
+		// 2 aliases × 2 attempts each.
+		if len(attempts) != 4 {
+			t.Errorf("attempts = %d, want 4", len(attempts))
+		}
+		if !strings.Contains(err.Error(), "4 attempt(s)") || !strings.Contains(err.Error(), "2 alias(es)") {
+			t.Errorf("err = %q, want it to name 4 attempts across 2 aliases", err.Error())
+		}
+	})
+
+	// (d) a dead run context aborts the ladder immediately (every retry would fail
+	// the same way) — one call, no backoff.
+	t.Run("cancelled_aborts", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		calls := 0
+		fake := func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, error) {
+			calls++
+			return "", errors.New("timed out after 5s")
+		}
+		cfg := config{CameraInvestigateFailoverCSV: "backup"}
+		if _, _, err := camResilientAnalyzeWith(ctx, cfg, "primary", "s", "u", nil, fake); err == nil {
+			t.Fatalf("err = nil, want the abort error")
+		}
+		if calls != 1 {
+			t.Errorf("calls = %d, want 1 (aborted after first cancelled classification)", calls)
+		}
+	})
 }

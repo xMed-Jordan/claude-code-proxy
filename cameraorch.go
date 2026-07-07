@@ -433,6 +433,218 @@ func analyzeWithAlias(ctx context.Context, cfg config, alias, systemPrompt, user
 	return out, err
 }
 
+// ─────────────────────── resilient investigation analysis ───────────────────────
+//
+// A camera investigation runs DETACHED on the background worker, so an analysis
+// call that times out or hits a transient upstream fault must never terminalize
+// the run: nobody is blocked on an HTTP response, and the alternative is an
+// "exhausted" investigation the operator has to resume by hand ("كمل"). This
+// section wraps analyzeWithAlias in a never-die ladder — raise the per-attempt
+// timeout, retry transient faults, fail over to backup aliases — and classifies
+// each error so the ladder knows whether to retry, jump aliases, or give up.
+
+// camAnalyzeErrClass buckets an analysis error by how the resilient ladder should
+// react: retry the same alias, skip to the next alias, abort the whole ladder
+// (the run's own context died), or give up (a permanent, non-retryable fault).
+type camAnalyzeErrClass int
+
+const (
+	camErrPermanent camAnalyzeErrClass = iota // non-retryable fault — abandon this alias, move on
+	camErrRetryable                           // transient (timeout / 5xx / overload / empty output) — retry the same alias
+	camErrSkipAlias                           // alias structurally can't help (no vision path / backend off) — jump to the next alias
+	camErrCancelled                           // the run's own context is dead — abort; every retry would fail identically
+)
+
+// camRetryableAnalyzeSubstrings are the lowercased markers of a transient analysis
+// failure worth retrying. Unlike claudeTransient (claude.go:308) we DELIBERATELY
+// retry the proxy's own deadline strings ("timed out after Ns"): the run is
+// detached, so burning another attempt to reach an answer beats terminalizing.
+var camRetryableAnalyzeSubstrings = []string{
+	"timed out after", "produced no output", "no output", "returned no text",
+	"internal server error", "api error: 5", "server-side issue",
+	"overloaded", "529", "503", "502", "service unavailable", "bad gateway",
+	"rate limit", "429", "too many requests",
+	"connection reset", "connection refused", "econnreset",
+}
+
+// camClassifyAnalyzeErr buckets a non-nil analysis error for the resilient ladder.
+// The run-context check wins first (a dead ctx means every retry fails the same
+// way), then the typed sentinels (errCameraVisionUnsupported / -AnalysisBackend
+// mean THIS alias structurally can't carry the request — jump aliases, don't
+// retry), then the transient-substring match, else permanent.
+func camClassifyAnalyzeErr(ctx context.Context, err error) camAnalyzeErrClass {
+	if err == nil {
+		return camErrPermanent // callers only classify non-nil errors; defensive
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return camErrCancelled
+	}
+	if errors.Is(err, errCameraVisionUnsupported) || errors.Is(err, errCameraAnalysisBackend) {
+		return camErrSkipAlias
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range camRetryableAnalyzeSubstrings {
+		if strings.Contains(msg, s) {
+			return camErrRetryable
+		}
+	}
+	return camErrPermanent
+}
+
+// camAnalyzeAttempt records one rung of the resilient ladder for logging and for
+// the post-success "analysis retried" transcript note.
+type camAnalyzeAttempt struct {
+	Alias   string
+	Err     string // "" on the successful attempt
+	Elapsed time.Duration
+}
+
+// camAnalyzeFunc is the analyze call the resilient ladder drives; real runs use
+// analyzeWithAlias, tests inject a fake to exercise retry/failover without a live
+// backend.
+type camAnalyzeFunc func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, error)
+
+// camAnalyzeTimeout resolves the per-ATTEMPT floor the ladder raises each backend
+// timeout to, so one detached analysis attempt gets a generous deadline (a
+// multi-image vision turn legitimately takes minutes).
+func camAnalyzeTimeout(cfg config) time.Duration {
+	d := cfg.CameraAnalyzeTimeout
+	if d <= 0 {
+		d = 600 * time.Second
+	}
+	return d
+}
+
+// camInvestigateFailoverAliases resolves the ordered fallback vision aliases the
+// ladder tries once the primary alias is exhausted (CSV, trimmed, empties
+// dropped). Empty when unset — the ladder then retries the primary alias alone.
+func camInvestigateFailoverAliases(cfg config) []string {
+	var out []string
+	for _, a := range strings.Split(cfg.CameraInvestigateFailoverCSV, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// camDedupAliases returns the ordered, unique, non-empty aliases the ladder walks:
+// the primary first, then each failover that isn't already listed. Always yields
+// at least one rung (an empty primary still attempts once — analyzeWithAlias then
+// resolves the backend default).
+func camDedupAliases(primary string, failovers []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(a string) {
+		a = strings.TrimSpace(a)
+		if a == "" || seen[a] {
+			return
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+	add(primary)
+	for _, a := range failovers {
+		add(a)
+	}
+	if len(out) == 0 {
+		out = append(out, strings.TrimSpace(primary)) // preserve one rung even if it is ""
+	}
+	return out
+}
+
+// camResilientAnalyze runs ONE investigation analysis through the full never-die
+// ladder: it raises every backend timeout to the per-attempt floor, then tries the
+// primary alias plus any configured failover aliases, retrying transient faults on
+// the same alias and jumping to the next alias on a structural one. It returns the
+// model text on the first success, the per-attempt trail (for a budget-free
+// "analysis retried" transcript note), and a wrapped error only when every rung
+// failed. Delegates to the injectable variant so tests can drive it with a fake.
+func camResilientAnalyze(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+	return camResilientAnalyzeWith(ctx, cfg, alias, sys, user, images, analyzeWithAlias)
+}
+
+// camResilientAnalyzeWith is camResilientAnalyze with the analyze call injected.
+func camResilientAnalyzeWith(ctx context.Context, cfg config, alias, sys, user string, images []string, analyze camAnalyzeFunc) (string, []camAnalyzeAttempt, error) {
+	// Raise each backend's per-call timeout to the analysis floor on a LOCAL cfg
+	// copy (only ever raise, never lower) so one detached attempt gets minutes —
+	// the same idiom analyzeWithClaude uses for ClaudeTimeout, but for all three
+	// backends at once, since the ladder can fail over across backends.
+	acfg := cfg
+	floor := camAnalyzeTimeout(cfg)
+	if acfg.AgyTimeout < floor {
+		acfg.AgyTimeout = floor
+	}
+	if acfg.AgyMediaTimeout < floor {
+		acfg.AgyMediaTimeout = floor
+	}
+	if acfg.ClaudeTimeout < floor {
+		acfg.ClaudeTimeout = floor
+	}
+
+	aliases := camDedupAliases(alias, camInvestigateFailoverAliases(cfg))
+	const attemptsPerAlias = 2
+
+	var (
+		attempts []camAnalyzeAttempt
+		lastErr  error
+		total    int
+	)
+	for _, al := range aliases {
+	attemptLoop:
+		for n := 1; n <= attemptsPerAlias; n++ {
+			total++
+			if n > 1 {
+				// Exponential backoff (reuse claude.go:343) between same-alias
+				// retries; a dead run context aborts the wait and the ladder.
+				if !claudeBackoffWait(ctx, n-1) {
+					if lastErr == nil {
+						lastErr = ctx.Err()
+					}
+					return "", attempts, lastErr
+				}
+			}
+			astart := time.Now()
+			out, err := analyze(ctx, acfg, al, sys, user, images)
+			elapsed := time.Since(astart)
+			if err == nil {
+				attempts = append(attempts, camAnalyzeAttempt{Alias: al, Elapsed: elapsed})
+				return out, attempts, nil
+			}
+			class := camClassifyAnalyzeErr(ctx, err)
+			attempts = append(attempts, camAnalyzeAttempt{Alias: al, Err: camErrStr(err), Elapsed: elapsed})
+			lastErr = err
+			camlog("warn", "investigate_analyze_retry", map[string]any{
+				"alias": al, "attempt": n, "class": int(class), "error": camErrStr(err),
+			})
+			switch class {
+			case camErrCancelled:
+				return "", attempts, lastErr
+			case camErrRetryable:
+				continue // same alias again (until attemptsPerAlias)
+			default: // camErrSkipAlias / camErrPermanent
+				break attemptLoop // stop retrying this alias, fall to the next
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("analysis produced no result")
+	}
+	return "", attempts, fmt.Errorf("analysis failed after %d attempt(s) across %d alias(es): %w", total, len(aliases), lastErr)
+}
+
+// camAnalyzeRetried reports whether the resilient ladder needed more than a clean
+// first try — i.e. at least one attempt failed before the run eventually
+// succeeded. Drives the budget-free "analysis retried" transcript breadcrumb.
+func camAnalyzeRetried(attempts []camAnalyzeAttempt) bool {
+	for _, a := range attempts {
+		if a.Err != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // analyzeWithAgy hands the capture files to agy via --add-dir (their parent dirs)
 // and a prompt carrying a "camera <id> => <path>" label map — mirroring
 // buildMediaPrompt. agy reads both images and .mp4 clips off disk itself.

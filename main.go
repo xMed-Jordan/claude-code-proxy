@@ -195,6 +195,14 @@ type config struct {
 	CameraInvestigateWorkerEnabled bool          // PROXY_CAMERA_INVESTIGATE_WORKER — run the durable background investigation queue (default true)
 	CameraInvestigateConcurrency   int           // PROXY_CAMERA_INVESTIGATE_CONCURRENCY — parallel investigation runs (default 2)
 	CameraInvestigateTickInterval  time.Duration // PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL — queue poll cadence (default 5s)
+	// Never-die analysis layer (camera_investigate.go / cameraorch.go): an
+	// investigation analysis call never terminalizes the run — it retries, fails
+	// over to a backup vision alias, and self-requeues instead of surfacing an
+	// "exhausted" run the operator would have to resume by hand.
+	CameraAnalyzeTimeout         time.Duration // PROXY_CAMERA_ANALYZE_TIMEOUT — per-ATTEMPT floor the resilient ladder raises each backend timeout to (default 600s)
+	CameraInvestigateFailoverCSV string        // PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES — comma list of fallback vision aliases tried after the primary
+	CameraInvestigateMaxRequeues int           // PROXY_CAMERA_INVESTIGATE_MAX_AUTO_REQUEUES — consecutive zero-progress self-requeues before "exhausted" (default 5, clamp 1..20)
+	CameraAnalyzeMaxImages       int           // PROXY_CAMERA_ANALYZE_MAX_IMAGES — images attached per analysis call (default 8, clamp 1..24)
 	// Camera frame archive → S3-compatible object storage (Hetzner). The archiver
 	// (camera_archive.go) writes one JPEG per second per camera per quality; the
 	// investigate read-through (camera_investigate.go) serves past frames from here.
@@ -743,6 +751,11 @@ func loadConfig() config {
 		CameraInvestigateWorkerEnabled: envFlag("PROXY_CAMERA_INVESTIGATE_WORKER", true),
 		CameraInvestigateConcurrency:   parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_CONCURRENCY", "2"), 2),
 		CameraInvestigateTickInterval:  parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL", "5")),
+
+		CameraAnalyzeTimeout:         parseAgyTimeout(getenv("PROXY_CAMERA_ANALYZE_TIMEOUT", "600")),
+		CameraInvestigateFailoverCSV: strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES", "")),
+		CameraInvestigateMaxRequeues: parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_MAX_AUTO_REQUEUES", "5"), 5),
+		CameraAnalyzeMaxImages:       parseIntDefault(getenv("PROXY_CAMERA_ANALYZE_MAX_IMAGES", "8"), 8),
 
 		CameraS3Endpoint:          strings.TrimSpace(getenv("PROXY_CAM_S3_ENDPOINT", "hel1.your-objectstorage.com")),
 		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams")),
