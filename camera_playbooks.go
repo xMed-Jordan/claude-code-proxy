@@ -341,6 +341,13 @@ func camToolPlaybook(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 	name := strings.TrimSpace(args.Name)
 	pb, err := findCameraPlaybookByName(db, site.ID, name)
 	if err != nil || !pb.Enabled {
+		// No operator playbook matches (operator names win on an exact-name
+		// collision because the DB lookup runs first). Fall back to the built-in,
+		// environment-agnostic investigation methods before giving up.
+		if s, ok := camFindBuiltinStrategy(name); ok {
+			camlog("info", "investigate_playbook", map[string]any{"builtin": s.Name})
+			return investigateToolResult{Summary: camStrategyToolSummary(s), Fetches: 0}
+		}
 		return investigateToolResult{Summary: camPlaybookUnknownSummary(db, site.ID, name)}
 	}
 
@@ -395,25 +402,29 @@ func camToolPlaybook(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 }
 
 // camPlaybookUnknownSummary is the unknown/disabled-name tool reply: names the
-// miss and lists up to 20 valid (enabled) playbook names for the next attempt.
+// miss, lists up to 20 valid (enabled) operator playbook names, and always lists
+// the built-in investigation-method names (which are environment-agnostic and thus
+// valid on every site) so the next attempt can pick an EXACT name from either set.
 func camPlaybookUnknownSummary(db *sql.DB, siteID, name string) string {
-	msg := fmt.Sprintf("playbook: no playbook named %q — use the EXACT name from the OPERATIONAL PLAYBOOKS list.", name)
+	msg := fmt.Sprintf("playbook: no playbook named %q — use the EXACT name from the OPERATIONAL PLAYBOOKS list, or a built-in INVESTIGATION METHOD name below.", name)
 	all, err := listCameraPlaybooks(db, siteID, true)
-	if err != nil || len(all) == 0 {
-		return msg + " This site has no enabled playbooks."
-	}
-	names := make([]string, 0, 20)
-	for i, p := range all {
-		if i >= 20 {
-			break
+	if err == nil && len(all) > 0 {
+		names := make([]string, 0, 20)
+		for i, p := range all {
+			if i >= 20 {
+				break
+			}
+			names = append(names, fmt.Sprintf("%q", p.Name))
 		}
-		names = append(names, fmt.Sprintf("%q", p.Name))
+		extra := ""
+		if len(all) > len(names) {
+			extra = fmt.Sprintf(" (+%d more)", len(all)-len(names))
+		}
+		msg += " Valid playbooks: " + strings.Join(names, ", ") + extra + "."
+	} else {
+		msg += " This site has no enabled playbooks."
 	}
-	extra := ""
-	if len(all) > len(names) {
-		extra = fmt.Sprintf(" (+%d more)", len(all)-len(names))
-	}
-	return msg + " Valid names: " + strings.Join(names, ", ") + extra
+	return msg + " Built-in methods: " + camStrategyNameList() + "."
 }
 
 // ─────────────────────────── HTTP handlers ───────────────────────────

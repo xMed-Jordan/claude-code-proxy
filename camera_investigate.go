@@ -469,6 +469,16 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 		b.WriteString("Never improvise a procedure the catalog already covers.\n\n")
 	}
 
+	// Built-in investigation methods — always present, environment-agnostic. The
+	// one-liner catalog ships every call; the full step-by-step text loads on demand
+	// through the existing playbook tool (camToolPlaybook checks built-ins too).
+	b.WriteString("INVESTIGATION METHODS (built-in, environment-agnostic — name — when to use):\n")
+	b.WriteString(camStrategyCatalog())
+	b.WriteString("\n")
+	b.WriteString("When the operator's question matches a METHOD, call tool \"playbook\" with args.name set to the EXACT method\n")
+	b.WriteString("name BEFORE pulling imagery — it returns the full step-by-step procedure. Operator playbooks (above) always\n")
+	b.WriteString("take precedence over methods when both match.\n\n")
+
 	// External API tools catalog — emitted only when the site has any.
 	if len(apiTools) > 0 {
 		b.WriteString("EXTERNAL API TOOLS (operator-configured HTTP lookups — name — what it does):\n")
@@ -493,8 +503,8 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("- past_frames: args.camera_ids (required), args.from + args.to (RFC3339, required), args.count (stills per camera, default 6), args.quality \"sub\"|\"main\" (see QUALITY below; default sub) — stills sampled from RECORDED footage; use to SEE a window directly, or to zoom into the exact times a contact_sheet flagged.\n")
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
 	b.WriteString("- motion_search: args.camera_ids (optional, default = all cameras), args.from + args.to (RFC3339, required), args.event_type (optional exact type) — queries the DVR MOTION LOG and returns the exact times motion/line-cross/intrusion episodes occurred, WITHOUT pulling any footage (costs no media budget). Use FIRST to find WHEN activity happened, then past_frames/contact_sheet/avatar_check those exact windows — don't brute-scan.\n")
-	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS) — returns that procedure's full\n")
-	b.WriteString("  instructions plus operator-approved reference images (shown to you next turn). Costs no media budget.\n")
+	b.WriteString("- playbook: args.name (EXACT name from OPERATIONAL PLAYBOOKS or INVESTIGATION METHODS) — returns that\n")
+	b.WriteString("  procedure's full instructions plus any operator-approved reference images (shown to you next turn). Costs no media budget.\n")
 	b.WriteString("- call_api: args.name (EXACT name from EXTERNAL API TOOLS), args.params {\"key\":\"value\"} — the loop\n")
 	b.WriteString("  performs the operator-configured HTTP request with your params substituted and shows you the text\n")
 	b.WriteString("  response next turn. Costs no media budget.\n")
@@ -512,8 +522,30 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("- ask_operator: pause and ask the operator action.question — ONLY for information no tool or playbook can provide.\n")
 	b.WriteString("- answer: finish with action.answer plus action.evidence citing exact media_url values from TOOL RESULT lines.\n\n")
 
-	b.WriteString("STRATEGY for counting people/occupancy over a time window: (1) use the ROSTER descriptions to pick the ONE relevant camera AND to judge whether it is a DOOR (mostly still) or a BUSY area (constant movement); (2) contact_sheet that camera with mode \"motion\" for a door or mode \"interval\" for a busy area; (3) read the numbered sheet, count DISTINCT people, and past_frames specific cells for detail/time. Do NOT blindly past_frames a wide multi-camera window — it is slow and misses people.\n\n")
-	b.WriteString("STRATEGY for finding WHEN something happened (\"first person to arrive\", \"any activity after hours\"): call motion_search FIRST on the relevant camera(s) and window — it returns the exact episode times cheaply from the motion log — then drill into those precise windows with past_frames/contact_sheet/avatar_check instead of scanning the whole day.\n\n")
+	// CORE PRINCIPLES — the distilled methodology that applies to EVERY question.
+	// Numbered contiguously from a slice so the delegate principle (WS3) can be
+	// omitted without leaving a gap when its tool is not yet enabled.
+	b.WriteString("CORE PRINCIPLES (apply to EVERY investigation):\n")
+	principles := []string{
+		"Motion-first: motion_search costs no media budget — make it your FIRST filter for \"when did X happen\", then drill into the exact episode times it returns instead of scanning hours.",
+		"Binary search, never linear scan, for \"when did X change/appear/disappear\": pull one past_frames still at the window midpoint, decide which half holds the change, halve again — six frames locate a moment in a ten-hour day.",
+		"Endpoint sampling for durations (arrival → service → departure): find the two endpoint instants and measure the gap; never scan the middle.",
+		"Wide→close escalation: LOCATE on wide cameras at sub quality, then VERIFY fine detail on the closest close-up camera at main quality — pick that close-up from the roster before judging any detail.",
+		"Topology handoff: to follow someone across the site, use the roster areas — corridors and doorways are chokepoints; hand off camera to camera in time order.",
+	}
+	if camDelegateToolEnabled {
+		principles = append(principles, "Fan out with delegate for long windows or many cameras — 3+ independent scans become ONE delegate call.")
+	}
+	principles = append(principles,
+		"Small windows: never contact_sheet more than ~45 minutes in one call — split the window and go where the motion is.",
+		"Identity discipline: the same person seconds apart is ONE entry; never NAME a person without avatar_check confirmation or an operator description you can actually SEE matching.",
+		"Evidence anchoring: every factual claim in your answer needs an annotated frame or a clip with its exact timestamp — annotate the person/object you cite.",
+		"Honest limits: when resolution or coverage cannot answer (phone screens, small text, unmapped areas), say so plainly, state WHICH camera/quality would be needed, and answer what IS visible.",
+	)
+	for i, p := range principles {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, p)
+	}
+	b.WriteString("\n")
 	if hasAvatars {
 		b.WriteString("STRATEGY for tracking a NAMED person across a day: (1) avatars → find their id; (2) avatar_info to study their references; (3) from the roster pick the entry/exit cameras and their usual areas; (4) avatar_find each such camera across the window to collect sightings; (5) avatar_check the pivotal ones (arrival, departure, anything unusual); (6) answer with a chronological timeline citing the annotated frames.\n\n")
 	}
