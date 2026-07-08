@@ -759,6 +759,20 @@ func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, us
 			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "dup_answer_accepted"})
 			return act2, raw2, true, attempts, nil
 		}
+		// The repair reply was unusable in some OTHER way (prose with no JSON, a
+		// decode failure). If attempt 1 held a real answer behind a sentinel, the
+		// last resort is still to ACCEPT it — erroring here would discard a usable
+		// answer, and each recurrence is a zero-progress requeue that can walk the
+		// run into "exhausted" with an answer in hand (never crash the loop).
+		if errors.Is(perr, errInvestigatePlanAsAnswer) {
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "dup_answer_accepted"})
+			return act, raw, true, attempts, nil
+		}
+		if errors.Is(perr, errInvestigateEmptyAnswer) {
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "thought_as_answer"})
+			act.Action.Answer = firstNonEmpty(strings.TrimSpace(act.Thought), "The investigation could not produce a conclusive answer.")
+			return act, raw, true, attempts, nil
+		}
 		camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error()})
 		return investigateAction{}, raw2, true, attempts, fmt.Errorf("could not parse investigation action JSON after repair: %w", perr2)
 	}
@@ -998,6 +1012,19 @@ func camDeferInvestigation(db *sql.DB, cfg config, invID, note string, msgs []ca
 //	   after every pending insert, closing the race where a message lands just as
 //	   the run settles (no next turn to drain it).
 
+// camViewReplySource marks a message that entered through the PUBLIC share-link
+// page: it is the pending row's origin AND the delivered operator row's
+// tool_name, so the per-investigation view-reply cap can be counted durably
+// from the transcript (countCameraInvestigationViewReplies). Authenticated
+// surfaces (admin/site-token) pass "" and stay unmarked/uncapped.
+const camViewReplySource = "view_reply"
+
+// errCamInvestigateReplyClosed reports a settled reply that lost its
+// settled→queued CAS to a concurrent operator close: the message was NOT
+// delivered (the appended row is removed again — closed is terminal by operator
+// choice), so callers must answer "closed", never a false "queued".
+var errCamInvestigateReplyClosed = errors.New("investigation is closed")
+
 // camResumeSettledInvestigation is the settled-reply core shared by the admin
 // reply handler, the service reply handler, and the public view reply endpoint:
 // append the operator message FIRST (the row is settled, so no worker owns the
@@ -1005,34 +1032,61 @@ func camDeferInvestigation(db *sql.DB, cfg config, invID, note string, msgs []ca
 // a row whose transcript already includes the reply — the ordering that closes
 // the resume-on-stale-transcript race. The queue flip is a CAS over the settled
 // states (requeueCameraInvestigationFromSettled): a lost race with a concurrent
-// resume can never yank back a row a worker already claimed.
-func camResumeSettledInvestigation(db *sql.DB, invID, message string) error {
-	camAppendInvestigateMessage(db, invID, "operator", message, "", "", 0, nil)
-	_, err := requeueCameraInvestigationFromSettled(db, invID)
-	return err
+// resume can never yank back a row a worker already claimed. A CAS lost to a
+// concurrent CLOSE deletes the just-appended row again and returns
+// errCamInvestigateReplyClosed — the append-first ordering must not let a reply
+// racing the close persist into the closed record's frozen transcript. origin
+// is camViewReplySource for the public page ("" for authenticated callers).
+func camResumeSettledInvestigation(db *sql.DB, invID, message, origin string) error {
+	m := camAppendInvestigateMessage(db, invID, "operator", message, origin, "", 0, nil)
+	requeued, err := requeueCameraInvestigationFromSettled(db, invID)
+	if err != nil {
+		return err
+	}
+	if !requeued {
+		// Lost CAS: either a concurrent resume already queued the row (the message
+		// is delivered — success), or a concurrent close froze it. Only the close
+		// unwinds the append.
+		if inv, gerr := getCameraInvestigation(db, invID); gerr == nil && inv.Status == "closed" {
+			if derr := deleteCameraInvestigationMessage(db, m.ID); derr != nil {
+				camlog("warn", "investigate_reply", map[string]any{"investigation_id": invID, "ok": false, "error": derr.Error(), "note": "closed-race unwind failed"})
+			}
+			return errCamInvestigateReplyClosed
+		}
+	}
+	return nil
 }
 
 // camDrainPendingInvestigateMessages (drain point A) folds every pending message
 // into the transcript — persisted AND appended to the in-memory slice the loop
-// feeds the model — then deletes the drained rows. Returns the grown slice and
-// how many messages were delivered. A failed delete only risks a duplicated
-// (never lost) delivery on the next turn, and is logged.
+// feeds the model — claiming each row FIRST (claimCameraInvestigationPendingMessage)
+// so a drain racing a stranded-flush can never deliver the same message twice.
+// The delivered operator row inherits the pending row's origin as its tool_name
+// (camViewReplySource for share-link messages) so the view-reply cap survives in
+// the transcript. Returns the grown slice and how many messages were delivered.
 func camDrainPendingInvestigateMessages(db *sql.DB, invID string, msgs []camInvestigationMessage) ([]camInvestigationMessage, int) {
 	pend, err := listCameraInvestigationPendingMessages(db, invID)
 	if err != nil || len(pend) == 0 {
 		return msgs, 0
 	}
-	ids := make([]string, 0, len(pend))
+	drained := 0
 	for _, p := range pend {
-		m := camAppendInvestigateMessage(db, invID, "operator", p.Message, "", "", 0, nil)
+		claimed, cerr := claimCameraInvestigationPendingMessage(db, p.ID)
+		if cerr != nil {
+			camlog("warn", "investigate_interrupt", map[string]any{"investigation_id": invID, "ok": false, "error": cerr.Error()})
+			continue
+		}
+		if !claimed {
+			continue // a concurrent flush won this row — it delivers it
+		}
+		m := camAppendInvestigateMessage(db, invID, "operator", p.Message, p.Origin, "", 0, nil)
 		msgs = append(msgs, m)
-		ids = append(ids, p.ID)
+		drained++
 	}
-	if derr := deleteCameraInvestigationPendingMessages(db, ids); derr != nil {
-		camlog("warn", "investigate_interrupt", map[string]any{"investigation_id": invID, "ok": false, "error": derr.Error()})
+	if drained > 0 {
+		camlog("info", "investigate_interrupt", map[string]any{"investigation_id": invID, "drained": drained})
 	}
-	camlog("info", "investigate_interrupt", map[string]any{"investigation_id": invID, "drained": len(ids)})
-	return msgs, len(pend)
+	return msgs, drained
 }
 
 // camFlushStrandedPendingInvestigateMessages (drain point B) rescues pending
@@ -1040,9 +1094,11 @@ func camDrainPendingInvestigateMessages(db *sql.DB, invID string, msgs []camInve
 // settles has no next turn to pick it up. Re-reads the CURRENT status and:
 //
 //   - settled (awaiting_operator/answered/exhausted): deliver through the settled
-//     reply semantics — append the operator rows FIRST, delete the pending rows
-//     BEFORE the queue flip (so a worker claiming the re-queued row can't drain
-//     them a second time), then CAS settled→queued so the worker resumes.
+//     reply semantics — CLAIM each pending row first (so a concurrent flush or a
+//     resumed run's drain point A can never deliver it a second time), append the
+//     operator rows, then CAS settled→queued so the worker resumes. A CAS lost to
+//     a concurrent CLOSE unwinds the appended rows (closed stays terminal —
+//     mirrors camResumeSettledInvestigation).
 //   - closed: drop the rows (deleted, not delivered) — closed is terminal by
 //     operator choice.
 //   - queued/running: leave them — the live run's own drain point A delivers them.
@@ -1055,25 +1111,46 @@ func camFlushStrandedPendingInvestigateMessages(db *sql.DB, invID string) {
 	if gerr != nil {
 		return
 	}
-	ids := make([]string, 0, len(pend))
-	for _, p := range pend {
-		ids = append(ids, p.ID)
-	}
 	switch inv.Status {
 	case "closed":
+		ids := make([]string, 0, len(pend))
+		for _, p := range pend {
+			ids = append(ids, p.ID)
+		}
 		_ = deleteCameraInvestigationPendingMessages(db, ids)
 		camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "dropped": len(ids), "status": "closed"})
 	case "awaiting_operator", "answered", "exhausted":
+		var appended []string
+		delivered := 0
 		for _, p := range pend {
-			camAppendInvestigateMessage(db, invID, "operator", p.Message, "", "", 0, nil)
+			claimed, cerr := claimCameraInvestigationPendingMessage(db, p.ID)
+			if cerr != nil || !claimed {
+				continue // lost to a concurrent drain/flush — that winner delivers it
+			}
+			m := camAppendInvestigateMessage(db, invID, "operator", p.Message, p.Origin, "", 0, nil)
+			appended = append(appended, m.ID)
+			delivered++
 		}
-		_ = deleteCameraInvestigationPendingMessages(db, ids)
+		if delivered == 0 {
+			return
+		}
 		requeued, rerr := requeueCameraInvestigationFromSettled(db, invID)
 		if rerr != nil {
 			camlog("warn", "investigate_pending_flush", map[string]any{"investigation_id": invID, "ok": false, "error": rerr.Error()})
 			return
 		}
-		camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "delivered": len(ids), "requeued": requeued})
+		if !requeued {
+			// Lost CAS: a concurrent resume already queued the row (delivered — fine),
+			// or a concurrent close froze it — unwind the appends, closed is terminal.
+			if cur, cerr := getCameraInvestigation(db, invID); cerr == nil && cur.Status == "closed" {
+				for _, id := range appended {
+					_ = deleteCameraInvestigationMessage(db, id)
+				}
+				camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "dropped": delivered, "status": "closed"})
+				return
+			}
+		}
+		camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "delivered": delivered, "requeued": requeued})
 	}
 }
 
@@ -1996,7 +2073,10 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			// starts a fresh budget — deliberately matching what
 			// camCountInvestigateProgress reconstructs from the transcript on a
 			// resumed pass (it resets at any non-ask_operator operator row), so the
-			// live counters and a resume can never disagree.
+			// live counters and a resume can never disagree. This reset stays
+			// bounded even though the share-link page can park messages: view-token
+			// messages are capped per investigation (camViewReplyMaxPerInvestigation)
+			// and the other pending writers are authenticated (admin/site token).
 			turnsSoFar, mediaUsed = 0, 0
 		}
 		if cctx.Err() != nil {
@@ -2504,7 +2584,13 @@ func handleCameraInvestigationReply(cfg config) http.HandlerFunc {
 		// still settled, so no worker touches it), THEN flips to "queued" so the
 		// background worker only ever claims a row whose transcript already includes
 		// this reply — this ordering closes the resume-on-stale-transcript race.
-		if serr := camResumeSettledInvestigation(db, id, message); serr != nil {
+		if serr := camResumeSettledInvestigation(db, id, message, ""); serr != nil {
+			if errors.Is(serr, errCamInvestigateReplyClosed) {
+				// The row was closed between the status read and the queue CAS — the
+				// reply was unwound, mirror the up-front closed refusal.
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
 			return
 		}

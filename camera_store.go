@@ -328,6 +328,7 @@ func migrateCameraDB(db *sql.DB) error {
 			id TEXT PRIMARY KEY,
 			investigation_id TEXT NOT NULL,
 			message TEXT NOT NULL,
+			origin TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cameras_site ON cameras(site_id, enabled)`,
@@ -652,6 +653,14 @@ func migrateCameraDB(db *sql.DB) error {
 		return err
 	}
 	if err := ensureSQLiteColumn(db, "camera_site_callbacks", "stream_progress", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Pending-message origin: which surface parked the message ('' = an
+	// authenticated admin/site-token reply, camViewReplySource = the public
+	// share-link page). The drained transcript row inherits it as tool_name so
+	// the per-investigation view-reply cap (an unauthenticated capability must
+	// stay bounded) can be counted durably from the transcript.
+	if err := ensureSQLiteColumn(db, "camera_investigation_pending_messages", "origin", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	// Index created AFTER the column exists (the stmts block above ran before
@@ -1981,6 +1990,39 @@ func appendCameraInvestigationMessage(db *sql.DB, m camInvestigationMessage) (st
 	return m.ID, nil
 }
 
+// deleteCameraInvestigationMessage removes one transcript row by id — used only
+// to undo an operator append that lost the settled→queued CAS to a concurrent
+// close (camResumeSettledInvestigation): closed is terminal by operator choice,
+// so a reply racing the close must not persist into the frozen transcript.
+func deleteCameraInvestigationMessage(db *sql.DB, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := db.Exec(`DELETE FROM camera_investigation_messages WHERE id = ?`, id)
+	return err
+}
+
+// countCameraInvestigationViewReplies counts the messages the PUBLIC share-link
+// page has contributed to an investigation: delivered operator rows carrying the
+// camViewReplySource marker plus still-parked pending rows with that origin. The
+// view reply endpoint refuses beyond camViewReplyMaxPerInvestigation — the cap
+// that keeps the unauthenticated view_token capability from resetting the run's
+// cumulative turn/media budget an unbounded number of times.
+func countCameraInvestigationViewReplies(db *sql.DB, investigationID string) (int, error) {
+	var delivered, parked int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM camera_investigation_messages
+		WHERE investigation_id = ? AND role = 'operator' AND tool_name = ?`,
+		investigationID, camViewReplySource).Scan(&delivered); err != nil {
+		return 0, err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM camera_investigation_pending_messages
+		WHERE investigation_id = ? AND origin = ?`,
+		investigationID, camViewReplySource).Scan(&parked); err != nil {
+		return 0, err
+	}
+	return delivered + parked, nil
+}
+
 // listCameraInvestigationMessages returns an investigation's transcript in seq order.
 func listCameraInvestigationMessages(db *sql.DB, investigationID string) ([]camInvestigationMessage, error) {
 	rows, err := db.Query(`SELECT `+camInvMsgCols+` FROM camera_investigation_messages WHERE investigation_id = ? ORDER BY seq`, investigationID)
@@ -2010,13 +2052,14 @@ type camInvestigationPendingMessage struct {
 	ID              string
 	InvestigationID string
 	Message         string
+	Origin          string // '' = authenticated (admin/site-token); camViewReplySource = public share link
 	CreatedAt       string
 }
 
-func insertCameraInvestigationPendingMessage(db *sql.DB, investigationID, message string) (string, error) {
+func insertCameraInvestigationPendingMessage(db *sql.DB, investigationID, message, origin string) (string, error) {
 	id := randomID("ipend")
-	_, err := db.Exec(`INSERT INTO camera_investigation_pending_messages (id, investigation_id, message, created_at)
-		VALUES (?, ?, ?, ?)`, id, investigationID, message, nowRFC3339())
+	_, err := db.Exec(`INSERT INTO camera_investigation_pending_messages (id, investigation_id, message, origin, created_at)
+		VALUES (?, ?, ?, ?, ?)`, id, investigationID, message, origin, nowRFC3339())
 	return id, err
 }
 
@@ -2024,7 +2067,7 @@ func insertCameraInvestigationPendingMessage(db *sql.DB, investigationID, messag
 // pending messages oldest-first (rowid breaks same-second created_at ties, so
 // delivery order is insertion order).
 func listCameraInvestigationPendingMessages(db *sql.DB, investigationID string) ([]camInvestigationPendingMessage, error) {
-	rows, err := db.Query(`SELECT id, investigation_id, message, created_at
+	rows, err := db.Query(`SELECT id, investigation_id, message, origin, created_at
 		FROM camera_investigation_pending_messages WHERE investigation_id = ? ORDER BY created_at, rowid`, investigationID)
 	if err != nil {
 		return nil, err
@@ -2033,12 +2076,31 @@ func listCameraInvestigationPendingMessages(db *sql.DB, investigationID string) 
 	var out []camInvestigationPendingMessage
 	for rows.Next() {
 		var m camInvestigationPendingMessage
-		if err := rows.Scan(&m.ID, &m.InvestigationID, &m.Message, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.InvestigationID, &m.Message, &m.Origin, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// claimCameraInvestigationPendingMessage atomically claims ONE pending row for
+// delivery by deleting it, returning true only when THIS caller performed the
+// delete (RowsAffected==1) — the same CAS idiom as claimCameraInvestigation.
+// Both drain points claim-before-append through this, so two concurrent drains
+// (the run's deferred flush racing a reply handler's post-insert flush) can
+// never deliver the same message twice; the price is a crash between the
+// delete and the append losing that one message, accepted for exactly-once.
+func claimCameraInvestigationPendingMessage(db *sql.DB, id string) (bool, error) {
+	res, err := db.Exec(`DELETE FROM camera_investigation_pending_messages WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // deleteCameraInvestigationPendingMessages removes drained rows by id (a no-op

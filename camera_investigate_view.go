@@ -23,6 +23,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -41,6 +42,21 @@ const (
 // camViewReplyMaxRunes caps a reply message server-side, in RUNES (never bytes —
 // the live sites write Arabic, and a byte slice could split a multibyte rune).
 const camViewReplyMaxRunes = 2000
+
+// camViewReplyMaxBody caps the /reply request body BEFORE it is decoded: without
+// it a multi-GB JSON string buffers fully into RAM before the rune cap ever runs
+// (the rate limit bounds request COUNT, not size). 32KB comfortably holds a
+// 2000-rune message even fully \uXXXX-escaped, matching main.go's convention.
+const camViewReplyMaxBody = 32 << 10
+
+// camViewReplyMaxPerInvestigation is the LIFETIME cap on messages one
+// investigation accepts from its share-link page (delivered + still-parked,
+// countCameraInvestigationViewReplies). Every accepted view message can reset
+// the run's cumulative turn/media budget (an interrupt or a settled follow-up
+// starts fresh operator input), so an uncapped view_token — an unauthenticated
+// capability — would mean unbounded model spend and DVR load for anyone holding
+// the link. Authenticated surfaces (admin/site token) are not capped.
+const camViewReplyMaxPerInvestigation = 20
 
 // camInvestigationViewURL builds the public timeline URL for an investigation, or
 // "" when the row has no view_token (nothing to link). r may be nil (background
@@ -166,7 +182,10 @@ func camServeViewReply(cfg config, w http.ResponseWriter, r *http.Request, token
 	var body struct {
 		Message string `json:"message"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// Byte-cap the body BEFORE decoding — this runs pre-token-validation, so an
+	// attacker who only knows the URL shape must never make us buffer more than
+	// this per request (the rate limit bounds count, MaxBytesReader bounds size).
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, camViewReplyMaxBody)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 		return
 	}
@@ -187,26 +206,65 @@ func camServeViewReply(cfg config, w http.ResponseWriter, r *http.Request, token
 		http.NotFound(w, r) // unknown token → uniform 404 (no token oracle)
 		return
 	}
+	if inv.ParentID != "" {
+		// A delegated sub-investigation runs in-process inside its lead run's
+		// delegate turn — it has no drain point and never re-enters the queue, so
+		// a reply here would strand (or misroute the child into the top-level
+		// worker queue). The lead run's page is the write surface.
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "replies must go to the lead investigation's page"})
+		return
+	}
+	// Lifetime cap on share-link messages (see camViewReplyMaxPerInvestigation):
+	// each accepted message may reset the run's cumulative budget, so the
+	// unauthenticated capability must stay bounded per investigation.
+	if n, cerr := countCameraInvestigationViewReplies(db, inv.ID); cerr != nil {
+		camlog("warn", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "ok": false, "error": cerr.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	} else if n >= camViewReplyMaxPerInvestigation {
+		camlog("warn", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "ok": false, "reason": "reply_cap", "count": n})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "reply limit reached for this investigation"})
+		return
+	}
 	switch inv.Status {
 	case "closed":
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
 	case "queued", "running":
 		// A worker owns the row — park the message in the pending side-channel
 		// (the run drains it at the top of its next turn) instead of writing the
-		// transcript here.
-		if _, perr := insertCameraInvestigationPendingMessage(db, inv.ID, message); perr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+		// transcript here. Internal errors are logged, never echoed: this is the
+		// unauthenticated surface, and raw DB error text is a schema/engine oracle.
+		if _, perr := insertCameraInvestigationPendingMessage(db, inv.ID, message, camViewReplySource); perr != nil {
+			camlog("warn", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "ok": false, "error": perr.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
 		}
 		// Stranding double-check (drain point B): if the run settled between the
-		// status read and the insert, deliver the message now.
+		// status read and the insert, deliver the message now. If that flush
+		// re-queued the row and the background worker is disabled, drain inline —
+		// nothing else would ever claim it.
 		camFlushStrandedPendingInvestigateMessages(db, inv.ID)
+		if !cfg.CameraInvestigateWorkerEnabled {
+			camRunInvestigationInline(db, cfg, r, inv.ID)
+		}
 		camlog("info", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "prev_status": inv.Status, "queued": true})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": inv.Status, "queued": true})
 	default: // awaiting_operator | answered | exhausted
-		if serr := camResumeSettledInvestigation(db, inv.ID, message); serr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+		if serr := camResumeSettledInvestigation(db, inv.ID, message, camViewReplySource); serr != nil {
+			if errors.Is(serr, errCamInvestigateReplyClosed) {
+				// Lost the queue CAS to a concurrent close — the reply was unwound.
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
+				return
+			}
+			camlog("warn", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "ok": false, "error": serr.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
+		}
+		// With the background worker disabled nothing claims the re-queued row —
+		// drain it inline like the sibling admin/svc reply paths, or the
+		// investigation would stick at "queued" forever.
+		if !cfg.CameraInvestigateWorkerEnabled {
+			camRunInvestigationInline(db, cfg, r, inv.ID)
 		}
 		camlog("info", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "prev_status": inv.Status})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "queued"})
@@ -311,7 +369,7 @@ func camViewStateJSON(cfg config, db *sql.DB, inv camInvestigation) map[string]a
 		"site_name":  siteName,
 		"created_at": inv.CreatedAt,
 		"updated_at": inv.UpdatedAt,
-		"can_reply":  !cfg.CameraViewReplyDisabled && inv.Status != "closed",
+		"can_reply":  camViewCanReply(cfg, db, inv),
 		"turns":      camViewTurnsJSON(db, msgs, inv.ViewToken, capCache),
 	}
 	// Children carry the PARENT's view_token in their media URLs: the media gate
@@ -328,6 +386,21 @@ func camViewStateJSON(cfg config, db *sql.DB, inv camInvestigation) map[string]a
 		state["children"] = carr
 	}
 	return state
+}
+
+// camViewCanReply computes state.json's can_reply — the shell shows the composer
+// only when the reply endpoint would actually accept a message: kill switch off,
+// not closed, a LEAD investigation (a delegated child's page has no reply
+// surface), and the share-link message cap not yet reached. Cosmetic only (the
+// endpoint re-enforces all four), so a count error fails open.
+func camViewCanReply(cfg config, db *sql.DB, inv camInvestigation) bool {
+	if cfg.CameraViewReplyDisabled || inv.Status == "closed" || inv.ParentID != "" {
+		return false
+	}
+	if n, err := countCameraInvestigationViewReplies(db, inv.ID); err == nil && n >= camViewReplyMaxPerInvestigation {
+		return false
+	}
+	return true
 }
 
 // camViewTurnsJSON maps a transcript to the page's turn shape {seq, role, content,

@@ -1588,6 +1588,15 @@ func handleSvcInvestigationReply(cfg config) camSvcHandler {
 			camSvcNotFound(w)
 			return
 		}
+		if inv.ParentID != "" {
+			// A delegated sub-investigation is executed IN-PROCESS inside its lead
+			// run's delegate turn (camRunSubagentLoop) — it has no pending-message
+			// drain point and never re-enters the worker queue, so a reply targeting
+			// a child id would strand forever (or, once the child settles, requeue a
+			// child into the top-level queue). Steer the caller to the lead run.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "replies must target the lead investigation, not a delegated sub-investigation"})
+			return
+		}
 		switch inv.Status {
 		case "closed":
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
@@ -1597,14 +1606,18 @@ func handleSvcInvestigationReply(cfg config) camSvcHandler {
 			// here (the worker-vs-request lost-update guard stands) — the message is
 			// parked in the pending side-channel and the run's own drain point picks
 			// it up on its next turn.
-			if _, perr := insertCameraInvestigationPendingMessage(db, id, message); perr != nil {
+			if _, perr := insertCameraInvestigationPendingMessage(db, id, message, ""); perr != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
 				return
 			}
 			// Stranding double-check (drain point B): if the run settled between the
 			// status read and the insert, deliver the message now instead of leaving
-			// it parked forever.
+			// it parked forever. If the flush re-queued the row and the background
+			// worker is disabled, drain it inline too — nothing else would claim it.
 			camFlushStrandedPendingInvestigateMessages(db, id)
+			if !cfg.CameraInvestigateWorkerEnabled {
+				camRunInvestigationInline(db, cfg, r, id)
+			}
 			camlog("info", "svc_investigate_reply", map[string]any{"investigation_id": id, "site_id": sc.SiteID, "prev_status": inv.Status, "queued": true})
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "status": inv.Status, "queued": true})
 			return
@@ -1612,7 +1625,11 @@ func handleSvcInvestigationReply(cfg config) camSvcHandler {
 		// Settled: the shared core appends the operator message FIRST (row still
 		// settled, so no worker touches it), THEN flips to "queued" — the
 		// resume-on-stale-transcript ordering.
-		if serr := camResumeSettledInvestigation(db, id, message); serr != nil {
+		if serr := camResumeSettledInvestigation(db, id, message, ""); serr != nil {
+			if errors.Is(serr, errCamInvestigateReplyClosed) {
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
 			return
 		}

@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -28,6 +29,10 @@ func newCamViewTestConfig(t *testing.T) config {
 		DBPath:                     filepath.Join(dir, ".proxy.db"),
 		CameraMediaDir:             filepath.Join(dir, "media"),
 		CameraCallbackAllowPrivate: true,
+		// Mirror production (PROXY_CAMERA_INVESTIGATE_WORKER defaults true): with
+		// the worker "enabled" (no worker actually runs in tests) the reply paths
+		// enqueue only — the worker-disabled inline drain has its own test.
+		CameraInvestigateWorkerEnabled: true,
 	}
 	if err := os.MkdirAll(cfg.CameraMediaDir, 0o700); err != nil {
 		t.Fatalf("mkdir media root: %v", err)
@@ -505,6 +510,243 @@ func TestCameraViewReplyTruncatesRunes(t *testing.T) {
 	}
 	if string(got) != string([]rune(long)[:2000]) {
 		t.Error("stored message is not the rune-safe prefix of the original")
+	}
+}
+
+// TestCameraViewReplyBodyCap: the reply body is byte-capped (http.MaxBytesReader)
+// BEFORE it is decoded, so a huge JSON string can never buffer into RAM — the
+// endpoint answers 400 and parks nothing.
+func TestCameraViewReplyBodyCap(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "big body")
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+
+	huge := `{"message":"` + strings.Repeat("a", 64<<10) + `"}` // 64KB > camViewReplyMaxBody
+	resp, err := srv.Client().Post(srv.URL+"/camera/investigations/"+viewTok+"/reply",
+		"application/json", strings.NewReader(huge))
+	if err != nil {
+		t.Fatalf("POST reply: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized body: %d, want 400", resp.StatusCode)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, invID); len(pend) != 0 {
+		t.Errorf("oversized body must park nothing: %+v", pend)
+	}
+}
+
+// TestCameraViewReplyGenericInternalError: a storage failure on the PUBLIC
+// surface answers a generic {"error":"internal error"} — never the raw engine/
+// schema text the authenticated handlers may echo.
+func TestCameraViewReplyGenericInternalError(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "leaky errors?")
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	// Force an internal failure the handler must not narrate.
+	if _, err := db.Exec(`DROP TABLE camera_investigation_pending_messages`); err != nil {
+		t.Fatalf("drop pending table: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{"message": "hello"})
+	resp, err := srv.Client().Post(srv.URL+"/camera/investigations/"+viewTok+"/reply",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST reply: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d %s, want 500", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	if out["error"] != "internal error" {
+		t.Errorf("error = %v, want the generic string", out["error"])
+	}
+	for _, leak := range []string{"sqlite", "SQL", "no such table", "camera_investigation_pending_messages"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("500 body leaks internals (%q): %s", leak, raw)
+		}
+	}
+}
+
+// TestCameraViewReplyChildRefused: a delegated sub-investigation's view token
+// must not accept replies — a child has no drain point (it runs in-process
+// inside the lead's delegate turn), so an accepted message would strand forever.
+// Its state.json also reports can_reply=false so the shell hides the composer.
+func TestCameraViewReplyChildRefused(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	parentID, _, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "lead question")
+	childID, childTok, _ := seedCamViewInvestigation(t, cfg, "site_1", parentID, "sub question")
+	if err := setCameraInvestigationStatus(db, childID, "running"); err != nil {
+		t.Fatalf("set child running: %v", err)
+	}
+
+	code, out := camViewReplyPost(t, srv, childTok, "hello child")
+	if code != http.StatusOK || out["ok"] != false {
+		t.Fatalf("child reply: %d %v, want 200 ok=false", code, out)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "lead investigation") {
+		t.Errorf("child reply error = %q, want it to steer to the lead", msg)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, childID); len(pend) != 0 {
+		t.Errorf("child reply must park nothing: %+v", pend)
+	}
+
+	// A settled child refuses too (a resume would misroute it into the queue).
+	if err := setCameraInvestigationStatus(db, childID, "answered"); err != nil {
+		t.Fatalf("set child answered: %v", err)
+	}
+	if code, out := camViewReplyPost(t, srv, childTok, "follow-up"); code != http.StatusOK || out["ok"] != false {
+		t.Errorf("settled child reply: %d %v, want ok=false", code, out)
+	}
+	if inv, _ := getCameraInvestigation(db, childID); inv.Status != "answered" {
+		t.Errorf("child status = %q, want answered (never requeued)", inv.Status)
+	}
+
+	code, body := camViewGet(t, srv, "/camera/investigations/"+childTok+"/state.json")
+	if code != http.StatusOK {
+		t.Fatalf("child state.json: %d %s", code, body)
+	}
+	var st map[string]any
+	_ = json.Unmarshal(body, &st)
+	if st["can_reply"] != false {
+		t.Errorf("child can_reply = %v, want false", st["can_reply"])
+	}
+}
+
+// TestCameraViewReplyCapPerInvestigation pins the lifetime share-link message
+// cap: once camViewReplyMaxPerInvestigation view-originated messages exist
+// (delivered markers + parked view pending rows), the endpoint refuses with
+// ok:false and state.json flips can_reply to false — the unauthenticated
+// view_token can never reset the run's budget an unbounded number of times.
+func TestCameraViewReplyCapPerInvestigation(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "capped?")
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	// Cap-1 delivered view messages + 1 still-parked one = at the cap.
+	for i := 0; i < camViewReplyMaxPerInvestigation-1; i++ {
+		camAppendInvestigateMessage(db, invID, "operator", "earlier view message", camViewReplySource, "", 0, nil)
+	}
+	if _, err := insertCameraInvestigationPendingMessage(db, invID, "parked view message", camViewReplySource); err != nil {
+		t.Fatalf("insert pending: %v", err)
+	}
+
+	code, out := camViewReplyPost(t, srv, viewTok, "one too many")
+	if code != http.StatusOK || out["ok"] != false {
+		t.Fatalf("capped reply: %d %v, want 200 ok=false", code, out)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "reply limit") {
+		t.Errorf("capped reply error = %q, want a reply-limit message", msg)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, invID); len(pend) != 1 {
+		t.Errorf("capped reply must not park more rows: %+v", pend)
+	}
+	code, body := camViewGet(t, srv, "/camera/investigations/"+viewTok+"/state.json")
+	if code != http.StatusOK {
+		t.Fatalf("state.json: %d %s", code, body)
+	}
+	var st map[string]any
+	_ = json.Unmarshal(body, &st)
+	if st["can_reply"] != false {
+		t.Errorf("can_reply at the cap = %v, want false", st["can_reply"])
+	}
+
+	// Authenticated ('' origin) operator rows never count against the view cap.
+	fresh, freshTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "uncapped admin traffic")
+	if err := setCameraInvestigationStatus(db, fresh, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	for i := 0; i < camViewReplyMaxPerInvestigation+3; i++ {
+		camAppendInvestigateMessage(db, fresh, "operator", "studio message", "", "", 0, nil)
+	}
+	if code, out := camViewReplyPost(t, srv, freshTok, "still fine"); code != http.StatusOK || out["ok"] != true {
+		t.Errorf("reply with only authenticated rows: %d %v, want ok=true", code, out)
+	}
+}
+
+// TestCameraViewReplyInlineDrainWorkerDisabled: with the background worker
+// DISABLED, a settled view reply must drain the re-queued row inline (like the
+// sibling admin/svc reply paths) instead of stranding it in "queued" forever.
+func TestCameraViewReplyInlineDrainWorkerDisabled(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraInvestigateWorkerEnabled = false
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	siteID, serr := insertCameraSite(db, camSite{Name: "Inline Site"})
+	if serr != nil {
+		t.Fatalf("insertCameraSite: %v", serr)
+	}
+	invID, ierr := insertCameraInvestigation(db, camInvestigation{SiteID: siteID, Question: "anything overnight?", Status: "answered"})
+	if ierr != nil {
+		t.Fatalf("insert investigation: %v", ierr)
+	}
+	camAppendInvestigateMessage(db, invID, "operator", "anything overnight?", "", "", 0, nil)
+	inv, _ := getCameraInvestigation(db, invID)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"reviewed","action":{"type":"answer","answer":"all clear at the gate"}}`, nil, nil
+	}
+
+	code, out := camViewReplyPost(t, srv, inv.ViewToken, "please double-check")
+	if code != http.StatusOK || out["ok"] != true {
+		t.Fatalf("settled reply: %d %v, want ok=true", code, out)
+	}
+	if calls < 1 {
+		t.Fatalf("inline drain never ran the model (calls = %d)", calls)
+	}
+	after, _ := getCameraInvestigation(db, invID)
+	if after.Status != "answered" {
+		t.Errorf("status = %q, want answered (inline-drained, not stranded in queued)", after.Status)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	last := msgs[len(msgs)-1]
+	if last.Role != "ai" || !strings.Contains(last.Content, "all clear at the gate") {
+		t.Errorf("final row = %+v, want the inline run's answer", last)
 	}
 }
 

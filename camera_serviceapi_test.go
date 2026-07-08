@@ -590,3 +590,47 @@ func TestSvcInvestigationReplyWhileRunning(t *testing.T) {
 		t.Errorf("cross-site reply must not park a message: %+v", pend)
 	}
 }
+
+// TestSvcInvestigationReplyChildRefused: a reply targeting a delegated
+// sub-investigation (parent_id set, its id exposed via investigations/get
+// children[]) is refused outright. A RUNNING child executes in-process inside
+// the lead's delegate turn — it has NO pending drain point, so an accepted
+// message would strand forever with a false ok:true/queued:true — and a settled
+// child must never be requeued into the top-level worker queue.
+func TestSvcInvestigationReplyChildRefused(t *testing.T) {
+	cfg := newSvcTestConfig(t)
+	db := svcTestDB(t, cfg)
+	srv := newSvcTestServer(t, cfg)
+
+	siteA, tokA := svcSeedSite(t, db, "Site A")
+	parent, _ := insertCameraInvestigation(db, camInvestigation{SiteID: siteA, Title: "lead", Question: "lead", Status: "running"})
+	child, _ := insertCameraInvestigation(db, camInvestigation{SiteID: siteA, ParentID: parent, Title: "sub", Question: "sub", Status: "running"})
+	camAppendInvestigateMessage(db, child, "operator", "sub", "", "", 0, nil)
+
+	// Running child: refused, nothing parked, nothing appended.
+	code, out, _ := svcCall(t, srv, http.MethodPost, "/api/cameras/investigations/reply", tokA, map[string]any{"id": child, "message": "steer the child"})
+	if code != http.StatusOK || out["ok"] != false {
+		t.Fatalf("running child reply: %d %v, want 200 ok=false", code, out)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "lead investigation") {
+		t.Errorf("child reply error = %q, want it to steer to the lead", msg)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, child); len(pend) != 0 {
+		t.Errorf("running child reply parked a message: %+v", pend)
+	}
+	if msgs, _ := listCameraInvestigationMessages(db, child); len(msgs) != 1 {
+		t.Errorf("child transcript rows = %d, want 1 (unchanged)", len(msgs))
+	}
+
+	// Settled child: refused too — a resume would push a child into the queue.
+	if err := setCameraInvestigationStatus(db, child, "answered"); err != nil {
+		t.Fatalf("set child answered: %v", err)
+	}
+	code, out, _ = svcCall(t, srv, http.MethodPost, "/api/cameras/investigations/reply", tokA, map[string]any{"id": child, "message": "follow up"})
+	if code != http.StatusOK || out["ok"] != false {
+		t.Fatalf("settled child reply: %d %v, want 200 ok=false", code, out)
+	}
+	if inv, _ := getCameraInvestigation(db, child); inv.Status != "answered" {
+		t.Errorf("child status = %q, want answered (never requeued)", inv.Status)
+	}
+}

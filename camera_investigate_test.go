@@ -515,6 +515,65 @@ func TestAnalyzeInvestigateActionPlanAsAnswerRepairInfraFailure(t *testing.T) {
 	}
 }
 
+// TestAnalyzeInvestigateActionPlanAsAnswerRepairUnparseable closes the last
+// gap in guard A's last resort: the first reply duplicates thought==answer and
+// the repair reply carries NO parseable JSON at all (prose). The duplicated —
+// but non-empty — answer from attempt 1 must be ACCEPTED, not returned as an
+// error: erroring here is a zero-progress requeue every time (no "ai" row
+// persists), which can terminalize the run "exhausted" with an answer in hand.
+func TestAnalyzeInvestigateActionPlanAsAnswerRepairUnparseable(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"the whole plan","action":{"type":"answer","answer":"the whole plan"}}`, nil, nil
+		}
+		return "Sure! Here is my final answer restated in plain prose without any JSON.", nil, nil
+	}
+	act, _, repaired, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (want the attempt-1 dup answer accepted)", err)
+	}
+	if !repaired {
+		t.Errorf("repaired = false, want true")
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2", calls)
+	}
+	if act.Action.Type != "answer" || act.Action.Answer != "the whole plan" {
+		t.Errorf("action = %+v, want the first reply's duplicated answer accepted", act.Action)
+	}
+}
+
+// TestAnalyzeInvestigateActionEmptyAnswerRepairUnparseable is the sibling gap
+// for the empty-answer sentinel: attempt 1 answers with an empty answer field,
+// the repair reply is prose with no JSON — the thought is promoted to the
+// answer (the documented last resort) instead of erroring the pass.
+func TestAnalyzeInvestigateActionEmptyAnswerRepairUnparseable(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"no motion was found overnight","action":{"type":"answer","answer":""}}`, nil, nil
+		}
+		return "I already answered above — nothing else to add.", nil, nil
+	}
+	act, _, _, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (want thought promoted to answer)", err)
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2", calls)
+	}
+	if act.Action.Answer != "no motion was found overnight" {
+		t.Errorf("answer = %q, want the promoted thought", act.Action.Answer)
+	}
+}
+
 func TestParseInvestigateActionErrors(t *testing.T) {
 	cases := []struct {
 		name string

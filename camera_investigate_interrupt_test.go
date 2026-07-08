@@ -17,7 +17,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -62,7 +64,7 @@ func TestRunInvestigationDrainsPendingInterrupt(t *testing.T) {
 		calls++
 		if calls == 1 {
 			// The interrupt arrives while the model is "thinking" on turn 1.
-			if _, perr := insertCameraInvestigationPendingMessage(db, invID, "wait — check the loading dock first"); perr != nil {
+			if _, perr := insertCameraInvestigationPendingMessage(db, invID, "wait — check the loading dock first", ""); perr != nil {
 				t.Fatalf("insert pending: %v", perr)
 			}
 			return `{"thought":"start cheap","action":{"type":"call_tool","tool":"roster"}}`, nil, nil
@@ -127,7 +129,7 @@ func TestCamFlushStrandedPendingInvestigateMessages(t *testing.T) {
 
 	// Settled → delivered + requeued.
 	settled := seed("answered")
-	if _, err := insertCameraInvestigationPendingMessage(db, settled, "follow-up"); err != nil {
+	if _, err := insertCameraInvestigationPendingMessage(db, settled, "follow-up", ""); err != nil {
 		t.Fatalf("insert pending: %v", err)
 	}
 	camFlushStrandedPendingInvestigateMessages(db, settled)
@@ -144,7 +146,7 @@ func TestCamFlushStrandedPendingInvestigateMessages(t *testing.T) {
 
 	// Closed → dropped, transcript and status untouched.
 	closed := seed("closed")
-	if _, err := insertCameraInvestigationPendingMessage(db, closed, "too late"); err != nil {
+	if _, err := insertCameraInvestigationPendingMessage(db, closed, "too late", ""); err != nil {
 		t.Fatalf("insert pending: %v", err)
 	}
 	camFlushStrandedPendingInvestigateMessages(db, closed)
@@ -160,12 +162,154 @@ func TestCamFlushStrandedPendingInvestigateMessages(t *testing.T) {
 
 	// Queued → left alone (the run's own drain point A owns delivery).
 	queued := seed("queued")
-	if _, err := insertCameraInvestigationPendingMessage(db, queued, "still parked"); err != nil {
+	if _, err := insertCameraInvestigationPendingMessage(db, queued, "still parked", ""); err != nil {
 		t.Fatalf("insert pending: %v", err)
 	}
 	camFlushStrandedPendingInvestigateMessages(db, queued)
 	if pend, _ := listCameraInvestigationPendingMessages(db, queued); len(pend) != 1 {
 		t.Errorf("queued flush must leave the row parked: %+v", pend)
+	}
+}
+
+// TestCamFlushStrandedPendingExactlyOnce proves drain point B's per-row claim:
+// many concurrent flushes over the same settled row deliver its pending message
+// EXACTLY once — never the duplicated operator row (and its spurious budget
+// reset on a later resume) that a list-append-delete interleaving allowed.
+func TestCamFlushStrandedPendingExactlyOnce(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, ierr := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", Question: "q", Status: "answered"})
+	if ierr != nil {
+		t.Fatalf("insert investigation: %v", ierr)
+	}
+	camAppendInvestigateMessage(db, invID, "operator", "q", "", "", 0, nil)
+	if _, err := insertCameraInvestigationPendingMessage(db, invID, "exactly once please", ""); err != nil {
+		t.Fatalf("insert pending: %v", err)
+	}
+
+	const flushers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < flushers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			camFlushStrandedPendingInvestigateMessages(db, invID)
+		}()
+	}
+	wg.Wait()
+
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	delivered := 0
+	for _, m := range msgs {
+		if m.Role == "operator" && m.Content == "exactly once please" {
+			delivered++
+		}
+	}
+	if delivered != 1 {
+		t.Errorf("delivered operator rows = %d, want exactly 1 (concurrent flushes must not double-deliver)", delivered)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, invID); len(pend) != 0 {
+		t.Errorf("pending rows after flush = %+v, want none", pend)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "queued" {
+		t.Errorf("status = %q, want queued", inv.Status)
+	}
+}
+
+// TestCamResumeSettledInvestigationClosedRace simulates a reply whose settled
+// status read went stale against a concurrent operator close: the append happens
+// first (the shared core's ordering), the settled→queued CAS then loses to the
+// closed row — the appended operator row must be UNWOUND (closed transcripts are
+// frozen) and the sentinel returned so callers answer "closed", never a false
+// "queued".
+func TestCamResumeSettledInvestigationClosedRace(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, ierr := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", Question: "q", Status: "closed"})
+	if ierr != nil {
+		t.Fatalf("insert investigation: %v", ierr)
+	}
+	camAppendInvestigateMessage(db, invID, "operator", "q", "", "", 0, nil)
+
+	serr := camResumeSettledInvestigation(db, invID, "sneaking into a closed record", "")
+	if !errors.Is(serr, errCamInvestigateReplyClosed) {
+		t.Fatalf("err = %v, want errCamInvestigateReplyClosed", serr)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if len(msgs) != 1 {
+		t.Errorf("transcript rows = %d, want 1 (the racing reply must be unwound)", len(msgs))
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "closed" {
+		t.Errorf("status = %q, want closed (terminal)", inv.Status)
+	}
+}
+
+// TestCamPendingOriginMarksDrainedRows pins the origin plumbing behind the
+// view-reply cap: a pending row parked by the share-link page (origin
+// camViewReplySource) drains into an operator row CARRYING that marker as its
+// tool_name — at drain point A and at the stranded flush — and
+// countCameraInvestigationViewReplies counts delivered markers plus still-parked
+// view rows while ignoring authenticated (empty-origin) messages.
+func TestCamPendingOriginMarksDrainedRows(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// Drain point A: running row, one view message + one authenticated message.
+	invID, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", Question: "q", Status: "running"})
+	msgs := []camInvestigationMessage{camAppendInvestigateMessage(db, invID, "operator", "q", "", "", 0, nil)}
+	if _, err := insertCameraInvestigationPendingMessage(db, invID, "from the share link", camViewReplySource); err != nil {
+		t.Fatalf("insert view pending: %v", err)
+	}
+	if _, err := insertCameraInvestigationPendingMessage(db, invID, "from the studio", ""); err != nil {
+		t.Fatalf("insert svc pending: %v", err)
+	}
+	msgs, drained := camDrainPendingInvestigateMessages(db, invID, msgs)
+	if drained != 2 {
+		t.Fatalf("drained = %d, want 2", drained)
+	}
+	byContent := map[string]string{}
+	for _, m := range msgs {
+		byContent[m.Content] = m.ToolName
+	}
+	if byContent["from the share link"] != camViewReplySource {
+		t.Errorf("view message tool_name = %q, want %q", byContent["from the share link"], camViewReplySource)
+	}
+	if byContent["from the studio"] != "" {
+		t.Errorf("authenticated message tool_name = %q, want empty", byContent["from the studio"])
+	}
+	if n, _ := countCameraInvestigationViewReplies(db, invID); n != 1 {
+		t.Errorf("view reply count = %d, want 1 (delivered marker only)", n)
+	}
+
+	// Stranded flush inherits the origin too, and parked view rows count.
+	settled, _ := insertCameraInvestigation(db, camInvestigation{SiteID: "site_1", Question: "q2", Status: "answered"})
+	camAppendInvestigateMessage(db, settled, "operator", "q2", "", "", 0, nil)
+	if _, err := insertCameraInvestigationPendingMessage(db, settled, "stranded view note", camViewReplySource); err != nil {
+		t.Fatalf("insert pending: %v", err)
+	}
+	if n, _ := countCameraInvestigationViewReplies(db, settled); n != 1 {
+		t.Errorf("parked view reply count = %d, want 1", n)
+	}
+	camFlushStrandedPendingInvestigateMessages(db, settled)
+	smsgs, _ := listCameraInvestigationMessages(db, settled)
+	last := smsgs[len(smsgs)-1]
+	if last.Content != "stranded view note" || last.ToolName != camViewReplySource {
+		t.Errorf("flushed row = %+v, want the view marker inherited", last)
+	}
+	if n, _ := countCameraInvestigationViewReplies(db, settled); n != 1 {
+		t.Errorf("view reply count after flush = %d, want still 1 (moved, not doubled)", n)
 	}
 }
 
