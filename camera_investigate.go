@@ -919,6 +919,47 @@ func camCountInvestigateProgress(msgs []camInvestigationMessage) (turns, mediaUs
 	return turns, mediaUsed
 }
 
+// camAnswerGuardAlreadyFired reconstructs the final-answer quality gate's one-shot
+// (answerGuardUsed) from the CURRENT budget epoch of the transcript, so a resumed
+// pass — a never-die requeue re-claiming the run after a budget/analysis wall, or
+// a stranded-flush resume — does NOT re-fire the single corrective round (guards
+// B/C AND the guard-D judge model call) a SECOND time. Without this, the one-shot
+// is only an in-memory local reset to false on every fresh runInvestigation call,
+// so a requeue that lands right after the round persisted its answer_quality note
+// would reopen the gate: another judge call, another corrective round, repeating
+// up to maxTurns — breaking both the "exactly one corrective round" guarantee and
+// the "zero judge calls once the round already fired" cost bound.
+//
+// It mirrors camCountInvestigateProgress's reset boundary EXACTLY: a
+// non-ask_operator operator row starts a fresh budget epoch (turns reset to 0) and
+// likewise clears the one-shot, so a genuinely new operator question/interrupt
+// earns a fresh corrective round (and the live interrupt drain resets the in-memory
+// bool at the same point, so a live pass and a resume can never disagree). Within
+// an epoch, the persisted "answer_quality" system note — written the instant the
+// round fires, before any requeue can interrupt — is the durable proof the round
+// already ran. Other system rows (auto_requeue, analysis_retry) never trip or reset
+// it, and a reply to an ask_operator continues the same epoch (guard stays used).
+func camAnswerGuardAlreadyFired(msgs []camInvestigationMessage) bool {
+	fired := false
+	lastAITool := ""
+	for _, m := range msgs {
+		switch m.Role {
+		case "operator":
+			if lastAITool != "ask_operator" {
+				fired = false
+			}
+			lastAITool = ""
+		case "ai":
+			lastAITool = strings.TrimSpace(m.ToolName)
+		case "system":
+			if strings.TrimSpace(m.ToolName) == "answer_quality" {
+				fired = true
+			}
+		}
+	}
+	return fired
+}
+
 // camCountAutoRequeues returns the CURRENT consecutive self-requeue streak from
 // the transcript: a system row with tool_name="auto_requeue" increments it, and
 // ANY genuine progress since — a model "ai" turn or an "operator" reply — resets
@@ -2140,10 +2181,14 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	}
 
 	var lastImages []string
-	// answerGuardUsed caps the final-answer quality gate (guards B+C at the accept
-	// site below) at ONE corrective round per pass, so a stubborn model can never
-	// loop on rejected answers — the second answer is accepted as-is.
-	answerGuardUsed := false
+	// answerGuardUsed caps the final-answer quality gate (guards B/C + the guard-D
+	// completeness judge at the accept site below) at ONE corrective round per budget
+	// epoch, so a stubborn model can never loop on rejected answers — the second
+	// answer is accepted as-is. Reconstructed from the persisted answer_quality note
+	// (NOT reset to false) so the one-shot SURVIVES a never-die requeue: a pass whose
+	// budget dies right after the round persisted its note resumes with the gate still
+	// closed, spending no second judge call and firing no second corrective round.
+	answerGuardUsed := camAnswerGuardAlreadyFired(msgs)
 	for {
 		// Drain point A (the interrupt): operator messages POSTed to the public
 		// timeline or the service reply route while this run is working land in the
@@ -2159,7 +2204,12 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			// bounded even though the share-link page can park messages: view-token
 			// messages are capped per investigation (camViewReplyMaxPerInvestigation)
 			// and the other pending writers are authenticated (admin/site token).
+			// The answer-guard one-shot resets on the SAME boundary — the interrupt is
+			// persisted as an operator row, so camAnswerGuardAlreadyFired would clear it
+			// on a resume; clearing it live keeps the two in lockstep and lets the new
+			// operator scope earn its own single corrective round.
 			turnsSoFar, mediaUsed = 0, 0
+			answerGuardUsed = false
 		}
 		if cctx.Err() != nil {
 			// NEVER-DIE: a per-pass budget exhaustion self-requeues for a fresh pass

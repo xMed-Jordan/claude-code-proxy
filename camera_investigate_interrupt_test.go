@@ -890,3 +890,154 @@ func TestCamJudgeAnswerCompletenessFunnel(t *testing.T) {
 		t.Errorf("actionable incomplete verdict: got %q, want the missing text", got)
 	}
 }
+
+// TestCamAnswerGuardAlreadyFired pins the one-shot reconstruction: within a budget
+// epoch the persisted answer_quality note means the corrective round already fired
+// (so a resumed pass must NOT re-fire it), a non-ask_operator operator row starts a
+// fresh epoch and clears it, a reply to an ask_operator continues the same epoch,
+// and unrelated system rows (auto_requeue, analysis_retry) neither set nor clear it.
+func TestCamAnswerGuardAlreadyFired(t *testing.T) {
+	op := func(tool string) camInvestigationMessage {
+		return camInvestigationMessage{Role: "operator", ToolName: tool}
+	}
+	ai := func(tool string) camInvestigationMessage { return camInvestigationMessage{Role: "ai", ToolName: tool} }
+	sysrow := func(tool string) camInvestigationMessage {
+		return camInvestigationMessage{Role: "system", ToolName: tool}
+	}
+	cases := []struct {
+		name string
+		msgs []camInvestigationMessage
+		want bool
+	}{
+		{"fresh question, no round yet", []camInvestigationMessage{op("")}, false},
+		{"round fired this epoch (the requeue case)", []camInvestigationMessage{op(""), ai("answer"), sysrow("answer_quality")}, true},
+		{"round fired then requeued (auto_requeue after the note)", []camInvestigationMessage{op(""), ai("answer"), sysrow("answer_quality"), sysrow("auto_requeue")}, true},
+		{"new operator interrupt clears the one-shot", []camInvestigationMessage{op(""), ai("answer"), sysrow("answer_quality"), op("view_reply")}, false},
+		{"ask_operator reply continues the same epoch", []camInvestigationMessage{op(""), ai("answer"), sysrow("answer_quality"), ai("ask_operator"), op("")}, true},
+		{"analysis_retry row is not a corrective round", []camInvestigationMessage{op(""), sysrow("analysis_retry"), ai("snapshot")}, false},
+		{"only the note in the LATEST epoch counts", []camInvestigationMessage{op(""), ai("answer"), sysrow("answer_quality"), op(""), ai("snapshot")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := camAnswerGuardAlreadyFired(tc.msgs); got != tc.want {
+				t.Errorf("camAnswerGuardAlreadyFired = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunInvestigationAnswerGuardSurvivesRequeue is the never-die regression for the
+// finding: a pass whose per-pass budget died right AFTER the single corrective round
+// persisted its answer_quality note is re-claimed and runInvestigation restarts. The
+// one-shot must be reconstructed from that persisted note (NOT reset to false), so
+// the resumed pass spends ZERO judge calls and fires NO second corrective round — it
+// accepts the model's next answer even though the scripted judge would still vote
+// "incomplete". This holds the "exactly one corrective round" + "zero judge calls once
+// the round fired" guarantees across a requeue.
+func TestRunInvestigationAnswerGuardSurvivesRequeue(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	invID := seedInterruptInvestigation(t, cfg, "give me a summary of what happened 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// Reconstruct the exact mid-correction transcript a requeue would resume from:
+	// the model's rejected first answer, the corrective answer_quality note, and the
+	// auto_requeue breadcrumb left when the per-pass budget then exhausted. The row is
+	// already "running" (a re-claim), so runInvestigation executes.
+	camAppendInvestigateMessage(db, invID, "ai", "At 07:01 a car parked near gate 2.", "answer", "", 0, nil)
+	camAppendInvestigateMessage(db, invID, "system",
+		"Final answer needs one correction before it is delivered: the answer does not cover the full scope the operator asked about — only 07:00-07:06 was examined. CONTINUE INVESTIGATING to cover the missing scope.",
+		"answer_quality", "", 0, nil)
+	camAppendInvestigateMessage(db, invID, "system",
+		"Time budget for this pass was exhausted before a final answer. Auto-resuming (attempt 1 of 5).", "auto_requeue", "", 0, nil)
+
+	// The judge would STILL reject on scope — but it must never be consulted on the
+	// resumed pass, because the round already fired.
+	judgeCalls := scriptCompletenessJudge(t, false, "still only saw the first six minutes", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"resuming after requeue","action":{"type":"answer","answer":"Across 07:00-09:00: a car parked at 07:01, staff arrived 07:40, a delivery at 08:30."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 0 {
+		t.Errorf("judge calls = %d, want 0 (the round already fired before the requeue — no second judge call)", *judgeCalls)
+	}
+	if calls != 1 {
+		t.Errorf("analyze calls = %d, want 1 (the resumed answer is accepted as-is, no second corrective round)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 1 {
+		t.Errorf("answer_quality notes = %d, want exactly 1 (the one from before the requeue — no second round)", n)
+	}
+	last := msgs[len(msgs)-1]
+	if last.Role != "ai" || last.ToolName != "answer" || !strings.Contains(last.Content, "08:30") {
+		t.Errorf("final row = %+v, want the resumed answer accepted", last)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationAnswerGuardRequeueThenInterrupt proves the one-shot RESETS when
+// a genuinely new operator interrupt lands after a round already fired: the resumed
+// pass reads a fresh question (its own budget epoch), so the guard-D judge is
+// consulted again for the NEW scope and one fresh corrective round is allowed — the
+// live drain reset and the reconstruction agree on the epoch boundary.
+func TestRunInvestigationAnswerGuardRequeueThenInterrupt(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	invID := seedInterruptInvestigation(t, cfg, "summarize 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// A prior epoch that already fired its corrective round, THEN a new operator
+	// interrupt (a fresh question) — this starts a new budget epoch, so the one-shot
+	// is spent no longer.
+	camAppendInvestigateMessage(db, invID, "ai", "At 07:01 a car parked.", "answer", "", 0, nil)
+	camAppendInvestigateMessage(db, invID, "system", "Final answer needs one correction: scope. CONTINUE INVESTIGATING.", "answer_quality", "", 0, nil)
+	camAppendInvestigateMessage(db, invID, "operator", "now also cover 09:00-10:00", "", "", 0, nil)
+
+	judgeCalls := scriptCompletenessJudge(t, false, "the new 09:00-10:00 hour is not covered", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"quick reply","action":{"type":"answer","answer":"Nothing at 09:15."}}`, nil, nil
+		}
+		return `{"thought":"covered the new hour","action":{"type":"answer","answer":"Across 09:00-10:00: quiet, one delivery at 09:40."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 1 {
+		t.Errorf("judge calls = %d, want 1 (new epoch after the interrupt earns a fresh judge call)", *judgeCalls)
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2 (one fresh corrective round for the new scope)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 2 {
+		t.Errorf("answer_quality notes = %d, want 2 (one per epoch: the seeded round + the new one)", n)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
