@@ -909,3 +909,99 @@ func TestSvcInvestigationCancel(t *testing.T) {
 		t.Errorf("cancel foreign: %d %v, want 404 not found", code, out)
 	}
 }
+
+// ─────────────────────────── 11. camera list snapshot thumbnails ───────────────────────────
+
+// TestSvcCamerasListSnapshotToken proves the svc camera list carries each
+// camera's current snapshot_token — the same thumbnail-capability token the
+// ADMIN cameraJSON derives via camSnapshotToken (camerahttp.go). A camera with
+// no snapshot pointer reports an empty token, and a FOREIGN site's snapshot
+// token never leaks into another site's list (the list is site-scoped; the
+// tokens themselves are only redeemed later via /api/cameras/media, which
+// site-checks).
+func TestSvcCamerasListSnapshotToken(t *testing.T) {
+	cfg := newSvcTestConfig(t)
+	db := svcTestDB(t, cfg)
+	srv := newSvcTestServer(t, cfg)
+
+	siteA, tokA := svcSeedSite(t, db, "Site A")
+	siteB, tokB := svcSeedSite(t, db, "Site B")
+
+	dvrA, err := insertCameraDVR(db, cfg, CamDVR{SiteID: siteA, Name: "DVR A", Brand: "hikvision", Host: "192.0.2.20", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCameraDVR A: %v", err)
+	}
+	dvrB, err := insertCameraDVR(db, cfg, CamDVR{SiteID: siteB, Name: "DVR B", Brand: "hikvision", Host: "192.0.2.21", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCameraDVR B: %v", err)
+	}
+
+	// Site A: one camera WITH a snapshot pointer, one WITHOUT.
+	camWithSnap, err := insertCamera(db, camera{SiteID: siteA, DVRID: dvrA, Channel: 1, Name: "Lobby", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCamera withSnap: %v", err)
+	}
+	camNoSnap, err := insertCamera(db, camera{SiteID: siteA, DVRID: dvrA, Channel: 2, Name: "Hallway", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCamera noSnap: %v", err)
+	}
+	_ = camNoSnap // referenced only by its rendered row below
+	capA, err := insertCameraCapture(db, camCapture{SiteID: siteA, CameraID: camWithSnap, Kind: "snapshot", Token: "snapatok1", ContentType: "image/jpeg"})
+	if err != nil {
+		t.Fatalf("insert capA: %v", err)
+	}
+	if err := setCameraSnapshot(db, camWithSnap, capA); err != nil {
+		t.Fatalf("setCameraSnapshot A: %v", err)
+	}
+
+	// Site B: a camera whose snapshot token must NEVER surface under site A.
+	camB, err := insertCamera(db, camera{SiteID: siteB, DVRID: dvrB, Channel: 1, Name: "Cam B", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCamera B: %v", err)
+	}
+	capB, err := insertCameraCapture(db, camCapture{SiteID: siteB, CameraID: camB, Kind: "snapshot", Token: "snapbtok9", ContentType: "image/jpeg"})
+	if err != nil {
+		t.Fatalf("insert capB: %v", err)
+	}
+	if err := setCameraSnapshot(db, camB, capB); err != nil {
+		t.Fatalf("setCameraSnapshot B: %v", err)
+	}
+
+	// Site A's list carries snapatok1 on the pointed camera, "" on the other, and
+	// never mentions site B's snapbtok9.
+	code, out, raw := svcCall(t, srv, http.MethodGet, "/api/cameras/list?dvr_id="+dvrA, tokA, nil)
+	if code != http.StatusOK {
+		t.Fatalf("cameras list A: %d %v", code, out)
+	}
+	cams, _ := out["cameras"].([]any)
+	if len(cams) != 2 {
+		t.Fatalf("site A cameras = %d, want 2", len(cams))
+	}
+	tokens := map[string]string{}
+	for _, c := range cams {
+		m := c.(map[string]any)
+		name, _ := m["name"].(string)
+		st, _ := m["snapshot_token"].(string)
+		tokens[name] = st
+	}
+	if tokens["Lobby"] != "snapatok1" {
+		t.Errorf("Lobby snapshot_token = %q, want snapatok1", tokens["Lobby"])
+	}
+	if tokens["Hallway"] != "" {
+		t.Errorf("Hallway (no capture) snapshot_token = %q, want empty", tokens["Hallway"])
+	}
+	if strings.Contains(string(raw), "snapbtok9") {
+		t.Errorf("site A list leaked site B snapshot token: %s", raw)
+	}
+
+	// Site B's own list carries snapbtok9 — proving the token exists and is only
+	// withheld cross-site, not globally dropped.
+	code, out, _ = svcCall(t, srv, http.MethodGet, "/api/cameras/list?dvr_id="+dvrB, tokB, nil)
+	if code != http.StatusOK {
+		t.Fatalf("cameras list B: %d %v", code, out)
+	}
+	bcams, _ := out["cameras"].([]any)
+	if len(bcams) != 1 || bcams[0].(map[string]any)["snapshot_token"] != "snapbtok9" {
+		t.Errorf("site B list snapshot_token wrong: %v", bcams)
+	}
+}
