@@ -3,8 +3,9 @@ package main
 // camera_investigate_view.go (WS4) — the PUBLIC, no-admin-session live timeline
 // page for an investigation, addressed by its unguessable view_token capability id:
 //
-//   GET /camera/investigations/<view_token>             → static HTML shell
-//   GET /camera/investigations/<view_token>/state.json  → transcript + children JSON
+//   GET  /camera/investigations/<view_token>             → static HTML shell
+//   GET  /camera/investigations/<view_token>/state.json  → transcript + children JSON
+//   POST /camera/investigations/<view_token>/reply       → reply/interrupt (camServeViewReply)
 //
 // The shell is a single zero-interpolation Go const (its JS reads the token from
 // location.pathname and polls state.json); serving it never touches the DB, so a
@@ -29,11 +30,17 @@ import (
 
 // Rate ceilings (requests/min) for the public view surface. The page bucket sizes
 // for a 4s state.json poll (~15/min) plus the shell load with headroom; the media
-// bucket is higher so a long transcript's thumbnails can all render on first paint.
+// bucket is higher so a long transcript's thumbnails can all render on first paint;
+// the reply bucket is tight — it gates the page's ONLY write surface.
 const (
 	camViewPageRatePerMin  = 60.0
 	camViewMediaRatePerMin = 300.0
+	camViewReplyRatePerMin = 6.0
 )
+
+// camViewReplyMaxRunes caps a reply message server-side, in RUNES (never bytes —
+// the live sites write Arabic, and a byte slice could split a multibyte rune).
+const camViewReplyMaxRunes = 2000
 
 // camInvestigationViewURL builds the public timeline URL for an investigation, or
 // "" when the row has no view_token (nothing to link). r may be nil (background
@@ -58,17 +65,22 @@ func camSetViewSecurityHeaders(w http.ResponseWriter) {
 }
 
 // handleCameraInvestigationView dispatches the public timeline routes: the bare
-// token serves the HTML shell, a "/state.json" suffix serves the transcript JSON.
+// token serves the HTML shell, a "/state.json" suffix serves the transcript JSON,
+// and a POST to a "/reply" suffix is the page's one write surface (camServeViewReply).
 // Rate-limited FIRST (per token + per IP); unknown tokens 404 uniformly on the JSON
 // path.
 func handleCameraInvestigationView(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		rest := strings.TrimPrefix(r.URL.Path, "/camera/investigations/")
+		if rest == "" {
 			http.NotFound(w, r)
 			return
 		}
-		rest := strings.TrimPrefix(r.URL.Path, "/camera/investigations/")
-		if rest == "" {
+		if strings.HasSuffix(rest, "/reply") {
+			camServeViewReply(cfg, w, r, strings.TrimSuffix(rest, "/reply"))
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.NotFound(w, r)
 			return
 		}
@@ -111,7 +123,93 @@ func handleCameraInvestigationView(cfg config) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, http.StatusOK, camViewStateJSON(db, inv))
+		writeJSON(w, http.StatusOK, camViewStateJSON(cfg, db, inv))
+	}
+}
+
+// camServeViewReply is POST /camera/investigations/<view_token>/reply — the
+// public timeline's reply/interrupt box. The view_token itself is the write
+// capability (anyone holding the share link can steer the run), so the surface
+// is deliberately narrow: POST only (GET/HEAD 404 like an absent route), a kill
+// switch that makes it indistinguishable from absent (PROXY_CAM_VIEW_REPLY_DISABLED),
+// a tight per-IP-then-per-token rate limit, a server-side rune cap, uniform 404s
+// for unknown tokens, and the investigation id always resolved FROM the token —
+// never from the body — so one link can never write into another investigation.
+//
+// Behavior by status mirrors the admin reply handler where the row is settled,
+// and parks the message in the pending side-channel while a worker owns the row:
+//
+//	closed          → {ok:false, error:"investigation is closed"}
+//	queued/running  → pending insert (+ stranding double-check) → {ok:true, queued:true}
+//	settled         → camResumeSettledInvestigation (append, then queue) → {ok:true}
+func camServeViewReply(cfg config, w http.ResponseWriter, r *http.Request, token string) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	if cfg.CameraViewReplyDisabled {
+		http.NotFound(w, r) // kill switch: indistinguishable from an absent endpoint
+		return
+	}
+	if token == "" || strings.ContainsAny(token, "/\\") {
+		http.NotFound(w, r)
+		return
+	}
+	ip := clientIP(r)
+	// Per-IP FIRST (see handleCameraInvestigationView) — bounds attacker-controlled
+	// bucket growth and 429s a flooding IP before the token bucket is touched.
+	if !camSvcRateAllow("viewreplyip:"+ip, camViewReplyRatePerMin) || !camSvcRateAllow("viewreply:"+token, camViewReplyRatePerMin) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	camSetViewSecurityHeaders(w)
+	var body struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	message := strings.TrimSpace(body.Message)
+	if message == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "message is required"})
+		return
+	}
+	message = camTruncateRunes(message, camViewReplyMaxRunes)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer db.Close()
+	inv, ierr := getCameraInvestigationByViewToken(db, token)
+	if ierr != nil {
+		http.NotFound(w, r) // unknown token → uniform 404 (no token oracle)
+		return
+	}
+	switch inv.Status {
+	case "closed":
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
+	case "queued", "running":
+		// A worker owns the row — park the message in the pending side-channel
+		// (the run drains it at the top of its next turn) instead of writing the
+		// transcript here.
+		if _, perr := insertCameraInvestigationPendingMessage(db, inv.ID, message); perr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+			return
+		}
+		// Stranding double-check (drain point B): if the run settled between the
+		// status read and the insert, deliver the message now.
+		camFlushStrandedPendingInvestigateMessages(db, inv.ID)
+		camlog("info", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "prev_status": inv.Status, "queued": true})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": inv.Status, "queued": true})
+	default: // awaiting_operator | answered | exhausted
+		if serr := camResumeSettledInvestigation(db, inv.ID, message); serr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+			return
+		}
+		camlog("info", "investigate_view_reply", map[string]any{"investigation_id": inv.ID, "prev_status": inv.Status})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "queued"})
 	}
 }
 
@@ -198,8 +296,9 @@ func camViewMediaAllowed(db *sql.DB, inv camInvestigation, mediaToken string) bo
 // content_type/kind plus an `expired` flag (capture reaped or past its TTL) so the
 // page can show an "expired" placeholder instead of a broken thumbnail. A single
 // capture-lookup cache spans parent + children so a token cited twice is fetched
-// once.
-func camViewStateJSON(db *sql.DB, inv camInvestigation) map[string]any {
+// once. can_reply gates the shell's composer: false hides it (kill switch on, or
+// the investigation is closed — closed is terminal by operator choice).
+func camViewStateJSON(cfg config, db *sql.DB, inv camInvestigation) map[string]any {
 	capCache := map[string]*camCapture{}
 	msgs, _ := listCameraInvestigationMessages(db, inv.ID)
 	siteName := ""
@@ -212,6 +311,7 @@ func camViewStateJSON(db *sql.DB, inv camInvestigation) map[string]any {
 		"site_name":  siteName,
 		"created_at": inv.CreatedAt,
 		"updated_at": inv.UpdatedAt,
+		"can_reply":  !cfg.CameraViewReplyDisabled && inv.Status != "closed",
 		"turns":      camViewTurnsJSON(db, msgs, inv.ViewToken, capCache),
 	}
 	// Children carry the PARENT's view_token in their media URLs: the media gate
@@ -299,8 +399,11 @@ func camViewCaptureLookup(db *sql.DB, cache map[string]*camCapture, tok string) 
 // chat UI whose JS reads the view_token from location.pathname, polls state.json
 // (4s while queued/running, 15s while awaiting_operator, stops when terminal), and
 // renders operator/ai/tool/system bubbles with inline media and collapsible child
-// sections. Zero server-side interpolation — the CSP allows only inline script/style
-// and same-origin media.
+// sections, plus a reply composer (shown only while state.json carries
+// can_reply:true) that POSTs to <path>/reply. Zero server-side interpolation — the
+// JS derives everything from location + state.json, and every dynamic string is
+// rendered via textContent — and the CSP allows only inline script/style,
+// same-origin media, and same-origin connect (the reply POST).
 const camInvestigationViewHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -353,6 +456,22 @@ const camInvestigationViewHTML = `<!doctype html>
   .child-q { color: #adbac7; }
   .child-body { padding: 4px 12px 12px; border-top: 1px solid #21262d; }
   #foot { margin-top: 24px; color: #7d8590; font-size: 13px; text-align: center; }
+  #composer { margin-top: 20px; border: 1px solid #21262d; border-radius: 10px; background: #161b22; padding: 12px; }
+  #composer[hidden] { display: none; }
+  #composer-label { font-size: 12px; letter-spacing: .02em; color: #7d8590; margin-bottom: 8px; }
+  #composer-text {
+    width: 100%; min-height: 64px; resize: vertical; background: #0d1117; color: #e6edf3;
+    border: 1px solid #30363d; border-radius: 8px; padding: 8px 10px; font: inherit;
+  }
+  #composer-text:focus { outline: none; border-color: #388bfd; }
+  .composer-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  #composer-send {
+    background: #238636; color: #fff; border: 1px solid #2ea043; border-radius: 8px;
+    padding: 6px 16px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  #composer-send:hover { background: #2ea043; }
+  #composer-send:disabled { opacity: .5; cursor: default; }
+  #composer-note { font-size: 13px; color: #7d8590; }
   .spin { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #58a6ff; margin-right: 6px; animation: pulse 1.2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
   .media-click { position: relative; cursor: zoom-in; }
@@ -390,6 +509,14 @@ const camInvestigationViewHTML = `<!doctype html>
   <main id="transcript"></main>
   <section id="children"></section>
   <div id="foot"></div>
+  <section id="composer" hidden>
+    <div id="composer-label"></div>
+    <textarea id="composer-text" maxlength="2000" placeholder="Write a message to the investigator…"></textarea>
+    <div class="composer-row">
+      <button id="composer-send">Send</button>
+      <span id="composer-note"></span>
+    </div>
+  </section>
 </div>
 <div id="lb" hidden>
   <button class="lb-btn" id="lb-close" aria-label="Close">&#10005;</button>
@@ -415,7 +542,14 @@ const camInvestigationViewHTML = `<!doctype html>
     children: document.getElementById("children"),
     foot: document.getElementById("foot")
   };
-  var timer = null, missing = false;
+  var composer = {
+    root: document.getElementById("composer"),
+    label: document.getElementById("composer-label"),
+    text: document.getElementById("composer-text"),
+    send: document.getElementById("composer-send"),
+    note: document.getElementById("composer-note")
+  };
+  var timer = null, missing = false, sending = false;
 
   function label(s) { return LABELS[s] || s || ""; }
   function badge(node, s) { node.className = "badge s-" + (s || "unknown"); node.textContent = label(s); }
@@ -609,8 +743,53 @@ const camInvestigationViewHTML = `<!doctype html>
     badge(el.status, state.status);
     renderTurns(el.transcript, state.turns);
     renderChildren(state.children);
+    renderComposer(state);
     if (lbIndex >= 0) lbEl.count.textContent = (lbIndex + 1) + " / " + gallery.length;
   }
+
+  // ── Reply composer ──
+  // Visible only while state.json says can_reply (kill switch off, not closed).
+  // All dynamic text lands via textContent — never innerHTML — so a message (or a
+  // server error string) can never execute in the page.
+  function composerLabel(s) {
+    if (s === "awaiting_operator") return "The investigator is waiting for your reply";
+    if (s === "queued" || s === "running" || s === "active") return "Send a note to the investigator — it reads it on its next step";
+    return "Ask a follow-up";
+  }
+
+  function renderComposer(state) {
+    if (!state.can_reply) { composer.root.hidden = true; return; }
+    composer.root.hidden = false;
+    composer.label.textContent = composerLabel(state.status);
+  }
+
+  composer.send.addEventListener("click", function () {
+    var msg = composer.text.value.replace(/^\s+|\s+$/g, "");
+    if (!msg || sending) return;
+    sending = true;
+    composer.send.disabled = true;
+    composer.note.textContent = "";
+    fetch(path + "/reply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ message: msg })
+    }).then(function (res) {
+      if (res.status === 429) throw new Error("Too many messages — wait a minute");
+      return res.json().catch(function () { throw new Error("Could not send — try again"); }).then(function (out) {
+        if (!out || out.ok !== true) throw new Error((out && out.error) || "Could not send — try again");
+        composer.text.value = "";
+        composer.note.textContent = "Sent";
+        setTimeout(function () { if (composer.note.textContent === "Sent") composer.note.textContent = ""; }, 4000);
+        if (timer) clearTimeout(timer);
+        tick(); // refresh now so the message (or the resumed run) appears immediately
+      });
+    }).catch(function (e) {
+      composer.note.textContent = (e && e.message) || "Could not send";
+    }).then(function () {
+      sending = false;
+      composer.send.disabled = false;
+    });
+  });
 
   function schedule(status) {
     var d = pollDelay(status);

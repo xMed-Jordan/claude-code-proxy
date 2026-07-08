@@ -385,10 +385,17 @@ func TestCamServiceProvisionFlow(t *testing.T) {
 	if m, _ := msgs[0].(map[string]any); m["role"] != "operator" || m["content"] != "Did the courier arrive today?" {
 		t.Errorf("opening message = %v", msgs[0])
 	}
-	// Replying to a queued row must bounce (a worker owns it).
+	// Replying to a queued row parks the message in the pending side-channel
+	// (the worker's own drain point delivers it) — never the transcript directly.
 	code, out, _ = svcCall(t, srv, http.MethodPost, "/api/cameras/investigations/reply", siteTok, map[string]any{"id": invID, "message": "also check the back door"})
-	if code != http.StatusOK || out["ok"] != false {
-		t.Errorf("reply while queued: %d %v, want ok=false bounce", code, out)
+	if code != http.StatusOK || out["ok"] != true || out["queued"] != true {
+		t.Errorf("reply while queued: %d %v, want ok=true queued=true", code, out)
+	}
+	if pend, perr := listCameraInvestigationPendingMessages(db, invID); perr != nil || len(pend) != 1 || pend[0].Message != "also check the back door" {
+		t.Errorf("pending after queued reply = %+v (%v), want the one parked message", pend, perr)
+	}
+	if msgs, _ := listCameraInvestigationMessages(db, invID); len(msgs) != 1 {
+		t.Errorf("transcript after queued reply has %d rows, want 1 (unchanged)", len(msgs))
 	}
 
 	// Callback registration round-trips (has_secret only, never the secret).
@@ -540,5 +547,46 @@ func TestCamServiceInvestigationMediaTokens(t *testing.T) {
 	media, _ := out["media"].([]map[string]any)
 	if len(media) != 1 || media[0]["token"] != "abc123" || media[0]["caption"] != "gate" {
 		t.Fatalf("svc media = %v, want token abc123", out["media"])
+	}
+}
+
+// TestSvcInvestigationReplyWhileRunning proves the service Reply works while a
+// worker owns the row: the message is parked in the pending side-channel (never
+// the transcript — the lost-update guard stands) and the caller gets
+// {ok:true, queued:true}. Site-scope ownership is still enforced first: a
+// cross-site id is the uniform 404 even for a running row.
+func TestSvcInvestigationReplyWhileRunning(t *testing.T) {
+	cfg := newSvcTestConfig(t)
+	db := svcTestDB(t, cfg)
+	srv := newSvcTestServer(t, cfg)
+
+	siteA, tokA := svcSeedSite(t, db, "Site A")
+	siteB, _ := svcSeedSite(t, db, "Site B")
+	running, _ := insertCameraInvestigation(db, camInvestigation{SiteID: siteA, Title: "r", Question: "r", Status: "running"})
+	camAppendInvestigateMessage(db, running, "operator", "r", "", "", 0, nil)
+	foreign, _ := insertCameraInvestigation(db, camInvestigation{SiteID: siteB, Title: "f", Question: "f", Status: "running"})
+
+	code, out, _ := svcCall(t, srv, http.MethodPost, "/api/cameras/investigations/reply", tokA, map[string]any{"id": running, "message": "zoom on the till"})
+	if code != http.StatusOK || out["ok"] != true || out["queued"] != true || out["status"] != "running" {
+		t.Fatalf("reply while running: %d %v, want ok=true queued=true status=running", code, out)
+	}
+	pend, perr := listCameraInvestigationPendingMessages(db, running)
+	if perr != nil || len(pend) != 1 || pend[0].Message != "zoom on the till" {
+		t.Errorf("pending rows = %+v (%v), want the one parked message", pend, perr)
+	}
+	if msgs, _ := listCameraInvestigationMessages(db, running); len(msgs) != 1 {
+		t.Errorf("transcript rows = %d, want 1 (running reply must not touch the transcript)", len(msgs))
+	}
+	if inv, _ := getCameraInvestigation(db, running); inv.Status != "running" {
+		t.Errorf("status = %q, want running (untouched)", inv.Status)
+	}
+
+	// Cross-site id: uniform 404, no pending row.
+	code, out, _ = svcCall(t, srv, http.MethodPost, "/api/cameras/investigations/reply", tokA, map[string]any{"id": foreign, "message": "hi"})
+	if code != http.StatusNotFound || out["error"] != "not found" {
+		t.Errorf("cross-site reply: %d %v, want uniform 404", code, out)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, foreign); len(pend) != 0 {
+		t.Errorf("cross-site reply must not park a message: %+v", pend)
 	}
 }

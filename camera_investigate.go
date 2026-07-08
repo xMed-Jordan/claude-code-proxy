@@ -68,6 +68,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ─────────────────────────────── tool-action contract ───────────────────────────────
@@ -631,6 +632,15 @@ var camInvestigateActionTypes = map[string]bool{"call_tool": true, "ask_operator
 // to the operator as the final answer.
 var errInvestigateEmptyAnswer = errors.New("answer action with empty answer text")
 
+// errInvestigatePlanAsAnswer flags an "answer" action whose answer text is an
+// exact copy of the thought: the model pasted its PLAN into the operator-facing
+// field (live failure inv_yka8FYwpY7TBxT3r — "I will now present the final Arabic
+// answer…" in both fields, English for an Arabic question, zero evidence). Like
+// errInvestigateEmptyAnswer it is returned ALONGSIDE the parsed action so the
+// caller can run one targeted repair; unlike it, the last resort is to ACCEPT the
+// duplicated text (it is at least a non-empty answer) — never crash the loop.
+var errInvestigatePlanAsAnswer = errors.New("answer action duplicates the thought (plan pasted as answer)")
+
 // parseInvestigateAction extracts and decodes one investigateAction from a
 // model's raw text, then normalizes it so a garbled reply can never crash or
 // stall the loop: an unrecognized action type falls back to "call_tool roster"
@@ -664,8 +674,12 @@ func parseInvestigateAction(raw string) (investigateAction, error) {
 		}
 		act.Action.Tool = tool
 	case "answer":
-		if strings.TrimSpace(act.Action.Answer) == "" {
+		ans := strings.TrimSpace(act.Action.Answer)
+		if ans == "" {
 			return act, errInvestigateEmptyAnswer
+		}
+		if th := strings.TrimSpace(act.Thought); th != "" && ans == th {
+			return act, errInvestigatePlanAsAnswer
 		}
 	}
 	return act, nil
@@ -704,6 +718,12 @@ func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, us
 			"put the COMPLETE final answer in the answer field, written in the operator's language, " +
 			"and cite the supporting frames in evidence[] by copying their exact media_url values."
 	}
+	if errors.Is(perr, errInvestigatePlanAsAnswer) {
+		repair = user + "\n\nYour previous reply chose action \"answer\" but the answer field was an exact copy of your thought — " +
+			"a plan, not an answer. The answer field must contain the FINAL operator-facing answer, never your plan or reasoning. " +
+			"Reply with ONLY the single JSON object again: write the COMPLETE final answer in the answer field, in the operator's " +
+			"language, and attach the supporting frames in evidence[] by copying their exact media_url values."
+	}
 	raw2, attempts2, err2 := camInvestigateAnalyzeFn(ctx, cfg, alias, sys, repair, images)
 	attempts = append(attempts, attempts2...)
 	if err2 != nil {
@@ -713,6 +733,12 @@ func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, us
 			// a whole pass on an analysis error at the finish line.
 			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": err2.Error(), "fallback": "thought_as_answer"})
 			act.Action.Answer = firstNonEmpty(strings.TrimSpace(act.Thought), "The investigation could not produce a conclusive answer.")
+			return act, raw, true, attempts, nil
+		}
+		if errors.Is(perr, errInvestigatePlanAsAnswer) {
+			// The duplicated text is at least a non-empty answer; accept it rather
+			// than burning a whole pass on an infrastructure error at the finish line.
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": err2.Error(), "fallback": "dup_answer_accepted"})
 			return act, raw, true, attempts, nil
 		}
 		return investigateAction{}, raw2, true, attempts, err2
@@ -725,6 +751,12 @@ func camAnalyzeInvestigateAction(ctx context.Context, cfg config, alias, sys, us
 			// silent fallback, demoted to a last resort behind the repair round.
 			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "thought_as_answer"})
 			act2.Action.Answer = firstNonEmpty(strings.TrimSpace(act2.Thought), "The investigation could not produce a conclusive answer.")
+			return act2, raw2, true, attempts, nil
+		}
+		if errors.Is(perr2, errInvestigatePlanAsAnswer) {
+			// A duplicated answer twice in a row: accept the text — non-empty beats
+			// erroring the pass at the finish line (never crash the loop).
+			camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error(), "fallback": "dup_answer_accepted"})
 			return act2, raw2, true, attempts, nil
 		}
 		camlog("warn", "investigate_parse", map[string]any{"ok": false, "attempt": 2, "error": perr2.Error()})
@@ -913,6 +945,11 @@ func camStopInvestigation(db *sql.DB, cfg config, invID, note string) error {
 	camAppendInvestigateMessage(db, invID, "system", note, "", "", 0, nil)
 	err := setCameraInvestigationStatus(db, invID, "exhausted")
 	go camNotifyInvestigationSettled(cfg, invID, "exhausted")
+	// A pending (interrupt) message that arrived mid-pass must not strand on the
+	// terminal write — deliver it as a fresh-run follow-up (drain point B). This
+	// also covers the terminalize paths that bypass runInvestigation's own flush
+	// (panic recovery, setup failures via camTerminalizeInvestigation).
+	camFlushStrandedPendingInvestigateMessages(db, invID)
 	return err
 }
 
@@ -946,6 +983,118 @@ func camDeferInvestigation(db *sql.DB, cfg config, invID, note string, msgs []ca
 		return fmt.Errorf("requeue investigation: %w", err)
 	}
 	return nil
+}
+
+// ─────────────────────── pending (interrupt) messages ───────────────────────
+//
+// The transcript has exactly ONE writer while a pass is live (the worker), so the
+// reply surfaces never append to it for a queued/running row — they insert into
+// camera_investigation_pending_messages instead, and the messages reach the
+// transcript through two drain points:
+//
+//	A. camDrainPendingInvestigateMessages — the run itself, at the top of every
+//	   turn, so the model sees an operator interrupt on its very next step.
+//	B. camFlushStrandedPendingInvestigateMessages — after every settle write and
+//	   after every pending insert, closing the race where a message lands just as
+//	   the run settles (no next turn to drain it).
+
+// camResumeSettledInvestigation is the settled-reply core shared by the admin
+// reply handler, the service reply handler, and the public view reply endpoint:
+// append the operator message FIRST (the row is settled, so no worker owns the
+// transcript), THEN flip settled→queued so the background worker only ever claims
+// a row whose transcript already includes the reply — the ordering that closes
+// the resume-on-stale-transcript race. The queue flip is a CAS over the settled
+// states (requeueCameraInvestigationFromSettled): a lost race with a concurrent
+// resume can never yank back a row a worker already claimed.
+func camResumeSettledInvestigation(db *sql.DB, invID, message string) error {
+	camAppendInvestigateMessage(db, invID, "operator", message, "", "", 0, nil)
+	_, err := requeueCameraInvestigationFromSettled(db, invID)
+	return err
+}
+
+// camDrainPendingInvestigateMessages (drain point A) folds every pending message
+// into the transcript — persisted AND appended to the in-memory slice the loop
+// feeds the model — then deletes the drained rows. Returns the grown slice and
+// how many messages were delivered. A failed delete only risks a duplicated
+// (never lost) delivery on the next turn, and is logged.
+func camDrainPendingInvestigateMessages(db *sql.DB, invID string, msgs []camInvestigationMessage) ([]camInvestigationMessage, int) {
+	pend, err := listCameraInvestigationPendingMessages(db, invID)
+	if err != nil || len(pend) == 0 {
+		return msgs, 0
+	}
+	ids := make([]string, 0, len(pend))
+	for _, p := range pend {
+		m := camAppendInvestigateMessage(db, invID, "operator", p.Message, "", "", 0, nil)
+		msgs = append(msgs, m)
+		ids = append(ids, p.ID)
+	}
+	if derr := deleteCameraInvestigationPendingMessages(db, ids); derr != nil {
+		camlog("warn", "investigate_interrupt", map[string]any{"investigation_id": invID, "ok": false, "error": derr.Error()})
+	}
+	camlog("info", "investigate_interrupt", map[string]any{"investigation_id": invID, "drained": len(ids)})
+	return msgs, len(pend)
+}
+
+// camFlushStrandedPendingInvestigateMessages (drain point B) rescues pending
+// messages that would otherwise never drain: a row inserted just as the run
+// settles has no next turn to pick it up. Re-reads the CURRENT status and:
+//
+//   - settled (awaiting_operator/answered/exhausted): deliver through the settled
+//     reply semantics — append the operator rows FIRST, delete the pending rows
+//     BEFORE the queue flip (so a worker claiming the re-queued row can't drain
+//     them a second time), then CAS settled→queued so the worker resumes.
+//   - closed: drop the rows (deleted, not delivered) — closed is terminal by
+//     operator choice.
+//   - queued/running: leave them — the live run's own drain point A delivers them.
+func camFlushStrandedPendingInvestigateMessages(db *sql.DB, invID string) {
+	pend, err := listCameraInvestigationPendingMessages(db, invID)
+	if err != nil || len(pend) == 0 {
+		return
+	}
+	inv, gerr := getCameraInvestigation(db, invID)
+	if gerr != nil {
+		return
+	}
+	ids := make([]string, 0, len(pend))
+	for _, p := range pend {
+		ids = append(ids, p.ID)
+	}
+	switch inv.Status {
+	case "closed":
+		_ = deleteCameraInvestigationPendingMessages(db, ids)
+		camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "dropped": len(ids), "status": "closed"})
+	case "awaiting_operator", "answered", "exhausted":
+		for _, p := range pend {
+			camAppendInvestigateMessage(db, invID, "operator", p.Message, "", "", 0, nil)
+		}
+		_ = deleteCameraInvestigationPendingMessages(db, ids)
+		requeued, rerr := requeueCameraInvestigationFromSettled(db, invID)
+		if rerr != nil {
+			camlog("warn", "investigate_pending_flush", map[string]any{"investigation_id": invID, "ok": false, "error": rerr.Error()})
+			return
+		}
+		camlog("info", "investigate_pending_flush", map[string]any{"investigation_id": invID, "delivered": len(ids), "requeued": requeued})
+	}
+}
+
+// camCountArabicRunes counts Arabic-script runes in s (unicode.Arabic covers the
+// Arabic block plus its supplements/presentation forms).
+func camCountArabicRunes(s string) int {
+	n := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Arabic, r) {
+			n++
+		}
+	}
+	return n
+}
+
+// camAnswerLanguageMismatch is the deterministic script check behind answer
+// guard C: the operator question is clearly Arabic (≥3 Arabic-script runes) yet
+// the final answer contains ZERO Arabic-script runes. Deliberately NOT language
+// detection — a mixed or ambiguous answer never trips it.
+func camAnswerLanguageMismatch(question, answer string) bool {
+	return camCountArabicRunes(question) >= 3 && camCountArabicRunes(answer) == 0
 }
 
 // camCollectMintedMedia returns the /camera/media/<token> URLs the loop's tools
@@ -1805,6 +1954,11 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 		return fmt.Errorf("load transcript: %w", err)
 	}
 	turnsSoFar, mediaUsed := camCountInvestigateProgress(msgs)
+	// Drain point B on EVERY exit path (answer / ask_operator / exhausted / defer /
+	// panic): a pending message inserted during the final turn has no next turn to
+	// drain it, so deliver-or-drop it against the settled status now. Runs before
+	// the deferred db.Close (LIFO).
+	defer camFlushStrandedPendingInvestigateMessages(db, invID)
 
 	camlog("info", "investigate_start", map[string]any{
 		"investigation_id": invID, "site_id": inv.SiteID, "alias": alias, "cameras": len(active),
@@ -1827,7 +1981,24 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	}
 
 	var lastImages []string
+	// answerGuardUsed caps the final-answer quality gate (guards B+C at the accept
+	// site below) at ONE corrective round per pass, so a stubborn model can never
+	// loop on rejected answers — the second answer is accepted as-is.
+	answerGuardUsed := false
 	for {
+		// Drain point A (the interrupt): operator messages POSTed to the public
+		// timeline or the service reply route while this run is working land in the
+		// pending side-channel (the worker owns the transcript). Fold them in at the
+		// top of every turn so the model reads the interrupt on its very next step.
+		if grown, drained := camDrainPendingInvestigateMessages(db, invID, msgs); drained > 0 {
+			msgs = grown
+			// An interrupt is NEW operator input (not an ask_operator reply), so it
+			// starts a fresh budget — deliberately matching what
+			// camCountInvestigateProgress reconstructs from the transcript on a
+			// resumed pass (it resets at any non-ask_operator operator row), so the
+			// live counters and a resume can never disagree.
+			turnsSoFar, mediaUsed = 0, 0
+		}
 		if cctx.Err() != nil {
 			// NEVER-DIE: a per-pass budget exhaustion self-requeues for a fresh pass
 			// instead of terminalizing (bounded by the requeue streak + turn cap).
@@ -1883,6 +2054,38 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			camlog("info", "investigate_evidence", map[string]any{
 				"investigation_id": invID, "cited": len(act.Action.Evidence), "kept": len(evidence), "dropped": dropped,
 			})
+			// Final-answer quality gate — guard B (answered with zero evidence
+			// despite minted media) and guard C (Arabic question, zero-Arabic
+			// answer) share ONE corrective round: the rejected answer is persisted
+			// (so the timeline shows it and a resumed pass counts the same turns),
+			// a system note explains why + carries the corrective instruction, and
+			// the loop re-asks. One-shot per pass (answerGuardUsed) and only when a
+			// turn remains — at the turn cap the imperfect answer beats "exhausted".
+			if !answerGuardUsed && turnsSoFar+1 < maxTurns {
+				var defects []string
+				if len(act.Action.Evidence) == 0 && len(mintedSet) > 0 {
+					defects = append(defects, "no evidence[] was attached even though media was captured during this investigation")
+				}
+				if camAnswerLanguageMismatch(inv.Question, act.Action.Answer) {
+					defects = append(defects, "the operator's question is in Arabic but the answer contains no Arabic text")
+				}
+				if len(defects) > 0 {
+					answerGuardUsed = true
+					aiMsg := camAppendInvestigateMessage(db, invID, "ai", camAIMessageContent(act.Thought, act.Action.Answer), "answer", "", 0, evidence)
+					msgs = append(msgs, aiMsg)
+					turnsSoFar++
+					note := "Final answer needs one correction before it is delivered: " + strings.Join(defects, "; ") +
+						". Attach the specific media URLs your answer relies on as evidence[] (copy the exact media_url values " +
+						"from the TOOL RESULT lines) and restate the COMPLETE final answer in the operator's language."
+					sysMsg := camAppendInvestigateMessage(db, invID, "system", note, "answer_quality", "", 0, nil)
+					msgs = append(msgs, sysMsg)
+					camlog("warn", "investigate_answer_guard", map[string]any{
+						"investigation_id": invID, "defects": defects, "turn": turnsSoFar,
+					})
+					lastImages = nil
+					continue
+				}
+			}
 			m := camAppendInvestigateMessage(db, invID, "ai", camAIMessageContent(act.Thought, act.Action.Answer), "answer", "", 0, evidence)
 			msgs = append(msgs, m)
 			if serr := setCameraInvestigationStatus(db, invID, "answered"); serr != nil {
@@ -2296,12 +2499,12 @@ func handleCameraInvestigationReply(cfg config) http.HandlerFunc {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is still working — wait for it to pause or finish, then reply"})
 			return
 		}
-		// Settled (awaiting_operator | answered | exhausted): append the operator message
-		// FIRST (row still settled, so no worker touches it), THEN flip to "queued" so the
-		// background worker only ever claims a row whose transcript already includes this
-		// reply — this ordering closes the resume-on-stale-transcript race.
-		camAppendInvestigateMessage(db, id, "operator", message, "", "", 0, nil)
-		if serr := setCameraInvestigationStatus(db, id, "queued"); serr != nil {
+		// Settled (awaiting_operator | answered | exhausted): the extracted core
+		// (camResumeSettledInvestigation) appends the operator message FIRST (row
+		// still settled, so no worker touches it), THEN flips to "queued" so the
+		// background worker only ever claims a row whose transcript already includes
+		// this reply — this ordering closes the resume-on-stale-transcript race.
+		if serr := camResumeSettledInvestigation(db, id, message); serr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
 			return
 		}

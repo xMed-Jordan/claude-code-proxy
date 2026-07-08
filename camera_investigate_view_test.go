@@ -7,12 +7,14 @@ package main
 // coalesced "media" flush). Temp sqlite + httptest only — no DVRs, no model calls.
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -316,5 +318,240 @@ func waitProgressEvent(t *testing.T, ch chan map[string]any, phase string) map[s
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timed out waiting for phase %q", phase)
 		return nil
+	}
+}
+
+// ─────────────────────────── reply endpoint ───────────────────────────
+
+// camResetSvcRateLimiter clears the process-wide token buckets so each reply
+// test starts with a full budget — the reply ceiling is only 6/min per IP and
+// the limiter is a package global shared across the whole test binary.
+func camResetSvcRateLimiter() {
+	camSvcRL.Lock()
+	camSvcRL.buckets = map[string]*camSvcBucket{}
+	camSvcRL.Unlock()
+}
+
+// camViewReplyPost POSTs a reply message to the public timeline endpoint.
+func camViewReplyPost(t *testing.T, srv *httptest.Server, token, message string) (int, map[string]any) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"message": message})
+	resp, err := srv.Client().Post(srv.URL+"/camera/investigations/"+token+"/reply",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST reply: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return resp.StatusCode, out
+}
+
+// TestCameraViewReplyMatrix walks the reply endpoint's behavior-by-status table
+// plus the uniform-404 and POST-only rules.
+func TestCameraViewReplyMatrix(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// Unknown token → uniform 404.
+	if code, _ := camViewReplyPost(t, srv, randToken(16), "hello"); code != http.StatusNotFound {
+		t.Errorf("unknown token reply: %d, want 404", code)
+	}
+
+	// GET on /reply → 404 (the write surface is POST-only).
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "settled question")
+	if code, _ := camViewGet(t, srv, "/camera/investigations/"+viewTok+"/reply"); code != http.StatusNotFound {
+		t.Errorf("GET on /reply: %d, want 404", code)
+	}
+
+	// Closed → ok:false (200, mirroring the admin reply handler's shape).
+	if err := setCameraInvestigationStatus(db, invID, "closed"); err != nil {
+		t.Fatalf("set closed: %v", err)
+	}
+	code, out := camViewReplyPost(t, srv, viewTok, "anyone there?")
+	if code != http.StatusOK || out["ok"] != false || out["error"] != "investigation is closed" {
+		t.Errorf("closed reply: %d %v, want ok=false closed error", code, out)
+	}
+
+	// Settled (answered): the operator row is appended FIRST, then the status
+	// flips to queued — both observable after the call (append-before-queue).
+	if err := setCameraInvestigationStatus(db, invID, "answered"); err != nil {
+		t.Fatalf("set answered: %v", err)
+	}
+	before, _ := listCameraInvestigationMessages(db, invID)
+	code, out = camViewReplyPost(t, srv, viewTok, "follow-up: which door?")
+	if code != http.StatusOK || out["ok"] != true || out["status"] != "queued" {
+		t.Fatalf("settled reply: %d %v, want ok=true status=queued", code, out)
+	}
+	after, _ := listCameraInvestigationMessages(db, invID)
+	if len(after) != len(before)+1 {
+		t.Fatalf("settled reply transcript rows = %d, want %d", len(after), len(before)+1)
+	}
+	lastMsg := after[len(after)-1]
+	if lastMsg.Role != "operator" || lastMsg.Content != "follow-up: which door?" {
+		t.Errorf("appended row = %+v, want the operator follow-up", lastMsg)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "queued" {
+		t.Errorf("status after settled reply = %q, want queued", inv.Status)
+	}
+	if pend, _ := listCameraInvestigationPendingMessages(db, invID); len(pend) != 0 {
+		t.Errorf("settled reply must not park pending rows: %+v", pend)
+	}
+
+	// Running → pending row inserted, transcript UNCHANGED.
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	before, _ = listCameraInvestigationMessages(db, invID)
+	code, out = camViewReplyPost(t, srv, viewTok, "also check the yard")
+	if code != http.StatusOK || out["ok"] != true || out["queued"] != true || out["status"] != "running" {
+		t.Fatalf("running reply: %d %v, want ok=true queued=true status=running", code, out)
+	}
+	after, _ = listCameraInvestigationMessages(db, invID)
+	if len(after) != len(before) {
+		t.Errorf("running reply transcript rows = %d, want unchanged %d", len(after), len(before))
+	}
+	pend, _ := listCameraInvestigationPendingMessages(db, invID)
+	if len(pend) != 1 || pend[0].Message != "also check the yard" {
+		t.Errorf("pending rows = %+v, want the one parked message", pend)
+	}
+}
+
+// TestCameraViewReplyRateLimit proves the tight per-IP reply ceiling: the 7th
+// POST inside a minute is 429'd.
+func TestCameraViewReplyRateLimit(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "rate limited?")
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		if code, out := camViewReplyPost(t, srv, viewTok, "ping"); code != http.StatusOK {
+			t.Fatalf("reply %d: %d %v, want 200", i+1, code, out)
+		}
+	}
+	if code, _ := camViewReplyPost(t, srv, viewTok, "ping"); code != http.StatusTooManyRequests {
+		t.Errorf("7th reply: %d, want 429", code)
+	}
+}
+
+// TestCameraViewReplyKillSwitch: with PROXY_CAM_VIEW_REPLY_DISABLED the endpoint
+// 404s (indistinguishable from absent) and state.json reports can_reply=false so
+// the shell hides the composer.
+func TestCameraViewReplyKillSwitch(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraViewReplyDisabled = true
+	srv := newCamViewTestServer(t, cfg)
+	_, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "switched off")
+
+	if code, _ := camViewReplyPost(t, srv, viewTok, "hello?"); code != http.StatusNotFound {
+		t.Errorf("kill-switch reply: %d, want 404", code)
+	}
+	code, body := camViewGet(t, srv, "/camera/investigations/"+viewTok+"/state.json")
+	if code != http.StatusOK {
+		t.Fatalf("state.json: %d %s", code, body)
+	}
+	var st map[string]any
+	_ = json.Unmarshal(body, &st)
+	if st["can_reply"] != false {
+		t.Errorf("can_reply = %v, want false under the kill switch", st["can_reply"])
+	}
+}
+
+// TestCameraViewReplyTruncatesRunes: an over-long message is capped at 2000
+// RUNES server-side — rune-safe for Arabic, never a byte slice that could split
+// a multibyte character.
+func TestCameraViewReplyTruncatesRunes(t *testing.T) {
+	camResetSvcRateLimiter()
+	cfg := newCamViewTestConfig(t)
+	srv := newCamViewTestServer(t, cfg)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	invID, viewTok, _ := seedCamViewInvestigation(t, cfg, "site_1", "", "طويل جدا")
+	if err := setCameraInvestigationStatus(db, invID, "running"); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+
+	long := strings.Repeat("مرحبا", 500) // 2500 Arabic runes (5000 bytes)
+	code, out := camViewReplyPost(t, srv, viewTok, long)
+	if code != http.StatusOK || out["ok"] != true {
+		t.Fatalf("long reply: %d %v", code, out)
+	}
+	pend, _ := listCameraInvestigationPendingMessages(db, invID)
+	if len(pend) != 1 {
+		t.Fatalf("pending rows = %d, want 1", len(pend))
+	}
+	got := []rune(pend[0].Message)
+	if len(got) != 2000 {
+		t.Errorf("stored message runes = %d, want exactly 2000", len(got))
+	}
+	if string(got) != string([]rune(long)[:2000]) {
+		t.Error("stored message is not the rune-safe prefix of the original")
+	}
+}
+
+// TestCamViewStateCanReplyMatrix pins the can_reply gate: true for every
+// non-closed status while the kill switch is off, false when closed or disabled.
+func TestCamViewStateCanReplyMatrix(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	for _, status := range []string{"queued", "running", "awaiting_operator", "answered", "exhausted"} {
+		inv := camInvestigation{ID: "inv_x", SiteID: "site_1", ViewToken: "vt", Status: status}
+		if st := camViewStateJSON(cfg, db, inv); st["can_reply"] != true {
+			t.Errorf("can_reply(%s) = %v, want true", status, st["can_reply"])
+		}
+		off := cfg
+		off.CameraViewReplyDisabled = true
+		if st := camViewStateJSON(off, db, inv); st["can_reply"] != false {
+			t.Errorf("can_reply(%s, disabled) = %v, want false", status, st["can_reply"])
+		}
+	}
+	closed := camInvestigation{ID: "inv_x", SiteID: "site_1", ViewToken: "vt", Status: "closed"}
+	if st := camViewStateJSON(cfg, db, closed); st["can_reply"] != false {
+		t.Errorf("can_reply(closed) = %v, want false", st["can_reply"])
+	}
+}
+
+// TestCamInvestigationViewHTMLComposer pins the shell's composer contract via
+// string containment (the const is zero-interpolation): the markup ids, the
+// 2000-char maxlength, the can_reply gating, and the /reply POST path.
+func TestCamInvestigationViewHTMLComposer(t *testing.T) {
+	for _, want := range []string{
+		`id="composer"`,
+		`id="composer-text"`,
+		`id="composer-send"`,
+		`maxlength="2000"`,
+		`state.can_reply`,
+		`path + "/reply"`,
+		`The investigator is waiting for your reply`,
+		`Send a note to the investigator`,
+		`Too many messages`,
+	} {
+		if !strings.Contains(camInvestigationViewHTML, want) {
+			t.Errorf("shell HTML missing %q", want)
+		}
 	}
 }

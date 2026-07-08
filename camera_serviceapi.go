@@ -1554,8 +1554,11 @@ func handleSvcInvestigationGet(cfg config) camSvcHandler {
 }
 
 // handleSvcInvestigationReply serves POST /api/cameras/investigations/reply
-// {id, message} — mirrors handleCameraInvestigationReply incl. the
-// still-running rejection and the append-then-flip settle ordering.
+// {id, message} — mirrors handleCameraInvestigationReply's settle ordering, but a
+// QUEUED/RUNNING row no longer refuses the reply: the message is parked in the
+// pending side-channel (camera_investigation_pending_messages) and the live run
+// drains it at the top of its next turn, so Connect's studio Reply works while
+// the investigation is still working.
 func handleSvcInvestigationReply(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		if r.Method != http.MethodPost {
@@ -1590,15 +1593,26 @@ func handleSvcInvestigationReply(cfg config) camSvcHandler {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is closed"})
 			return
 		case "queued", "running":
-			// A worker owns this row right now; refusing to mutate it is what prevents
-			// the worker-vs-request lost-update race.
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "investigation is still working — wait for it to pause or finish, then reply"})
+			// A worker owns this row right now, so the transcript is never written
+			// here (the worker-vs-request lost-update guard stands) — the message is
+			// parked in the pending side-channel and the run's own drain point picks
+			// it up on its next turn.
+			if _, perr := insertCameraInvestigationPendingMessage(db, id, message); perr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+				return
+			}
+			// Stranding double-check (drain point B): if the run settled between the
+			// status read and the insert, deliver the message now instead of leaving
+			// it parked forever.
+			camFlushStrandedPendingInvestigateMessages(db, id)
+			camlog("info", "svc_investigate_reply", map[string]any{"investigation_id": id, "site_id": sc.SiteID, "prev_status": inv.Status, "queued": true})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "status": inv.Status, "queued": true})
 			return
 		}
-		// Settled: append the operator message FIRST (row still settled, so no worker
-		// touches it), THEN flip to "queued" — the resume-on-stale-transcript ordering.
-		camAppendInvestigateMessage(db, id, "operator", message, "", "", 0, nil)
-		if serr := setCameraInvestigationStatus(db, id, "queued"); serr != nil {
+		// Settled: the shared core appends the operator message FIRST (row still
+		// settled, so no worker touches it), THEN flips to "queued" — the
+		// resume-on-stale-transcript ordering.
+		if serr := camResumeSettledInvestigation(db, id, message); serr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
 			return
 		}

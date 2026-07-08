@@ -405,6 +405,116 @@ func TestAnalyzeInvestigateActionEmptyAnswerRepairInfraFailure(t *testing.T) {
 	}
 }
 
+// TestParseInvestigateActionPlanAsAnswerSentinel covers guard A's parser half: an
+// "answer" whose answer text is an exact copy of the thought (the model pasted its
+// PLAN into the operator-facing field — live failure inv_yka8FYwpY7TBxT3r) is a
+// REPAIRABLE error (errInvestigatePlanAsAnswer), with the parsed action still
+// returned so the caller's last resort can accept the non-empty text.
+func TestParseInvestigateActionPlanAsAnswerSentinel(t *testing.T) {
+	raw := `{"thought":"I will now present the final Arabic answer","action":{"type":"answer","answer":"I will now present the final Arabic answer"}}`
+	act, err := parseInvestigateAction(raw)
+	if !errors.Is(err, errInvestigatePlanAsAnswer) {
+		t.Fatalf("err = %v, want errInvestigatePlanAsAnswer", err)
+	}
+	if act.Action.Answer != "I will now present the final Arabic answer" {
+		t.Errorf("answer = %q, want preserved for the caller's last resort", act.Action.Answer)
+	}
+
+	// Whitespace-only differences still count as a duplicate.
+	raw = `{"thought":"  the plan  ","action":{"type":"answer","answer":"the plan"}}`
+	if _, err := parseInvestigateAction(raw); !errors.Is(err, errInvestigatePlanAsAnswer) {
+		t.Errorf("trimmed dup err = %v, want errInvestigatePlanAsAnswer", err)
+	}
+
+	// A genuinely different answer must NOT trip the guard.
+	raw = `{"thought":"reviewed everything","action":{"type":"answer","answer":"الإجابة النهائية"}}`
+	if _, err := parseInvestigateAction(raw); err != nil {
+		t.Errorf("distinct answer err = %v, want nil", err)
+	}
+}
+
+// TestAnalyzeInvestigateActionPlanAsAnswerRepaired covers guard A's repair round:
+// the first reply duplicates thought==answer, the targeted repair prompt is issued
+// (it must name the answer field and the plan-not-answer defect), and the second
+// reply's REAL answer wins — exactly two analyze calls.
+func TestAnalyzeInvestigateActionPlanAsAnswerRepaired(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	var prompts []string
+	replies := []string{
+		`{"thought":"the plan","action":{"type":"answer","answer":"the plan"}}`,
+		`{"thought":"the plan","action":{"type":"answer","answer":"الإجابة النهائية مع الدليل"}}`,
+	}
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		prompts = append(prompts, user)
+		r := replies[0]
+		replies = replies[1:]
+		return r, nil, nil
+	}
+	act, _, repaired, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !repaired {
+		t.Errorf("repaired = false, want true")
+	}
+	if act.Action.Answer != "الإجابة النهائية مع الدليل" {
+		t.Errorf("answer = %q, want the repaired reply's real answer", act.Action.Answer)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("analyze calls = %d, want exactly 2", len(prompts))
+	}
+	if !strings.Contains(prompts[1], "answer field") || !strings.Contains(prompts[1], "a plan, not an answer") {
+		t.Errorf("repair prompt missing the targeted plan-as-answer instruction: %q", prompts[1])
+	}
+}
+
+// TestAnalyzeInvestigateActionPlanAsAnswerTwiceAccepted covers guard A's last
+// resort: a duplicated answer twice in a row is ACCEPTED (the text is at least a
+// non-empty answer) — never an error that would crash the loop at the finish line.
+func TestAnalyzeInvestigateActionPlanAsAnswerTwiceAccepted(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"still the plan","action":{"type":"answer","answer":"still the plan"}}`, nil, nil
+	}
+	act, _, _, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2 (one repair round, then accept)", calls)
+	}
+	if act.Action.Answer != "still the plan" {
+		t.Errorf("answer = %q, want the duplicated text accepted as last resort", act.Action.Answer)
+	}
+}
+
+// TestAnalyzeInvestigateActionPlanAsAnswerRepairInfraFailure: the repair round
+// dying on infrastructure after a duplicated answer accepts the FIRST reply's
+// (non-empty) answer instead of erroring the pass.
+func TestAnalyzeInvestigateActionPlanAsAnswerRepairInfraFailure(t *testing.T) {
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, cfg config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"dup text","action":{"type":"answer","answer":"dup text"}}`, nil, nil
+		}
+		return "", nil, errors.New("agy timed out after 600s")
+	}
+	act, _, _, _, err := camAnalyzeInvestigateAction(context.Background(), config{}, "a", "sys", "user", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (want dup answer accepted, not pass error)", err)
+	}
+	if act.Action.Answer != "dup text" {
+		t.Errorf("answer = %q, want the first reply's duplicated text", act.Action.Answer)
+	}
+}
+
 func TestParseInvestigateActionErrors(t *testing.T) {
 	cases := []struct {
 		name string

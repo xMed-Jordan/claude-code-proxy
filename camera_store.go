@@ -320,6 +320,16 @@ func migrateCameraDB(db *sql.DB) error {
 			fetches INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL
 		)`,
+		// Pending (interrupt) messages: operator input sent while a worker OWNS the
+		// investigation row (status queued/running). The reply surfaces park messages
+		// here instead of writing the transcript (single-writer invariant); the run
+		// drains them into the transcript itself (camera_investigate.go drain points).
+		`CREATE TABLE IF NOT EXISTS camera_investigation_pending_messages (
+			id TEXT PRIMARY KEY,
+			investigation_id TEXT NOT NULL,
+			message TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cameras_site ON cameras(site_id, enabled)`,
 		`CREATE INDEX IF NOT EXISTS idx_cameras_dvr ON cameras(dvr_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_dvrs_site ON camera_dvrs(site_id)`,
@@ -333,6 +343,7 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_site ON camera_investigations(site_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_status ON camera_investigations(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigation_messages_inv ON camera_investigation_messages(investigation_id, seq)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_investigation_pending_inv ON camera_investigation_pending_messages(investigation_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_ts ON camera_events(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_dvr ON camera_events(dvr_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_events_op ON camera_events(op, ok)`,
@@ -1816,6 +1827,26 @@ func requeueCameraInvestigationFromRun(db *sql.DB, id string) (bool, error) {
 	return n == 1, nil
 }
 
+// requeueCameraInvestigationFromSettled atomically returns a SETTLED investigation
+// (awaiting_operator/answered/exhausted) to "queued" so the worker resumes it — the
+// operator-reply counterpart to requeueCameraInvestigationFromRun. It is a
+// compare-and-swap over exactly the settled states: a lost race (the row already
+// re-queued, claimed "running" by a worker, or closed) is RowsAffected==0, never a
+// blind overwrite — so a reply path can never flip a row a worker just claimed back
+// to "queued" and cause a double-run. Returns true only when THIS caller flipped it.
+func requeueCameraInvestigationFromSettled(db *sql.DB, id string) (bool, error) {
+	res, err := db.Exec(`UPDATE camera_investigations SET status = 'queued', updated_at = ?
+		WHERE id = ? AND status IN ('awaiting_operator','answered','exhausted')`, nowRFC3339(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // cancelCameraInvestigation atomically closes a settled/queued investigation via a
 // compare-and-swap over the cancellable states (queued/awaiting_operator/answered/
 // exhausted), returning true only when THIS caller performed the close. 'running' is
@@ -1966,6 +1997,63 @@ func listCameraInvestigationMessages(db *sql.DB, investigationID string) ([]camI
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ─────────────── camera_investigation_pending_messages ───────────────
+
+// camInvestigationPendingMessage is one operator message parked while a worker
+// owned the investigation row (status queued/running): the transcript has exactly
+// one writer while a pass is live, so the reply surfaces write THIS side-channel
+// and the run itself folds rows into the transcript (camera_investigate.go's
+// drain points), deleting them once delivered.
+type camInvestigationPendingMessage struct {
+	ID              string
+	InvestigationID string
+	Message         string
+	CreatedAt       string
+}
+
+func insertCameraInvestigationPendingMessage(db *sql.DB, investigationID, message string) (string, error) {
+	id := randomID("ipend")
+	_, err := db.Exec(`INSERT INTO camera_investigation_pending_messages (id, investigation_id, message, created_at)
+		VALUES (?, ?, ?, ?)`, id, investigationID, message, nowRFC3339())
+	return id, err
+}
+
+// listCameraInvestigationPendingMessages returns an investigation's undelivered
+// pending messages oldest-first (rowid breaks same-second created_at ties, so
+// delivery order is insertion order).
+func listCameraInvestigationPendingMessages(db *sql.DB, investigationID string) ([]camInvestigationPendingMessage, error) {
+	rows, err := db.Query(`SELECT id, investigation_id, message, created_at
+		FROM camera_investigation_pending_messages WHERE investigation_id = ? ORDER BY created_at, rowid`, investigationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []camInvestigationPendingMessage
+	for rows.Next() {
+		var m camInvestigationPendingMessage
+		if err := rows.Scan(&m.ID, &m.InvestigationID, &m.Message, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// deleteCameraInvestigationPendingMessages removes drained rows by id (a no-op
+// for an empty list).
+func deleteCameraInvestigationPendingMessages(db *sql.DB, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := db.Exec(`DELETE FROM camera_investigation_pending_messages WHERE id IN (`+ph+`)`, args...)
+	return err
 }
 
 // getCameraInvestigationWithMessages loads an investigation plus its full ordered
