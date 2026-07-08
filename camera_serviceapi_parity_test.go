@@ -1005,3 +1005,87 @@ func TestSvcCamerasListSnapshotToken(t *testing.T) {
 		t.Errorf("site B list snapshot_token wrong: %v", bcams)
 	}
 }
+
+// TestCamSnapshotTokenFallback proves the thumbnail token survives the reaper:
+// when the stamped snapshot_capture_id points at a deleted row, camSnapshotToken
+// falls back to the camera's newest UNEXPIRED still image (snapshot/frame) —
+// expired rows and non-image kinds (clip/mosaic) never surface.
+func TestCamSnapshotTokenFallback(t *testing.T) {
+	cfg := newSvcTestConfig(t)
+	db := svcTestDB(t, cfg)
+
+	siteID, _ := svcSeedSite(t, db, "Fallback Site")
+	dvrID, err := insertCameraDVR(db, cfg, CamDVR{SiteID: siteID, Name: "DVR", Brand: "hikvision", Host: "192.0.2.30", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCameraDVR: %v", err)
+	}
+	camID, err := insertCamera(db, camera{SiteID: siteID, DVRID: dvrID, Channel: 1, Name: "Yard", Enabled: true})
+	if err != nil {
+		t.Fatalf("insertCamera: %v", err)
+	}
+
+	// The stamped pointer references a capture that the reaper already deleted.
+	if err := setCameraSnapshot(db, camID, "cap_gone"); err != nil {
+		t.Fatalf("setCameraSnapshot: %v", err)
+	}
+
+	seed := func(kind, token, createdAt, expiresAt string) {
+		t.Helper()
+		if _, err := insertCameraCapture(db, camCapture{
+			SiteID: siteID, CameraID: camID, Kind: kind, Token: token,
+			ContentType: "image/jpeg", CreatedAt: createdAt, ExpiresAt: expiresAt,
+		}); err != nil {
+			t.Fatalf("insert capture %s: %v", token, err)
+		}
+	}
+
+	cam, err := getCamera(db, camID)
+	if err != nil {
+		t.Fatalf("getCamera: %v", err)
+	}
+
+	// No captures at all → empty.
+	if got := camSnapshotToken(db, cam); got != "" {
+		t.Errorf("dead pointer, no captures: token = %q, want empty", got)
+	}
+
+	// A clip (video) is never a thumbnail.
+	seed("clip", "cliptok", "2026-01-01T10:00:00Z", "")
+	if got := camSnapshotToken(db, cam); got != "" {
+		t.Errorf("clip only: token = %q, want empty", got)
+	}
+
+	// An unexpired older snapshot is served…
+	seed("snapshot", "oldsnap", "2026-01-01T11:00:00Z", "")
+	if got := camSnapshotToken(db, cam); got != "oldsnap" {
+		t.Errorf("live snapshot: token = %q, want oldsnap", got)
+	}
+
+	// …and a NEWER but expired frame does not displace it.
+	seed("frame", "expframe", "2026-01-01T12:00:00Z", "2026-01-02T00:00:00Z")
+	if got := camSnapshotToken(db, cam); got != "oldsnap" {
+		t.Errorf("expired newer frame: token = %q, want oldsnap", got)
+	}
+
+	// A newer unexpired frame wins.
+	seed("frame", "newframe", "2026-01-01T13:00:00Z", "2999-01-01T00:00:00Z")
+	if got := camSnapshotToken(db, cam); got != "newframe" {
+		t.Errorf("newer live frame: token = %q, want newframe", got)
+	}
+
+	// The stamped pointer still wins over any fallback while its row is alive.
+	liveCap, err := insertCameraCapture(db, camCapture{
+		SiteID: siteID, CameraID: camID, Kind: "snapshot", Token: "pinnedtok",
+		ContentType: "image/jpeg", CreatedAt: "2026-01-01T09:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("insert pinned capture: %v", err)
+	}
+	if err := setCameraSnapshot(db, camID, liveCap); err != nil {
+		t.Fatalf("setCameraSnapshot live: %v", err)
+	}
+	cam.SnapshotCaptureID = liveCap
+	if got := camSnapshotToken(db, cam); got != "pinnedtok" {
+		t.Errorf("live pointer: token = %q, want pinnedtok", got)
+	}
+}

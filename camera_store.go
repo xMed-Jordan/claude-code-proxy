@@ -329,6 +329,7 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_captures_token ON camera_captures(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_run ON camera_captures(watch_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_captures_expires ON camera_captures(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_captures_camera ON camera_captures(camera_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_site ON camera_investigations(site_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigations_status ON camera_investigations(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_investigation_messages_inv ON camera_investigation_messages(investigation_id, seq)`,

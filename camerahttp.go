@@ -174,17 +174,27 @@ func cameraJSON(c camera, thumbToken string) map[string]any {
 	}
 }
 
-// camSnapshotToken resolves a camera's current-thumbnail capability token from
-// its snapshot_capture_id pointer ("" if never captured or the row is gone).
+// camSnapshotToken resolves a camera's current-thumbnail capability token. The
+// stamped snapshot_capture_id pointer wins while its capture row is alive, but
+// those captures expire and get reaped (site analysis runs rarely), so fall
+// back to the camera's most recent unexpired still image — scan frames and
+// motion snapshots keep grid thumbnails alive between explicit snapshots.
+// "" when the camera has no servable imagery at all.
 func camSnapshotToken(db *sql.DB, c camera) string {
-	if strings.TrimSpace(c.SnapshotCaptureID) == "" {
-		return ""
+	if id := strings.TrimSpace(c.SnapshotCaptureID); id != "" {
+		if cap, err := getCameraCapture(db, id); err == nil {
+			return cap.Token
+		}
 	}
-	cap, err := getCameraCapture(db, c.SnapshotCaptureID)
+	var token string
+	err := db.QueryRow(`SELECT token FROM camera_captures
+		WHERE camera_id = ? AND kind IN ('snapshot', 'frame')
+		AND (expires_at = '' OR expires_at > ?)
+		ORDER BY created_at DESC LIMIT 1`, c.ID, nowRFC3339()).Scan(&token)
 	if err != nil {
 		return ""
 	}
-	return cap.Token
+	return token
 }
 
 func watchJSON(w watch) map[string]any {
