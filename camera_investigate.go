@@ -1174,6 +1174,88 @@ func camAnswerLanguageMismatch(question, answer string) bool {
 	return camCountArabicRunes(question) >= 3 && camCountArabicRunes(answer) == 0
 }
 
+// ─────────────────────── answer guard D (completeness judge) ───────────────────────
+//
+// Guards A/B/C catch FORM defects (plan-as-answer, no evidence, wrong language).
+// Guard D catches SCOPE: an answer that does not address the FULL question — the
+// live failure was "summarize 07:00–09:00" answered from 06:56–07:06 only. It is a
+// single model call, made once per pass at the top-level answer-accept site, that
+// never blocks or crashes a settle: every failure path (transport error,
+// unparseable reply, empty/keyless object) FAILS OPEN to "complete" and settles.
+
+// camAnswerCompletenessVerdict is guard D's parsed judge reply. complete uses the
+// tolerant flexBool decoder so a stringified "true"/"false"/"yes" still decodes.
+type camAnswerCompletenessVerdict struct {
+	Complete flexBool `json:"complete"`
+	Missing  string   `json:"missing"`
+}
+
+// camAnswerCompletenessJudgeFn is guard D's injectable judge seam — a package var
+// so tests script the verdict without a network call (mirrors camInvestigateAnalyzeFn).
+// It receives the operator QUESTION (which already embeds any "[Operator scope: …]"
+// window/camera list) and the proposed final ANSWER, and returns whether the answer
+// covers the full scope plus a one-sentence "missing" description when it does not.
+// A non-nil error (transport failure, unparseable reply) makes the CALL SITE fail
+// open — the judge can never block a settle.
+var camAnswerCompletenessJudgeFn = camDefaultAnswerCompletenessJudge
+
+// camDefaultAnswerCompletenessJudge is the production judge: ONE camResilientAnalyze
+// call through the run's own vision alias, tolerantly parsed. It never inspects or
+// echoes media (text-only), so it is cheap next to an investigation turn.
+func camDefaultAnswerCompletenessJudge(ctx context.Context, cfg config, alias, question, answer string) (complete bool, missing string, err error) {
+	const sys = "You are a completeness checker for a camera-investigation answer. " +
+		"You are given the operator's QUESTION (it may embed an \"[Operator scope: …]\" time window or camera list) " +
+		"and the proposed final ANSWER. Decide whether the answer addresses the FULL scope the operator asked for: " +
+		"the whole time window (not a fraction of it), the subject(s) named, and the level of detail requested — for " +
+		"example \"a summary of what happened\" needs a narrative across the whole window, not a single observation. " +
+		"Do NOT judge whether the answer is correct or well-evidenced, only whether it COVERS the scope asked. " +
+		"Reply with EXACTLY ONE JSON object and nothing else: " +
+		"{\"complete\":true|false,\"missing\":\"one short sentence naming what scope is missing\"}. " +
+		"If the answer covers the full scope, set complete=true and missing=\"\"."
+	user := "QUESTION:\n" + strings.TrimSpace(question) + "\n\nANSWER:\n" + strings.TrimSpace(answer) +
+		"\n\nReply with ONLY the single JSON object now."
+	raw, _, aerr := camResilientAnalyze(ctx, cfg, alias, sys, user, nil)
+	if aerr != nil {
+		return false, "", aerr
+	}
+	obj, ok := extractFirstJSONObject(raw)
+	if !ok {
+		return false, "", fmt.Errorf("completeness judge: no JSON object in reply")
+	}
+	var v camAnswerCompletenessVerdict
+	if jerr := json.Unmarshal(obj, &v); jerr != nil {
+		return false, "", fmt.Errorf("completeness judge: decode reply: %w", jerr)
+	}
+	return bool(v.Complete), strings.TrimSpace(v.Missing), nil
+}
+
+// camJudgeAnswerCompleteness runs guard D at the top-level answer-accept site and
+// returns the "missing scope" defect string ("" = no completeness defect). It is
+// the single fail-open funnel: the kill switch, a transport/parse error, an empty
+// or keyless verdict object, and a blank "missing" all resolve to "" (settle as
+// complete). Only an explicit complete=false WITH a non-empty "missing" produces a
+// defect — an incomplete verdict with nothing to act on is useless as a corrective
+// instruction, so it too fails open. Emits exactly one camlog verdict line and
+// never logs the answer text.
+func camJudgeAnswerCompleteness(ctx context.Context, cfg config, invID, alias, question, answer string) string {
+	complete, missing, err := camAnswerCompletenessJudgeFn(ctx, cfg, alias, question, answer)
+	if err != nil {
+		camlog("warn", "investigate_answer_judge", map[string]any{
+			"investigation_id": invID, "ok": false, "error": truncateString(err.Error(), 200), "fallback": "settle_complete",
+		})
+		return ""
+	}
+	fields := map[string]any{"investigation_id": invID, "complete": complete}
+	if !complete {
+		fields["missing"] = missing
+	}
+	camlog("info", "investigate_answer_judge", fields)
+	if complete || strings.TrimSpace(missing) == "" {
+		return ""
+	}
+	return missing
+}
+
 // camCollectMintedMedia returns the /camera/media/<token> URLs the loop's tools
 // actually minted across an investigation's WHOLE transcript (every tool row's
 // persisted media_json, so evidence from a pre-ask_operator pause or an earlier
@@ -2135,12 +2217,15 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 				"investigation_id": invID, "cited": len(act.Action.Evidence), "kept": len(evidence), "dropped": dropped,
 			})
 			// Final-answer quality gate — guard B (answered with zero evidence
-			// despite minted media) and guard C (Arabic question, zero-Arabic
-			// answer) share ONE corrective round: the rejected answer is persisted
-			// (so the timeline shows it and a resumed pass counts the same turns),
-			// a system note explains why + carries the corrective instruction, and
-			// the loop re-asks. One-shot per pass (answerGuardUsed) and only when a
-			// turn remains — at the turn cap the imperfect answer beats "exhausted".
+			// despite minted media), guard C (Arabic question, zero-Arabic answer)
+			// and guard D (the completeness judge: an answer that does not cover the
+			// full scope asked) share ONE corrective round: the rejected answer is
+			// persisted (so the timeline shows it and a resumed pass counts the same
+			// turns), a single system note names EVERY defect + carries the corrective
+			// instruction, and the loop re-asks. One-shot per pass (answerGuardUsed)
+			// and only when a turn remains — at the turn cap the imperfect answer beats
+			// "exhausted", and the same cap is why guard D is not consulted here (no
+			// budget to act on its verdict, so the call is not spent).
 			if !answerGuardUsed && turnsSoFar+1 < maxTurns {
 				var defects []string
 				if len(act.Action.Evidence) == 0 && len(mintedSet) > 0 {
@@ -2149,14 +2234,35 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 				if camAnswerLanguageMismatch(inv.Question, act.Action.Answer) {
 					defects = append(defects, "the operator's question is in Arabic but the answer contains no Arabic text")
 				}
+				// Guard D (SCOPE): one top-level, kill-switchable judge call asking
+				// whether the answer addresses the FULL question — the whole time
+				// window, every subject/camera, the detail level asked for. Fails open
+				// to "" (settle as complete) on any error/garbage/empty verdict, so it
+				// can never block or crash the settle. Sub-investigations are never
+				// judged (a child answers inside its lead's delegate turn).
+				missingScope := ""
+				if !cfg.CameraAnswerJudgeDisabled && inv.ParentID == "" {
+					missingScope = camJudgeAnswerCompleteness(cctx, cfg, invID, alias, inv.Question, act.Action.Answer)
+					if missingScope != "" {
+						defects = append(defects, "the answer does not cover the full scope the operator asked about — "+missingScope)
+					}
+				}
 				if len(defects) > 0 {
 					answerGuardUsed = true
 					aiMsg := camAppendInvestigateMessage(db, invID, "ai", camAIMessageContent(act.Thought, act.Action.Answer), "answer", "", 0, evidence)
 					msgs = append(msgs, aiMsg)
 					turnsSoFar++
-					note := "Final answer needs one correction before it is delivered: " + strings.Join(defects, "; ") +
-						". Attach the specific media URLs your answer relies on as evidence[] (copy the exact media_url values " +
-						"from the TOOL RESULT lines) and restate the COMPLETE final answer in the operator's language."
+					note := "Final answer needs one correction before it is delivered: " + strings.Join(defects, "; ") + "."
+					if missingScope != "" {
+						// Completeness is NOT a rewrite — the model must gather the missing
+						// scope first, so explicitly license more tool calls before it
+						// answers again.
+						note += " CONTINUE INVESTIGATING to cover the missing scope: make more tool calls (widen the time " +
+							"window, check every camera the question names) and only THEN give the final answer — do not merely " +
+							"restate the same answer over the same fraction of the window."
+					}
+					note += " Attach the specific media URLs your answer relies on as evidence[] (copy the exact media_url " +
+						"values from the TOOL RESULT lines) and restate the COMPLETE final answer in the operator's language."
 					sysMsg := camAppendInvestigateMessage(db, invID, "system", note, "answer_quality", "", 0, nil)
 					msgs = append(msgs, sysMsg)
 					camlog("warn", "investigate_answer_guard", map[string]any{

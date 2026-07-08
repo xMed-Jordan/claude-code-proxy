@@ -33,6 +33,11 @@ func newCamViewTestConfig(t *testing.T) config {
 		// the worker "enabled" (no worker actually runs in tests) the reply paths
 		// enqueue only — the worker-disabled inline drain has its own test.
 		CameraInvestigateWorkerEnabled: true,
+		// Answer guard D (the completeness judge) is a live model call; disable it by
+		// default so any test that drives runInvestigation to an answer stays offline
+		// and deterministic. The guard-D tests opt back in (CameraAnswerJudgeDisabled
+		// = false) and script camAnswerCompletenessJudgeFn.
+		CameraAnswerJudgeDisabled: true,
 	}
 	if err := os.MkdirAll(cfg.CameraMediaDir, 0o700); err != nil {
 		t.Fatalf("mkdir media root: %v", err)

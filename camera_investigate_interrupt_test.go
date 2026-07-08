@@ -12,11 +12,18 @@ package main
 //     corrective round, then the second evidence-less answer is accepted.
 //   - guard C: Arabic question + zero-Arabic answer → one corrective round; a
 //     combined B+C failure still produces ONE round, not two.
+//   - guard D (the completeness judge): an incomplete verdict folds into the SAME
+//     one corrective round (naming the missing scope + a continue-investigating
+//     instruction) then the corrected answer settles; a complete verdict settles
+//     at once; a judge error/empty verdict fails open; the judge is never called a
+//     second time in a pass, on a sub-investigation, or under the kill switch.
 //
-// Temp sqlite only — no DVRs, no network (the analyze seam is scripted).
+// Temp sqlite only — no DVRs, no network (both the analyze seam and the guard-D
+// judge seam camAnswerCompletenessJudgeFn are scripted).
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -461,5 +468,425 @@ func TestRunInvestigationAnswerGuardCombinedOneRound(t *testing.T) {
 	}
 	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
 		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// ─────────────────────── answer guard D (completeness judge) ───────────────────────
+
+// scriptCompletenessJudge installs a scripted guard-D judge seam returning a fixed
+// verdict and counts its calls; restores the original on cleanup.
+func scriptCompletenessJudge(t *testing.T, complete bool, missing string, jerr error) *int {
+	t.Helper()
+	orig := camAnswerCompletenessJudgeFn
+	t.Cleanup(func() { camAnswerCompletenessJudgeFn = orig })
+	calls := 0
+	camAnswerCompletenessJudgeFn = func(ctx context.Context, cfg config, alias, question, answer string) (bool, string, error) {
+		calls++
+		return complete, missing, jerr
+	}
+	return &calls
+}
+
+// TestRunInvestigationCompletenessIncomplete covers guard D's incomplete path AND
+// the "no second judge call" rule (spec bullets 1 + 5): the judge rejects the first
+// answer for scope, exactly ONE corrective round fires (its note carries the judge's
+// missing text and the CONTINUE-INVESTIGATING instruction), the model's second REAL
+// answer settles the run, and the judge is consulted EXACTLY once (never on the
+// post-corrective answer).
+func TestRunInvestigationCompletenessIncomplete(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	invID := seedInterruptInvestigation(t, cfg, "give me a summary of what happened 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	const missing = "only the 06:56-07:06 window was examined, not the full 07:00-09:00 the operator asked for"
+	judgeCalls := scriptCompletenessJudge(t, false, missing, nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"peeked at 07:00","action":{"type":"answer","answer":"At 07:01 a car parked near gate 2."}}`, nil, nil
+		}
+		if !strings.Contains(user, missing) {
+			t.Errorf("turn-2 context is missing the judge's missing text:\n%s", user)
+		}
+		return `{"thought":"covered the whole window now","action":{"type":"answer","answer":"Across 07:00-09:00: a car parked at 07:01, staff arrived 07:40, a delivery at 08:30, quiet after."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 1 {
+		t.Errorf("judge calls = %d, want exactly 1 (once on the first answer, never after the round)", *judgeCalls)
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2 (one corrective round)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 1 {
+		t.Fatalf("answer_quality notes = %d, want exactly 1", n)
+	}
+	for _, m := range msgs {
+		if m.Role == "system" && m.ToolName == "answer_quality" {
+			if !strings.Contains(m.Content, missing) {
+				t.Errorf("corrective note is missing the judge's missing text: %q", m.Content)
+			}
+			if !strings.Contains(m.Content, "CONTINUE INVESTIGATING") {
+				t.Errorf("corrective note is missing the continue-investigating instruction: %q", m.Content)
+			}
+		}
+	}
+	last := msgs[len(msgs)-1]
+	if last.Role != "ai" || last.ToolName != "answer" || !strings.Contains(last.Content, "08:30") {
+		t.Errorf("final row = %+v, want the corrected full-window answer", last)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationCompletenessComplete: a complete verdict settles the first
+// answer immediately — judge called exactly once, no corrective round.
+func TestRunInvestigationCompletenessComplete(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	invID := seedInterruptInvestigation(t, cfg, "summarize 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	judgeCalls := scriptCompletenessJudge(t, true, "", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"full sweep done","action":{"type":"answer","answer":"Across 07:00-09:00: quiet until 07:40, staff arrived, a delivery at 08:30, nothing else."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 1 {
+		t.Errorf("judge calls = %d, want exactly 1", *judgeCalls)
+	}
+	if calls != 1 {
+		t.Errorf("analyze calls = %d, want 1 (complete answer settles at once)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 0 {
+		t.Errorf("answer_quality notes = %d, want 0 (complete verdict)", n)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationCompletenessFailOpen: every judge failure mode — a transport
+// error and an "incomplete but nothing actionable" verdict (empty / whitespace
+// missing, i.e. the empty-object case) — FAILS OPEN: the answer settles with no
+// corrective round. The judge is still consulted exactly once.
+func TestRunInvestigationCompletenessFailOpen(t *testing.T) {
+	cases := []struct {
+		name     string
+		complete bool
+		missing  string
+		jerr     error
+	}{
+		{"transport error", false, "would-be-scope", errors.New("judge upstream unreachable")},
+		{"empty verdict object", false, "", nil},
+		{"whitespace-only missing", false, "   ", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newCamViewTestConfig(t)
+			cfg.CameraAnswerJudgeDisabled = false
+			invID := seedInterruptInvestigation(t, cfg, "summarize 07:00-09:00 across all cameras")
+			db, err := openProxyDB(cfg)
+			if err != nil {
+				t.Fatalf("openProxyDB: %v", err)
+			}
+			defer db.Close()
+
+			judgeCalls := scriptCompletenessJudge(t, tc.complete, tc.missing, tc.jerr)
+
+			orig := camInvestigateAnalyzeFn
+			defer func() { camInvestigateAnalyzeFn = orig }()
+			calls := 0
+			camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+				calls++
+				return `{"thought":"answering","action":{"type":"answer","answer":"Between 07:00 and 09:00 it was quiet."}}`, nil, nil
+			}
+
+			if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+				t.Fatalf("runInvestigation: %v", rerr)
+			}
+			if *judgeCalls != 1 {
+				t.Errorf("judge calls = %d, want exactly 1", *judgeCalls)
+			}
+			if calls != 1 {
+				t.Errorf("analyze calls = %d, want 1 (fail open → settle, no round)", calls)
+			}
+			msgs, _ := listCameraInvestigationMessages(db, invID)
+			if n := countAnswerQualityNotes(msgs); n != 0 {
+				t.Errorf("answer_quality notes = %d, want 0 (judge must fail open)", n)
+			}
+			if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+				t.Errorf("status = %q, want answered", inv.Status)
+			}
+		})
+	}
+}
+
+// TestRunInvestigationCompletenessCombinedWithBC proves guard D folds into the SAME
+// single corrective round as B (no evidence) and C (Arabic answered in English):
+// one answer_quality note naming ALL THREE defects, exactly one judge call, one
+// corrective round, then the corrected answer settles.
+func TestRunInvestigationCompletenessCombinedWithBC(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	invID := seedInterruptInvestigation(t, cfg, "لخّص ما حدث بين الساعة 07:00 و09:00 على كل الكاميرات")
+	seedMintedMedia(t, cfg, invID)
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	const missing = "only a single frame near 07:00 was described, not the whole 07:00-09:00 window"
+	judgeCalls := scriptCompletenessJudge(t, false, missing, nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		if calls == 1 {
+			return `{"thought":"quick answer","action":{"type":"answer","answer":"A car parked at 07:01."}}`, nil, nil
+		}
+		return `{"thought":"restating fully in Arabic with evidence","action":{"type":"answer","answer":"بين 07:00 و09:00: توقفت سيارة 07:01، وصل الموظفون 07:40، وتسليم 08:30.","evidence":[{"media_url":"/camera/media/tokSeed1"}]}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 1 {
+		t.Errorf("judge calls = %d, want exactly 1", *judgeCalls)
+	}
+	if calls != 2 {
+		t.Errorf("analyze calls = %d, want 2 — B+C+D must be ONE round", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 1 {
+		t.Fatalf("answer_quality notes = %d, want exactly 1", n)
+	}
+	for _, m := range msgs {
+		if m.Role == "system" && m.ToolName == "answer_quality" {
+			if !strings.Contains(m.Content, "evidence[]") {
+				t.Errorf("combined note must name the evidence defect: %q", m.Content)
+			}
+			if !strings.Contains(m.Content, "Arabic") {
+				t.Errorf("combined note must name the language defect: %q", m.Content)
+			}
+			if !strings.Contains(m.Content, missing) || !strings.Contains(m.Content, "CONTINUE INVESTIGATING") {
+				t.Errorf("combined note must name the completeness defect + continue instruction: %q", m.Content)
+			}
+		}
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationCompletenessSubInvestigationSkipped: a delegated child run
+// (ParentID set) is never judged, even with the judge enabled — a child answers
+// inside its lead's delegate turn.
+func TestRunInvestigationCompletenessSubInvestigationSkipped(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	siteID, serr := insertCameraSite(db, camSite{Name: "Sub-Investigation Site"})
+	if serr != nil {
+		t.Fatalf("insertCameraSite: %v", serr)
+	}
+	parentID, _ := insertCameraInvestigation(db, camInvestigation{SiteID: siteID, Question: "lead question", Status: "running"})
+	childID, cerr := insertCameraInvestigation(db, camInvestigation{SiteID: siteID, ParentID: parentID, Question: "summarize 07:00-09:00", Status: "running"})
+	if cerr != nil {
+		t.Fatalf("insert child: %v", cerr)
+	}
+	camAppendInvestigateMessage(db, childID, "operator", "summarize 07:00-09:00", "", "", 0, nil)
+
+	judgeCalls := scriptCompletenessJudge(t, false, "should never be consulted", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		return `{"thought":"child answer","action":{"type":"answer","answer":"Between 07:00 and 09:00 it was quiet."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, childID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 0 {
+		t.Errorf("judge calls = %d, want 0 (sub-investigations are never judged)", *judgeCalls)
+	}
+	if inv, _ := getCameraInvestigation(db, childID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationCompletenessKillSwitch: with PROXY_CAM_ANSWER_JUDGE_DISABLED
+// the judge is never consulted and the answer settles unchanged.
+func TestRunInvestigationCompletenessKillSwitch(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = true // the kill switch
+	invID := seedInterruptInvestigation(t, cfg, "summarize 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	judgeCalls := scriptCompletenessJudge(t, false, "would-be-scope", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"answering","action":{"type":"answer","answer":"Between 07:00 and 09:00 it was quiet."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 0 {
+		t.Errorf("judge calls = %d, want 0 (kill switch)", *judgeCalls)
+	}
+	if calls != 1 {
+		t.Errorf("analyze calls = %d, want 1 (settle unchanged)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 0 {
+		t.Errorf("answer_quality notes = %d, want 0 (judge disabled)", n)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestRunInvestigationCompletenessMaxTurnsEdge: when the corrective round would
+// exceed the cumulative turn cap (maxTurns=1, so turnsSoFar+1 is not < maxTurns),
+// the guard block is skipped entirely — the imperfect answer is accepted as-is and
+// the judge is NOT spent (there is no budget to act on its verdict).
+func TestRunInvestigationCompletenessMaxTurnsEdge(t *testing.T) {
+	cfg := newCamViewTestConfig(t)
+	cfg.CameraAnswerJudgeDisabled = false
+	cfg.CameraInvestigateMaxTurns = 1 // no room for a corrective round
+	invID := seedInterruptInvestigation(t, cfg, "summarize 07:00-09:00 across all cameras")
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	judgeCalls := scriptCompletenessJudge(t, false, "the rest of the window", nil)
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	calls := 0
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls++
+		return `{"thought":"only saw the start","action":{"type":"answer","answer":"At 07:01 a car parked."}}`, nil, nil
+	}
+
+	if rerr := runInvestigation(context.Background(), cfg, nil, invID); rerr != nil {
+		t.Fatalf("runInvestigation: %v", rerr)
+	}
+	if *judgeCalls != 0 {
+		t.Errorf("judge calls = %d, want 0 (no budget for a round → judge not spent)", *judgeCalls)
+	}
+	if calls != 1 {
+		t.Errorf("analyze calls = %d, want 1 (imperfect answer accepted as-is)", calls)
+	}
+	msgs, _ := listCameraInvestigationMessages(db, invID)
+	if n := countAnswerQualityNotes(msgs); n != 0 {
+		t.Errorf("answer_quality notes = %d, want 0 (turn cap)", n)
+	}
+	if inv, _ := getCameraInvestigation(db, invID); inv.Status != "answered" {
+		t.Errorf("status = %q, want answered", inv.Status)
+	}
+}
+
+// TestCamAnswerCompletenessVerdictParse pins the tolerant parse behind the default
+// judge: extractFirstJSONObject pulls the object out of surrounding prose and the
+// flexBool "complete" decodes a stringified boolean.
+func TestCamAnswerCompletenessVerdictParse(t *testing.T) {
+	for _, raw := range []string{
+		`{"complete":false,"missing":"the 08:00-09:00 hour"}`,
+		"here is my verdict: {\"complete\":\"false\",\"missing\":\"the 08:00-09:00 hour\"} — done",
+	} {
+		obj, ok := extractFirstJSONObject(raw)
+		if !ok {
+			t.Fatalf("no JSON object found in %q", raw)
+		}
+		var v camAnswerCompletenessVerdict
+		if err := json.Unmarshal(obj, &v); err != nil {
+			t.Fatalf("decode %q: %v", raw, err)
+		}
+		if bool(v.Complete) {
+			t.Errorf("complete = true, want false for %q", raw)
+		}
+		if v.Missing == "" {
+			t.Errorf("missing decoded empty for %q", raw)
+		}
+	}
+}
+
+// TestCamJudgeAnswerCompletenessFunnel exercises the fail-open funnel directly (no
+// runInvestigation): a transport error, a blank "missing", and a complete verdict
+// all resolve to "" (settle); only complete=false WITH real missing text produces a
+// defect string.
+func TestCamJudgeAnswerCompletenessFunnel(t *testing.T) {
+	orig := camAnswerCompletenessJudgeFn
+	defer func() { camAnswerCompletenessJudgeFn = orig }()
+	set := func(complete bool, missing string, jerr error) {
+		camAnswerCompletenessJudgeFn = func(ctx context.Context, cfg config, alias, question, answer string) (bool, string, error) {
+			return complete, missing, jerr
+		}
+	}
+	call := func() string {
+		return camJudgeAnswerCompleteness(context.Background(), config{}, "inv_test", "alias", "q", "ans")
+	}
+
+	set(false, "actionable", errors.New("boom"))
+	if got := call(); got != "" {
+		t.Errorf("transport error: got %q, want \"\" (fail open)", got)
+	}
+	set(false, "   ", nil)
+	if got := call(); got != "" {
+		t.Errorf("blank missing: got %q, want \"\" (fail open)", got)
+	}
+	set(true, "ignored when complete", nil)
+	if got := call(); got != "" {
+		t.Errorf("complete verdict: got %q, want \"\"", got)
+	}
+	set(false, "the whole 07:00-09:00 window", nil)
+	if got := call(); got != "the whole 07:00-09:00 window" {
+		t.Errorf("actionable incomplete verdict: got %q, want the missing text", got)
 	}
 }

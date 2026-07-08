@@ -196,6 +196,7 @@ type config struct {
 	CameraInvestigateConcurrency   int           // PROXY_CAMERA_INVESTIGATE_CONCURRENCY — parallel investigation runs (default 2)
 	CameraInvestigateTickInterval  time.Duration // PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL — queue poll cadence (default 5s)
 	CameraViewReplyDisabled        bool          // PROXY_CAM_VIEW_REPLY_DISABLED — kill switch for the public timeline reply box (endpoint 404s, shell hides the composer)
+	CameraAnswerJudgeDisabled      bool          // PROXY_CAM_ANSWER_JUDGE_DISABLED — kill switch for answer guard D (the completeness judge); when set, a final answer is never judged for scope coverage
 	// Never-die analysis layer (camera_investigate.go / cameraorch.go): an
 	// investigation analysis call never terminalizes the run — it retries, fails
 	// over to a backup vision alias, and self-requeues instead of surfacing an
@@ -779,6 +780,7 @@ func loadConfig() config {
 		CameraInvestigateConcurrency:   parseIntDefault(getenv("PROXY_CAMERA_INVESTIGATE_CONCURRENCY", "2"), 2),
 		CameraInvestigateTickInterval:  parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL", "5")),
 		CameraViewReplyDisabled:        envFlag("PROXY_CAM_VIEW_REPLY_DISABLED", false),
+		CameraAnswerJudgeDisabled:      envFlag("PROXY_CAM_ANSWER_JUDGE_DISABLED", false),
 
 		CameraAnalyzeTimeout:         parseAgyTimeout(getenv("PROXY_CAMERA_ANALYZE_TIMEOUT", "600")),
 		CameraInvestigateFailoverCSV: strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES", "")),
