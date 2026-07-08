@@ -1040,6 +1040,144 @@ func camDeferInvestigation(db *sql.DB, cfg config, invID, note string, msgs []ca
 	return nil
 }
 
+// camAutoRequeueExhausted predicts, from OUTSIDE camDeferInvestigation, whether the
+// NEXT deferral would be its terminal give-up rather than another requeue. It MUST
+// compute the identical decision camDeferInvestigation makes internally
+// (camCountAutoRequeues(msgs)+1 > maxRequeues, evaluated over the SAME msgs) so a
+// caller can fire the forced final answer on EXACTLY the give-up attempt — never one
+// requeue early (cutting a still-viable run short) and never late (missing the
+// terminal). Any genuine progress in msgs (an "ai" turn or an operator reply) resets
+// the streak to zero via camCountAutoRequeues, so this returns false and the run
+// requeues, in lockstep with camDeferInvestigation.
+func camAutoRequeueExhausted(msgs []camInvestigationMessage, cfg config) bool {
+	return camCountAutoRequeues(msgs)+1 > camInvestigateMaxAutoRequeues(cfg)
+}
+
+// camForceAnswerTimeout resolves the wall-clock cap for the single forced
+// final-answer model call (default 180s), mirroring camAnalyzeTimeout's zero-default
+// clamp idiom. It bounds the FRESH context camForceFinalAnswer builds, so one
+// last-resort call can never block a terminal exit indefinitely.
+func camForceAnswerTimeout(cfg config) time.Duration {
+	d := cfg.CameraForceAnswerTimeout
+	if d <= 0 {
+		d = 180 * time.Second
+	}
+	return d
+}
+
+// camForceFinalAnswer makes ONE forced best-effort final-answer model call before a
+// TOP-LEVEL investigation terminalizes as "exhausted", so the operator gets an answer
+// (even a partial one) instead of nothing. It is the last resort at both true-terminal
+// exits (the cumulative turn cap and the auto-requeue give-up). Contract:
+//
+//   - Kill switch: CameraForceAnswerDisabled → return false immediately (the caller
+//     does the honest empty stop, unchanged behavior).
+//   - FRESH context, independent of any per-pass ctx: one terminal exit is reached
+//     PRECISELY because the pass ctx is already dead (cctx.Err()!=nil), so inheriting
+//     it would make this call fail instantly. A bounded context.Background() timeout
+//     (camForceAnswerTimeout) is used instead.
+//   - EXACTLY ONE model call, through the resilient ladder (the camInvestigateAnalyzeFn
+//     seam = camResilientAnalyze in production, scriptable in tests) — no repair round,
+//     no tool execution, no requeue, never a loop. No images: the model reasons over
+//     the transcript and cites evidence media_urls already minted there.
+//   - Fail-open EVERYWHERE: any error, parse failure, tool-call reply, or blank
+//     resolved answer → return false so the caller terminalizes exactly as today. It
+//     NEVER panics and NEVER blocks past the bounded context.
+//   - On a usable answer it persists a "forced_answer" breadcrumb + the answer row and
+//     settles via the SAME terminal write the normal answer-accept site uses
+//     (setCameraInvestigationStatus "answered" + camNotifyInvestigationSettled), then
+//     returns true. It BYPASSES guard D (the completeness judge): this IS the last
+//     resort, there is no budget left, and re-rejecting would defeat the purpose.
+//
+// Only ever wired into runInvestigation (top-level); sub-investigations
+// (camRunSubagentLoop) are out of scope and keep returning their "exhausted" verdict.
+func camForceFinalAnswer(cfg config, db *sql.DB, r *http.Request, site camSite, alias, invID, sys string, msgs []camInvestigationMessage) (answered bool) {
+	_ = r // reserved for symmetry with the answer-accept site; the forced call mints no new media
+	if cfg.CameraForceAnswerDisabled {
+		return false
+	}
+	// Fail-open umbrella: a forced-answer bug must never crash a terminal exit — a
+	// panic here still leaves the caller to terminalize honestly (answered stays false).
+	defer func() {
+		if rec := recover(); rec != nil {
+			camlog("error", "investigate_force_answer", map[string]any{
+				"investigation_id": invID, "site_id": site.ID, "answered": false, "panic": fmt.Sprint(rec),
+			})
+			answered = false
+		}
+	}()
+
+	// FRESH context — deliberately NOT derived from the dead per-pass ctx.
+	ctx, cancel := context.WithTimeout(context.Background(), camForceAnswerTimeout(cfg))
+	defer cancel()
+
+	userText := camInvestigateTranscriptText(msgs) + "\n\n" +
+		"You are OUT of investigation budget and MUST stop now. Do NOT call any tool. " +
+		"Reply with the JSON action object using action.type = \"answer\". Give your BEST FINAL ANSWER " +
+		"to the operator's ORIGINAL question from everything gathered above, in the OPERATOR'S LANGUAGE, " +
+		"and cite the evidence media_urls you already have in action.evidence. If you could not fully answer, " +
+		"give a partial answer stating what you DID establish and explicitly list what remains unknown. " +
+		"A partial answer is REQUIRED — do not refuse."
+
+	raw, _, err := camInvestigateAnalyzeFn(ctx, cfg, alias, sys, userText, nil)
+	if err != nil {
+		camlog("warn", "investigate_force_answer", map[string]any{
+			"investigation_id": invID, "site_id": site.ID, "answered": false, "error": truncateString(err.Error(), 200),
+		})
+		return false
+	}
+
+	// Tolerant resolution of the answer text, reusing the same coercion the normal
+	// path relies on: parseInvestigateAction returns the sentinel errors (empty/dup
+	// answer) with the action still populated, and camSubagentCoerceAnswer turns an
+	// ask_operator into an answer (a top-level run out of budget has no operator to
+	// pause for, exactly like a sub-investigator). A tool-call reply (the model
+	// disobeyed) or a structurally unparseable reply leaves Type != "answer" → decline.
+	act, _ := parseInvestigateAction(raw)
+	act = camSubagentCoerceAnswer(act)
+	if act.Action.Type != "answer" {
+		camlog("warn", "investigate_force_answer", map[string]any{
+			"investigation_id": invID, "site_id": site.ID, "answered": false, "reason": "no_answer_action",
+		})
+		return false
+	}
+	answerText := strings.TrimSpace(act.Action.Answer)
+	if answerText == "" {
+		answerText = strings.TrimSpace(act.Thought) // empty-answer sentinel: promote the thought so prose still becomes an answer
+	}
+	if answerText == "" {
+		camlog("warn", "investigate_force_answer", map[string]any{
+			"investigation_id": invID, "site_id": site.ID, "answered": false, "reason": "blank_answer",
+		})
+		return false
+	}
+
+	// Persist EXACTLY like the normal answer-accept site: keep only evidence whose
+	// media_url a tool actually minted this investigation, drop hallucinated links.
+	mintedSet, mintedByToken := camCollectMintedMedia(msgs)
+	evidence, _ := camFilterEvidence(act.Action.Evidence, mintedSet, mintedByToken)
+	// Breadcrumb first, so the timeline reads "out of budget → best-effort" and the
+	// answer row remains the LAST transcript row (matching the normal accept site).
+	camAppendInvestigateMessage(db, invID, "system",
+		"Out of investigation budget — delivering a best-effort final answer from the evidence gathered so far.",
+		"forced_answer", "", 0, nil)
+	camAppendInvestigateMessage(db, invID, "ai", camAIMessageContent(act.Thought, answerText), "answer", "", 0, evidence)
+	// SAME terminal write the normal answer path uses — no divergent status. On a write
+	// failure, fail open (the answer row is already persisted for the operator) and let
+	// the caller terminalize, firing no settle webhook from here (avoids a double settle).
+	if serr := setCameraInvestigationStatus(db, invID, "answered"); serr != nil {
+		camlog("warn", "investigate_force_answer", map[string]any{
+			"investigation_id": invID, "site_id": site.ID, "answered": false, "error": "status write: " + truncateString(serr.Error(), 160),
+		})
+		return false
+	}
+	go camNotifyInvestigationSettled(cfg, invID, "answered") // settle webhook (camera_serviceapi.go)
+	camlog("info", "investigate_force_answer", map[string]any{
+		"investigation_id": invID, "site_id": site.ID, "answered": true, "evidence": len(evidence),
+	})
+	return true
+}
+
 // ─────────────────────── pending (interrupt) messages ───────────────────────
 //
 // The transcript has exactly ONE writer while a pass is live (the worker), so the
@@ -2189,6 +2327,24 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 	// budget dies right after the round persisted its note resumes with the gate still
 	// closed, spending no second judge call and firing no second corrective round.
 	answerGuardUsed := camAnswerGuardAlreadyFired(msgs)
+	// forceOrDefer is the never-die give-up gate shared by the three budget/analysis
+	// walls. On EXACTLY the attempt camDeferInvestigation would give up on — predicted
+	// with camAutoRequeueExhausted, which computes the SAME streak+1>cap decision over
+	// the SAME msgs, so it fires on the give-up attempt and no earlier — a top-level run
+	// makes ONE forced best-effort final answer before terminalizing. On its success the
+	// run settles "answered" (nil); on decline (or a non-top-level row, or an earlier
+	// attempt that still has requeue budget) it delegates to camDeferInvestigation
+	// exactly as before, whose own give-up→camStopInvestigation is the honest fallback.
+	// It captures the loop's `msgs` variable by reference, so each call sees the current
+	// transcript — and passes that same slice to BOTH the pre-check and the deferral,
+	// making the streak lockstep impossible to break.
+	forceOrDefer := func(note string) error {
+		if inv.ParentID == "" && camAutoRequeueExhausted(msgs, cfg) &&
+			camForceFinalAnswer(cfg, db, r, site, alias, invID, sys, msgs) {
+			return nil
+		}
+		return camDeferInvestigation(db, cfg, invID, note, msgs)
+	}
 	for {
 		// Drain point A (the interrupt): operator messages POSTed to the public
 		// timeline or the service reply route while this run is working land in the
@@ -2213,14 +2369,19 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 		}
 		if cctx.Err() != nil {
 			// NEVER-DIE: a per-pass budget exhaustion self-requeues for a fresh pass
-			// instead of terminalizing (bounded by the requeue streak + turn cap).
+			// instead of terminalizing (bounded by the requeue streak + turn cap). On the
+			// LAST requeue attempt, a top-level run forces a best-effort answer first.
 			camlog("warn", "investigate_budget", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
-			return camDeferInvestigation(db, cfg, invID, "Time budget for this pass was exhausted before a final answer.", msgs)
+			return forceOrDefer("Time budget for this pass was exhausted before a final answer.")
 		}
 		if turnsSoFar >= maxTurns {
 			// Cumulative turn cap is the true terminal bound across passes — stays
-			// "exhausted" (operator-gated: a follow-up begins a fresh, bounded run).
+			// "exhausted" (operator-gated: a follow-up begins a fresh, bounded run). A
+			// top-level run makes ONE forced best-effort final answer before it stops empty.
 			camlog("warn", "investigate_max_turns", map[string]any{"investigation_id": invID, "turns": turnsSoFar})
+			if inv.ParentID == "" && camForceFinalAnswer(cfg, db, r, site, alias, invID, sys, msgs) {
+				return nil
+			}
 			return camStopInvestigation(db, cfg, invID, "Investigation stopped: reached the maximum number of turns before a final answer.")
 		}
 
@@ -2235,11 +2396,12 @@ func runInvestigation(ctx context.Context, cfg config, r *http.Request, invID st
 			})
 			// NEVER-DIE: an analysis wall self-requeues rather than terminalizing. If
 			// the run's OWN budget died mid-analysis, defer it as a budget pass so the
-			// note reads honestly; either way camDeferInvestigation caps the streak.
+			// note reads honestly; either way forceOrDefer forces a best-effort answer on
+			// the give-up attempt and camDeferInvestigation caps the streak otherwise.
 			if cctx.Err() != nil {
-				return camDeferInvestigation(db, cfg, invID, "Time budget for this pass was exhausted before a final answer.", msgs)
+				return forceOrDefer("Time budget for this pass was exhausted before a final answer.")
 			}
-			return camDeferInvestigation(db, cfg, invID, "Analysis failed after all retries ("+truncateString(aerr.Error(), 200)+").", msgs)
+			return forceOrDefer("Analysis failed after all retries (" + truncateString(aerr.Error(), 200) + ").")
 		}
 		// A multi-attempt success (a retry or a failover kicked in) leaves a
 		// budget-free breadcrumb so the operator/UI can see the run self-healed —

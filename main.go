@@ -197,6 +197,8 @@ type config struct {
 	CameraInvestigateTickInterval  time.Duration // PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL — queue poll cadence (default 5s)
 	CameraViewReplyDisabled        bool          // PROXY_CAM_VIEW_REPLY_DISABLED — kill switch for the public timeline reply box (endpoint 404s, shell hides the composer)
 	CameraAnswerJudgeDisabled      bool          // PROXY_CAM_ANSWER_JUDGE_DISABLED — kill switch for answer guard D (the completeness judge); when set, a final answer is never judged for scope coverage
+	CameraForceAnswerDisabled      bool          // PROXY_CAMERA_FORCE_ANSWER_DISABLED — kill switch for the forced best-effort final answer a TOP-LEVEL run makes before it terminalizes "exhausted"; when set, an exhausted run stops empty as before
+	CameraForceAnswerTimeout       time.Duration // PROXY_CAMERA_FORCE_ANSWER_TIMEOUT — fresh-context wall-clock cap for the single forced final-answer model call (default 180s)
 	// Never-die analysis layer (camera_investigate.go / cameraorch.go): an
 	// investigation analysis call never terminalizes the run — it retries, fails
 	// over to a backup vision alias, and self-requeues instead of surfacing an
@@ -782,6 +784,8 @@ func loadConfig() config {
 		CameraInvestigateTickInterval:  parseAgyTimeout(getenv("PROXY_CAMERA_INVESTIGATE_TICK_INTERVAL", "5")),
 		CameraViewReplyDisabled:        envFlag("PROXY_CAM_VIEW_REPLY_DISABLED", false),
 		CameraAnswerJudgeDisabled:      envFlag("PROXY_CAM_ANSWER_JUDGE_DISABLED", false),
+		CameraForceAnswerDisabled:      envFlag("PROXY_CAMERA_FORCE_ANSWER_DISABLED", false),
+		CameraForceAnswerTimeout:       parseAgyTimeout(getenv("PROXY_CAMERA_FORCE_ANSWER_TIMEOUT", "180")),
 
 		CameraAnalyzeTimeout:         parseAgyTimeout(getenv("PROXY_CAMERA_ANALYZE_TIMEOUT", "600")),
 		CameraInvestigateFailoverCSV: strings.TrimSpace(getenv("PROXY_CAMERA_INVESTIGATE_FAILOVER_ALIASES", "")),
