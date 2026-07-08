@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -253,6 +254,90 @@ func TestCamInvestigatePromptDelegateGating(t *testing.T) {
 	}
 	if !strings.Contains(on, `annotate|evidence_export|delegate`) {
 		t.Error("the OUTPUT tool enum must include delegate when enabled")
+	}
+}
+
+// TestCamToolDelegateSubagentAliasOverride proves the PROXY_CAMERA_SUBAGENT_ALIAS
+// reroute: when set, EVERY child analysis call and the child's persisted row use the
+// override alias while the parent alias passed into delegate is untouched; when unset,
+// children run on the parent alias exactly as before (byte-identical regression guard).
+// It scripts the child model to answer in one turn and records the alias each child
+// analysis was invoked with via the camInvestigateAnalyzeFn seam.
+func TestCamToolDelegateSubagentAliasOverride(t *testing.T) {
+	const parentAlias = "gemini-3.5-flash-medium"
+	cases := []struct {
+		name      string
+		subagent  string
+		wantChild string
+	}{
+		{name: "override reroutes children", subagent: "claude-sonnet-5", wantChild: "claude-sonnet-5"},
+		{name: "unset keeps the parent alias", subagent: "", wantChild: parentAlias},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openCamTestDB(t)
+			if err := migrateCameraDB(db); err != nil {
+				t.Fatalf("migrateCameraDB: %v", err)
+			}
+			siteID, err := insertCameraSite(db, camSite{Name: "Clinic"})
+			if err != nil {
+				t.Fatalf("insertCameraSite: %v", err)
+			}
+			site := camSite{ID: siteID, Name: "Clinic"}
+			inv := camInvestigation{ID: "inv_lead", SiteID: siteID}
+
+			// Script the child analysis: record the alias it ran under and answer at
+			// once so the child completes in one turn needing no tool/DVR backend.
+			orig := camInvestigateAnalyzeFn
+			defer func() { camInvestigateAnalyzeFn = orig }()
+			var (
+				mu   sync.Mutex
+				seen []string
+			)
+			camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+				mu.Lock()
+				seen = append(seen, alias)
+				mu.Unlock()
+				return `{"thought":"done","action":{"type":"answer","answer":"nothing of note"}}`, nil, nil
+			}
+
+			cfg := config{CameraSubagentMax: 4, CameraSubagentAlias: tc.subagent}
+			cam := camera{ID: "cam1", Name: "Front Door", Enabled: true}
+			camByID := map[string]camera{"cam1": cam}
+			allowed := map[string]bool{"cam1": true}
+			sub := investigateSubtask{Question: "who entered", CameraIDs: []string{"cam1"}, From: "2026-07-01T09:00:00Z", To: "2026-07-01T10:00:00Z"}
+
+			res := camToolDelegate(context.Background(), cfg, db, nil, site, parentAlias, inv,
+				investigateArgs{Subtasks: []investigateSubtask{sub}}, camByID, nil, allowed, []camera{cam}, t.TempDir(), 30, nil)
+			if !strings.Contains(res.Summary, "SUBTASK 1") {
+				t.Fatalf("delegate did not run a child: %q", res.Summary)
+			}
+
+			// Every recorded child analysis alias must be the expected one.
+			mu.Lock()
+			got := append([]string(nil), seen...)
+			mu.Unlock()
+			if len(got) == 0 {
+				t.Fatalf("no child analysis call was recorded")
+			}
+			for _, a := range got {
+				if a != tc.wantChild {
+					t.Errorf("child analysis alias = %q, want %q", a, tc.wantChild)
+				}
+			}
+
+			// The persisted child row's stored alias reflects where it actually ran.
+			children, err := listCameraInvestigationChildren(db, inv.ID)
+			if err != nil {
+				t.Fatalf("listCameraInvestigationChildren: %v", err)
+			}
+			if len(children) != 1 {
+				t.Fatalf("children = %d, want exactly 1", len(children))
+			}
+			if children[0].Alias != tc.wantChild {
+				t.Errorf("persisted child row alias = %q, want %q", children[0].Alias, tc.wantChild)
+			}
+		})
 	}
 }
 

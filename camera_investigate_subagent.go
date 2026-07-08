@@ -358,6 +358,14 @@ func camToolDelegate(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 		return investigateToolResult{Summary: "delegate: not enough time budget remains this pass to fan out sub-investigators — answer with the evidence you already have (the run auto-resumes if it needs another pass)."}
 	}
 
+	// Sub-investigations analyze frame-heavy multi-camera slices — the same "many
+	// frames per call" profile the operator routed OFF agy for avatar scans. When
+	// PROXY_CAMERA_SUBAGENT_ALIAS is set it overrides the parent's alias for EVERY
+	// child (its stored row + its analysis + nested-tool calls), so the frame-heavy
+	// children can move to a reliable backend while the parent stays on the cheap
+	// alias it was invoked with. Unset → children run on the parent alias, unchanged.
+	childAlias := firstNonEmpty(strings.TrimSpace(cfg.CameraSubagentAlias), alias)
+
 	// Operator context for the children's prompts, loaded once. The DVR clock is
 	// fetched once here and shared by every child so a fan-out makes at most one clock
 	// probe (the deadline check above guarantees there is time for it).
@@ -437,7 +445,7 @@ func camToolDelegate(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 			ParentID: inv.ID,
 			Title:    "sub: " + truncateString(strings.TrimSpace(plans[i].sub.Question), 70),
 			Question: plans[i].sub.Question,
-			Alias:    alias,
+			Alias:    childAlias,
 			Status:   "running",
 		})
 		if ierr != nil {
@@ -501,7 +509,7 @@ func camToolDelegate(ctx context.Context, cfg config, db *sql.DB, r *http.Reques
 			}
 			sys := camSubagentSystemPrompt(site, dvrs, p.cams, avatars, p.toolList, srvNow, dvrClock, dvrClockOK, tzName)
 			status, answer, evidence, keyImages, fetches := camRunSubagentLoop(
-				cctx, cfg, db, r, site, alias, p.childID, sys, camByID, dvrByID, p.allowed, p.cams, p.tools, childScratch, perChildMedia, prog)
+				cctx, cfg, db, r, site, childAlias, p.childID, sys, camByID, dvrByID, p.allowed, p.cams, p.tools, childScratch, perChildMedia, prog)
 			verdicts[i] = camSubagentVerdict{
 				ChildID: p.childID, Question: p.sub.Question, CamIDs: p.camIDs, Window: p.window,
 				Status: status, Answer: answer, Evidence: evidence, KeyImages: keyImages, Fetches: fetches,

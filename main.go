@@ -250,6 +250,7 @@ type config struct {
 	CameraAvatarScanTickInterval   time.Duration // PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL — queue poll cadence (default 5s)
 	CameraAvatarScanBudget         time.Duration // PROXY_CAM_AVATAR_SCAN_BUDGET — wall-clock cap per scan (default 1800s; camAvatarScanBudget hard-caps at 1h)
 	CameraAvatarScanAlias          string        // PROXY_CAM_AVATAR_SCAN_ALIAS — VLM alias for scans ("" → CameraInvestigateAlias)
+	CameraSubagentAlias            string        // PROXY_CAMERA_SUBAGENT_ALIAS — vision alias for delegated sub-investigations ("" → the parent/investigate alias)
 	CameraAvatarScanMaxFrames      int           // PROXY_CAM_AVATAR_SCAN_MAX_FRAMES — archive frames scanned per camera (default 600)
 	CameraAvatarScanBatch          int           // PROXY_CAM_AVATAR_SCAN_BATCH — candidate frames per VLM call (default 8)
 	CameraAvatarScanMaxVLM         int           // PROXY_CAM_AVATAR_SCAN_MAX_VLM — VLM calls per scan (default 40)
@@ -822,6 +823,7 @@ func loadConfig() config {
 		CameraAvatarScanTickInterval:   parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL", "5")),
 		CameraAvatarScanBudget:         parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_BUDGET", "1800")),
 		CameraAvatarScanAlias:          strings.TrimSpace(getenv("PROXY_CAM_AVATAR_SCAN_ALIAS", "")),
+		CameraSubagentAlias:            strings.TrimSpace(getenv("PROXY_CAMERA_SUBAGENT_ALIAS", "")),
 		CameraAvatarScanMaxFrames:      parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_MAX_FRAMES", "600"), 600),
 		CameraAvatarScanBatch:          parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_BATCH", "8"), 8),
 		CameraAvatarScanMaxVLM:         parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_MAX_VLM", "40"), 40),
