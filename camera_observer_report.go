@@ -29,10 +29,23 @@ package main
 //     re-notifies (the Connect-loop guard), and a report left undelivered by a
 //     crash is picked up by the next tick while it is still day D.
 //
+// STALE-CLAIM RECOVERY: claimLogDay commits a `pending` row in its own tiny
+// transaction; the compose (a model call) and finishLogDay run after it. A
+// crash in that window — or a finishLogDay failure (a transient store error
+// after the long call) — would strand the (stream,day) row `pending` forever:
+// the sync route hides it, the webhook never fires, the public page shows
+// "generating…" indefinitely. So the recovery paths do NOT treat `pending` as
+// untouchable: camObserverDailyTick reclaims a pending row whose claim is older
+// than a compose lease (camObserverDayReclaimLease) and rebuilds it in place,
+// and camObserverGenerateLogDay lets force recompose a pending row too. A fresh
+// pending row (a live generation on this or another instance) is still left
+// alone until the lease elapses.
+//
 // camObserverGenerateLogDay is the on-demand path behind days/generate:
-// build-if-missing (or rebuild with force) on the SAME row — id and view_token
-// survive regeneration so a shared /camera/reports/<view_token> link keeps
-// working — and it NEVER emits the webhook.
+// build-if-missing (or rebuild with force — which also heals a stranded pending
+// row) on the SAME row — id and view_token survive regeneration so a shared
+// /camera/reports/<view_token> link keeps working — and it NEVER emits the
+// webhook.
 
 import (
 	"context"
@@ -235,11 +248,38 @@ func camObserverReportInstant(s logStream, dayStart time.Time) time.Time {
 	return time.Date(dayStart.Year(), dayStart.Month(), dayStart.Day(), hh, mm, 0, 0, dayStart.Location())
 }
 
+// camObserverDayReclaimLease is how long a daily-report row may sit `pending`
+// before camObserverDailyTick treats the claim as stranded (a crash, or a
+// finishLogDay failure after the compose) and rebuilds it in place. It exceeds
+// the compose budget so a generation still legitimately in flight — on this or
+// another instance — is never interrupted.
+func camObserverDayReclaimLease(cfg config) time.Duration {
+	if lease := 2 * camObserverBudget(cfg); lease > 10*time.Minute {
+		return lease
+	}
+	return 10 * time.Minute
+}
+
+// camObserverDayPendingStale reports whether a pending day row's claim (stamped
+// at created_at) is at least `lease` old at `now`. A blank/unparseable claim
+// timestamp is treated as stale — a row that cannot prove it is fresh can only
+// be a stranded claim.
+func camObserverDayPendingStale(d logDay, now time.Time, lease time.Duration) bool {
+	created, err := time.Parse(time.RFC3339, strings.TrimSpace(d.CreatedAt))
+	if err != nil {
+		return true
+	}
+	return now.Sub(created) >= lease
+}
+
 // camObserverDailyTick is the scheduled daily-report path for one stream: past
 // daily_report_time on day D (site-local, and only while still day D) it
 // generates the missing report (atomic claim — one winner across ticks and
 // instances) and then takes the notified_at CAS to fire the webhook exactly
-// once. Pending rows (another claimant mid-generation) and error rows (a
+// once. A row STRANDED pending past the compose lease (a crash or a
+// finishLogDay failure after an earlier claim) is reclaimed and rebuilt in
+// place — otherwise it, and its delivery, would be lost forever; a fresh
+// pending row (a live generation) is left to its owner. Error rows (a
 // regenerate heals them; the NEXT tick then delivers) are skipped.
 func camObserverDailyTick(cfg config, db *sql.DB, s logStream, site camSite, now time.Time, loc *time.Location, tzName, language string) {
 	localNow := now.In(loc)
@@ -278,7 +318,29 @@ func camObserverDailyTick(cfg config, db *sql.DB, s logStream, site camSite, now
 		return
 	}
 
-	if d.Status == "pending" || d.Status == "error" || strings.TrimSpace(d.NotifiedAt) != "" {
+	if d.Status == "pending" {
+		// A row still pending here was claimed by an earlier run that never
+		// reached a terminal state (a crash mid-compose, or a finishLogDay
+		// failure after the long model call). Left alone it is stuck forever —
+		// the sync route hides it, this webhook never fires, the public page
+		// shows "generating…" indefinitely. Once the claim is older than the
+		// compose lease (no live generation on any tick/instance could still
+		// hold it), reclaim and rebuild the SAME row in place (id + view_token
+		// survive); a fresher claim is left to its in-flight owner.
+		if !camObserverDayPendingStale(d, now, camObserverDayReclaimLease(cfg)) {
+			return
+		}
+		d = camObserverComposeDay(cfg, db, s, site, d, loc, tzName, language)
+		if ferr := finishLogDay(db, d); ferr != nil {
+			camlog("warn", "observer_daily", map[string]any{"stream_id": s.ID, "day": day, "ok": false, "error": ferr.Error(), "reclaim": true})
+			return
+		}
+		camlog("info", "observer_daily", map[string]any{
+			"stream_id": s.ID, "site_id": s.SiteID, "day": day, "status": d.Status,
+			"hours_used": d.HoursUsed, "entries_used": d.EntriesUsed, "language": d.Language, "reclaimed": true,
+		})
+	}
+	if d.Status == "error" || strings.TrimSpace(d.NotifiedAt) != "" {
 		return
 	}
 	won, nerr := claimLogDayNotified(db, d.ID, nowRFC3339())
@@ -295,9 +357,13 @@ func camObserverDailyTick(cfg config, db *sql.DB, s logStream, site camSite, now
 
 // camObserverGenerateLogDay is the on-demand days/generate path: build the
 // report for day (site-local "2006-01-02", "" = today) when it is missing,
-// return the existing row untouched when it exists (idempotent button-mash),
-// or rebuild it in place with force — the SAME row id and view_token survive
-// (finishLogDay), only the sync seq is re-stamped. This path NEVER emits the
+// return the existing row untouched when it exists and force is off (idempotent
+// button-mash, and the hands-off-a-live-claim case), or rebuild it in place
+// with force — the SAME row id and view_token survive (finishLogDay), only the
+// sync seq is re-stamped. force rebuilds REGARDLESS of status, so it is also
+// the manual escape hatch that heals a row stranded `pending` by a crash /
+// finishLogDay failure (the status test must not precede the force branch, or
+// force could never override a pending row). This path NEVER emits the
 // camera_daily_report webhook: only the scheduled tick takes the notified_at
 // CAS, so a Connect-initiated regenerate can never trigger a webhook loop.
 func camObserverGenerateLogDay(cfg config, db *sql.DB, s logStream, day string, force bool) (logDay, error) {
@@ -315,9 +381,11 @@ func camObserverGenerateLogDay(cfg config, db *sql.DB, s logStream, day string, 
 
 	existing, gerr := getLogDayByStreamDay(db, s.ID, day)
 	if gerr == nil {
-		if existing.Status == "pending" || !force {
-			return existing, nil // mid-generation, or already built and not forced
+		if !force {
+			return existing, nil // idempotent button-mash, or another claimant mid-generation
 		}
+		// force recomposes on the SAME row whatever its status — including a
+		// pending row stranded by a crash/finishLogDay failure after its claim.
 		rebuilt := camObserverComposeDay(cfg, db, s, site, existing, loc, tzName, language)
 		if ferr := finishLogDay(db, rebuilt); ferr != nil {
 			return rebuilt, ferr

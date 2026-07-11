@@ -70,7 +70,12 @@ func camToolActivityLog(cfg config, db *sql.DB, site camSite, args investigateAr
 
 	switch gran {
 	case "hours":
-		return camActivityLogHours(db, site, fromUTC, toUTC, window, loc)
+		// Floor the lower bound to the site-local hour that CONTAINS the window
+		// start: hour rows are keyed to exact local-hour boundaries, so a raw
+		// sub-hour `from` (e.g. 15:30) would exclude the 15:00 summary that
+		// covers 15:30–16:00 and drop the first minutes of the asked window.
+		fromHourUTC := camFloorToLocalHour(from, loc).UTC().Format(time.RFC3339)
+		return camActivityLogHours(db, site, fromHourUTC, toUTC, window, loc)
 	case "days":
 		return camActivityLogDays(db, site, from.In(loc).Format("2006-01-02"), to.In(loc).Format("2006-01-02"), window)
 	}
@@ -223,6 +228,15 @@ func camActivityToolHourLabel(hourStartUTC string, loc *time.Location) string {
 		return hourStartUTC
 	}
 	return t.In(loc).Format("2006-01-02 15:04") + "–" + t.Add(time.Hour).In(loc).Format("15:04")
+}
+
+// camFloorToLocalHour truncates t to the start of the site-local hour that
+// contains it. Flooring in loc (not UTC) is what makes it correct for zones
+// whose offset is not a whole hour: hour_start rows are the UTC instants of
+// site-local boundaries, so a UTC-hour floor could miss the containing row.
+func camFloorToLocalHour(t time.Time, loc *time.Location) time.Time {
+	lt := t.In(loc)
+	return time.Date(lt.Year(), lt.Month(), lt.Day(), lt.Hour(), 0, 0, 0, loc)
 }
 
 // camPluralIES returns "ies"/"y" for entry/summary-style pluralization.

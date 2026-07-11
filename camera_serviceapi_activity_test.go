@@ -390,8 +390,14 @@ func TestSvcActivityBrowse(t *testing.T) {
 	if u, _ := dr["view_url"].(string); !strings.Contains(u, "/camera/reports/") {
 		t.Errorf("day view_url = %q, want a /camera/reports/ link", u)
 	}
-	if v, _ := dr["view_url"].(string); strings.Contains(fmt.Sprint(dr), dayA.ViewToken) && !strings.Contains(v, dayA.ViewToken) {
-		t.Errorf("view_token must only surface inside view_url: %v", dr)
+	// The capability token must surface ONLY inside view_url, never as a
+	// standalone field the day JSON hands out. Assert both directions: view_url
+	// carries the token, and no bare view_token key exists.
+	if v, _ := dr["view_url"].(string); !strings.Contains(v, dayA.ViewToken) {
+		t.Errorf("view_url = %q, want it to embed the view_token %q", v, dayA.ViewToken)
+	}
+	if _, leaked := dr["view_token"]; leaked {
+		t.Errorf("day JSON leaked a standalone view_token field (the token must live only inside view_url): %v", dr)
 	}
 }
 

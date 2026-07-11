@@ -211,6 +211,50 @@ func TestCamToolActivityLogHours(t *testing.T) {
 	}
 }
 
+// TestCamToolActivityLogHoursFloorsWindowStart: a sub-hour window start must
+// still return the summary of the hour that CONTAINS it — the hours lower bound
+// is floored to the local hour, so a 05:30 start keeps the 05:00 summary
+// (covering 05:30–06:00) instead of dropping the first minutes of the window.
+func TestCamToolActivityLogHoursFloorsWindowStart(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	site, allowed, camByID, dvrByID := obsToolSeed(t)
+
+	mkHour := func(hourStart string) {
+		t.Helper()
+		h := logHour{StreamID: "logstream_x", SiteID: site.ID, HourStart: hourStart, TZ: "UTC"}
+		id, won, err := claimLogHour(db, h)
+		if err != nil || !won {
+			t.Fatalf("claimLogHour(%s): won=%v err=%v", hourStart, won, err)
+		}
+		h.ID, h.Status, h.Summary, h.Language = id, "done", "summary "+hourStart, "English"
+		if err := finishLogHour(db, h); err != nil {
+			t.Fatalf("finishLogHour: %v", err)
+		}
+	}
+	mkHour("2020-01-15T05:00:00Z")
+	mkHour("2020-01-15T06:00:00Z")
+	mkHour("2020-01-15T07:00:00Z")
+
+	// Window 05:30 → 07:30: the containing hour (05:00) must not be dropped, and
+	// the end side still includes the 07:00 hour that holds 07:30.
+	res := camToolActivityLog(config{}, db, site, investigateArgs{
+		From: "2020-01-15T05:30:00Z", To: "2020-01-15T07:30:00Z", Granularity: "hours",
+	}, allowed, camByID, dvrByID)
+	for _, want := range []string{
+		"3 hourly summaries",
+		"summary 2020-01-15T05:00:00Z",
+		"summary 2020-01-15T06:00:00Z",
+		"summary 2020-01-15T07:00:00Z",
+	} {
+		if !strings.Contains(res.Summary, want) {
+			t.Errorf("hours window start not floored to the containing hour — missing %q:\n%s", want, res.Summary)
+		}
+	}
+}
+
 func TestCamToolActivityLogDays(t *testing.T) {
 	db := openCamTestDB(t)
 	if err := migrateCameraDB(db); err != nil {

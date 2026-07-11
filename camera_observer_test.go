@@ -749,6 +749,74 @@ func TestObserverFailureCycleEntry(t *testing.T) {
 	}
 }
 
+// TestObserverCycleNoFramesSampled: when neither the S3 archive nor the bounded
+// DVR playback fallback yields a single frame, the cycle still writes an entry —
+// headline "Logging failed", error "…no frames sampled" — the DVR fallback IS
+// attempted (allowDVR=true fetches) rather than silently skipped, the model is
+// never called (nothing to analyze), and the cursor still advances (no hole).
+func TestObserverCycleNoFramesSampled(t *testing.T) {
+	cfg := newCamObserverTestConfig(t)
+	siteID, _ := seedObserverSite(t, cfg)
+	s := seedObserverStream(t, cfg, logStream{SiteID: siteID, Name: "Blackout", Enabled: true})
+
+	origFetch := camObserverFetchFrameFn
+	defer func() { camObserverFetchFrameFn = origFetch }()
+	var mu sync.Mutex
+	subAttempts, dvrAttempts := 0, 0
+	camObserverFetchFrameFn = func(ctx context.Context, c config, cam camera, dvr CamDVR, quality string, ts time.Time, destPath string, allowDVR bool) (bool, error) {
+		mu.Lock()
+		if allowDVR {
+			dvrAttempts++
+		} else {
+			subAttempts++
+		}
+		mu.Unlock()
+		return false, nil // archive empty AND the DVR has no recording for the window
+	}
+	origAnalyze := camObserverAnalyzeFn
+	defer func() { camObserverAnalyzeFn = origAnalyze }()
+	camObserverAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		t.Error("a frameless window must never reach the model")
+		return "", nil, nil
+	}
+
+	camExecuteLogCycle(cfg, s)
+
+	entries := obsStreamEntries(t, cfg, siteID, s.ID)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want the single failure entry", len(entries))
+	}
+	e := entries[0]
+	if e.Headline != camObserverFailedHeadline {
+		t.Errorf("headline = %q, want %q", e.Headline, camObserverFailedHeadline)
+	}
+	if !strings.Contains(e.Error, "no frames sampled") {
+		t.Errorf("error = %q, want it to mention 'no frames sampled'", e.Error)
+	}
+	if e.Frames != 0 {
+		t.Errorf("frames = %d, want 0", e.Frames)
+	}
+	mu.Lock()
+	sub, dvr := subAttempts, dvrAttempts
+	mu.Unlock()
+	if sub == 0 {
+		t.Error("expected S3/sub sampling attempts before falling back")
+	}
+	if dvr == 0 {
+		t.Error("expected the bounded DVR playback fallback to be attempted when S3 served zero frames")
+	}
+
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+	st, _ := getLogStream(db, s.ID)
+	if st.LastWindowTo != e.ToTS {
+		t.Errorf("cursor = %q, want the entry's to_ts %q (frameless cycles advance too)", st.LastWindowTo, e.ToTS)
+	}
+}
+
 // TestCamObserverContinuityBlockIdleCompression: consecutive motion-gated idle
 // entries compress into one "[from–to] No activity (N idle cycles)" line while
 // active entries keep their own lines, and the newest entries quote verbatim.

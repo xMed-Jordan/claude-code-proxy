@@ -566,3 +566,150 @@ func TestCamNotifyDailyReportWebhook(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestObserverGenerateForceHealsPending: a row stranded `pending` (crash after
+// claimLogDay, before finishLogDay) is NOT healed by an unforced generate
+// (idempotent no-op, no model call) but IS rebuilt in place by force — the same
+// id + view_token survive, the seq re-stamps, and the status becomes terminal.
+// Guards the exact regression where the `pending` test preceded the force
+// branch, so force could never override a stranded row.
+func TestObserverGenerateForceHealsPending(t *testing.T) {
+	cfg := newCamObserverTestConfig(t)
+	siteID, _ := seedObserverSite(t, cfg)
+	s := seedObserverStream(t, cfg, logStream{SiteID: siteID, Name: "Stranded", Enabled: true})
+	obsSeedHourEntries(t, cfg, siteID, s.ID)
+
+	origAnalyze := camObserverAnalyzeFn
+	defer func() { camObserverAnalyzeFn = origAnalyze }()
+	var calls atomic.Int32
+	camObserverAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		calls.Add(1)
+		return `{"headline":"Recovered day","report":"Rebuilt after a stranded claim."}`, nil, nil
+	}
+
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// Simulate the crash window: a bare pending row for the day, no content.
+	id, won, cerr := claimLogDay(db, logDay{StreamID: s.ID, SiteID: siteID, Day: "2026-07-11"})
+	if cerr != nil || !won {
+		t.Fatalf("claimLogDay = %v, %v", won, cerr)
+	}
+	stranded, _ := getLogDay(db, id)
+	if stranded.Status != "pending" {
+		t.Fatalf("seed status = %q, want pending", stranded.Status)
+	}
+
+	// Unforced generate over a pending row: returns it untouched, no model call.
+	noop, gerr := camObserverGenerateLogDay(cfg, db, s, "2026-07-11", false)
+	if gerr != nil || noop.Status != "pending" || calls.Load() != 0 {
+		t.Fatalf("unforced generate over pending = %+v, %v, calls=%d; want the untouched pending row and no call", noop, gerr, calls.Load())
+	}
+
+	// Forced generate heals it IN PLACE: same identity, terminal status, content.
+	healed, gerr := camObserverGenerateLogDay(cfg, db, s, "2026-07-11", true)
+	if gerr != nil {
+		t.Fatalf("forced generate over pending: %v", gerr)
+	}
+	if healed.ID != id || healed.ViewToken != stranded.ViewToken {
+		t.Errorf("force changed identity: id %q→%q token %q→%q", id, healed.ID, stranded.ViewToken, healed.ViewToken)
+	}
+	if healed.Status != "done" || healed.Headline != "Recovered day" {
+		t.Errorf("healed row = %+v, want a done rebuild", healed)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("analyze calls = %d, want exactly 1 (only the forced rebuild)", calls.Load())
+	}
+	if healed.Seq <= stranded.Seq {
+		t.Errorf("healed seq = %d, want > claim seq %d (re-stamped so Connect re-ingests)", healed.Seq, stranded.Seq)
+	}
+}
+
+// TestObserverDailyTickReclaimsStalePending: the SCHEDULED tick recovers a day
+// row stranded `pending` past the compose lease — it rebuilds the row in place
+// and delivers it exactly once — while a FRESH pending claim (within the lease)
+// is left to its in-flight owner. This is the crash-AFTER-claim recovery the
+// on-demand force path can only fix manually.
+func TestObserverDailyTickReclaimsStalePending(t *testing.T) {
+	cfg := newCamObserverTestConfig(t)
+	cfg.CameraObserverRollupCatchup = 1
+	siteID, _ := seedObserverSite(t, cfg)
+	s := seedObserverStream(t, cfg, logStream{SiteID: siteID, Name: "Reclaim", Enabled: true})
+	obsSeedHourEntries(t, cfg, siteID, s.ID)
+
+	origAnalyze := camObserverAnalyzeFn
+	defer func() { camObserverAnalyzeFn = origAnalyze }()
+	camObserverAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		if strings.Contains(user, "DAILY REPORT WINDOW") {
+			return `{"headline":"Reclaimed report","report":"Rebuilt by the scheduled tick after a stranded claim."}`, nil, nil
+		}
+		return "Morning summary.", nil, nil
+	}
+	origNotify := camObserverNotifyDailyReportFn
+	defer func() { camObserverNotifyDailyReportFn = origNotify }()
+	var notifies atomic.Int32
+	notified := make(chan string, 4)
+	camObserverNotifyDailyReportFn = func(c config, dayID string) {
+		notifies.Add(1)
+		notified <- dayID
+	}
+
+	db, err := openProxyDB(cfg)
+	if err != nil {
+		t.Fatalf("openProxyDB: %v", err)
+	}
+	defer db.Close()
+
+	// A claim stranded pending long ago (created_at well before the tick, so it
+	// is past the reclaim lease).
+	id, won, cerr := claimLogDay(db, logDay{StreamID: s.ID, SiteID: siteID, Day: "2026-07-11", CreatedAt: "2026-07-11T00:00:00Z"})
+	if cerr != nil || !won {
+		t.Fatalf("claimLogDay = %v, %v", won, cerr)
+	}
+	stranded, _ := getLogDay(db, id)
+	if stranded.Status != "pending" {
+		t.Fatalf("seed status = %q, want pending", stranded.Status)
+	}
+
+	// 20:30 local (17:30Z), past the 20:00 report time: reclaim + deliver once.
+	obsRunStreamRollups(t, cfg, s.ID, time.Date(2026, 7, 11, 17, 30, 0, 0, time.UTC))
+	select {
+	case gotID := <-notified:
+		if gotID != id {
+			t.Errorf("delivered id = %q, want the reclaimed row %q", gotID, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale pending row was never reclaimed/delivered")
+	}
+	d, derr := getLogDayByStreamDay(db, s.ID, "2026-07-11")
+	if derr != nil {
+		t.Fatalf("getLogDayByStreamDay: %v", derr)
+	}
+	if d.ID != id || d.ViewToken != stranded.ViewToken {
+		t.Errorf("reclaim changed identity: id %q→%q token %q→%q", id, d.ID, stranded.ViewToken, d.ViewToken)
+	}
+	if d.Status != "done" || d.Headline != "Reclaimed report" || d.NotifiedAt == "" {
+		t.Errorf("reclaimed row = %+v, want done + delivered", d)
+	}
+
+	// Guard: a FRESH pending claim (within the lease) is left to its owner — the
+	// tick must not steal and rebuild it.
+	s2 := seedObserverStream(t, cfg, logStream{SiteID: siteID, Name: "Fresh", Enabled: true})
+	fid, won2, cerr2 := claimLogDay(db, logDay{StreamID: s2.ID, SiteID: siteID, Day: "2026-07-11", CreatedAt: "2026-07-11T17:29:30Z"})
+	if cerr2 != nil || !won2 {
+		t.Fatalf("claimLogDay(fresh) = %v, %v", won2, cerr2)
+	}
+	notifiesBefore := notifies.Load()
+	obsRunStreamRollups(t, cfg, s2.ID, time.Date(2026, 7, 11, 17, 30, 0, 0, time.UTC))
+	fresh, _ := getLogDay(db, fid)
+	if fresh.Status != "pending" {
+		t.Errorf("fresh pending row status = %q, want still pending (owner keeps it)", fresh.Status)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if notifies.Load() != notifiesBefore {
+		t.Errorf("fresh pending row triggered a delivery; the lease guard failed")
+	}
+}
