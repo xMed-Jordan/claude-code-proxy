@@ -65,6 +65,20 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/ui/api/cameras/watches/toggle", noStore(requireAdmin(cfg, handleCameraWatchToggle(cfg))))
 	mux.HandleFunc("/ui/api/cameras/watches/run", noStore(requireAdmin(cfg, handleCameraWatchRun(cfg))))
 
+	// Activity-log admin twins (camera_observer_http.go): stream CRUD/toggle/run,
+	// the entries/hours/days browsers, and the on-demand daily generate. Thin
+	// twins of the /api/cameras/activity/* service routes
+	// (camera_serviceapi_activity.go) sharing the same helpers.
+	mux.HandleFunc("/ui/api/cameras/activity/streams", noStore(requireAdmin(cfg, handleCameraActivityStreams(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/streams/update", noStore(requireAdmin(cfg, handleCameraActivityStreamUpdate(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/streams/delete", noStore(requireAdmin(cfg, handleCameraActivityStreamDelete(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/streams/toggle", noStore(requireAdmin(cfg, handleCameraActivityStreamToggle(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/streams/run", noStore(requireAdmin(cfg, handleCameraActivityStreamRun(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/entries", noStore(requireAdmin(cfg, handleCameraActivityEntries(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/hours", noStore(requireAdmin(cfg, handleCameraActivityHours(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/days", noStore(requireAdmin(cfg, handleCameraActivityDays(cfg))))
+	mux.HandleFunc("/ui/api/cameras/activity/days/generate", noStore(requireAdmin(cfg, handleCameraActivityDayGenerate(cfg))))
+
 	// Ask-AI investigation chat (camera_investigate.go): start a run, reply to an
 	// ask_operator pause, list a site's investigations, and fetch a full transcript.
 	mux.HandleFunc("/ui/api/cameras/investigations", noStore(requireAdmin(cfg, handleCameraInvestigations(cfg))))

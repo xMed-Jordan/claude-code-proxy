@@ -159,6 +159,7 @@ var camSubagentAllowedTools = map[string]bool{
 	"past_frames":   true,
 	"contact_sheet": true,
 	"motion_search": true,
+	"activity_log":  true,
 	"avatars":       true,
 	"avatar_info":   true,
 	"avatar_check":  true,
@@ -240,6 +241,8 @@ func camSubagentToolLine(tool string) string {
 		return "- past_frames: args.camera_ids, args.from + args.to (RFC3339), args.count, args.quality — stills sampled from recorded footage; use to SEE a window or zoom into flagged times.\n"
 	case "motion_search":
 		return "- motion_search: args.camera_ids (optional), args.from + args.to (RFC3339), args.event_type (optional) — the DVR motion log's exact episode times, no footage pulled (no media cost). Use FIRST to find WHEN.\n"
+	case "activity_log":
+		return "- activity_log: args.from + args.to (RFC3339), args.granularity \"entries\"|\"hours\"|\"days\" (default entries), args.camera_ids (optional, ONE id) — the site's continuous AI activity JOURNAL as text, no footage pulled (no media cost). PREFER it over re-scanning footage for \"what happened <when>\"; verify only pivotal moments with frames.\n"
 	case "avatars":
 		return "- avatars: (no args) — list the site's known people/vehicles/pets (id, name, type).\n"
 	case "avatar_info":
@@ -303,7 +306,7 @@ func camSubagentSystemPrompt(site camSite, dvrs []CamDVR, childCams []camera, av
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
 	b.WriteString(`{"thought":"...","action":{"type":"call_tool|answer",`)
 	b.WriteString("\n")
-	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
+	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","granularity":"entries|hours|days","avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},`)
 	b.WriteString("\n")
 	b.WriteString(`  "answer":"...(your verdict)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nUse ONLY the EXACT camera ids listed above. Reply with ONLY the JSON object.")

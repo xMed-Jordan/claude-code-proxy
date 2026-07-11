@@ -77,8 +77,8 @@ import (
 // emits. Its nested Action carries the actual command:
 //
 //	{"thought":"...","action":{"type":"call_tool|ask_operator|answer",
-//	  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate",
-//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"VMD",
+//	  "tool":"roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|activity_log|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate",
+//	  "args":{"camera_ids":[...],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"VMD","granularity":"entries|hours|days",
 //	    "name":"<playbook or api tool>","params":{"key":"value"},
 //	    "avatar_id":"...","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}},
 //	  "question":"...(ask_operator)","answer":"...(final narrative)",
@@ -104,19 +104,20 @@ type investigateCommand struct {
 // uses camera_ids + quality; past_frames adds count). Count uses the tolerant
 // flexInt decoder so a text model emitting "6" is still accepted.
 type investigateArgs struct {
-	CameraIDs []string        `json:"camera_ids"`
-	Quality   string          `json:"quality"`    // sub | main
-	From      string          `json:"from"`       // RFC3339 absolute time (DVR timezone honored by the loop)
-	To        string          `json:"to"`         // RFC3339 absolute time
-	Count     flexInt         `json:"count"`      // desired still count for past_frames
-	Mode      string          `json:"mode"`       // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
-	Name      string          `json:"name"`       // playbook / call_api: the catalog entry to invoke (exact name)
-	Params    map[string]any  `json:"params"`     // call_api: {{placeholder}} values (stringified tolerantly)
-	AvatarID  string          `json:"avatar_id"`  // avatar_info / avatar_check / avatar_find: the avatar to inspect/match
-	Time      string          `json:"time"`       // avatar_check / annotate: RFC3339 archive instant
-	BBox      json.RawMessage `json:"bbox"`       // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
-	EventType string          `json:"event_type"` // motion_search: optional exact event-type filter (VMD | linedetection | …)
-	Layout    string          `json:"layout"`     // evidence_export: "sequential" | "grid" | "separate" (default separate)
+	CameraIDs   []string        `json:"camera_ids"`
+	Quality     string          `json:"quality"`     // sub | main
+	From        string          `json:"from"`        // RFC3339 absolute time (DVR timezone honored by the loop)
+	To          string          `json:"to"`          // RFC3339 absolute time
+	Count       flexInt         `json:"count"`       // desired still count for past_frames
+	Mode        string          `json:"mode"`        // contact_sheet: "motion" (changed frames) | "interval" (uniform time-lapse)
+	Name        string          `json:"name"`        // playbook / call_api: the catalog entry to invoke (exact name)
+	Params      map[string]any  `json:"params"`      // call_api: {{placeholder}} values (stringified tolerantly)
+	AvatarID    string          `json:"avatar_id"`   // avatar_info / avatar_check / avatar_find: the avatar to inspect/match
+	Time        string          `json:"time"`        // avatar_check / annotate: RFC3339 archive instant
+	BBox        json.RawMessage `json:"bbox"`        // annotate: {"x0","y0","x1","y1"} normalized 0-1000, top-left origin
+	EventType   string          `json:"event_type"`  // motion_search: optional exact event-type filter (VMD | linedetection | …)
+	Granularity string          `json:"granularity"` // activity_log: "entries" (default) | "hours" | "days"
+	Layout      string          `json:"layout"`      // evidence_export: "sequential" | "grid" | "separate" (default separate)
 
 	Subtasks []investigateSubtask `json:"subtasks"` // delegate: one entry per PARALLEL sub-investigation to fan out (WS3)
 }
@@ -143,7 +144,7 @@ type evidenceItem struct {
 
 // investigateToolNames is the set of tools the loop can execute. Kept here so the
 // prompt builder and the executor agree on exactly one list.
-var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate", "evidence_export", "delegate"}
+var investigateToolNames = []string{"roster", "snapshot", "mosaic", "contact_sheet", "past_frames", "past_clip", "motion_search", "activity_log", "playbook", "call_api", "avatars", "avatar_info", "avatar_check", "avatar_find", "annotate", "evidence_export", "delegate"}
 
 // ─────────────────────────────── roster-first targeting ───────────────────────────────
 
@@ -534,6 +535,7 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("- past_clip: args.camera_ids (one id used), args.from + args.to (RFC3339, required), args.quality \"sub\"|\"main\" (see QUALITY below) — saves a recorded clip as citable EVIDENCE. You are NOT shown its frames (use past_frames first if you need to see the footage yourself).\n")
 	b.WriteString("- evidence_export: args.camera_ids (one OR MORE), args.from + args.to (RFC3339 — may span up to 60 minutes, NOT limited to the 300s clip cap), args.layout \"sequential\"|\"grid\"|\"separate\", args.quality — queues a BACKGROUND evidence-video export across those cameras; permanent public video link(s) are delivered to the operator automatically when ready. Returns IMMEDIATELY — do NOT wait for it or re-check it; keep investigating / answer normally. Costs no media budget.\n")
 	b.WriteString("- motion_search: args.camera_ids (optional, default = all cameras), args.from + args.to (RFC3339, required), args.event_type (optional exact type) — queries the DVR MOTION LOG and returns the exact times motion/line-cross/intrusion episodes occurred, WITHOUT pulling any footage (costs no media budget). Use FIRST to find WHEN activity happened, then past_frames/contact_sheet/avatar_check those exact windows — don't brute-scan.\n")
+	b.WriteString("- activity_log: args.from + args.to (RFC3339, required), args.granularity \"entries\"|\"hours\"|\"days\" (default entries), args.camera_ids (optional, ONE id — narrows entries to windows that sampled that camera) — searches the site's CONTINUOUS ACTIVITY LOG as TEXT (costs no media budget): an AI journal already describing what happened every few minutes, plus its hourly summaries and daily reports. PREFER it over re-reading frames for \"what happened <when>\" questions — read the log first, then verify only the pivotal moments with past_frames/avatar_check.\n")
 	if subagentMax > 0 {
 		fmt.Fprintf(&b, "- delegate: args.subtasks = [{\"question\":\"...\",\"camera_ids\":[\"<id>\"],\"from\":\"RFC3339\",\"to\":\"RFC3339\",\"tools_allowed\":[\"<tool>\"]}] (max %d) — fans each subtask out to a PARALLEL sub-investigator with its own turn budget. Each sub-agent scans its OWN cameras/window and reports a verdict plus key evidence; their evidence media_urls appear in the TOOL RESULT and are citable in YOUR final answer. Subtasks must be INDEPENDENT and self-contained — a sub-agent sees NOTHING of this conversation, cannot ask the operator, and cannot delegate further. Costs 1 turn; the sub-agents' device fetches spend YOUR media budget. Use it for long windows or many cameras (3+ independent scans → ONE delegate call), not for a single quick check you can do yourself.\n", subagentMax)
 	}
@@ -605,13 +607,13 @@ func camInvestigateSystemPrompt(site camSite, dvrs []CamDVR, active []camera,
 	b.WriteString("\n")
 	// The delegate tool + its subtasks arg appear in the OUTPUT contract only when the
 	// deployment enabled fan-out, matching the TOOLS/PRINCIPLES gate above.
-	toolEnum := "roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate|evidence_export"
+	toolEnum := "roster|snapshot|mosaic|contact_sheet|past_frames|past_clip|motion_search|activity_log|playbook|call_api|avatars|avatar_info|avatar_check|avatar_find|annotate|evidence_export"
 	subtasksArg := ""
 	if subagentMax > 0 {
 		toolEnum += "|delegate"
 		subtasksArg = `,"subtasks":[{"question":"...","camera_ids":["<id>"],"from":"RFC3339","to":"RFC3339"}]`
 	}
-	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}` + subtasksArg + `},`)
+	b.WriteString(`  "tool":"` + toolEnum + `","args":{"camera_ids":["<id>"],"quality":"sub|main","from":"RFC3339","to":"RFC3339","count":6,"event_type":"<motion type>","granularity":"entries|hours|days","layout":"sequential|grid|separate","name":"<playbook or api tool name>","params":{"key":"value"},"avatar_id":"<avatar id>","time":"RFC3339","bbox":{"x0":0,"y0":0,"x1":1000,"y1":1000}` + subtasksArg + `},`)
 	b.WriteString("\n")
 	b.WriteString(`  "question":"...(ask_operator)","answer":"...(final narrative)","evidence":[{"media_url":"...","caption":"..."}]}}`)
 	b.WriteString("\nThe answer field is the ONLY text the operator reads: it must carry the COMPLETE final answer, written in the operator's language — never your plan or reasoning, never empty.")
@@ -1573,6 +1575,8 @@ func camExecuteInvestigateTool(ctx context.Context, cfg config, db *sql.DB, r *h
 		return camToolPastClip(ctx, cfg, db, r, site, args, camByID, dvrByID, allowed, scratch, mediaLeft)
 	case "motion_search":
 		return camToolMotionSearch(cfg, db, site, args, allowed, camByID, dvrByID)
+	case "activity_log":
+		return camToolActivityLog(cfg, db, site, args, allowed, camByID, dvrByID)
 	case "playbook":
 		return camToolPlaybook(ctx, cfg, db, r, site, args, scratch)
 	case "call_api":

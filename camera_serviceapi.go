@@ -722,6 +722,20 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 
 	// Parity group I — investigation cancel (camera_serviceapi_parity.go).
 	mux.HandleFunc("/api/cameras/investigations/cancel", noStore(requireCameraService(cfg, "site", handleSvcInvestigationCancel(cfg))))
+
+	// Activity log (camera_serviceapi_activity.go): stream CRUD/toggle/run, the
+	// entries/hours/days browse routes, the on-demand daily generate, and the
+	// dedicated pull-sync cursor (Connect's durability channel).
+	mux.HandleFunc("/api/cameras/activity/streams", noStore(requireCameraService(cfg, "site", handleSvcActivityStreams(cfg))))
+	mux.HandleFunc("/api/cameras/activity/streams/update", noStore(requireCameraService(cfg, "site", handleSvcActivityStreamUpdate(cfg))))
+	mux.HandleFunc("/api/cameras/activity/streams/delete", noStore(requireCameraService(cfg, "site", handleSvcActivityStreamDelete(cfg))))
+	mux.HandleFunc("/api/cameras/activity/streams/toggle", noStore(requireCameraService(cfg, "site", handleSvcActivityStreamToggle(cfg))))
+	mux.HandleFunc("/api/cameras/activity/streams/run", noStore(requireCameraService(cfg, "site", handleSvcActivityStreamRun(cfg))))
+	mux.HandleFunc("/api/cameras/activity/entries", noStore(requireCameraService(cfg, "site", handleSvcActivityEntries(cfg))))
+	mux.HandleFunc("/api/cameras/activity/hours", noStore(requireCameraService(cfg, "site", handleSvcActivityHours(cfg))))
+	mux.HandleFunc("/api/cameras/activity/days", noStore(requireCameraService(cfg, "site", handleSvcActivityDays(cfg))))
+	mux.HandleFunc("/api/cameras/activity/days/generate", noStore(requireCameraService(cfg, "site", handleSvcActivityDayGenerate(cfg))))
+	mux.HandleFunc("/api/cameras/activity/sync", noStore(requireCameraService(cfg, "site", handleSvcActivitySync(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────
