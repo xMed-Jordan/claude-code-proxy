@@ -62,6 +62,9 @@ const (
 	defaultVersionURL      = "https://raw.githubusercontent.com/xMed-Jordan/claude-code-proxy/main/VERSION"
 	defaultTokenHardLimit  = 200000
 	defaultCodexWindow     = 200000
+	// ChatGPT gates newer models on the advertised Codex CLI version; bump when
+	// upstream replies "requires a newer version of Codex" (override: PROXY_CODEX_VERSION).
+	defaultCodexVersion = "0.144.1"
 )
 
 type updateLatestCache struct {
@@ -79,6 +82,7 @@ type config struct {
 	AgyDisabled       bool // PROXY_AGY_ENABLED=0 → refuse the agy upstream
 	CodexBaseURL      string
 	CodexAuthFile     string
+	CodexVersion      string // PROXY_CODEX_VERSION — Codex CLI version advertised upstream; newer models are gated on it
 	CodexSessionFile  string
 	DBPath            string
 	ProxyKey          string
@@ -676,6 +680,7 @@ func loadConfig() config {
 		Upstream:          strings.ToLower(getenv("UPSTREAM", "codex")),
 		CodexBaseURL:      strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
 		CodexAuthFile:     codexAuthFile,
+		CodexVersion:      strings.TrimSpace(getenv("PROXY_CODEX_VERSION", defaultCodexVersion)),
 		CodexSessionFile:  getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
 		DBPath:            getenv("PROXY_DB_PATH", ".proxy.db"),
 		ProxyKey:          getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
@@ -2978,7 +2983,7 @@ func newCodexRequest(ctx context.Context, cfg config, path string, body any) (*h
 	req.Header.Set("Authorization", "Bearer "+auth.Tokens.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("version", "0.128.0")
+	req.Header.Set("version", firstNonEmpty(cfg.CodexVersion, defaultCodexVersion))
 	if auth.Tokens.AccountID != "" {
 		req.Header.Set("ChatGPT-Account-ID", auth.Tokens.AccountID)
 	}
