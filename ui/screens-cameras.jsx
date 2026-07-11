@@ -2725,6 +2725,7 @@
       { id: "questions", label: "Questions", icon: "info", badge: openQuestions.length || undefined },
       { id: "investigate", label: "Ask AI", icon: "search", badge: awaitingInvestigations.length || undefined },
       { id: "avatars", label: "Avatars", icon: "user", badge: pendingCandidates || undefined },
+      { id: "activity", label: "Activity", icon: "logs" },
       { id: "knowledge", label: "Knowledge", icon: "book" },
       { id: "watches", label: "Watches", icon: "activity" },
       { id: "runs", label: "Run history", icon: "clock" },
@@ -2775,6 +2776,9 @@
             )}
             {activeTab === "avatars" && window.AvatarsTab && (
               <window.AvatarsTab site={site} dvrs={dvrs} cameras={cameras} aliasOptions={aliasOptions} notify={notify} onChanged={avatarsLive.refresh} />
+            )}
+            {activeTab === "activity" && window.ActivityTab && (
+              <window.ActivityTab site={site} cameras={cameras} aliasOptions={aliasOptions} notify={notify} />
             )}
             {activeTab === "knowledge" && (
               <KnowledgeTab site={site} dvrs={dvrs} notify={notify} />
