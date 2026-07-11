@@ -207,7 +207,7 @@ func camObserverClock(utcRFC3339 string, loc *time.Location) string {
 // (site-local + UTC), one legend line per attached sheet (the legend binds
 // cells to camera+time — without it the composites are anonymous thumbnails),
 // and the DVR motion digest when events exist.
-func camObserverUserPrompt(from, to time.Time, loc *time.Location, tzName string, legends []string, motionDigest string) string {
+func camObserverUserPrompt(from, to time.Time, loc *time.Location, tzName string, legends []string, motionDigest, identities string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "LOG WINDOW: %s – %s (%s) = %s – %s UTC. Describe THIS window only.\n\n",
 		from.In(loc).Format("2006-01-02 15:04:05"), to.In(loc).Format("15:04:05"), tzName,
@@ -222,6 +222,10 @@ func camObserverUserPrompt(from, to time.Time, loc *time.Location, tzName string
 	b.WriteString("\n")
 	if motionDigest != "" {
 		b.WriteString(motionDigest)
+		b.WriteString("\n\n")
+	}
+	if identities != "" {
+		b.WriteString(identities)
 		b.WriteString("\n\n")
 	}
 	b.WriteString("Write the log entry for this window now. ")

@@ -314,6 +314,9 @@ type config struct {
 	CameraObserverFullContext     int           // PROXY_CAMERA_OBSERVER_FULL_CONTEXT — recent entries quoted verbatim in the continuity block (default 3)
 	CameraObserverHeadlineContext int           // PROXY_CAMERA_OBSERVER_HEADLINE_CONTEXT — recent one-line headlines in the continuity block (default 50, cap 100)
 	CameraObserverRollupCatchup   int           // PROXY_CAMERA_OBSERVER_ROLLUP_CATCHUP — completed local hours back-filled per rollup tick (default 4)
+	CameraObserverFaceRec         bool          // PROXY_CAMERA_OBSERVER_FACE_REC — run per-cycle face recognition (default true; also needs the stream's face_rec flag, PROXY_FACE_ENABLED and enrolled human faces)
+	CameraObserverFaceMaxFrames   int           // PROXY_CAMERA_OBSERVER_FACE_MAX_FRAMES — face-detection frames sampled per camera per cycle (default 4)
+	CameraObserverFaceThreshold   float64       // PROXY_CAMERA_OBSERVER_FACE_THRESHOLD — cosine match floor for a confirmed identity (default 0 → FaceMatchThreshold, 0.40)
 	CameraActivityRetention       time.Duration // PROXY_CAMERA_ACTIVITY_RETENTION — keep log entries + hourly summaries this long (default 2160h/90d; Connect archives forever)
 	CameraActivityReportRetention time.Duration // PROXY_CAMERA_ACTIVITY_REPORT_RETENTION — keep daily reports this long (default 8760h/365d)
 }
@@ -902,6 +905,9 @@ func loadConfig() config {
 		CameraObserverFullContext:     parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FULL_CONTEXT", "3"), 3),
 		CameraObserverHeadlineContext: parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_HEADLINE_CONTEXT", "50"), 50),
 		CameraObserverRollupCatchup:   parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_ROLLUP_CATCHUP", "4"), 4),
+		CameraObserverFaceRec:         envFlag("PROXY_CAMERA_OBSERVER_FACE_REC", true),
+		CameraObserverFaceMaxFrames:   parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FACE_MAX_FRAMES", "4"), 4),
+		CameraObserverFaceThreshold:   camParseFloat(getenv("PROXY_CAMERA_OBSERVER_FACE_THRESHOLD", "0"), 0),
 		CameraActivityRetention:       parseAgyTimeout(getenv("PROXY_CAMERA_ACTIVITY_RETENTION", "7776000")),         // 2160h = 90d
 		CameraActivityReportRetention: parseAgyTimeout(getenv("PROXY_CAMERA_ACTIVITY_REPORT_RETENTION", "31536000")), // 8760h = 365d
 	}

@@ -491,10 +491,22 @@ func camRunLogCycle(ctx context.Context, cfg config, db *sql.DB, s logStream, fr
 		recent = nil
 	}
 
-	sys := camObserverSystemPrompt(site, dvrs, cams, camAvatarsForCameras(avatars, cams), policy,
+	scoped := camAvatarsForCameras(avatars, cams)
+
+	// Face recognition (bounded): match detected faces in the sampled frames
+	// against enrolled human avatars so the model names people reliably instead
+	// of guessing from appearance. Additive — a miss/absent sidecar just omits
+	// the block and the description-based roster below still applies.
+	var identityBlock string
+	if cfg.CameraObserverFaceRec && s.FaceRec {
+		identities := camObserverRecognizeFaces(ctx, cfg, db, cams, frames, scoped, loc)
+		identityBlock = camObserverIdentityBlock(identities, loc, tzName)
+	}
+
+	sys := camObserverSystemPrompt(site, dvrs, cams, scoped, policy,
 		recent, time.Now().In(loc), loc, tzName, camObserverFullContextFor(cfg))
 	user := camObserverUserPrompt(from, to, loc, tzName, legends,
-		camObserverMotionDigest(motionEvents, camByID, loc, tzName))
+		camObserverMotionDigest(motionEvents, camByID, loc, tzName), identityBlock)
 
 	raw, _, aerr2 := camObserverAnalyzeFn(ctx, cfg, alias, sys, user, sheetPaths)
 	if aerr2 != nil {

@@ -618,6 +618,7 @@ func migrateCameraDB(db *sql.DB) error {
 			analysis_alias TEXT NOT NULL DEFAULT '',
 			active_hours TEXT NOT NULL DEFAULT '',
 			motion_gate INTEGER NOT NULL DEFAULT 1,
+			face_rec INTEGER NOT NULL DEFAULT 1,
 			daily_report_time TEXT NOT NULL DEFAULT '20:00',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			next_run_at TEXT NOT NULL DEFAULT '',
@@ -756,6 +757,13 @@ func migrateCameraDB(db *sql.DB) error {
 		return err
 	}
 	if err := ensureSQLiteColumn(db, "camera_site_callbacks", "stream_progress", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Per-stream face-recognition toggle (default 1 = on, so streams that
+	// predate the feature start naming enrolled people the moment the sidecar +
+	// global PROXY_CAMERA_OBSERVER_FACE_REC knob are on — the observer's
+	// description-only matching was the recognition gap operators hit).
+	if err := ensureSQLiteColumn(db, "camera_log_streams", "face_rec", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
 	// Pending-message origin: which surface parked the message ('' = an

@@ -69,7 +69,7 @@ func logStreamJSON(s logStream) map[string]any {
 		"camera_ids":       camParseIDArray(s.CameraIDs),
 		"interval_minutes": s.IntervalMinutes, "frame_step_seconds": s.FrameStepSeconds,
 		"analysis_alias": s.AnalysisAlias, "active_hours": s.ActiveHours,
-		"motion_gate": s.MotionGate, "daily_report_time": s.DailyReportTime,
+		"motion_gate": s.MotionGate, "face_rec": s.FaceRec, "daily_report_time": s.DailyReportTime,
 		"enabled": s.Enabled, "next_run_at": s.NextRunAt, "last_run_at": s.LastRunAt,
 		"last_window_to": s.LastWindowTo, "last_error": s.LastError,
 		"created_at": s.CreatedAt, "updated_at": s.UpdatedAt,
@@ -122,6 +122,7 @@ type camActivityStreamBody struct {
 	AnalysisAlias    string   `json:"analysis_alias"`
 	ActiveHours      string   `json:"active_hours"`
 	MotionGate       *bool    `json:"motion_gate"`
+	FaceRec          *bool    `json:"face_rec"`
 	DailyReportTime  string   `json:"daily_report_time"`
 	Enabled          *bool    `json:"enabled"`
 }
@@ -184,6 +185,7 @@ func camActivityBuildStream(siteID string, body camActivityStreamBody) (logStrea
 		IntervalMinutes: interval, FrameStepSeconds: step,
 		AnalysisAlias: strings.TrimSpace(body.AnalysisAlias), ActiveHours: strings.TrimSpace(body.ActiveHours),
 		MotionGate:      body.MotionGate == nil || *body.MotionGate,
+		FaceRec:         body.FaceRec == nil || *body.FaceRec,
 		DailyReportTime: strings.TrimSpace(body.DailyReportTime),
 		Enabled:         body.Enabled != nil && *body.Enabled,
 		// NextRunAt stays "" — an enabled stream is due on the next tick.
@@ -225,6 +227,9 @@ func camActivityApplyStreamUpdate(existing *logStream, body camActivityStreamBod
 	existing.ActiveHours = strings.TrimSpace(body.ActiveHours)
 	if body.MotionGate != nil {
 		existing.MotionGate = *body.MotionGate
+	}
+	if body.FaceRec != nil {
+		existing.FaceRec = *body.FaceRec
 	}
 	return ""
 }

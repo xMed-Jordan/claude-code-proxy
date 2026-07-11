@@ -48,6 +48,7 @@ type logStream struct {
 	AnalysisAlias    string
 	ActiveHours      string // watch spec, "" = always
 	MotionGate       bool
+	FaceRec          bool   // run the face-recognition step each cycle (default on)
 	DailyReportTime  string // "HH:MM" site-local, default "20:00"
 	Enabled          bool
 	NextRunAt        string
@@ -158,15 +159,16 @@ func camSyncMaxSeq(db *sql.DB) (int64, error) {
 
 // ─────────────────────────── camera_log_streams ───────────────────────────
 
-const camLogStreamCols = `id, site_id, name, camera_ids, interval_minutes, frame_step_seconds, analysis_alias, active_hours, motion_gate, daily_report_time, enabled, next_run_at, last_run_at, last_window_to, last_error, created_at, updated_at`
+const camLogStreamCols = `id, site_id, name, camera_ids, interval_minutes, frame_step_seconds, analysis_alias, active_hours, motion_gate, face_rec, daily_report_time, enabled, next_run_at, last_run_at, last_window_to, last_error, created_at, updated_at`
 
 func scanLogStream(s rowScanner) (logStream, error) {
 	var v logStream
-	var motionGate, enabled int
+	var motionGate, faceRec, enabled int
 	err := s.Scan(&v.ID, &v.SiteID, &v.Name, &v.CameraIDs, &v.IntervalMinutes, &v.FrameStepSeconds,
-		&v.AnalysisAlias, &v.ActiveHours, &motionGate, &v.DailyReportTime, &enabled,
+		&v.AnalysisAlias, &v.ActiveHours, &motionGate, &faceRec, &v.DailyReportTime, &enabled,
 		&v.NextRunAt, &v.LastRunAt, &v.LastWindowTo, &v.LastError, &v.CreatedAt, &v.UpdatedAt)
 	v.MotionGate = motionGate != 0
+	v.FaceRec = faceRec != 0
 	v.Enabled = enabled != 0
 	return v, err
 }
@@ -186,10 +188,10 @@ func insertLogStream(db *sql.DB, s logStream) (string, error) {
 	}
 	now := nowRFC3339()
 	_, err := db.Exec(`INSERT INTO camera_log_streams
-		(id, site_id, name, camera_ids, interval_minutes, frame_step_seconds, analysis_alias, active_hours, motion_gate, daily_report_time, enabled, next_run_at, last_run_at, last_window_to, last_error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, site_id, name, camera_ids, interval_minutes, frame_step_seconds, analysis_alias, active_hours, motion_gate, face_rec, daily_report_time, enabled, next_run_at, last_run_at, last_window_to, last_error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ID, s.SiteID, s.Name, s.CameraIDs, s.IntervalMinutes, s.FrameStepSeconds, s.AnalysisAlias,
-		s.ActiveHours, boolToInt(s.MotionGate), s.DailyReportTime, boolToInt(s.Enabled),
+		s.ActiveHours, boolToInt(s.MotionGate), boolToInt(s.FaceRec), s.DailyReportTime, boolToInt(s.Enabled),
 		s.NextRunAt, s.LastRunAt, s.LastWindowTo, s.LastError, now, now)
 	return s.ID, err
 }
@@ -251,10 +253,10 @@ func claimLogStream(db *sql.DB, id, expectedNextRun, newNextRun string) (bool, e
 // next/last columns or the continuity cursor).
 func updateLogStream(db *sql.DB, s logStream) error {
 	_, err := db.Exec(`UPDATE camera_log_streams SET name = ?, camera_ids = ?, interval_minutes = ?,
-		frame_step_seconds = ?, analysis_alias = ?, active_hours = ?, motion_gate = ?, daily_report_time = ?,
+		frame_step_seconds = ?, analysis_alias = ?, active_hours = ?, motion_gate = ?, face_rec = ?, daily_report_time = ?,
 		enabled = ?, updated_at = ? WHERE id = ?`,
 		s.Name, s.CameraIDs, s.IntervalMinutes, s.FrameStepSeconds, s.AnalysisAlias, s.ActiveHours,
-		boolToInt(s.MotionGate), s.DailyReportTime, boolToInt(s.Enabled), nowRFC3339(), s.ID)
+		boolToInt(s.MotionGate), boolToInt(s.FaceRec), s.DailyReportTime, boolToInt(s.Enabled), nowRFC3339(), s.ID)
 	return err
 }
 
