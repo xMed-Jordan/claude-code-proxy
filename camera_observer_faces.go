@@ -20,8 +20,9 @@ package main
 //   - detects on at most PROXY_CAMERA_OBSERVER_FACE_MAX_FRAMES frames per
 //     camera (evenly spread across the window) and a hard per-cycle cap
 //     (camObserverFaceMaxDetect);
-//   - reuses the SUB frames already fetched for the composite sheets — zero
-//     extra S3/DVR pulls;
+//   - detects on MAIN-quality archive frames (faces need pixels; the SUB frames
+//     the sheets use embed too poorly to match) with a fallback to the sampled
+//     SUB bytes when no main frame exists there — archive-only, never a DVR pull;
 //   - each detected face is assigned to its single best-matching avatar (argmax
 //     cosine ≥ threshold), so one person never lights up two names;
 //   - a sidecar that fails its first calls (with nothing yet matched) aborts the
@@ -144,6 +145,24 @@ func camObserverThinFrames(fs []camObserverFrame, max int) []camObserverFrame {
 	return out
 }
 
+// camObserverFaceImage returns the best available bytes to detect faces on for
+// a sampled frame: a MAIN-quality archive frame (faces need pixels — the SUB
+// frames the composite sheets use are too low-res to embed reliably) at the
+// frame's second, falling back to the already-sampled SUB bytes on disk when
+// the archive has no main frame there (main is keyframe-only) or S3 is off. The
+// bool reports whether the returned bytes are main-quality (diagnostics only).
+// Mirrors faceScan/avatar_find: MAIN is keyed on the 1-fps grid at the exact
+// second, not the 30s snapshot snap.
+func camObserverFaceImage(ctx context.Context, cfg config, f camObserverFrame) ([]byte, bool) {
+	if camS3Enabled(cfg) {
+		if b, err := s3GetObject(ctx, cfg, camS3FrameKey(f.Cam.ID, "main", f.T.Truncate(time.Second))); err == nil && len(b) > 0 {
+			return b, true
+		}
+	}
+	b, _ := os.ReadFile(f.Path)
+	return b, false
+}
+
 // camObserverRecognizeFaces runs the sidecar over the cycle's sampled frames and
 // returns the enrolled people confidently recognized, best sighting per person.
 // Returns nil when face rec has nothing to do (no candidate enrolled), the
@@ -178,7 +197,8 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 	}
 	bests := map[string]*bestHit{}
 
-	detects, faceErrs, matched, facesSeen := 0, 0, 0, 0
+	detects, faceErrs, matched, facesSeen, mainHits := 0, 0, 0, 0, 0
+	bestSimSeen := 0.0 // highest cosine of ANY detected face vs ANY candidate (even below threshold) — the key "close but rejected?" diagnostic
 	for _, c := range cams {
 		fs := frames[c.ID]
 		if len(fs) == 0 {
@@ -188,9 +208,12 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 			if detects >= budget {
 				break
 			}
-			img, rerr := os.ReadFile(f.Path)
-			if rerr != nil || len(img) == 0 {
+			img, isMain := camObserverFaceImage(ctx, cfg, f)
+			if len(img) == 0 {
 				continue
+			}
+			if isMain {
+				mainHits++
 			}
 			detects++
 			faces, ferr := camObserverFaceDetectFn(ctx, cfg, img)
@@ -216,6 +239,9 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 							bestSim, bestIdx = s, i
 						}
 					}
+				}
+				if bestSim > bestSimSeen {
+					bestSimSeen = bestSim
 				}
 				if bestIdx < 0 || bestSim < threshold {
 					continue
@@ -247,8 +273,8 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		// tally so a missed employee shows up as "faces=N matches=0" (tune the
 		// threshold / add reference photos) vs "faces=0" (frames too low-res).
 		camlog("info", "observer_faces", map[string]any{
-			"ok": true, "candidates": len(candidates), "detects": detects,
-			"faces": facesSeen, "matches": 0, "identities": 0,
+			"ok": true, "candidates": len(candidates), "detects": detects, "main_hits": mainHits,
+			"faces": facesSeen, "matches": 0, "identities": 0, "best_sim": fmt.Sprintf("%.2f", bestSimSeen), "threshold": threshold,
 		})
 		return nil
 	}
@@ -270,8 +296,8 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		return out[i].Name < out[j].Name
 	})
 	camlog("info", "observer_faces", map[string]any{
-		"ok": true, "candidates": len(candidates), "detects": detects,
-		"faces": facesSeen, "matches": matched, "identities": len(out),
+		"ok": true, "candidates": len(candidates), "detects": detects, "main_hits": mainHits,
+		"faces": facesSeen, "matches": matched, "identities": len(out), "best_sim": fmt.Sprintf("%.2f", bestSimSeen), "threshold": threshold,
 	})
 	return out
 }
