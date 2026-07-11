@@ -154,6 +154,9 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 
 	candidates := camObserverFaceCandidates(db, avatars, cfg)
 	if len(candidates) == 0 {
+		// Log even the no-op: "recognition did nothing" must be distinguishable
+		// from "sidecar found nobody" when diagnosing a missed employee.
+		camlog("info", "observer_faces", map[string]any{"ok": true, "candidates": 0, "reason": "no enrolled human faces in scope"})
 		return nil
 	}
 	threshold := camObserverFaceThreshold(cfg)
@@ -175,7 +178,7 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 	}
 	bests := map[string]*bestHit{}
 
-	detects, faceErrs, matched := 0, 0, 0
+	detects, faceErrs, matched, facesSeen := 0, 0, 0, 0
 	for _, c := range cams {
 		fs := frames[c.ID]
 		if len(fs) == 0 {
@@ -201,6 +204,7 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 				}
 				continue
 			}
+			facesSeen += len(faces)
 			// Each detected face is assigned to its single best-matching avatar
 			// (argmax cosine), so two enrolled look-alikes never both claim one face.
 			for _, face := range faces {
@@ -239,6 +243,13 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 	}
 
 	if len(bests) == 0 {
+		// Faces may have been detected but none cleared the threshold — log the
+		// tally so a missed employee shows up as "faces=N matches=0" (tune the
+		// threshold / add reference photos) vs "faces=0" (frames too low-res).
+		camlog("info", "observer_faces", map[string]any{
+			"ok": true, "candidates": len(candidates), "detects": detects,
+			"faces": facesSeen, "matches": 0, "identities": 0,
+		})
 		return nil
 	}
 	out := make([]camObserverIdentity, 0, len(bests))
@@ -258,7 +269,10 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		}
 		return out[i].Name < out[j].Name
 	})
-	camlog("info", "observer_faces", map[string]any{"ok": true, "detects": detects, "identities": len(out)})
+	camlog("info", "observer_faces", map[string]any{
+		"ok": true, "candidates": len(candidates), "detects": detects,
+		"faces": facesSeen, "matches": matched, "identities": len(out),
+	})
 	return out
 }
 
