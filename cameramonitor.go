@@ -251,13 +251,20 @@ func camWatchIntervalDur(w watch) time.Duration {
 }
 
 // camWithinActiveHours reports whether now falls inside the watch's configured
-// active window ("" → always active). Format: comma-separated "HH:MM-HH:MM"
-// ranges in server-local time; a range whose end is before its start wraps past
+// active window — the watch-typed wrapper over camWithinActiveHoursSpec.
+func camWithinActiveHours(w watch, now time.Time) bool {
+	return camWithinActiveHoursSpec(w.ActiveHours, now)
+}
+
+// camWithinActiveHoursSpec reports whether now falls inside an active-hours
+// spec ("" → always active), shared by the watch scheduler and the activity-log
+// observer (camera_observer.go). Format: comma-separated "HH:MM-HH:MM" ranges
+// in server-local time; a range whose end is before its start wraps past
 // midnight (e.g. "22:00-06:00"). Any value that fails to parse at all is
 // treated as always-active (fail open) so a typo can never silently stop
 // monitoring.
-func camWithinActiveHours(w watch, now time.Time) bool {
-	spec := strings.TrimSpace(w.ActiveHours)
+func camWithinActiveHoursSpec(spec string, now time.Time) bool {
+	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return true
 	}
