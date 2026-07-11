@@ -113,6 +113,79 @@ func TestCamValidateRoleAndVocabulary(t *testing.T) {
 	}
 }
 
+// TestSitePolicyReportLanguageRoundTrip covers the activity-log language
+// ride-along: report_language normalizes (trim + 32-rune cap), survives the
+// storage serializer both ways, keeps a language-only policy from collapsing
+// to the empty column, appears in the response JSON, and round-trips through
+// the dedicated policy setter on a real row.
+func TestSitePolicyReportLanguageRoundTrip(t *testing.T) {
+	// Normalize trims and caps at 32 RUNES (Arabic-safe).
+	p := camSitePolicy{ReportLanguage: "  Arabic  "}
+	if problem := camNormalizeSitePolicy(&p); problem != "" {
+		t.Fatalf("normalize: %q", problem)
+	}
+	if p.ReportLanguage != "Arabic" {
+		t.Fatalf("report_language = %q, want trimmed %q", p.ReportLanguage, "Arabic")
+	}
+	long := camSitePolicy{ReportLanguage: strings.Repeat("م", 40)}
+	if problem := camNormalizeSitePolicy(&long); problem != "" {
+		t.Fatalf("normalize long: %q", problem)
+	}
+	if got := []rune(long.ReportLanguage); len(got) != 32 {
+		t.Fatalf("report_language capped to %d runes, want 32", len(got))
+	}
+
+	// A language-only policy must persist — the emptiness check may not
+	// collapse it to "" (that would silently reset the site to English).
+	raw := camSitePolicyJSON(camSitePolicy{ReportLanguage: "Arabic"})
+	if raw == "" {
+		t.Fatal("language-only policy must not serialize to the empty column")
+	}
+	if got := camParseSitePolicy(raw); got.ReportLanguage != "Arabic" {
+		t.Fatalf("serializer round-trip = %q, want Arabic", got.ReportLanguage)
+	}
+	// "" still means English → untouched sites keep an empty column.
+	if camSitePolicyJSON(camSitePolicy{}) != "" {
+		t.Error("empty policy must still serialize to \"\"")
+	}
+
+	// The response JSON carries the field (Connect reads it for round-trip
+	// policy POSTs).
+	resp := camSitePolicyResponseJSON(camSitePolicy{ReportLanguage: "Arabic", Notes: "n"})
+	if resp["report_language"] != "Arabic" {
+		t.Fatalf("response JSON report_language = %v, want Arabic", resp["report_language"])
+	}
+	if resp2 := camSitePolicyResponseJSON(camSitePolicy{}); resp2["report_language"] != "" {
+		t.Fatalf("empty policy response report_language = %v, want \"\"", resp2["report_language"])
+	}
+
+	// Store round-trip through the dedicated policy setter: custom roles and
+	// the language ride together without disturbing each other.
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	siteID, err := insertCameraSite(db, camSite{Name: "Amman"})
+	if err != nil {
+		t.Fatalf("insertCameraSite: %v", err)
+	}
+	pol := camSitePolicy{CustomRoles: []camRole{{Slug: "courier", Label: "Courier"}}, ReportLanguage: "Arabic"}
+	if problem := camNormalizeSitePolicy(&pol); problem != "" {
+		t.Fatalf("normalize stored policy: %q", problem)
+	}
+	if err := updateCameraSitePolicy(db, siteID, camSitePolicyJSON(pol)); err != nil {
+		t.Fatalf("updateCameraSitePolicy: %v", err)
+	}
+	site, err := getCameraSite(db, siteID)
+	if err != nil {
+		t.Fatalf("getCameraSite: %v", err)
+	}
+	got := camParseSitePolicy(site.PolicyJSON)
+	if got.ReportLanguage != "Arabic" || len(got.CustomRoles) != 1 || got.CustomRoles[0].Slug != "courier" {
+		t.Fatalf("stored policy round-trip = %+v", got)
+	}
+}
+
 // ─────────────────────────── role write paths ───────────────────────────
 
 func TestSetCameraAvatarRoleStampsConfirmation(t *testing.T) {

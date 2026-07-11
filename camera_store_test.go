@@ -34,6 +34,11 @@ var camTestTables = []string{
 	"camera_site_callbacks",
 	"camera_motion_events",
 	"camera_motion_arm",
+	"camera_sync_counter",
+	"camera_log_streams",
+	"camera_log_entries",
+	"camera_log_hours",
+	"camera_log_days",
 }
 
 func openCamTestDB(t *testing.T) *sql.DB {

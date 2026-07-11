@@ -295,6 +295,26 @@ type config struct {
 	CameraMotionCooldown  time.Duration // PROXY_CAM_MOTION_COOLDOWN — default per-(camera,event) webhook cooldown (default 60s)
 	CameraMotionReconnect time.Duration // PROXY_CAM_MOTION_RECONNECT — base reconnect backoff for a dropped alert stream (default 5s)
 	CameraMotionReconcile time.Duration // PROXY_CAM_MOTION_RECONCILE — how often the supervisor reconciles listeners with the DVR list (default 30s)
+	// Activity-log observer (camera_observer*.go): a per-stream periodic AI
+	// journal over frames sampled from the elapsed window (composited into
+	// contact sheets), plus hourly summaries and a daily report per stream. Runs
+	// on its own scheduler (cloned from the watch scheduler), gated by
+	// CameraEnabled && CameraObserverEnabled.
+	CameraObserverEnabled         bool          // PROXY_CAMERA_OBSERVER_ENABLED — run the activity-log scheduler (default true; still requires PROXY_CAM_ENABLED)
+	CameraObserverAlias           string        // PROXY_CAMERA_OBSERVER_ALIAS — vision alias for log cycles ("" → stream alias → CameraAnalysisAlias → CameraInvestigateAlias)
+	CameraObserverTickInterval    time.Duration // PROXY_CAMERA_OBSERVER_TICK_INTERVAL — due-stream poll cadence (default 15s)
+	CameraObserverConcurrency     int           // PROXY_CAMERA_OBSERVER_CONCURRENCY — parallel log cycles (default 1)
+	CameraObserverBudget          time.Duration // PROXY_CAMERA_OBSERVER_BUDGET — wall-clock cap per log cycle (default 300s)
+	CameraObserverLag             time.Duration // PROXY_CAMERA_OBSERVER_LAG — the analyzed window ends this far behind now so the sampled frames already exist in S3/DVR (default 60s)
+	CameraObserverMaxStreams      int           // PROXY_CAMERA_OBSERVER_MAX_STREAMS — log streams per site (default 8)
+	CameraObserverMaxSheets       int           // PROXY_CAMERA_OBSERVER_MAX_SHEETS — composite sheets per cycle (default 3)
+	CameraObserverMaxDetailFrames int           // PROXY_CAMERA_OBSERVER_MAX_DETAIL_FRAMES — needs_detail drill-down frames per cycle (default 4)
+	CameraObserverMaxDVRFrames    int           // PROXY_CAMERA_OBSERVER_MAX_DVR_FRAMES — DVR playback-fallback frames per cycle when S3 misses (default 4)
+	CameraObserverFullContext     int           // PROXY_CAMERA_OBSERVER_FULL_CONTEXT — recent entries quoted verbatim in the continuity block (default 3)
+	CameraObserverHeadlineContext int           // PROXY_CAMERA_OBSERVER_HEADLINE_CONTEXT — recent one-line headlines in the continuity block (default 50, cap 100)
+	CameraObserverRollupCatchup   int           // PROXY_CAMERA_OBSERVER_ROLLUP_CATCHUP — completed local hours back-filled per rollup tick (default 4)
+	CameraActivityRetention       time.Duration // PROXY_CAMERA_ACTIVITY_RETENTION — keep log entries + hourly summaries this long (default 2160h/90d; Connect archives forever)
+	CameraActivityReportRetention time.Duration // PROXY_CAMERA_ACTIVITY_REPORT_RETENTION — keep daily reports this long (default 8760h/365d)
 }
 
 type modelAliasConfig struct {
@@ -866,6 +886,22 @@ func loadConfig() config {
 		CameraMotionCooldown:  parseAgyTimeout(getenv("PROXY_CAM_MOTION_COOLDOWN", "60")),
 		CameraMotionReconnect: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RECONNECT", "5")),
 		CameraMotionReconcile: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RECONCILE", "30")),
+
+		CameraObserverEnabled:         envFlag("PROXY_CAMERA_OBSERVER_ENABLED", true),
+		CameraObserverAlias:           strings.TrimSpace(getenv("PROXY_CAMERA_OBSERVER_ALIAS", "")),
+		CameraObserverTickInterval:    parseAgyTimeout(getenv("PROXY_CAMERA_OBSERVER_TICK_INTERVAL", "15")),
+		CameraObserverConcurrency:     parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_CONCURRENCY", "1"), 1),
+		CameraObserverBudget:          parseAgyTimeout(getenv("PROXY_CAMERA_OBSERVER_BUDGET", "300")),
+		CameraObserverLag:             parseAgyTimeout(getenv("PROXY_CAMERA_OBSERVER_LAG", "60")),
+		CameraObserverMaxStreams:      parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_STREAMS", "8"), 8),
+		CameraObserverMaxSheets:       parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_SHEETS", "3"), 3),
+		CameraObserverMaxDetailFrames: parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_DETAIL_FRAMES", "4"), 4),
+		CameraObserverMaxDVRFrames:    parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_DVR_FRAMES", "4"), 4),
+		CameraObserverFullContext:     parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FULL_CONTEXT", "3"), 3),
+		CameraObserverHeadlineContext: parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_HEADLINE_CONTEXT", "50"), 50),
+		CameraObserverRollupCatchup:   parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_ROLLUP_CATCHUP", "4"), 4),
+		CameraActivityRetention:       parseAgyTimeout(getenv("PROXY_CAMERA_ACTIVITY_RETENTION", "7776000")),         // 2160h = 90d
+		CameraActivityReportRetention: parseAgyTimeout(getenv("PROXY_CAMERA_ACTIVITY_REPORT_RETENTION", "31536000")), // 8760h = 365d
 	}
 }
 

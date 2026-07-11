@@ -592,6 +592,109 @@ func migrateCameraDB(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_cluster ON camera_sightings(cluster_id, started_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_sightings_camera ON camera_sightings(camera_id, started_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_camera_sighting_clusters_site ON camera_sighting_clusters(site_id, status)`,
+		// ── Activity log (observer feature, camera_observer*.go): per-stream
+		// periodic AI journal entries plus hourly/daily rollups. Every log table
+		// carries a `seq` stamped from the shared camera_sync_counter (via
+		// nextCamSyncSeq, camera_observer_store.go) so Connect can pull-sync
+		// resumably with `WHERE site_id=? AND seq>cursor`. ids stay TEXT PRIMARY
+		// KEY (store convention — implicit rowid is VACUUM-unsafe as a cursor and
+		// AUTOINCREMENT can't re-sequence updates); seq gets a per-table UNIQUE
+		// index instead. Entry inserts stamp seq once (entries are immutable);
+		// hour/day claim-inserts AND their terminal updates (pending→done/empty/
+		// error, daily regenerate) re-stamp, so a mutated row reappears past any
+		// cursor Connect already held and is upserted there by id. The counter row
+		// is never pruned, so seq never regresses.
+		`CREATE TABLE IF NOT EXISTS camera_sync_counter (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			val INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_log_streams (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			camera_ids TEXT NOT NULL DEFAULT '',
+			interval_minutes INTEGER NOT NULL DEFAULT 5,
+			frame_step_seconds INTEGER NOT NULL DEFAULT 30,
+			analysis_alias TEXT NOT NULL DEFAULT '',
+			active_hours TEXT NOT NULL DEFAULT '',
+			motion_gate INTEGER NOT NULL DEFAULT 1,
+			daily_report_time TEXT NOT NULL DEFAULT '20:00',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			next_run_at TEXT NOT NULL DEFAULT '',
+			last_run_at TEXT NOT NULL DEFAULT '',
+			last_window_to TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_log_entries (
+			id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL DEFAULT 0,
+			stream_id TEXT NOT NULL,
+			site_id TEXT NOT NULL,
+			from_ts TEXT NOT NULL,
+			to_ts TEXT NOT NULL,
+			camera_ids TEXT NOT NULL DEFAULT '',
+			headline TEXT NOT NULL DEFAULT '',
+			report TEXT NOT NULL DEFAULT '',
+			motion_gated INTEGER NOT NULL DEFAULT 0,
+			frames INTEGER NOT NULL DEFAULT 0,
+			media_tokens TEXT NOT NULL DEFAULT '',
+			detail_tokens TEXT NOT NULL DEFAULT '',
+			alias TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_log_hours (
+			id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL DEFAULT 0,
+			stream_id TEXT NOT NULL,
+			site_id TEXT NOT NULL,
+			hour_start TEXT NOT NULL,
+			tz TEXT NOT NULL DEFAULT '',
+			summary TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '',
+			entry_count INTEGER NOT NULL DEFAULT 0,
+			gated_count INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'pending',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS camera_log_days (
+			id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL DEFAULT 0,
+			stream_id TEXT NOT NULL,
+			site_id TEXT NOT NULL,
+			day TEXT NOT NULL,
+			from_ts TEXT NOT NULL DEFAULT '',
+			to_ts TEXT NOT NULL DEFAULT '',
+			headline TEXT NOT NULL DEFAULT '',
+			report TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '',
+			hours_used INTEGER NOT NULL DEFAULT 0,
+			entries_used INTEGER NOT NULL DEFAULT 0,
+			view_token TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			error TEXT NOT NULL DEFAULT '',
+			notified_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_streams_due ON camera_log_streams(enabled, next_run_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_streams_site ON camera_log_streams(site_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_log_entries_seq ON camera_log_entries(seq)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_entries_stream ON camera_log_entries(stream_id, from_ts)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_entries_site ON camera_log_entries(site_id, from_ts)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_log_hours_seq ON camera_log_hours(seq)`,
+		// (stream_id, hour_start) UNIQUE doubles as the atomic hourly-rollup claim:
+		// the pending INSERT that wins this index owns the rollup (claimLogHour).
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_log_hours_claim ON camera_log_hours(stream_id, hour_start)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_hours_site ON camera_log_hours(site_id, hour_start)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_log_days_seq ON camera_log_days(seq)`,
+		// (stream_id, day) UNIQUE is the daily-report claim (claimLogDay);
+		// regeneration UPDATEs the claimed row in place (same id + view_token).
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_log_days_claim ON camera_log_days(stream_id, day)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_days_site ON camera_log_days(site_id, day)`,
+		`CREATE INDEX IF NOT EXISTS idx_camera_log_days_token ON camera_log_days(view_token)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

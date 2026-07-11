@@ -11,7 +11,9 @@ package main
 // Connect.
 //
 // The vocabulary = a fixed core set (below) plus per-site custom roles stored in
-// camera_sites.policy_json: {"custom_roles":[{slug,label,description}],"notes":""}.
+// camera_sites.policy_json: {"custom_roles":[{slug,label,description}],"notes":"",
+// "report_language":""} (report_language is the activity-log rollup language,
+// camera_observer_report.go — it rides along in this policy object).
 // The vocabulary lives proxy-side because the person-profile VLM prompt
 // (camera_profile.go, R1) is built here and must constrain its role hypothesis
 // to the site's labels at call time.
@@ -43,10 +45,17 @@ var camRoleCore = []camRole{
 }
 
 // camSitePolicy is the decoded camera_sites.policy_json. Descriptive context
-// only — labels and notes, no behavior.
+// only — labels, notes and presentation preferences, no behavior.
 type camSitePolicy struct {
 	CustomRoles []camRole `json:"custom_roles,omitempty"`
 	Notes       string    `json:"notes,omitempty"`
+	// ReportLanguage is the language activity-log ROLLUPS (hourly summaries +
+	// the daily report, camera_observer_report.go) are written in — a free-text
+	// language name ("Arabic", "ar", …); "" means English. Log ENTRIES stay
+	// English regardless (they are the AI's own continuity memory). It rides
+	// the existing site-policy routes; POSTs replace the whole policy object,
+	// so writers must round-trip a GET first (existing semantics).
+	ReportLanguage string `json:"report_language,omitempty"`
 }
 
 var camRoleSlugRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
@@ -106,6 +115,7 @@ func camNormalizeSitePolicy(p *camSitePolicy) string {
 	}
 	p.CustomRoles = clean
 	p.Notes = camTruncateRunes(p.Notes, 4000)
+	p.ReportLanguage = camTruncateRunes(strings.TrimSpace(p.ReportLanguage), 32)
 	return ""
 }
 
@@ -154,7 +164,7 @@ func camRoleSlugFromLabel(label string) string {
 // camSitePolicyJSON serializes a policy for storage ("" when empty so untouched
 // sites keep an empty column).
 func camSitePolicyJSON(p camSitePolicy) string {
-	if len(p.CustomRoles) == 0 && strings.TrimSpace(p.Notes) == "" {
+	if len(p.CustomRoles) == 0 && strings.TrimSpace(p.Notes) == "" && strings.TrimSpace(p.ReportLanguage) == "" {
 		return ""
 	}
 	return mustJSON(p)
@@ -203,5 +213,5 @@ func camSitePolicyResponseJSON(p camSitePolicy) map[string]any {
 			"slug": r.Slug, "label": r.Label, "description": r.Description,
 		})
 	}
-	return map[string]any{"custom_roles": custom, "notes": p.Notes}
+	return map[string]any{"custom_roles": custom, "notes": p.Notes, "report_language": p.ReportLanguage}
 }
