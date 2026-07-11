@@ -287,6 +287,7 @@ type config struct {
 	CameraCallbackAllowPrivate bool          // PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE — allow settle webhooks to private IPs (local dev only; default false)
 	CameraCallbackTimeout      time.Duration // PROXY_CAMERA_CALLBACK_TIMEOUT — per-attempt settle-webhook timeout (default 20s)
 	CameraProgressMinInterval  time.Duration // PROXY_CAMERA_PROGRESS_MIN_INTERVAL — min gap between coalesced progress "media" webhooks (default 20s)
+	CameraSyncExportSecrets    bool          // PROXY_CAMERA_SYNC_EXPORT_SECRETS — allow GET /api/cameras/sync/export to return the site's DECRYPTED secrets for DR mirroring (default true; off → explicit 403)
 	// DVR motion listeners (camera_motion.go): one long-lived Hikvision ISAPI
 	// alert-stream connection per DVR that coalesces motion into episodes, stores a
 	// queryable history, and fires a signed camera_motion webhook for armed cameras.
@@ -880,6 +881,7 @@ func loadConfig() config {
 		CameraCallbackAllowPrivate: envFlag("PROXY_CAMERA_CALLBACK_ALLOW_PRIVATE", false),
 		CameraCallbackTimeout:      parseAgyTimeout(getenv("PROXY_CAMERA_CALLBACK_TIMEOUT", "20")),
 		CameraProgressMinInterval:  parseAgyTimeout(getenv("PROXY_CAMERA_PROGRESS_MIN_INTERVAL", "20")),
+		CameraSyncExportSecrets:    envFlag("PROXY_CAMERA_SYNC_EXPORT_SECRETS", true),
 
 		CameraMotionEnabled:   envFlag("PROXY_CAM_MOTION_ENABLED", false),
 		CameraMotionRetention: parseAgyTimeout(getenv("PROXY_CAM_MOTION_RETENTION", "2592000")), // 720h = 30d

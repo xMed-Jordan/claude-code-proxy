@@ -150,7 +150,8 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 // Store row types (camera_store.go) have no json tags, so every response is
 // built as an explicit snake_case map here instead of marshaling the row
 // directly — and so any encrypted column (password_enc, action token_enc)
-// never has a code path that could leak it.
+// never has a code path that could leak it. (Sole deliberate exception: the
+// flag-gated DR secrets export, camera_serviceapi_sync.go.)
 
 func siteJSON(s camSite) map[string]any {
 	pol := camParseSitePolicy(s.PolicyJSON)

@@ -736,6 +736,11 @@ func registerCameraServiceRoutes(cfg config, mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras/activity/days", noStore(requireCameraService(cfg, "site", handleSvcActivityDays(cfg))))
 	mux.HandleFunc("/api/cameras/activity/days/generate", noStore(requireCameraService(cfg, "site", handleSvcActivityDayGenerate(cfg))))
 	mux.HandleFunc("/api/cameras/activity/sync", noStore(requireCameraService(cfg, "site", handleSvcActivitySync(cfg))))
+
+	// DR mirror (camera_serviceapi_sync.go): the index-only manifest Connect
+	// diffs against, and the flag-gated decrypted-secrets export.
+	mux.HandleFunc("/api/cameras/sync/manifest", noStore(requireCameraService(cfg, "site", handleSvcSyncManifest(cfg))))
+	mux.HandleFunc("/api/cameras/sync/export", noStore(requireCameraService(cfg, "site", handleSvcSyncExport(cfg))))
 }
 
 // ─────────────────────────── shared handler plumbing ───────────────────────────
@@ -1317,7 +1322,10 @@ func handleSvcCamerasList(cfg config) camSvcHandler {
 }
 
 // handleSvcCameraUpdate serves POST /api/cameras/update {id, name?, area?,
-// notes?, enabled?} (all optional — pointers where clearing must be possible).
+// notes?, ai_description?, ai_location?, enabled?} (all optional — pointers
+// where clearing must be possible). The ai_* fields exist for the DR restore
+// path (camera_serviceapi_sync.go): without them a rebuilt proxy would lose
+// the AI-authored camera knowledge that feeds camBuildRoster.
 func handleSvcCameraUpdate(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		if r.Method != http.MethodPost {
@@ -1325,11 +1333,13 @@ func handleSvcCameraUpdate(cfg config) camSvcHandler {
 			return
 		}
 		var body struct {
-			ID      string  `json:"id"`
-			Name    string  `json:"name"`
-			Area    *string `json:"area"`
-			Notes   *string `json:"notes"`
-			Enabled *bool   `json:"enabled"`
+			ID            string  `json:"id"`
+			Name          string  `json:"name"`
+			Area          *string `json:"area"`
+			Notes         *string `json:"notes"`
+			AIDescription *string `json:"ai_description"`
+			AILocation    *string `json:"ai_location"`
+			Enabled       *bool   `json:"enabled"`
 		}
 		if !camSvcDecode(w, r, &body) {
 			return
@@ -1351,6 +1361,12 @@ func handleSvcCameraUpdate(cfg config) camSvcHandler {
 		}
 		if body.Notes != nil {
 			cam.Notes = strings.TrimSpace(*body.Notes)
+		}
+		if body.AIDescription != nil {
+			cam.AIDescription = strings.TrimSpace(*body.AIDescription)
+		}
+		if body.AILocation != nil {
+			cam.AILocation = strings.TrimSpace(*body.AILocation)
 		}
 		if body.Enabled != nil {
 			cam.Enabled = *body.Enabled
@@ -2054,6 +2070,59 @@ func handleSvcAvatarDelete(cfg config) camSvcHandler {
 	}
 }
 
+// camSvcSaveUploadedImage decodes a base64 JSON image upload (bare or a data:
+// URL), validates it (magic-byte sniff, the ~40MP pixel cap) and persists it
+// as a PINNED capture (expires_at="" — reference imagery is never reaped) of
+// the given kind for siteID. It writes the HTTP error response itself and
+// returns ok=false on any failure; raw is returned for callers that
+// post-process the bytes (face embedding). Shared by the avatar-photos and
+// playbook-media upload paths.
+func camSvcSaveUploadedImage(db *sql.DB, cfg config, w http.ResponseWriter, siteID, kind, imageBase64 string) (token, contentType string, raw []byte, ok bool) {
+	b64 := strings.TrimSpace(imageBase64)
+	if i := strings.Index(b64, ";base64,"); i >= 0 && strings.HasPrefix(b64, "data:") {
+		b64 = b64[i+len(";base64,"):]
+	}
+	raw, derr := base64.StdEncoding.DecodeString(b64)
+	if derr != nil {
+		if raw, derr = base64.RawStdEncoding.DecodeString(b64); derr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image_base64 is not valid base64"})
+			return "", "", nil, false
+		}
+	}
+	if len(raw) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image_base64 is required"})
+		return "", "", nil, false
+	}
+	scratch, serr := os.MkdirTemp("", "camsvcphoto-")
+	if serr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
+		return "", "", nil, false
+	}
+	defer os.RemoveAll(scratch)
+	tmp := filepath.Join(scratch, "photo.bin")
+	if werr := os.WriteFile(tmp, raw, 0o600); werr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": werr.Error()})
+		return "", "", nil, false
+	}
+	ct, _ := sniffImage(tmp)
+	if ct == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported image type (jpeg/png/webp expected)"})
+		return "", "", nil, false
+	}
+	wpx, hpx := imageDimensions(tmp)
+	if !camUploadPixelsOK(wpx, hpx) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image resolution is too large (max ~40 megapixels)"})
+		return "", "", nil, false
+	}
+	// Pinned (expires_at="") — reference imagery is never reaped.
+	tok, perr := camPersistCaptureExpires(db, cfg, "", siteID, "", kind, "", tmp, ct, wpx, hpx, "", "", "")
+	if perr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+		return "", "", nil, false
+	}
+	return tok, ct, raw, true
+}
+
 // handleSvcAvatarPhotos serves POST /api/cameras/avatars/photos {avatar_id,
 // image_base64, content_type?, note?} → {ok, photo_id}: decodes the upload,
 // persists it PINNED (kind "avatar_ref"), best-effort face-embeds it via the
@@ -2083,46 +2152,8 @@ func handleSvcAvatarPhotos(cfg config) camSvcHandler {
 		if !ok {
 			return
 		}
-		b64 := strings.TrimSpace(body.ImageBase64)
-		if i := strings.Index(b64, ";base64,"); i >= 0 && strings.HasPrefix(b64, "data:") {
-			b64 = b64[i+len(";base64,"):]
-		}
-		raw, derr := base64.StdEncoding.DecodeString(b64)
-		if derr != nil {
-			if raw, derr = base64.RawStdEncoding.DecodeString(b64); derr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image_base64 is not valid base64"})
-				return
-			}
-		}
-		if len(raw) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image_base64 is required"})
-			return
-		}
-		scratch, serr := os.MkdirTemp("", "camsvcphoto-")
-		if serr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": serr.Error()})
-			return
-		}
-		defer os.RemoveAll(scratch)
-		tmp := filepath.Join(scratch, "photo.bin")
-		if werr := os.WriteFile(tmp, raw, 0o600); werr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": werr.Error()})
-			return
-		}
-		ct, _ := sniffImage(tmp)
-		if ct == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported image type (jpeg/png/webp expected)"})
-			return
-		}
-		wpx, hpx := imageDimensions(tmp)
-		if !camUploadPixelsOK(wpx, hpx) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image resolution is too large (max ~40 megapixels)"})
-			return
-		}
-		// Pinned (expires_at="") — reference imagery is never reaped.
-		token, perr := camPersistCaptureExpires(db, cfg, "", sc.SiteID, "", "avatar_ref", "", tmp, ct, wpx, hpx, "", "", "")
-		if perr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+		token, _, raw, ok := camSvcSaveUploadedImage(db, cfg, w, sc.SiteID, "avatar_ref", body.ImageBase64)
+		if !ok {
 			return
 		}
 		capRow, cerr := getCameraCaptureByToken(db, token)

@@ -11,7 +11,9 @@ package main
 // secret, execution goes through the EXISTING SSRF-guarded outbound client
 // (camGuardedHTTPClient, cameramonitor.go — post-DNS isBlockedIP dial hook),
 // and responses are TEXT only (never citable evidence). auth_secret_enc is
-// encryptSecret'd and has NO code path into JSON — handlers echo only has_secret.
+// encryptSecret'd and has NO code path into JSON — handlers echo only
+// has_secret (sole deliberate exception: the flag-gated DR secrets export,
+// camera_serviceapi_sync.go).
 //
 // Schema lives in migrateCameraDB (camera_store.go): camera_api_tools with
 // UNIQUE(site_id, name).

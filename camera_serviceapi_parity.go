@@ -1127,8 +1127,13 @@ func handleSvcRecapture(cfg config) camSvcHandler {
 // service-only cpt.SiteID == sc.SiteID check that returns the IDENTICAL 400 body
 // as a missing/expired capture, so a cross-site capture token can't be probed.
 
-// handleSvcPlaybookMedia serves GET (list) / POST (attach) on
-// /api/cameras/playbooks/media, both gated by camSvcPlaybook.
+// handleSvcPlaybookMedia serves GET (list) / POST on
+// /api/cameras/playbooks/media, both gated by camSvcPlaybook. POST accepts
+// either {playbook_id, token, note?} (attach an existing capture) or
+// {playbook_id, image_base64, note?} (raw upload, mirroring the avatar-photos
+// body — the DR restore path re-creates reference imagery from Connect's
+// mirrored binaries; a fresh proxy has no capture tokens to attach). Uploads
+// are persisted as PINNED captures of kind "playbook_ref"; no face embedding.
 func handleSvcPlaybookMedia(cfg config) camSvcHandler {
 	return func(w http.ResponseWriter, r *http.Request, sc camSvcCtx) {
 		db := camSvcOpenDB(cfg, w)
@@ -1162,49 +1167,68 @@ func handleSvcPlaybookMedia(cfg config) camSvcHandler {
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"media": out})
 		case http.MethodPost:
+			r.Body = http.MaxBytesReader(w, r.Body, 16<<20) // raw uploads share the avatar-photos base64 cap
 			var body struct {
-				PlaybookID string `json:"playbook_id"`
-				Token      string `json:"token"`
-				Note       string `json:"note"`
+				PlaybookID  string `json:"playbook_id"`
+				Token       string `json:"token"`
+				ImageBase64 string `json:"image_base64"`
+				Note        string `json:"note"`
 			}
 			if !camSvcDecode(w, r, &body) {
 				return
 			}
 			pbID := strings.TrimSpace(body.PlaybookID)
 			token := strings.TrimSpace(body.Token)
-			if pbID == "" || token == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "playbook_id and token are required"})
+			upload := strings.TrimSpace(body.ImageBase64)
+			if pbID == "" || (token == "" && upload == "") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "playbook_id and token or image_base64 are required"})
+				return
+			}
+			if token != "" && upload != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provide either token or image_base64, not both"})
 				return
 			}
 			pb, ok := camSvcPlaybook(db, w, pbID, sc.SiteID)
 			if !ok {
 				return
 			}
-			// Attach validation: the capture row must exist, its file must still be
-			// on disk, it must not be expired, AND it must belong to this site. A
-			// cross-site token returns the IDENTICAL body as missing/expired so the
-			// token namespace can't be probed for existence across sites.
-			const unavailable = "capture no longer available — re-run the setup investigation"
-			cpt, cerr := getCameraCaptureByToken(db, token)
-			if cerr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
-				return
-			}
-			if _, serr := os.Stat(cpt.Path); serr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
-				return
-			}
-			if cpt.ExpiresAt != "" && cpt.ExpiresAt <= nowRFC3339() {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
-				return
-			}
-			if cpt.SiteID != sc.SiteID {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
-				return
-			}
-			if perr := pinCameraCapture(db, token); perr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
-				return
+			var contentType, kind string
+			if upload != "" {
+				// Raw upload (the DR restore path): decode, validate and persist a
+				// NEW pinned capture. Reference imagery only — no face embedding.
+				utok, ct, _, uok := camSvcSaveUploadedImage(db, cfg, w, sc.SiteID, "playbook_ref", upload)
+				if !uok {
+					return
+				}
+				token, contentType, kind = utok, ct, "playbook_ref"
+			} else {
+				// Attach validation: the capture row must exist, its file must still be
+				// on disk, it must not be expired, AND it must belong to this site. A
+				// cross-site token returns the IDENTICAL body as missing/expired so the
+				// token namespace can't be probed for existence across sites.
+				const unavailable = "capture no longer available — re-run the setup investigation"
+				cpt, cerr := getCameraCaptureByToken(db, token)
+				if cerr != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+					return
+				}
+				if _, serr := os.Stat(cpt.Path); serr != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+					return
+				}
+				if cpt.ExpiresAt != "" && cpt.ExpiresAt <= nowRFC3339() {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+					return
+				}
+				if cpt.SiteID != sc.SiteID {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": unavailable})
+					return
+				}
+				if perr := pinCameraCapture(db, token); perr != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": perr.Error()})
+					return
+				}
+				contentType, kind = cpt.ContentType, cpt.Kind
 			}
 			m := camPlaybookMedia{
 				PlaybookID:   pb.ID,
@@ -1214,14 +1238,15 @@ func handleSvcPlaybookMedia(cfg config) camSvcHandler {
 			}
 			id, ierr := insertCameraPlaybookMedia(db, m)
 			if ierr != nil {
-				// Undo the pin we just took if the row could not be recorded.
+				// Undo the pin we just took (or expire the fresh upload) if the row
+				// could not be recorded.
 				camReleaseCaptureIfUnreferenced(db, cfg, token)
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": ierr.Error()})
 				return
 			}
 			m.ID = id
-			camlog("info", "svc_playbook_media_attach", map[string]any{"playbook_id": pb.ID, "media_id": id, "site_id": sc.SiteID, "kind": cpt.Kind})
-			resp := map[string]any{"ok": true, "media": cameraPlaybookMediaJSON(cfg, r, m, cpt.ContentType)}
+			camlog("info", "svc_playbook_media_attach", map[string]any{"playbook_id": pb.ID, "media_id": id, "site_id": sc.SiteID, "kind": kind, "uploaded": upload != ""})
+			resp := map[string]any{"ok": true, "media": cameraPlaybookMediaJSON(cfg, r, m, contentType)}
 			if cfg.CameraMediaDir == "" {
 				resp["warning"] = "PROXY_CAM_MEDIA_DIR is not set — reference images live in a temp directory"
 			}
