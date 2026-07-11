@@ -380,13 +380,20 @@ func TestLogDayClaimFinishRegenerate(t *testing.T) {
 		t.Fatalf("regenerated row = %+v (want same id + view_token, fresh content)", regen)
 	}
 
-	// notified_at is delivery bookkeeping — stamped without a seq re-stamp.
-	if err := setLogDayNotified(db, id, "2026-07-10T17:05:00Z"); err != nil {
-		t.Fatalf("setLogDayNotified: %v", err)
+	// notified_at is delivery bookkeeping — a CAS stamp (exactly one winner,
+	// re-fires never) that moves no seq.
+	if won, err := claimLogDayNotified(db, id, "2026-07-10T17:05:00Z"); err != nil || !won {
+		t.Fatalf("claimLogDayNotified = %v, %v; want the first stamp to win", won, err)
 	}
 	after, _ := getLogDay(db, id)
 	if after.NotifiedAt != "2026-07-10T17:05:00Z" || after.Seq != regen.Seq {
 		t.Fatalf("notified stamp = %+v (seq must not move)", after)
+	}
+	if won, err := claimLogDayNotified(db, id, "2026-07-10T18:00:00Z"); err != nil || won {
+		t.Fatalf("second claimLogDayNotified = %v, %v; want lost (already delivered)", won, err)
+	}
+	if again, _ := getLogDay(db, id); again.NotifiedAt != "2026-07-10T17:05:00Z" {
+		t.Fatalf("notified_at moved to %q after a lost CAS", again.NotifiedAt)
 	}
 
 	// View-token lookup resolves a real token; blank never resolves.

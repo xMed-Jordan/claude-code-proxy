@@ -126,6 +126,10 @@ func registerCameraRoutes(cfg config, mux *http.ServeMux) {
 	// poll (camera_investigate_view.go). Rate-limited per view-token and per IP;
 	// the shell is a static const so an unknown token leaks nothing.
 	mux.HandleFunc("/camera/investigations/", noStore(handleCameraInvestigationView(cfg)))
+
+	// Public daily activity-report share page + its state.json
+	// (camera_observer_view.go) — same hardening, text-only, read-only.
+	mux.HandleFunc("/camera/reports/", noStore(handleCameraReportView(cfg)))
 }
 
 // ─────────────────────────────── JSON row mappers ───────────────────────────────

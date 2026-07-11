@@ -659,12 +659,22 @@ func finishLogDay(db *sql.DB, d logDay) error {
 	return tx.Commit()
 }
 
-// setLogDayNotified stamps notified_at after the daily-report webhook settles
-// (delivery bookkeeping, not content — no seq re-stamp, Connect got the report
-// through the webhook and/or the sync row itself).
-func setLogDayNotified(db *sql.DB, id, at string) error {
-	_, err := db.Exec(`UPDATE camera_log_days SET notified_at = ? WHERE id = ?`, at, id)
-	return err
+// claimLogDayNotified atomically stamps notified_at iff it is still empty and
+// the row is terminal — the exactly-once gate the SCHEDULED daily notifier
+// takes before spawning camNotifyDailyReport (camObserverDailyTick). The
+// on-demand generate path never takes it, so a regenerate can never re-fire
+// the webhook. Delivery bookkeeping, not content — no seq re-stamp (Connect
+// gets the report through the webhook and/or the sync row itself).
+func claimLogDayNotified(db *sql.DB, id, at string) (bool, error) {
+	res, err := db.Exec(`UPDATE camera_log_days SET notified_at = ? WHERE id = ? AND notified_at = '' AND status != 'pending'`, at, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 func getLogDay(db *sql.DB, id string) (logDay, error) {

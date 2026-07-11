@@ -45,8 +45,9 @@ package main
 // seam, persisted as kind "log_detail") and must then finalize — a second
 // round's requests are ignored.
 //
-// Hourly/daily rollups live in camera_observer_report.go (chunk P3) — see the
-// TODO hook in startCameraObserver. Retention: camObserverPruneOnce.
+// Hourly/daily rollups + the daily-report webhook live in
+// camera_observer_report.go (60s ticker started here); the public report share
+// page lives in camera_observer_view.go. Retention: camObserverPruneOnce.
 
 import (
 	"context"
@@ -136,8 +137,17 @@ func startCameraObserver(cfg config) {
 		}
 	}()
 
-	// TODO(chunk P3): start the 60s rollup ticker here (camObserverRollupTick,
-	// camera_observer_report.go) — hourly summaries + the daily report/webhook.
+	// 60s rollup cadence (camera_observer_report.go): hourly summaries, the
+	// scheduled daily report and its exactly-once webhook, per enabled stream.
+	go func() {
+		time.Sleep(camStartupJitter(camObserverRollupInterval))
+		camObserverRollupTick(cfg)
+		ticker := time.NewTicker(camObserverRollupInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			camObserverRollupTick(cfg)
+		}
+	}()
 
 	go camObserverPruner(cfg)
 }
