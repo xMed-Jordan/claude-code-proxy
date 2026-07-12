@@ -574,12 +574,88 @@ type avScanRun struct {
 	faceMin   float64
 	retention time.Duration
 	persisted map[string]bool // cam.ID|frameTS already minted — keeps incremental + final persistence idempotent
+
+	// mu guards every mutation of prog and persisted so cameras can be scanned
+	// concurrently (CameraAvatarScanCamConcurrency workers) without racing the
+	// shared counters, the dedupe map, or the progress-row JSON write.
+	mu sync.Mutex
+	// fetchSem bounds S3 GETs across ALL in-flight cameras (not per-camera), so
+	// N parallel cameras don't multiply into N×avScanFetchConc concurrent reads.
+	fetchSem chan struct{}
 }
 
+// saveProgress persists the live progress row. Safe to call without holding mu.
 func (r *avScanRun) saveProgress() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.saveProgressLocked()
+}
+
+// saveProgressLocked persists progress assuming the caller already holds mu (so
+// the marshaled snapshot is consistent with the mutation that preceded it).
+func (r *avScanRun) saveProgressLocked() {
 	if err := setCameraAvatarScanProgress(r.db, r.sc.ID, mustJSON(r.prog)); err != nil {
 		camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "progress_ok": false, "error": err.Error()})
 	}
+}
+
+// ─── locked progress mutators (tiny critical sections; never held across a VLM
+// call, S3 fetch, or candidate persist) ───
+
+func (r *avScanRun) setCurrentCamera(id string) {
+	r.mu.Lock()
+	r.prog.CurrentCamera = id
+	r.saveProgressLocked()
+	r.mu.Unlock()
+}
+
+func (r *avScanRun) addFrames(n int) {
+	r.mu.Lock()
+	r.prog.FramesScanned += n
+	r.mu.Unlock()
+}
+
+func (r *avScanRun) bumpVLM() {
+	r.mu.Lock()
+	r.prog.VLMCalls++
+	r.saveProgressLocked()
+	r.mu.Unlock()
+}
+
+func (r *avScanRun) markCameraDone(id string) {
+	r.mu.Lock()
+	r.prog.CamerasDone = append(r.prog.CamerasDone, id)
+	r.prog.CurrentCamera = ""
+	r.saveProgressLocked()
+	r.mu.Unlock()
+}
+
+func (r *avScanRun) noteOnce(s string) {
+	r.mu.Lock()
+	if r.prog.Note == "" {
+		r.prog.Note = s
+	}
+	r.mu.Unlock()
+}
+
+func (r *avScanRun) vlmBudgetHit() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxVLM > 0 && r.prog.VLMCalls >= r.maxVLM
+}
+
+func (r *avScanRun) candBudgetHit() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxCand > 0 && r.prog.Candidates >= r.maxCand
+}
+
+// progressSnapshot returns the counters needed for a per-camera log line without
+// exposing the live struct to a racy read.
+func (r *avScanRun) progressSnapshot() (camerasDone, frames, vlm, cand int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.prog.CamerasDone), r.prog.FramesScanned, r.prog.VLMCalls, r.prog.Candidates
 }
 
 // finish terminalizes the run as "done", folding an early-stop reason into the
@@ -792,6 +868,8 @@ func runAvatarScan(ctx context.Context, cfg config, scanID string) error {
 		maxFrames: maxFrames, batch: batch,
 		maxVLM: cfg.CameraAvatarScanMaxVLM, maxCand: cfg.CameraAvatarScanMaxCandidates,
 		faceMin: faceMin, retention: retention,
+		persisted: map[string]bool{},
+		fetchSem:  make(chan struct{}, avScanFetchConc),
 	}
 
 	camlog("info", "avatar_scan", map[string]any{
@@ -800,47 +878,124 @@ func runAvatarScan(ctx context.Context, cfg config, scanID string) error {
 		"refs": len(refPaths), "resumed_cameras_done": len(prog.CamerasDone),
 	})
 
+	// The pending set (resume skips cameras already in cameras_done). Cameras are
+	// scanned concurrently by a bounded worker pool — a 16- or 32-camera site
+	// finishes in roughly wall_clock/camConc instead of the sum of every camera.
+	var pending []camera
 	for _, cam := range scanCams {
-		if doneSet[cam.ID] {
-			continue
+		if !doneSet[cam.ID] {
+			pending = append(pending, cam)
 		}
-		if cctx.Err() != nil {
-			return r.finish("wall-clock budget exhausted", start)
-		}
-		if r.maxVLM > 0 && prog.VLMCalls >= r.maxVLM {
-			return r.finish("VLM call budget exhausted", start)
-		}
-		if r.maxCand > 0 && prog.Candidates >= r.maxCand {
-			return r.finish("candidate budget exhausted", start)
-		}
-		prog.CurrentCamera = cam.ID
-		r.saveProgress()
+	}
+	camConc := cfg.CameraAvatarScanCamConcurrency
+	if camConc < 1 {
+		camConc = 1
+	}
+	if camConc > len(pending) {
+		camConc = len(pending)
+	}
 
-		loc := time.Local
-		if dv, ok := dvrByID[cam.DVRID]; ok && dv.Timezone != "" {
-			if l, e := time.LoadLocation(dv.Timezone); e == nil {
-				loc = l
+	// Shared early-termination signals. A terminal backend failure (fatalErr)
+	// takes precedence over a graceful budget stop (stopMsg); whichever fires
+	// first cancels cctx so in-flight cameras wind down instead of finishing a
+	// now-pointless pass. FIRST writer wins each field.
+	var (
+		termMu   sync.Mutex
+		fatalErr error
+		stopMsg  string
+	)
+	setFatal := func(e error) {
+		termMu.Lock()
+		if fatalErr == nil {
+			fatalErr = e
+		}
+		termMu.Unlock()
+		cancel()
+	}
+	setStop := func(m string) {
+		termMu.Lock()
+		if stopMsg == "" {
+			stopMsg = m
+		}
+		termMu.Unlock()
+		cancel()
+	}
+	terminated := func() bool {
+		termMu.Lock()
+		defer termMu.Unlock()
+		return fatalErr != nil || stopMsg != ""
+	}
+
+	work := make(chan camera)
+	var wg sync.WaitGroup
+	for i := 0; i < camConc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cam := range work {
+				// Drain (don't process) once the run is winding down — this is what
+				// keeps the feeder's send from ever deadlocking on a stopped worker.
+				if terminated() || cctx.Err() != nil {
+					continue
+				}
+				// Budgets are shared across cameras (enforced again inside vlmScan /
+				// persistSightings); this pre-check just avoids opening a new camera
+				// when the pool is already spent.
+				if r.vlmBudgetHit() {
+					setStop("VLM call budget exhausted")
+					continue
+				}
+				if r.candBudgetHit() {
+					setStop("candidate budget exhausted")
+					continue
+				}
+				r.setCurrentCamera(cam.ID)
+
+				loc := time.Local
+				if dv, ok := dvrByID[cam.DVRID]; ok && dv.Timezone != "" {
+					if l, e := time.LoadLocation(dv.Timezone); e == nil {
+						loc = l
+					}
+				}
+				stop, fatal := r.scanCamera(cctx, cam, loc)
+				if fatal != nil {
+					setFatal(fatal)
+					camlog("error", "avatar_scan", map[string]any{"scan_id": scanID, "camera_id": cam.ID, "ok": false, "error": fatal.Error()})
+					continue
+				}
+				if stop != "" {
+					// Partially scanned camera — deliberately NOT marked done.
+					setStop(stop)
+					continue
+				}
+				r.markCameraDone(cam.ID)
+				camerasDone, frames, vlm, cand := r.progressSnapshot()
+				camlog("info", "avatar_scan", map[string]any{
+					"scan_id": scanID, "camera_id": cam.ID, "cameras_done": camerasDone,
+					"frames_scanned": frames, "vlm_calls": vlm, "candidates": cand,
+				})
 			}
+		}()
+	}
+	for _, cam := range pending {
+		if terminated() {
+			break // stop feeding; workers drain the rest as no-ops
 		}
-		stop, fatal := r.scanCamera(cctx, cam, loc)
-		if fatal != nil {
-			prog.CurrentCamera = ""
-			r.saveProgress()
-			_ = setCameraAvatarScanStatus(db, scanID, "error", fatal.Error())
-			camlog("error", "avatar_scan", map[string]any{"scan_id": scanID, "camera_id": cam.ID, "ok": false, "error": fatal.Error()})
-			return nil // self-terminalized: the run DID make progress
-		}
-		if stop != "" {
-			// Partially scanned camera — deliberately NOT added to cameras_done.
-			return r.finish(stop, start)
-		}
-		prog.CamerasDone = append(prog.CamerasDone, cam.ID)
-		prog.CurrentCamera = ""
-		r.saveProgress()
-		camlog("info", "avatar_scan", map[string]any{
-			"scan_id": scanID, "camera_id": cam.ID, "cameras_done": len(prog.CamerasDone),
-			"frames_scanned": prog.FramesScanned, "vlm_calls": prog.VLMCalls, "candidates": prog.Candidates,
-		})
+		work <- cam
+	}
+	close(work)
+	wg.Wait()
+
+	termMu.Lock()
+	fe, sm := fatalErr, stopMsg
+	termMu.Unlock()
+	if fe != nil {
+		r.setCurrentCamera("")
+		_ = setCameraAvatarScanStatus(db, scanID, "error", fe.Error())
+		return nil // self-terminalized: the run DID make progress
+	}
+	if sm != "" {
+		return r.finish(sm, start)
 	}
 	return r.finish("", start)
 }
@@ -859,7 +1014,7 @@ func (r *avScanRun) scanCamera(ctx context.Context, cam camera, loc *time.Locati
 		ok   bool
 	}
 	slots := make([]scanSlot, len(instants))
-	sem := make(chan struct{}, avScanFetchConc)
+	sem := r.fetchSem // shared across all in-flight cameras (bounds total S3 GETs)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	realErrs := 0 // genuine S3 failures (timeout/5xx/auth), NOT plain 404 misses
@@ -902,11 +1057,22 @@ func (r *avScanRun) scanCamera(ctx context.Context, cam camera, loc *time.Locati
 			prevSig = slots[i].sig
 		}
 	}
-	r.prog.FramesScanned += fetched
+	r.addFrames(fetched)
 	camlog("info", "avatar_scan", map[string]any{
 		"scan_id": r.sc.ID, "camera_id": cam.ID, "instants": len(instants),
 		"fetched": fetched, "active": len(survivors), "real_errs": realErrs, "path": map[bool]string{true: "face", false: "vlm"}[r.faceMode],
 	})
+	// If the context was cancelled (deadline OR a sibling camera triggered the
+	// run to wind down), the S3 GETs above fail as ctx errors — which would look
+	// like an archive outage below. Report it as a graceful stop, never a fatal.
+	// A sibling-triggered cancel already recorded the real reason (setStop/setFatal
+	// run before cancel), so this "run stopping" is only ever a loser.
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "wall-clock budget exhausted", nil
+		}
+		return "run stopping", nil
+	}
 	if len(survivors) == 0 {
 		// Distinguish an empty window (all genuine 404 misses → legitimately "done"
 		// with zero candidates) from an S3 outage (real failures → do NOT mark the
@@ -927,9 +1093,7 @@ func (r *avScanRun) scanCamera(ctx context.Context, cam camera, loc *time.Locati
 		if faceDown && stop == "" {
 			// Sidecar unavailable mid-run — fall back to appearance matching and
 			// record it so the operator understands the match_kind mix.
-			if r.prog.Note == "" {
-				r.prog.Note = "face engine unavailable — used appearance matching"
-			}
+			r.noteOnce("face engine unavailable — used appearance matching")
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "note": "face engine unavailable — used appearance matching"})
 			// Persist the face sightings gathered before the sidecar died; the VLM
 			// fallback then persists its own matches incrementally.
@@ -960,9 +1124,6 @@ func (r *avScanRun) persistSightings(cam camera, sightings []avScanSighting, sto
 	if len(sightings) == 0 {
 		return
 	}
-	if r.persisted == nil {
-		r.persisted = map[string]bool{}
-	}
 	keys := make([]avSightingKey, len(sightings))
 	for i, s := range sightings {
 		keys[i] = avSightingKey{T: s.T, Conf: s.Conf}
@@ -971,26 +1132,34 @@ func (r *avScanRun) persistSightings(cam camera, sightings []avScanSighting, sto
 		// Idempotency across the incremental per-batch flushes and the final
 		// per-camera pass: a keeper already minted (keyed by frame instant) is
 		// never re-persisted, so we neither orphan capture blobs nor double-count.
+		// (Each pk belongs to exactly one camera → one worker, but the map itself
+		// is shared, so its reads/writes are still guarded.)
 		pk := cam.ID + "|" + sightings[idx].T.UTC().Format(time.RFC3339)
-		if r.persisted[pk] {
+		r.mu.Lock()
+		already := r.persisted[pk]
+		budgetHit := r.maxCand > 0 && r.prog.Candidates >= r.maxCand
+		r.mu.Unlock()
+		if already {
 			continue
 		}
-		if r.maxCand > 0 && r.prog.Candidates >= r.maxCand {
+		if budgetHit {
 			if *stop == "" {
 				*stop = "candidate budget exhausted"
 			}
 			return
 		}
-		inserted, perr := r.persistCandidate(cam, sightings[idx])
+		inserted, perr := r.persistCandidate(cam, sightings[idx]) // slow work — mutex NOT held
 		if perr != nil {
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "candidate_ok": false, "error": perr.Error()})
 			continue
 		}
+		r.mu.Lock()
 		r.persisted[pk] = true
 		if inserted {
 			r.prog.Candidates++
-			r.saveProgress() // surface each new candidate to the live UI immediately
+			r.saveProgressLocked() // surface each new candidate to the live UI immediately
 		}
+		r.mu.Unlock()
 	}
 }
 
@@ -1144,7 +1313,7 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 			stop = "wall-clock budget exhausted"
 			return
 		}
-		if r.maxVLM > 0 && r.prog.VLMCalls >= r.maxVLM {
+		if r.vlmBudgetHit() {
 			stop = "VLM call budget exhausted"
 			return
 		}
@@ -1160,7 +1329,9 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 		lines = append(lines, r.refLines...)
 		writeFail := false
 		for i, f := range frames {
-			p := filepath.Join(r.scratch, fmt.Sprintf("frame_%02d.jpg", i+1))
+			// cam.ID in the name so parallel cameras never clobber each other's
+			// batch frames in the shared scratch dir.
+			p := filepath.Join(r.scratch, fmt.Sprintf("frame_%s_%02d.jpg", cam.ID, i+1))
 			if os.WriteFile(p, f.data, 0o600) != nil {
 				writeFail = true
 				break
@@ -1174,8 +1345,7 @@ func (r *avScanRun) vlmScan(ctx context.Context, cam camera, survivors []avScanF
 		user := header + "\nATTACHMENTS IN ORDER:\n" + strings.Join(lines, "\n")
 
 		out, aerr := analyzeWithAlias(ctx, r.cfg, r.alias, sys, user, paths)
-		r.prog.VLMCalls++
-		r.saveProgress() // heartbeat + live UI counters
+		r.bumpVLM() // heartbeat + live UI counters
 		if aerr != nil {
 			consec++
 			camlog("warn", "avatar_scan", map[string]any{"scan_id": r.sc.ID, "camera_id": cam.ID, "vlm_ok": false, "error": aerr.Error()})

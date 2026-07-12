@@ -253,6 +253,7 @@ type config struct {
 	// for human review. Bounded per scan by frames/VLM calls/candidates/wall clock.
 	CameraAvatarScanWorkerEnabled  bool          // PROXY_CAM_AVATAR_SCAN_WORKER — run the durable avatar-scan queue (default true)
 	CameraAvatarScanConcurrency    int           // PROXY_CAM_AVATAR_SCAN_CONCURRENCY — parallel scans (default 1)
+	CameraAvatarScanCamConcurrency int           // PROXY_CAM_AVATAR_SCAN_CAM_CONCURRENCY — cameras scanned in parallel WITHIN one scan (default 4)
 	CameraAvatarScanTickInterval   time.Duration // PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL — queue poll cadence (default 5s)
 	CameraAvatarScanBudget         time.Duration // PROXY_CAM_AVATAR_SCAN_BUDGET — wall-clock cap per scan (default 1800s; camAvatarScanBudget hard-caps at 1h)
 	CameraAvatarScanAlias          string        // PROXY_CAM_AVATAR_SCAN_ALIAS — VLM alias for scans ("" → CameraInvestigateAlias)
@@ -308,7 +309,9 @@ type config struct {
 	CameraObserverBudget          time.Duration // PROXY_CAMERA_OBSERVER_BUDGET — wall-clock cap per log cycle (default 300s)
 	CameraObserverLag             time.Duration // PROXY_CAMERA_OBSERVER_LAG — the analyzed window ends this far behind now so the sampled frames already exist in S3/DVR (default 60s)
 	CameraObserverMaxStreams      int           // PROXY_CAMERA_OBSERVER_MAX_STREAMS — log streams per site (default 8)
-	CameraObserverMaxSheets       int           // PROXY_CAMERA_OBSERVER_MAX_SHEETS — composite sheets per cycle (default 3)
+	CameraObserverMaxSheets       int           // PROXY_CAMERA_OBSERVER_MAX_SHEETS — full-size grids per cycle; cameras auto-group to fit this cap (default 8)
+	CameraObserverFramesPerSheet  int           // PROXY_CAMERA_OBSERVER_FRAMES_PER_SHEET — large cells per grid; thins each camera's frames to keep cells big (default 9)
+	CameraObserverSheetQuality    string        // PROXY_CAMERA_OBSERVER_SHEET_QUALITY — sheet frame quality: "main" (crisp, sub fallback) or "sub" (default "main")
 	CameraObserverMaxDetailFrames int           // PROXY_CAMERA_OBSERVER_MAX_DETAIL_FRAMES — needs_detail drill-down frames per cycle (default 4)
 	CameraObserverMaxDVRFrames    int           // PROXY_CAMERA_OBSERVER_MAX_DVR_FRAMES — DVR playback-fallback frames per cycle when S3 misses (default 4)
 	CameraObserverFullContext     int           // PROXY_CAMERA_OBSERVER_FULL_CONTEXT — recent entries quoted verbatim in the continuity block (default 3)
@@ -853,6 +856,7 @@ func loadConfig() config {
 
 		CameraAvatarScanWorkerEnabled:  envFlag("PROXY_CAM_AVATAR_SCAN_WORKER", true),
 		CameraAvatarScanConcurrency:    parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_CONCURRENCY", "1"), 1),
+		CameraAvatarScanCamConcurrency: parseIntDefault(getenv("PROXY_CAM_AVATAR_SCAN_CAM_CONCURRENCY", "4"), 4),
 		CameraAvatarScanTickInterval:   parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_TICK_INTERVAL", "5")),
 		CameraAvatarScanBudget:         parseAgyTimeout(getenv("PROXY_CAM_AVATAR_SCAN_BUDGET", "1800")),
 		CameraAvatarScanAlias:          strings.TrimSpace(getenv("PROXY_CAM_AVATAR_SCAN_ALIAS", "")),
@@ -899,7 +903,9 @@ func loadConfig() config {
 		CameraObserverBudget:          parseAgyTimeout(getenv("PROXY_CAMERA_OBSERVER_BUDGET", "300")),
 		CameraObserverLag:             parseAgyTimeout(getenv("PROXY_CAMERA_OBSERVER_LAG", "60")),
 		CameraObserverMaxStreams:      parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_STREAMS", "8"), 8),
-		CameraObserverMaxSheets:       parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_SHEETS", "3"), 3),
+		CameraObserverMaxSheets:       parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_SHEETS", "8"), 8),
+		CameraObserverFramesPerSheet:  parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FRAMES_PER_SHEET", "9"), 9),
+		CameraObserverSheetQuality:    getenv("PROXY_CAMERA_OBSERVER_SHEET_QUALITY", "main"),
 		CameraObserverMaxDetailFrames: parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_DETAIL_FRAMES", "4"), 4),
 		CameraObserverMaxDVRFrames:    parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_MAX_DVR_FRAMES", "4"), 4),
 		CameraObserverFullContext:     parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FULL_CONTEXT", "3"), 3),

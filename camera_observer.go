@@ -56,7 +56,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -455,7 +454,7 @@ func camRunLogCycle(ctx context.Context, cfg config, db *sql.DB, s logStream, fr
 		return entry
 	}
 
-	sheets := camObserverBuildSheets(cams, frames, loc, tzName, camObserverMaxSheetsFor(cfg), scratch)
+	sheets := camObserverBuildSheets(cams, frames, loc, tzName, camObserverMaxSheetsFor(cfg), camObserverFramesPerSheetFor(cfg), scratch)
 	if len(sheets) == 0 {
 		entry.Error = strings.Join(append(notes, "no sheets assembled"), "; ")
 		entry.Headline = camObserverFailedHeadline
@@ -615,7 +614,25 @@ func camObserverMaxSheetsFor(cfg config) int {
 	if n := cfg.CameraObserverMaxSheets; n > 0 {
 		return n
 	}
-	return 3
+	return 8
+}
+
+// camObserverFramesPerSheetFor is the target cell count per full-size grid; each
+// grid's cameras are thinned to fit so cells stay large.
+func camObserverFramesPerSheetFor(cfg config) int {
+	if n := cfg.CameraObserverFramesPerSheet; n > 0 {
+		return n
+	}
+	return 9
+}
+
+// camObserverSheetQualityFor is the archive quality sampled for the sheets —
+// "main" (crisp, falls back to sub per frame) unless explicitly set to "sub".
+func camObserverSheetQualityFor(cfg config) string {
+	if strings.EqualFold(strings.TrimSpace(cfg.CameraObserverSheetQuality), "sub") {
+		return "sub"
+	}
+	return "main"
 }
 
 func camObserverMaxDetailFramesFor(cfg config) int {
@@ -724,14 +741,16 @@ func siteHasMotionEventSince(db *sql.DB, siteID, sinceUTC string) (bool, error) 
 
 const (
 	camObserverFetchConc      = 16  // parallel S3 GETs while sampling (contact-sheet shape)
-	camObserverMaxTotalFrames = 300 // total sampled frames per cycle (3 packed sheets × 100 cells)
-	camObserverMaxSheetCells  = 100 // cells per composite sheet (contact-sheet cap)
-	camObserverPerCamCols     = 5   // roomy per-camera sheet geometry (≤ MAX_SHEETS cameras)
-	camObserverPerCamCellW    = 320
-	camObserverPerCamCellH    = 180
-	camObserverPackedCols     = 10 // packed multi-camera geometry (contact-sheet numbers)
-	camObserverPackedCellW    = 160
-	camObserverPackedCellH    = 90
+	camObserverMaxTotalFrames = 300 // total sampled frames per cycle
+	camObserverMaxSheetCells  = 100 // cells per composite sheet (sampling cap)
+	// Full-size grid geometry. Dense 160×90 packing made the model misread whole
+	// scenes (a bake-off proved a 48-cell sheet read a clinic as a "vehicle
+	// interior"); large cells preserve faces/objects/signage. Fewer cells per
+	// grid ⇒ MORE grids, bounded by PROXY_CAMERA_OBSERVER_MAX_SHEETS. This is the
+	// standard observer behavior now: full-size frames, spread across more grids.
+	camObserverSheetCols  = 3   // large-cell grids are 3 wide (1440px sheet)
+	camObserverSheetCellW = 480 // ≈ the per-cell size that read cleanly in the bake-off
+	camObserverSheetCellH = 270
 )
 
 // camObserverFrame is one sampled frame: which camera, which instant, and the
@@ -747,23 +766,28 @@ type camObserverFrame struct {
 // when allowDVR — a single-frame playback grab from the camera's enabled DVR.
 // ok=false with nil error means "no frame exists there" (skip, not a fault).
 func camObserverFetchFrame(ctx context.Context, cfg config, cam camera, dvr CamDVR, quality string, t time.Time, destPath string, allowDVR bool) (bool, error) {
-	q := StreamSub
+	// Quality ladder: "main" prefers the crisp keyframe but falls back to the
+	// denser sub archive per-frame, so a missing main keyframe never drops the
+	// instant (the archiver keys main sparsely, sub at ~1 fps).
+	ladder := []StreamQuality{StreamSub}
 	if strings.EqualFold(strings.TrimSpace(quality), "main") {
-		q = StreamMain
+		ladder = []StreamQuality{StreamMain, StreamSub}
 	}
 	if camS3Enabled(cfg) {
-		ft := camS3SnapArchiveTime(t, avToolSnapInterval(cfg, q))
-		if data, err := s3GetObject(ctx, cfg, camS3FrameKey(cam.ID, q.String(), ft)); err == nil {
-			if werr := os.WriteFile(destPath, data, 0o600); werr != nil {
-				return false, werr
+		for _, q := range ladder {
+			ft := camS3SnapArchiveTime(t, avToolSnapInterval(cfg, q))
+			if data, err := s3GetObject(ctx, cfg, camS3FrameKey(cam.ID, q.String(), ft)); err == nil {
+				if werr := os.WriteFile(destPath, data, 0o600); werr != nil {
+					return false, werr
+				}
+				return true, nil
 			}
-			return true, nil
 		}
 	}
 	if !allowDVR || dvr.ID == "" || !dvr.Enabled {
 		return false, nil
 	}
-	if _, err := captureFrameAtTime(ctx, cfg, dvr, cam.Channel, q, t, destPath); err != nil {
+	if _, err := captureFrameAtTime(ctx, cfg, dvr, cam.Channel, ladder[0], t, destPath); err != nil {
 		return false, nil // "no footage at t" — a miss, not a cycle fault
 	}
 	return true, nil
@@ -815,6 +839,7 @@ func camObserverThinTimes(times []time.Time, max int) []time.Time {
 func camObserverSampleFrames(ctx context.Context, cfg config, cams []camera, dvrByID map[string]CamDVR,
 	from, to time.Time, step time.Duration, maxSheets, dvrBudget int, scratch string) (map[string][]camObserverFrame, int, int) {
 	instants := camObserverInstants(from, to, step)
+	sheetQ := camObserverSheetQualityFor(cfg) // "main" (crisp, sub fallback) or "sub"
 	perCam := camObserverMaxSheetCells
 	if len(cams) > maxSheets && len(cams) > 0 {
 		perCam = camObserverMaxTotalFrames / len(cams)
@@ -845,7 +870,7 @@ func camObserverSampleFrames(ctx context.Context, cfg config, cams []camera, dvr
 			defer wg.Done()
 			defer func() { <-sem }()
 			sl := &slots[i]
-			ok, err := camObserverFetchFrameFn(ctx, cfg, sl.cam, dvrByID[sl.cam.DVRID], "sub", sl.t, sl.path, false)
+			ok, err := camObserverFetchFrameFn(ctx, cfg, sl.cam, dvrByID[sl.cam.DVRID], sheetQ, sl.t, sl.path, false)
 			if err != nil {
 				camlog("debug", "observer_frame", map[string]any{"camera_id": sl.cam.ID, "ok": false, "error": err.Error()})
 			}
@@ -894,7 +919,7 @@ func camObserverSampleFrames(ctx context.Context, cfg config, cams []camera, dvr
 				}
 				remaining-- // an attempt costs budget whether or not footage exists
 				p := filepath.Join(scratch, fmt.Sprintf("obsdvr_%s_%d.jpg", c.ID, t.Unix()))
-				ok, err := camObserverFetchFrameFn(ctx, cfg, c, dvrByID[c.DVRID], "sub", t, p, true)
+				ok, err := camObserverFetchFrameFn(ctx, cfg, c, dvrByID[c.DVRID], sheetQ, t, p, true)
 				if err != nil || !ok {
 					continue
 				}
@@ -919,20 +944,24 @@ type camObserverSheet struct {
 	Height   int
 }
 
-// camObserverBuildSheets tiles the sampled frames into composite sheets: one
-// roomy sheet per camera (cols 5, 320×180) when at most maxSheets cameras have
-// frames, else ALL frames packed into ≤ maxSheets sheets at contact-sheet
-// geometry (cols 10, 160×90). Cells are numbered per sheet; each legend reads
+// camObserverBuildSheets tiles the sampled frames into FULL-SIZE composite grids
+// (large 480×270 cells so faces, objects, and signage survive — dense small-cell
+// packing made the model misread scenes). Cameras are laid out one per grid for
+// maximum clarity, auto-grouped only when the camera count exceeds maxSheets so
+// the grid count never blows past the cost cap. Each grid holds at most
+// framesPerSheet cells; a group's cameras split those cells evenly, their own
+// frames thinned to fit. Cells are numbered per grid; each legend reads
 // "SHEET n — CELL=CAMERA@TIME (tz): 1=Gate 14:00:30 …".
-func camObserverBuildSheets(cams []camera, frames map[string][]camObserverFrame, loc *time.Location, tzName string, maxSheets int, scratch string) []camObserverSheet {
+func camObserverBuildSheets(cams []camera, frames map[string][]camObserverFrame, loc *time.Location, tzName string, maxSheets, framesPerSheet int, scratch string) []camObserverSheet {
 	if maxSheets < 1 {
 		maxSheets = 1
+	}
+	if framesPerSheet < 1 {
+		framesPerSheet = 1
 	}
 	var withFrames []camera
 	for _, c := range cams {
 		if len(frames[c.ID]) > 0 {
-			fs := frames[c.ID]
-			sort.Slice(fs, func(a, b int) bool { return fs[a].T.Before(fs[b].T) })
 			withFrames = append(withFrames, c)
 		}
 	}
@@ -940,7 +969,7 @@ func camObserverBuildSheets(cams []camera, frames map[string][]camObserverFrame,
 		return nil
 	}
 
-	build := func(chunk []camObserverFrame, cameraID string, cols, cellW, cellH int, sheetNo int) (camObserverSheet, bool) {
+	build := func(chunk []camObserverFrame, cameraID string, sheetNo int) (camObserverSheet, bool) {
 		items := make([]mosaicItem, 0, len(chunk))
 		legendParts := make([]string, 0, len(chunk))
 		for i, f := range chunk {
@@ -948,7 +977,7 @@ func camObserverBuildSheets(cams []camera, frames map[string][]camObserverFrame,
 			items = append(items, mosaicItem{Index: i + 1, CameraID: f.Cam.ID, Name: clock, Path: f.Path})
 			legendParts = append(legendParts, fmt.Sprintf("%d=%s %s", i+1, camDisplayName(f.Cam), clock))
 		}
-		res, err := buildContactSheet(items, cols, cellW, cellH)
+		res, err := buildContactSheet(items, camObserverSheetCols, camObserverSheetCellW, camObserverSheetCellH)
 		if err != nil {
 			camlog("warn", "observer_sheet", map[string]any{"ok": false, "error": err.Error()})
 			return camObserverSheet{}, false
@@ -964,30 +993,34 @@ func camObserverBuildSheets(cams []camera, frames map[string][]camObserverFrame,
 		}, true
 	}
 
-	var out []camObserverSheet
-	if len(withFrames) <= maxSheets {
-		for _, c := range withFrames {
-			if sh, ok := build(frames[c.ID], c.ID, camObserverPerCamCols, camObserverPerCamCellW, camObserverPerCamCellH, len(out)+1); ok {
-				out = append(out, sh)
-			}
-		}
-		return out
+	// One camera per grid for maximum clarity; group just enough to fit maxSheets.
+	camsPerGrid := 1
+	if len(withFrames) > maxSheets {
+		camsPerGrid = (len(withFrames) + maxSheets - 1) / maxSheets // ceil
 	}
 
-	var all []camObserverFrame
-	for _, c := range withFrames {
-		all = append(all, frames[c.ID]...)
-	}
-	perSheet := (len(all) + maxSheets - 1) / maxSheets
-	if perSheet > camObserverMaxSheetCells {
-		perSheet = camObserverMaxSheetCells
-	}
-	for start := 0; start < len(all) && len(out) < maxSheets; start += perSheet {
-		end := start + perSheet
-		if end > len(all) {
-			end = len(all)
+	var out []camObserverSheet
+	for start := 0; start < len(withFrames) && len(out) < maxSheets; start += camsPerGrid {
+		end := start + camsPerGrid
+		if end > len(withFrames) {
+			end = len(withFrames)
 		}
-		if sh, ok := build(all[start:end], "", camObserverPackedCols, camObserverPackedCellW, camObserverPackedCellH, len(out)+1); ok {
+		group := withFrames[start:end]
+		// Split the grid's cells evenly across its cameras, thinning each camera's
+		// frames so cells stay full-size (camObserverThinFrames sorts by time).
+		fpc := framesPerSheet / len(group)
+		if fpc < 1 {
+			fpc = 1
+		}
+		var chunk []camObserverFrame
+		for _, c := range group {
+			chunk = append(chunk, camObserverThinFrames(frames[c.ID], fpc)...)
+		}
+		cameraID := "" // single-camera grids keep their id for drill-down association
+		if len(group) == 1 {
+			cameraID = group[0].ID
+		}
+		if sh, ok := build(chunk, cameraID, len(out)+1); ok {
 			out = append(out, sh)
 		}
 	}

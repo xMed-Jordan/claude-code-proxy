@@ -6,9 +6,12 @@ package main
 // contract against a temp database (openCamTestDB + migrateCameraDB).
 
 import (
-	"strings"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"strings"
 )
 
 // ─────────────────────────── parseAvatarScanMatches ───────────────────────────
@@ -353,6 +356,89 @@ func TestAvScanCandidateInsertIdempotent(t *testing.T) {
 	}
 	if got, _ := listCameraAvatarCandidates(db, "avscan_old", "", ""); len(got) != 0 {
 		t.Fatalf("expired candidate survived: %v", got)
+	}
+}
+
+// ─────────────────────────── concurrent camera scanning ───────────────────────────
+
+// TestAvScanConcurrentProgressMutators drives every shared-state mutator from
+// many goroutines at once — the exact contention the per-camera worker pool
+// creates — and asserts (a) zero lost updates (mutex correctness) and (b) no
+// data race when run under `go test -race`. Progress-row DB writes all happen
+// under r.mu (via saveProgressLocked), so they self-serialize; production's
+// concurrent candidate INSERTs instead lean on openProxyDB's WAL+busy_timeout.
+func TestAvScanConcurrentProgressMutators(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	id, err := insertCameraAvatarScan(db, camAvatarScan{
+		AvatarID: "avatar_1", SiteID: "site_1",
+		FromTS: "2026-07-02T06:00:00Z", ToTS: "2026-07-02T08:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("insertCameraAvatarScan: %v", err)
+	}
+
+	r := &avScanRun{
+		db:        db,
+		sc:        camAvatarScan{ID: id, SiteID: "site_1"},
+		prog:      &avScanProgress{CamerasTotal: 999},
+		persisted: map[string]bool{},
+		fetchSem:  make(chan struct{}, avScanFetchConc),
+	}
+
+	const workers, each = 8, 150
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				r.addFrames(1)
+				r.bumpVLM()
+				r.setCurrentCamera(fmt.Sprintf("cam_%d_%d", w, i))
+				r.markCameraDone(fmt.Sprintf("cam_%d_%d", w, i))
+				// Mirror persistSightings' locked critical section (map + counter).
+				pk := fmt.Sprintf("cam_%d|%d", w, i)
+				r.mu.Lock()
+				r.persisted[pk] = true
+				r.prog.Candidates++
+				r.saveProgressLocked()
+				r.mu.Unlock()
+				// Concurrent readers must also be race-free.
+				_ = r.vlmBudgetHit()
+				_ = r.candBudgetHit()
+				_, _, _, _ = r.progressSnapshot()
+				r.noteOnce("touched")
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	want := workers * each
+	if r.prog.FramesScanned != want {
+		t.Errorf("FramesScanned = %d, want %d (lost updates)", r.prog.FramesScanned, want)
+	}
+	if r.prog.VLMCalls != want {
+		t.Errorf("VLMCalls = %d, want %d (lost updates)", r.prog.VLMCalls, want)
+	}
+	if r.prog.Candidates != want {
+		t.Errorf("Candidates = %d, want %d (lost updates)", r.prog.Candidates, want)
+	}
+	if len(r.prog.CamerasDone) != want {
+		t.Errorf("CamerasDone = %d, want %d (lost appends)", len(r.prog.CamerasDone), want)
+	}
+	if len(r.persisted) != want {
+		t.Errorf("persisted = %d, want %d (map races/lost writes)", len(r.persisted), want)
+	}
+	if r.prog.Note != "touched" {
+		t.Errorf("Note = %q, want stable single value", r.prog.Note)
+	}
+	// The final progress row round-trips.
+	sc, _ := getCameraAvatarScan(db, id)
+	if !strings.Contains(sc.Progress, `"frames_scanned":`) {
+		t.Errorf("progress row not persisted: %q", sc.Progress)
 	}
 }
 

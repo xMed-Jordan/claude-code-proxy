@@ -35,6 +35,7 @@ import (
 	"image/color"
 	"image/png"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -207,8 +208,8 @@ func TestObserverCycleNormal(t *testing.T) {
 		mu.Lock()
 		subFetches++
 		mu.Unlock()
-		if quality != "sub" {
-			t.Errorf("sampling quality = %q, want sub", quality)
+		if quality != "main" {
+			t.Errorf("sampling quality = %q, want main (full-size default)", quality)
 		}
 		if allowDVR {
 			t.Error("first sampling pass must not allow the DVR fallback")
@@ -468,13 +469,13 @@ func TestObserverDrillDown(t *testing.T) {
 	var mu sync.Mutex
 	mainFetches := 0
 	camObserverFetchFrameFn = func(ctx context.Context, c config, cam camera, dvr CamDVR, quality string, ts time.Time, destPath string, allowDVR bool) (bool, error) {
-		if quality == "main" {
+		// Sampling and drill-down BOTH request main quality now (full-size sheets),
+		// so the discriminator is allowDVR: only drill-down allows the bounded
+		// playback fallback. Count those.
+		if quality == "main" && allowDVR {
 			mu.Lock()
 			mainFetches++
 			mu.Unlock()
-			if !allowDVR {
-				t.Error("drill-down fetch must allow the bounded playback fallback")
-			}
 		}
 		if err := writeObsTestFrame(destPath); err != nil {
 			return false, err
@@ -526,6 +527,69 @@ func TestObserverDrillDown(t *testing.T) {
 		if !strings.Contains(secondUser, want) {
 			t.Errorf("second-round prompt missing %q", want)
 		}
+	}
+}
+
+// TestObserverBuildSheetsFullSizeGrids pins the full-size, multi-grid layout:
+// one grid per camera when the count fits maxSheets (each grid keeps its camera
+// id for drill-down), and even auto-grouping so the grid count never exceeds the
+// maxSheets cost cap when there are more cameras than grids.
+func TestObserverBuildSheetsFullSizeGrids(t *testing.T) {
+	scratch := t.TempDir()
+	base := time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC)
+	mkFrames := func(cam camera, n int) []camObserverFrame {
+		fs := make([]camObserverFrame, 0, n)
+		for i := 0; i < n; i++ {
+			p := filepath.Join(scratch, fmt.Sprintf("f_%s_%d.jpg", cam.ID, i))
+			if err := writeObsTestFrame(p); err != nil {
+				t.Fatalf("writeObsTestFrame: %v", err)
+			}
+			fs = append(fs, camObserverFrame{Cam: cam, T: base.Add(time.Duration(i) * 30 * time.Second), Path: p})
+		}
+		return fs
+	}
+
+	// Few cameras (≤ maxSheets) → one grid per camera, each tagged with its id.
+	cams := []camera{{ID: "cam_a", Name: "A"}, {ID: "cam_b", Name: "B"}, {ID: "cam_c", Name: "C"}}
+	frames := map[string][]camObserverFrame{}
+	for _, c := range cams {
+		frames[c.ID] = mkFrames(c, 10)
+	}
+	sheets := camObserverBuildSheets(cams, frames, time.UTC, "UTC", 8, 9, scratch)
+	if len(sheets) != 3 {
+		t.Fatalf("one grid per camera: got %d grids, want 3", len(sheets))
+	}
+	for i, sh := range sheets {
+		if sh.CameraID != cams[i].ID {
+			t.Errorf("grid %d cameraID = %q, want %q (single-camera grid keeps its id)", i, sh.CameraID, cams[i].ID)
+		}
+		if sh.Width == 0 || sh.Height == 0 {
+			t.Errorf("grid %d has zero dimensions", i)
+		}
+	}
+
+	// More cameras than maxSheets → auto-group so #grids ≤ maxSheets; grouped
+	// grids mix cameras, so they carry no single camera id.
+	var many []camera
+	manyFrames := map[string][]camObserverFrame{}
+	for i := 0; i < 16; i++ {
+		c := camera{ID: fmt.Sprintf("cam_%02d", i), Name: fmt.Sprintf("C%d", i)}
+		many = append(many, c)
+		manyFrames[c.ID] = mkFrames(c, 4)
+	}
+	grouped := camObserverBuildSheets(many, manyFrames, time.UTC, "UTC", 8, 9, scratch)
+	if len(grouped) != 8 { // ceil(16/8)=2 cameras per grid → 8 grids
+		t.Fatalf("auto-grouped grids = %d, want 8 (≤ maxSheets)", len(grouped))
+	}
+	for _, sh := range grouped {
+		if sh.CameraID != "" {
+			t.Errorf("grouped grid should carry no single camera id, got %q", sh.CameraID)
+		}
+	}
+
+	// No frames anywhere → no grids.
+	if got := camObserverBuildSheets(cams, map[string][]camObserverFrame{}, time.UTC, "UTC", 8, 9, scratch); got != nil {
+		t.Errorf("no frames should yield nil, got %d grids", len(got))
 	}
 }
 
