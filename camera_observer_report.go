@@ -107,6 +107,8 @@ func camObserverRollupTick(cfg config) {
 		}
 		camObserverStreamRollups(cfg, db, s, now)
 	}
+	// Close presence intervals for anyone unseen past the absence grace (departures).
+	camPresenceSweep(cfg, db)
 }
 
 // camObserverStreamRollups resolves one stream's report environment (site,

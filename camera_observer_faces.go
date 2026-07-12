@@ -53,13 +53,16 @@ const camObserverFaceMaxDetect = 40
 // confirmed in a cycle's sampled frames: the best (highest-similarity) sighting
 // plus the display names of any OTHER cameras they also matched on.
 type camObserverIdentity struct {
-	Name       string
-	Kind       string
-	CameraID   string    // camera of the best sighting
-	CameraName string    // display name of that camera
-	T          time.Time // instant of the best sighting
-	Similarity float64   // best cosine similarity across the window
-	AlsoOn     []string  // display names of other cameras the person matched on
+	Name          string
+	AvatarID      string    // enrolled avatar id (for the presence/attendance layer)
+	Kind          string
+	CameraID      string    // camera of the best sighting
+	CameraName    string    // display name of that camera
+	T             time.Time // instant of the best sighting
+	Similarity    float64   // best cosine similarity across the window
+	AlsoOn        []string  // display names of other cameras the person matched on
+	FirstT        time.Time // EARLIEST sighting instant this cycle (arrival within the cycle)
+	FirstCameraID string    // camera of the earliest sighting
 }
 
 // camFaceCandidate is one enrolled human avatar the recognizer can match a
@@ -190,10 +193,13 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		camNameByID[c.ID] = camDisplayName(c)
 	}
 
-	// Best sighting per avatar id, plus the set of cameras it matched on.
+	// Best sighting per avatar id, plus the set of cameras it matched on and the
+	// earliest sighting instant/camera (the arrival within this cycle).
 	type bestHit struct {
-		idty camObserverIdentity
-		cams map[string]bool
+		idty     camObserverIdentity
+		cams     map[string]bool
+		firstT   time.Time
+		firstCam string
 	}
 	bests := map[string]*bestHit{}
 
@@ -254,9 +260,12 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 					bests[cand.av.ID] = b
 				}
 				b.cams[c.ID] = true
+				if b.firstT.IsZero() || f.T.Before(b.firstT) {
+					b.firstT, b.firstCam = f.T, c.ID
+				}
 				if bestSim > b.idty.Similarity {
 					b.idty = camObserverIdentity{
-						Name: cand.av.Name, Kind: avToolType(cand.av),
+						Name: cand.av.Name, AvatarID: cand.av.ID, Kind: avToolType(cand.av),
 						CameraID: c.ID, CameraName: camNameByID[c.ID],
 						T: f.T, Similarity: bestSim,
 					}
@@ -286,6 +295,7 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 			}
 		}
 		sort.Strings(b.idty.AlsoOn)
+		b.idty.FirstT, b.idty.FirstCameraID = b.firstT, b.firstCam
 		out = append(out, b.idty)
 	}
 	// Strongest match first — a stable, useful order for the prompt block.

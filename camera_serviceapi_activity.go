@@ -641,8 +641,8 @@ func handleSvcActivitySync(cfg config) camSvcHandler {
 		}
 		q := r.URL.Query()
 		typ := strings.ToLower(strings.TrimSpace(q.Get("type")))
-		if typ != "entries" && typ != "hours" && typ != "days" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": `type must be "entries", "hours" or "days"`})
+		if typ != "entries" && typ != "hours" && typ != "days" && typ != "sightings" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": `type must be "entries", "hours", "days" or "sightings"`})
 			return
 		}
 		var afterSeq int64
@@ -712,6 +712,18 @@ func handleSvcActivitySync(cfg config) camSvcHandler {
 				row := logDayJSON(cfg, d)
 				row["seq"] = d.Seq
 				rows = append(rows, row)
+			}
+		case "sightings":
+			list, err := listSightingsAfterSeq(db, sc.SiteID, afterSeq, limit+1)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			if len(list) > limit {
+				hasMore, list = true, list[:limit]
+			}
+			for _, s := range list {
+				rows = append(rows, camSightingSyncJSON(s))
 			}
 		}
 		maxSeq, err := camSyncMaxSeq(db)

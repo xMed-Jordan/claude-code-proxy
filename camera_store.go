@@ -766,6 +766,15 @@ func migrateCameraDB(db *sql.DB) error {
 	if err := ensureSQLiteColumn(db, "camera_log_streams", "face_rec", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
+	// Proactive presence (camera_presence.go) writes the previously-inert
+	// camera_sightings table; add the shared sync-cursor column + index so
+	// Connect can pull-sync arrivals/departures exactly like the activity journal.
+	if err := ensureSQLiteColumn(db, "camera_sightings", "seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_camera_sightings_seq ON camera_sightings(site_id, seq)`); err != nil {
+		return err
+	}
 	// Pending-message origin: which surface parked the message ('' = an
 	// authenticated admin/site-token reply, camViewReplySource = the public
 	// share-link page). The drained transcript row inherits it as tool_name so

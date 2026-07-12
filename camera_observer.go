@@ -500,6 +500,9 @@ func camRunLogCycle(ctx context.Context, cfg config, db *sql.DB, s logStream, fr
 	if cfg.CameraObserverFaceRec && s.FaceRec {
 		identities := camObserverRecognizeFaces(ctx, cfg, db, cams, frames, scoped, loc)
 		identityBlock = camObserverIdentityBlock(identities, loc, tzName)
+		// Proactive presence: persist arrivals/departures from the identities we
+		// just computed (side effect — never fails the cycle).
+		camPresenceObserve(cfg, db, s.SiteID, identities, cams, to, loc)
 	}
 
 	sys := camObserverSystemPrompt(site, dvrs, cams, scoped, policy,
