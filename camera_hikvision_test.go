@@ -2,8 +2,10 @@ package main
 
 // camera_hikvision_test.go — table-driven tests for the pure/deterministic
 // Hikvision URL builders (LiveURL/SnapshotURL/PlaybackURL). These never touch the
-// network; PlaybackURL's GMT/"Z" time formatting (unlike Dahua's local-underscore
-// convention, see camera_dahua_test.go) is the main thing worth pinning down.
+// network; PlaybackURL's time base — DVR-local digits with the literal "Z" token
+// kept, falling back to UTC when no timezone is configured (see hikLocation) — is
+// the main thing worth pinning down, since a UTC seek returns stale footage on the
+// field DVRs that read starttime against their own local clock.
 
 import (
 	"strings"
@@ -90,15 +92,16 @@ func TestHikSnapshotURL(t *testing.T) {
 	}
 }
 
-func TestHikPlaybackURLGMTZFormat(t *testing.T) {
+func TestHikPlaybackURLSeeksInDVRLocalTime(t *testing.T) {
 	dvr := hikTestDVR()
+	dvr.Timezone = "Asia/Amman" // UTC+3 in July 2026 (no DST)
 	adapter := hikvisionBrandAdapter{}
-	// Hikvision playback time is GMT/"Z", formatted from start.UTC()/end.UTC() —
-	// this must hold even when the input times are constructed in a non-UTC
-	// location (a client in +03:00 asking for "10:00-10:05 local").
-	loc := time.FixedZone("TestTZ", 3*3600)
-	start := time.Date(2026, 7, 1, 10, 0, 0, 0, loc)
-	end := time.Date(2026, 7, 1, 10, 5, 0, 0, loc)
+	// The field DVRs interpret starttime/endtime against their OWN local clock and
+	// ignore the trailing "Z", so a UTC seek returns stale footage. We render the
+	// digits in the DVR timezone (keeping the literal "Z" token): a 10:00 UTC
+	// request must land as 13:00 Amman.
+	start := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 1, 10, 5, 0, 0, time.UTC)
 
 	got, err := adapter.PlaybackURL(dvr, 3, StreamMain, start, end)
 	if err != nil {
@@ -110,17 +113,36 @@ func TestHikPlaybackURLGMTZFormat(t *testing.T) {
 	if !strings.Contains(got, "/Streaming/tracks/301") {
 		t.Errorf("PlaybackURL = %q, want /Streaming/tracks/301 (channel*100+1)", got)
 	}
-	// start/end must be rendered in UTC (07:00Z, not 10:00 local) with the
-	// trailing "Z" GMT marker — this is the top cause of playback drift bugs if
-	// someone accidentally formats in local time (Dahua's convention).
-	if !strings.Contains(got, "starttime=20260701T070000Z") {
-		t.Errorf("PlaybackURL = %q, want starttime=20260701T070000Z (GMT)", got)
+	// 10:00 UTC -> 13:00 local (Asia/Amman, UTC+3); local digits, "Z" token kept.
+	if !strings.Contains(got, "starttime=20260701T130000Z") {
+		t.Errorf("PlaybackURL = %q, want starttime=20260701T130000Z (DVR-local digits)", got)
 	}
-	if !strings.Contains(got, "endtime=20260701T070500Z") {
-		t.Errorf("PlaybackURL = %q, want endtime=20260701T070500Z (GMT)", got)
+	if !strings.Contains(got, "endtime=20260701T130500Z") {
+		t.Errorf("PlaybackURL = %q, want endtime=20260701T130500Z (DVR-local digits)", got)
 	}
+	// Still Hikvision's compact "T…Z" shape, never Dahua's underscore local format.
 	if strings.Contains(got, "_") {
 		t.Errorf("PlaybackURL = %q, must not use Dahua's underscore local-time format", got)
+	}
+}
+
+func TestHikPlaybackURLDefaultsToUTCWithoutTimezone(t *testing.T) {
+	dvr := hikTestDVR() // Timezone == "" -> keep the ISAPI-documented GMT behavior
+	adapter := hikvisionBrandAdapter{}
+	// Constructed in a +03:00 location to prove the fallback still normalizes to UTC.
+	loc := time.FixedZone("TestTZ", 3*3600)
+	start := time.Date(2026, 7, 1, 10, 0, 0, 0, loc) // 07:00 UTC
+	end := time.Date(2026, 7, 1, 10, 5, 0, 0, loc)   // 07:05 UTC
+
+	got, err := adapter.PlaybackURL(dvr, 3, StreamMain, start, end)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "starttime=20260701T070000Z") {
+		t.Errorf("PlaybackURL (no tz) = %q, want UTC fallback starttime=20260701T070000Z", got)
+	}
+	if !strings.Contains(got, "endtime=20260701T070500Z") {
+		t.Errorf("PlaybackURL (no tz) = %q, want UTC fallback endtime=20260701T070500Z", got)
 	}
 }
 
@@ -142,8 +164,8 @@ func TestHikPlaybackURLRejectsInvertedWindow(t *testing.T) {
 
 func TestHikChannelsFromStreamingFoldsMainSubAndPreservesDeviceIDs(t *testing.T) {
 	list := hikStreamingChannelList{Channels: []hikStreamingChannel{
-		{ID: "101", ChannelName: "Lobby", Width: "1920", Height: "1080"}, // ch1 main
-		{ID: "102", ChannelName: "Lobby-sub"},                            // ch1 sub (lower priority, ignored for name)
+		{ID: "101", ChannelName: "Lobby", Width: "1920", Height: "1080"},     // ch1 main
+		{ID: "102", ChannelName: "Lobby-sub"},                                // ch1 sub (lower priority, ignored for name)
 		{ID: "3201", ChannelName: "Back Door", Width: "1280", Height: "720"}, // ch32 main (non-contiguous)
 		{ID: "bogus"}, // unparseable, must be skipped
 	}}

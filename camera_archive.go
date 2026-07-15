@@ -38,8 +38,12 @@ package main
 // captured into its own temp dir that is always removed; archived frames never
 // touch camera_captures/served media — they are read back directly from S3.
 //
-// Frames are never deleted here — retention is forever / handled by an S3
-// lifecycle rule out of band.
+// Frames are never deleted here — retention is enforced out of band by a bucket
+// lifecycle rule that expires objects under the "cam_" key prefix after N days
+// (set to 7d on the live Hetzner bucket; evidence exports/ and clips/ live under
+// other prefixes and are unaffected). That rule is REQUIRED: without it the 1-fps
+// sub archive (~90% of the volume) grows unbounded until the bucket quota is hit,
+// after which every PUT fails with 403 QuotaExceeded and archiving silently stops.
 import (
 	"context"
 	"fmt"

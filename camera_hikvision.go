@@ -162,20 +162,51 @@ func (hikvisionBrandAdapter) SnapshotURL(dvr CamDVR, ch int, q StreamQuality) (s
 	return u.String(), true, true
 }
 
+// hikLocation resolves the IANA timezone this DVR uses when it interprets playback
+// starttime/endtime (see PlaybackURL — these devices seek against their OWN local
+// clock, not GMT). Defaults to UTC when unset or unparseable, so a deployment with
+// no configured timezone keeps the ISAPI-documented GMT behavior; a bad tz string
+// is logged once rather than failing playback. Mirrors dahuaLocation.
+func hikLocation(dvr CamDVR) *time.Location {
+	tz := strings.TrimSpace(dvr.Timezone)
+	if tz == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		camlog("warn", "hik_timezone_invalid", map[string]any{
+			"dvr_id": dvr.ID, "timezone": tz, "ok": false, "error": err.Error(),
+		})
+		return time.UTC
+	}
+	return loc
+}
+
 // PlaybackURL: rtsp://user:pass@host:port/Streaming/tracks/<channel*100+1>
-// ?starttime=<t>&endtime=<t> where t is GMT "YYYYMMDDThhmmssZ" from x.UTC() — the
-// documented Hikvision ISAPI playback convention (unlike Dahua's local underscore
-// time). The main track (…01) carries recorded footage. "No recording in the
-// window" is detected at capture time (typed errNoRecording); here we only build a
-// well-formed URL, rejecting only an inverted window with a clean (non-500) error.
+// ?starttime=<t>&endtime=<t> where t is "YYYYMMDDThhmmssZ".
+//
+// Time base: the Hikvision ISAPI spec documents starttime/endtime as GMT (the
+// trailing "Z"), but the DVRs in the field interpret the digits against their OWN
+// configured wall clock and IGNORE the Z — a request for "…T080907Z" returns the
+// frame the DVR stamped 08:09:07 in ITS local time, not 08:09:07 UTC. Seeking in
+// UTC therefore lands the tz offset off (e.g. 3h in Asia/Amman), silently returning
+// stale footage. So we render the digits in the DVR's configured timezone
+// (hikLocation) while keeping the literal "Z" token for URL-syntax compatibility,
+// and fall back to UTC when no timezone is configured. The main track (…01) carries
+// recorded footage. "No recording in the window" is detected at capture time (typed
+// errNoRecording); here we only build a well-formed URL, rejecting only an inverted
+// window with a clean (non-500) error.
 func (hikvisionBrandAdapter) PlaybackURL(dvr CamDVR, ch int, q StreamQuality, start, end time.Time) (string, error) {
 	if !end.After(start) {
 		return "", fmt.Errorf("hikvision playback: end (%s) must be after start (%s)", end, start)
 	}
+	loc := hikLocation(dvr)
 	u := hikRTSPBaseURL(dvr)
 	u.Path = fmt.Sprintf("/Streaming/tracks/%d", ch*100+1)
-	st := start.UTC().Format("20060102T150405Z")
-	et := end.UTC().Format("20060102T150405Z")
+	// The "Z" here is a literal (Go treats a lone trailing Z as a literal, not a
+	// zone token), so the digits render in loc while the token shape stays intact.
+	st := start.In(loc).Format("20060102T150405Z")
+	et := end.In(loc).Format("20060102T150405Z")
 	// Build the query manually: the values are ASCII-safe (digits/T/Z) and Hik
 	// expects the raw starttime/endtime tokens; url.Values.Encode would reorder.
 	u.RawQuery = fmt.Sprintf("starttime=%s&endtime=%s", st, et)
