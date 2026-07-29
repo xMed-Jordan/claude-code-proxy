@@ -170,6 +170,13 @@ type agyjOutput struct {
 	Error      string  `json:"error"`
 	ExitCode   *int    `json:"exit_code"`
 	DurationMs int64   `json:"duration_ms"`
+	// agyj already captures the CLI's own streams on the failure path; without
+	// carrying them through, an agy-side failure reaches the caller as a bare
+	// wrapper message ("could not find a conversation db …") that says nothing
+	// about WHY the CLI produced nothing — which is exactly the information
+	// needed to tell a quota rejection from a crash from a slow disk.
+	AgyStderr string `json:"agy_stderr"`
+	AgyStdout string `json:"agy_stdout"`
 }
 
 // parseAgyjOutput decodes agyj's stdout. It returns an error only when the bytes
@@ -194,7 +201,25 @@ func parseAgyjOutput(raw []byte) (agyResult, error) {
 	if !res.Ok && res.Error == "" {
 		res.Error = "agy returned ok=false"
 	}
+	if !res.Ok {
+		if detail := agyFailureDetail(o); detail != "" {
+			res.Error += " [agy: " + detail + "]"
+		}
+	}
 	return res, nil
+}
+
+// agyFailureDetail summarises whatever the CLI itself said on a failed run, so
+// the proxy's 502 body names the real cause instead of only the wrapper's
+// symptom. Prefers stderr (where crashes and auth/quota rejections land) and
+// falls back to stdout.
+func agyFailureDetail(o agyjOutput) string {
+	for _, s := range []string{o.AgyStderr, o.AgyStdout} {
+		if s = strings.TrimSpace(s); s != "" {
+			return truncateString(strings.Join(strings.Fields(s), " "), 400)
+		}
+	}
+	return ""
 }
 
 // agyBinPath resolves the agyj wrapper: explicit config first, then a sibling of
