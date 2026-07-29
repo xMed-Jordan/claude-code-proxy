@@ -293,7 +293,16 @@ func camStreamFFmpegArgs(cfg config, liveURL string, q StreamQuality, fps int) [
 	stall := stallGuardMicros(15 * time.Second)
 	keyframe := q == StreamMain && !strings.EqualFold(strings.TrimSpace(cfg.CameraStreamMainMode), "full")
 
-	args := []string{"-nostdin", "-loglevel", "error"}
+	// Cap decoder threads. ffmpeg defaults to one thread per core PER PROCESS, so a
+	// 32-camera fleet spawns thousands of threads that mostly wait — enough to hit
+	// the service's TasksMax and make fork() fail for the upstream AI CLIs
+	// ("resource temporarily unavailable"), and enough context-switching to hurt
+	// throughput. These streams sample ~1 fps; two threads is ample.
+	threads := cfg.CameraStreamThreads
+	if threads < 1 {
+		threads = 2
+	}
+	args := []string{"-nostdin", "-loglevel", "error", "-threads", strconv.Itoa(threads)}
 	if keyframe {
 		// Input-side: decode ONLY keyframes — near-zero CPU for full-res frames.
 		args = append(args, "-skip_frame", "nokey")
