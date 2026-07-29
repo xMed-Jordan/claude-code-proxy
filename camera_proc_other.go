@@ -38,9 +38,11 @@ func camDeprioritizeProcess(cmd *exec.Cmd, nice int) {
 	if cmd == nil || cmd.Process == nil || nice <= 0 {
 		return
 	}
-	// PRIO_PGRP: configureCamProcAttr put the child in its own group, so this
-	// covers any helper ffmpeg forks too.
-	_ = syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, nice)
+	// PRIO_PROCESS, not PRIO_PGRP: only runCamCommand puts its child in a fresh
+	// process group (configureCamProcAttr). The persistent stream workers do not,
+	// so their pid is NOT a pgid and a PRIO_PGRP call would silently renice
+	// nothing — which is exactly what happened the first time this shipped.
+	_ = syscall.Setpriority(syscall.PRIO_PROCESS, cmd.Process.Pid, nice)
 }
 
 // killCamProcessTree sends SIGKILL to the process group rooted at cmd's pid
