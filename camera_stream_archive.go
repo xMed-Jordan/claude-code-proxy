@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +87,20 @@ func camStreamSupervisor(cfg config, fps, maxWorkers int) {
 // camStreamReconcile starts a worker for every enabled (camera, quality) that
 // isn't running, and stops any running worker no longer wanted. While the proxy is
 // paused it tears every worker down (background traffic stops, like the scheduler).
+// camStreamWantSub / camStreamWantMain read PROXY_CAM_STREAM_QUALITIES
+// ("both" | "sub" | "main", default both). Archiving both qualities for every
+// camera means TWO persistent ffmpeg processes per camera, which on a 32-camera
+// fleet is 64 of them and by far the largest CPU consumer on the host. Dropping
+// to "sub" halves that at the cost of full-resolution archived frames (the
+// observer samples sub anyway; main only matters for face work).
+func camStreamWantSub(cfg config) bool {
+	return strings.ToLower(strings.TrimSpace(cfg.CameraStreamQualities)) != "main"
+}
+
+func camStreamWantMain(cfg config) bool {
+	return strings.ToLower(strings.TrimSpace(cfg.CameraStreamQualities)) != "sub"
+}
+
 func camStreamReconcile(cfg config, fps, maxWorkers int, workers map[camStreamKey]context.CancelFunc) {
 	if !proxyEnabled.Load() {
 		if len(workers) > 0 {
@@ -129,8 +144,12 @@ func camStreamReconcile(cfg config, fps, maxWorkers int, workers map[camStreamKe
 			if !cam.Enabled {
 				continue
 			}
-			desired[camStreamKey{cam.ID, StreamSub}] = target{dvr, cam}
-			desired[camStreamKey{cam.ID, StreamMain}] = target{dvr, cam}
+			if camStreamWantSub(cfg) {
+				desired[camStreamKey{cam.ID, StreamSub}] = target{dvr, cam}
+			}
+			if camStreamWantMain(cfg) {
+				desired[camStreamKey{cam.ID, StreamMain}] = target{dvr, cam}
+			}
 		}
 	}
 
@@ -143,10 +162,28 @@ func camStreamReconcile(cfg config, fps, maxWorkers int, workers map[camStreamKe
 		}
 	}
 
-	// Start missing workers, bounded by maxWorkers.
+	// Start missing workers, bounded by maxWorkers. Iterate in a DETERMINISTIC
+	// order — sub streams first, then main, each by camera id — because Go map
+	// order is random and the cap would otherwise land on an arbitrary half of the
+	// fleet, giving some cameras only a main stream and others only a sub, with
+	// the split reshuffling on every reconcile. Sub goes first because it is the
+	// cheap stream the observer actually samples; main is the one worth dropping
+	// when the box cannot afford everything.
+	order := make([]camStreamKey, 0, len(desired))
+	for k := range desired {
+		order = append(order, k)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if (order[i].q == StreamSub) != (order[j].q == StreamSub) {
+			return order[i].q == StreamSub
+		}
+		return order[i].camID < order[j].camID
+	})
+
 	started := 0
 	capped := false
-	for k, tg := range desired {
+	for _, k := range order {
+		tg := desired[k]
 		if _, ok := workers[k]; ok {
 			continue
 		}

@@ -241,6 +241,7 @@ type config struct {
 	CameraStreamEnabled       bool          // PROXY_CAM_STREAM_ENABLED — archive via persistent RTSP streams (~1fps) instead of snapshot polling
 	CameraStreamFPS           int           // PROXY_CAM_STREAM_FPS — frames/sec sampled from each stream (default 1)
 	CameraStreamMaxWorkers    int           // PROXY_CAM_STREAM_MAX_WORKERS — cap on concurrent persistent ffmpeg stream workers (default 64)
+	CameraStreamQualities     string        // PROXY_CAM_STREAM_QUALITIES — both|sub|main; which persistent streams to archive (default both = 2 ffmpeg processes per camera)
 	CameraStreamMainMode      string        // PROXY_CAM_STREAM_MAIN_MODE — "keyframe" (I-frames only, light) or "full" (full decode) for the main stream (default keyframe)
 	CameraStreamReconcile     time.Duration // PROXY_CAM_STREAM_RECONCILE — how often the supervisor reconciles workers with the camera list (default 30s)
 	// Face-recognition sidecar (faceapi/ FastAPI+insightface; Go client in
@@ -850,6 +851,7 @@ func loadConfig() config {
 		CameraStreamEnabled:       envFlag("PROXY_CAM_STREAM_ENABLED", false),
 		CameraStreamFPS:           parseIntDefault(getenv("PROXY_CAM_STREAM_FPS", "1"), 1),
 		CameraStreamMaxWorkers:    parseIntDefault(getenv("PROXY_CAM_STREAM_MAX_WORKERS", "64"), 64),
+		CameraStreamQualities:     strings.TrimSpace(getenv("PROXY_CAM_STREAM_QUALITIES", "both")),
 		CameraStreamMainMode:      strings.TrimSpace(getenv("PROXY_CAM_STREAM_MAIN_MODE", "keyframe")),
 		CameraStreamReconcile:     parseAgyTimeout(getenv("PROXY_CAM_STREAM_RECONCILE", "30")),
 
