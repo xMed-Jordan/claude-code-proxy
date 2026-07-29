@@ -752,28 +752,21 @@ func main() {
 	}
 
 	if dbPath == "" {
-		cutoff := start.Add(-2 * time.Second)
-		var bestMtime time.Time
-		_ = filepath.WalkDir(convDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
+		// agy.exe writes the conversation db asynchronously, so it can still be
+		// in flight when the process exits — especially on a loaded box where the
+		// flush lands behind other I/O. A single scan the instant agy returns
+		// therefore fails intermittently with "could not find a conversation db",
+		// which surfaces to the caller as a 502 on a request that actually
+		// succeeded. Poll for a couple of seconds before giving up.
+		cutoff := start.Add(-5 * time.Second)
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			dbPath = newestConversationDB(convDir, cutoff)
+			if dbPath != "" || time.Now().After(deadline) {
+				break
 			}
-			if !strings.HasSuffix(d.Name(), ".db") {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			if info.ModTime().Before(cutoff) {
-				return nil
-			}
-			if info.ModTime().After(bestMtime) {
-				bestMtime = info.ModTime()
-				dbPath = path
-			}
-			return nil
-		})
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
 	if dbPath == "" {
@@ -963,4 +956,28 @@ func main() {
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+}
+
+// newestConversationDB returns the most recently modified *.db under convDir
+// whose mtime is at or after cutoff, or "" when there is none. Split out of the
+// scan so the caller can poll: agy.exe's db write can land after the process
+// exits, and a single scan turns that race into a spurious hard error.
+func newestConversationDB(convDir string, cutoff time.Time) string {
+	best := ""
+	var bestMtime time.Time
+	_ = filepath.WalkDir(convDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".db") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil || info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if info.ModTime().After(bestMtime) {
+			bestMtime = info.ModTime()
+			best = path
+		}
+		return nil
+	})
+	return best
 }
