@@ -22,6 +22,11 @@ func configureCamProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNewProcessGroup}
 }
 
+// camDeprioritizeProcess is a no-op on Windows: the dev box does not run the
+// camera fleet alongside live AI traffic, which is the contention this guards
+// against on the Linux server. See the Unix implementation for the rationale.
+func camDeprioritizeProcess(cmd *exec.Cmd, nice int) {}
+
 // killCamProcessTree force-kills cmd's process AND every process it spawned.
 // This matters because some ffmpeg/ffprobe installs are a launcher/shim whose
 // real worker process has a DIFFERENT pid than cmd.Process.Pid (observed with a

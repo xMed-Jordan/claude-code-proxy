@@ -22,6 +22,27 @@ func configureCamProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// camDeprioritizeProcess drops a camera subprocess to a low CPU priority.
+//
+// The proxy serves interactive AI traffic by spawning UPSTREAM CLI CHILDREN
+// (codex/claude/agy) in the same cgroup as the camera ffmpeg processes. A fleet
+// of persistent stream-archiver ffmpegs will happily consume every core, and
+// because the scheduler treats them as equal to those CLI children, live
+// conversations start timing out while footage is being archived. Camera work is
+// batch work and can always wait; a conversation cannot. Renicing the whole
+// process group means ffmpeg only gets the CPU nobody else wants.
+//
+// Best-effort: a failure here is not worth failing a capture over, and an
+// unprivileged process cannot lower its own niceness again anyway.
+func camDeprioritizeProcess(cmd *exec.Cmd, nice int) {
+	if cmd == nil || cmd.Process == nil || nice <= 0 {
+		return
+	}
+	// PRIO_PGRP: configureCamProcAttr put the child in its own group, so this
+	// covers any helper ffmpeg forks too.
+	_ = syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, nice)
+}
+
 // killCamProcessTree sends SIGKILL to the process group rooted at cmd's pid
 // (see configureCamProcAttr) so any child the launched process spawned is
 // killed too, not just the immediate exec'd process.

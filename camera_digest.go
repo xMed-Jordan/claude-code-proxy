@@ -12,6 +12,7 @@ package main
 // client at a user-supplied URL.
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -50,10 +51,18 @@ func camHTTPClient() *http.Client {
 // response=md5(HA1:nonce:nc:cnonce:qop:HA2) with nc=00000001 and a random cnonce.
 // The returned *http.Response body is the caller's to close.
 func httpDigestGet(ctx context.Context, client *http.Client, rawURL, user, pass string) (*http.Response, error) {
+	return httpDigestDo(ctx, client, http.MethodGet, rawURL, nil, "", user, pass)
+}
+
+// httpDigestDo is httpDigestGet generalized over method and request body, for the
+// ISAPI endpoints that are POST-only (ContentMgmt/search, ContentMgmt/download).
+// body is buffered rather than streamed because the auth handshake replays the
+// request after the 401 — ISAPI request bodies are a few hundred bytes of XML.
+func httpDigestDo(ctx context.Context, client *http.Client, method, rawURL string, body []byte, contentType, user, pass string) (*http.Response, error) {
 	if client == nil {
 		client = camHTTPClient()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := camNewRequest(ctx, method, rawURL, body, contentType)
 	if err != nil {
 		return nil, err
 	}
@@ -75,21 +84,38 @@ func httpDigestGet(ctx context.Context, client *http.Client, rawURL, user, pass 
 	}
 	switch {
 	case strings.HasPrefix(scheme, "digest"):
-		return camDoDigest(ctx, client, rawURL, user, pass, challenge)
+		return camDoDigest(ctx, client, method, rawURL, body, contentType, user, pass, challenge)
 	case strings.HasPrefix(scheme, "basic"), scheme == "":
-		return camDoBasic(ctx, client, rawURL, user, pass)
+		return camDoBasic(ctx, client, method, rawURL, body, contentType, user, pass)
 	default:
 		// Unknown/negotiate scheme: try Digest, then fall back to Basic.
-		if r, derr := camDoDigest(ctx, client, rawURL, user, pass, challenge); derr == nil {
+		if r, derr := camDoDigest(ctx, client, method, rawURL, body, contentType, user, pass, challenge); derr == nil {
 			return r, nil
 		}
-		return camDoBasic(ctx, client, rawURL, user, pass)
+		return camDoBasic(ctx, client, method, rawURL, body, contentType, user, pass)
 	}
 }
 
-// camDoBasic retries the GET with an Authorization: Basic header.
-func camDoBasic(ctx context.Context, client *http.Client, rawURL, user, pass string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+// camNewRequest builds a request with an optional buffered body, so the same
+// bytes can be replayed on the authenticated retry.
+func camNewRequest(ctx context.Context, method, rawURL string, body []byte, contentType string) (*http.Request, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, rdr)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil && contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req, nil
+}
+
+// camDoBasic retries the request with an Authorization: Basic header.
+func camDoBasic(ctx context.Context, client *http.Client, method, rawURL string, body []byte, contentType, user, pass string) (*http.Response, error) {
+	req, err := camNewRequest(ctx, method, rawURL, body, contentType)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +123,8 @@ func camDoBasic(ctx context.Context, client *http.Client, rawURL, user, pass str
 	return client.Do(req)
 }
 
-// camDoDigest retries the GET with a computed Digest Authorization header.
-func camDoDigest(ctx context.Context, client *http.Client, rawURL, user, pass, challenge string) (*http.Response, error) {
+// camDoDigest retries the request with a computed Digest Authorization header.
+func camDoDigest(ctx context.Context, client *http.Client, method, rawURL string, body []byte, contentType, user, pass, challenge string) (*http.Response, error) {
 	p := parseWWWAuthenticate(challenge)
 	realm := p["realm"]
 	nonce := p["nonce"]
@@ -138,13 +164,13 @@ func camDoDigest(ctx context.Context, client *http.Client, rawURL, user, pass, c
 		ha1 = md5Hex(ha1 + ":" + nonce + ":" + cnonce)
 	}
 	// HA2 depends on qop. Plain "auth" (and RFC 2069) use md5(method:uri); "auth-int"
-	// folds in a hash of the entity body — our request is a bodyless GET, so the body
-	// hash is md5(""). All real Hikvision/Dahua firmware advertises "auth", so the
-	// auth-int branch only matters for an auth-int-only device (which would otherwise
-	// keep returning 401 from a wrong response digest).
-	ha2 := md5Hex("GET:" + uri)
+	// folds in a hash of the entity body (md5("") for a bodyless request). All real
+	// Hikvision/Dahua firmware advertises "auth", so the auth-int branch only matters
+	// for an auth-int-only device (which would otherwise keep returning 401 from a
+	// wrong response digest).
+	ha2 := md5Hex(method + ":" + uri)
 	if qop == "auth-int" {
-		ha2 = md5Hex("GET:" + uri + ":" + md5Hex(""))
+		ha2 = md5Hex(method + ":" + uri + ":" + md5Hex(string(body)))
 	}
 
 	var response string
@@ -168,7 +194,7 @@ func camDoDigest(ctx context.Context, client *http.Client, rawURL, user, pass, c
 		fmt.Fprintf(&h, ", opaque=%q", opaque)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := camNewRequest(ctx, method, rawURL, body, contentType)
 	if err != nil {
 		return nil, err
 	}

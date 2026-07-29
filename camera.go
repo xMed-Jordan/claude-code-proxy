@@ -196,6 +196,7 @@ func initCameras(cfg config) {
 		n = 1
 	}
 	captureSem = make(chan struct{}, n)
+	camProcNice.Store(int64(cfg.CameraProcessNice))
 	root := cameraMediaRoot(cfg)
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		camlog("error", "init", map[string]any{"error": err.Error(), "media_dir": root, "ok": false})
@@ -205,6 +206,7 @@ func initCameras(cfg config) {
 		"analysis_alias":      cfg.CameraAnalysisAlias,
 		"orch_mode":           cfg.CameraOrchMode,
 		"capture_concurrency": n,
+		"process_nice":        cfg.CameraProcessNice,
 		"media_dir":           root,
 		"ffmpeg":              cameraFFmpegBin(cfg),
 		"ffprobe":             cameraFFprobeBin(cfg),

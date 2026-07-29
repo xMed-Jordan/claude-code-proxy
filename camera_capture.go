@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,6 +95,11 @@ type camFFmpegDiag struct {
 // non-nil returned error means the process could not even be run/awaited; a bad
 // exit or timeout is reported via the returned camExecResult so callers can
 // log/classify it (e.g. looksLikeNoRecording) instead of it being swallowed.
+
+// camProcNice mirrors cfg.CameraProcessNice for the exec helpers that are called
+// from code paths without a config in hand. Seeded by initCameras at startup.
+var camProcNice atomic.Int64
+
 func runCamCommand(ctx context.Context, timeout time.Duration, name string, args ...string) (camExecResult, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -113,7 +119,14 @@ func runCamCommand(ctx context.Context, timeout time.Duration, name string, args
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	start := time.Now()
-	runErr := cmd.Run()
+	// Start/Wait rather than Run so the child can be reniced the moment it exists:
+	// camera work must never outbid live AI traffic for CPU (see
+	// camDeprioritizeProcess).
+	runErr := cmd.Start()
+	if runErr == nil {
+		camDeprioritizeProcess(cmd, int(camProcNice.Load()))
+		runErr = cmd.Wait()
+	}
 	dur := time.Since(start)
 
 	res := camExecResult{Stdout: stdout.String(), Stderr: stderr.String(), DurationMs: dur.Milliseconds()}
@@ -481,6 +494,14 @@ func captureFrameAtTime(ctx context.Context, cfg config, dvr CamDVR, ch int, q S
 	if brand == nil {
 		return captureResult{}, fmt.Errorf("no brand adapter available for %q", dvr.Brand)
 	}
+	// Some Hikvision NVRs have no working RTSP playback at all (see
+	// camera_hikvision_playback.go). Once that has been established for a DVR we
+	// go straight to ISAPI instead of paying a doomed RTSP attempt per frame.
+	isapiOK := camPlaybackSupportsISAPI(dvr)
+	if isapiOK && hikPlaybackModeGet(dvr.ID) == hikPlaybackISAPI {
+		return hikISAPIFrameAt(ctx, cfg, dvr, ch, t, destPath)
+	}
+
 	rawURL, err := brand.PlaybackURL(dvr, ch, q, t, t.Add(pastFrameWindow))
 	if err != nil {
 		return captureResult{}, err
@@ -488,6 +509,36 @@ func captureFrameAtTime(ctx context.Context, cfg config, dvr CamDVR, ch int, q S
 	start := time.Now()
 	res, diag, cerr := captureSnapshotFFmpeg(ctx, cfg, rawURL, destPath)
 	logClipAttempt(dvr.ID, ch, q, "playback_frame", rawURL, 1, start, res, diag, cerr)
+	if cerr == nil {
+		if isapiOK {
+			hikPlaybackModeSet(dvr.ID, hikPlaybackRTSP)
+		}
+		return res, nil
+	}
+	if !isapiOK || hikPlaybackModeGet(dvr.ID) == hikPlaybackRTSP {
+		return res, cerr
+	}
+	// RTSP playback failed and we have not yet confirmed it works on this device.
+	// A device with broken playback reports the same way as a device with a gap in
+	// its recording, so the only way to tell them apart is to try ISAPI once.
+	alt, aerr := hikISAPIFrameAt(ctx, cfg, dvr, ch, t, destPath)
+	if aerr == nil {
+		hikPlaybackModeSet(dvr.ID, hikPlaybackISAPI)
+		camlog("info", "playback_transport_switch", map[string]any{
+			"dvr_id": dvr.ID, "channel": ch, "transport": hikPlaybackISAPI, "ok": true,
+			"reason": cerr.Error(),
+		})
+		return alt, nil
+	}
+	if errors.Is(aerr, errNoRecording) {
+		// Both transports agree there is nothing recorded at t; that is an answer,
+		// not a transport problem, so leave the mode unresolved and try again later.
+		return res, cerr
+	}
+	camlog("warn", "playback_isapi_fallback", map[string]any{
+		"dvr_id": dvr.ID, "channel": ch, "ok": false,
+		"rtsp_error": cerr.Error(), "isapi_error": aerr.Error(),
+	})
 	return res, cerr
 }
 

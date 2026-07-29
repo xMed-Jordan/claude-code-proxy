@@ -211,6 +211,10 @@ func camStreamRun(ctx context.Context, cfg config, dvr CamDVR, cam camera, q Str
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
+	// These workers are persistent — one per camera per quality — so they are the
+	// single biggest CPU consumer on the box. Renice them below the interactive AI
+	// path immediately after start.
+	camDeprioritizeProcess(cmd, cfg.CameraProcessNice)
 	camlog("info", "stream_run_start", map[string]any{
 		"camera_id": cam.ID, "dvr_id": dvr.ID, "quality": q.String(), "cmd": maskedCamCmd(bin, args, liveURL),
 	})
