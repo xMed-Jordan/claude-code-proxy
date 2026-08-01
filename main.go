@@ -323,6 +323,7 @@ type config struct {
 	CameraObserverFaceRec         bool          // PROXY_CAMERA_OBSERVER_FACE_REC — run per-cycle face recognition (default true; also needs the stream's face_rec flag, PROXY_FACE_ENABLED and enrolled human faces)
 	CameraObserverFaceMaxFrames   int           // PROXY_CAMERA_OBSERVER_FACE_MAX_FRAMES — face-detection frames sampled per camera per cycle (default 4)
 	CameraObserverFaceThreshold   float64       // PROXY_CAMERA_OBSERVER_FACE_THRESHOLD — cosine match floor for a confirmed identity (default 0 → FaceMatchThreshold, 0.40)
+	CameraObserverFaceMargin      float64       // PROXY_CAMERA_OBSERVER_FACE_MARGIN — how far the best match must beat the SECOND-best PERSON before a name is asserted (default 0.06; 0 disables)
 	CameraPresenceEnabled         bool          // PROXY_CAMERA_PRESENCE_ENABLED — record known-person arrivals/departures from observer face rec + push them (default true)
 	CameraPresenceAbsenceGrace    time.Duration // PROXY_CAMERA_PRESENCE_ABSENCE_GRACE — unseen-for-this-long closes a presence interval as a departure (default 600s)
 	CameraActivityRetention       time.Duration // PROXY_CAMERA_ACTIVITY_RETENTION — keep log entries + hourly summaries this long (default 2160h/90d; Connect archives forever)
@@ -922,6 +923,7 @@ func loadConfig() config {
 		CameraObserverFaceRec:         envFlag("PROXY_CAMERA_OBSERVER_FACE_REC", true),
 		CameraObserverFaceMaxFrames:   parseIntDefault(getenv("PROXY_CAMERA_OBSERVER_FACE_MAX_FRAMES", "4"), 4),
 		CameraObserverFaceThreshold:   camParseFloat(getenv("PROXY_CAMERA_OBSERVER_FACE_THRESHOLD", "0"), 0),
+		CameraObserverFaceMargin:      camParseFloat(getenv("PROXY_CAMERA_OBSERVER_FACE_MARGIN", "0.06"), 0.06),
 		CameraPresenceEnabled:         envFlag("PROXY_CAMERA_PRESENCE_ENABLED", true),
 		CameraPresenceAbsenceGrace:    parseAgyTimeout(getenv("PROXY_CAMERA_PRESENCE_ABSENCE_GRACE", "600")),
 		CameraActivityRetention:       parseAgyTimeout(getenv("PROXY_CAMERA_ACTIVITY_RETENTION", "7776000")),         // 2160h = 90d

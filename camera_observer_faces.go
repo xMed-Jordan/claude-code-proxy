@@ -54,7 +54,7 @@ const camObserverFaceMaxDetect = 40
 // plus the display names of any OTHER cameras they also matched on.
 type camObserverIdentity struct {
 	Name          string
-	AvatarID      string    // enrolled avatar id (for the presence/attendance layer)
+	AvatarID      string // enrolled avatar id (for the presence/attendance layer)
 	Kind          string
 	CameraID      string    // camera of the best sighting
 	CameraName    string    // display name of that camera
@@ -70,6 +70,19 @@ type camObserverIdentity struct {
 type camFaceCandidate struct {
 	av     camAvatar
 	embeds [][]float32
+}
+
+// camObserverFaceMargin is how far the best-matching person must beat the
+// SECOND-best person before we are willing to put a name to a face. An absolute
+// threshold alone cannot separate two enrolled look-alikes: on CCTV crops the
+// same face routinely scores 0.51 against one person and 0.49 against another,
+// and argmax then states the wrong name with full confidence. 0 disables the
+// check (pre-existing behaviour).
+func camObserverFaceMargin(cfg config) float64 {
+	if cfg.CameraObserverFaceMargin < 0 {
+		return 0
+	}
+	return cfg.CameraObserverFaceMargin
 }
 
 // camObserverFaceThreshold resolves the cosine floor for a confirmed identity:
@@ -202,6 +215,10 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		firstCam string
 	}
 	bests := map[string]*bestHit{}
+	margin := camObserverFaceMargin(cfg)
+	ambiguous := 0    // faces cleared the threshold but two people were too close to call
+	closestGap := 1.0 // smallest winner-vs-runner-up gap seen (diagnostic)
+	closestPair := "" // who the ambiguous winner would have been
 
 	detects, faceErrs, matched, facesSeen, mainHits := 0, 0, 0, 0, 0
 	bestSimSeen := 0.0 // highest cosine of ANY detected face vs ANY candidate (even below threshold) — the key "close but rejected?" diagnostic
@@ -237,19 +254,43 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 			// Each detected face is assigned to its single best-matching avatar
 			// (argmax cosine), so two enrolled look-alikes never both claim one face.
 			for _, face := range faces {
-				bestSim := -1.0
-				bestIdx := -1
+				// Track the best score PER AVATAR, not just the single best
+				// reference: the runner-up that matters is the closest OTHER
+				// person, not another photo of the same person.
+				bestSim, bestIdx := -1.0, -1
+				runnerUp := -1.0
 				for i := range candidates {
+					avSim := -1.0
 					for _, ref := range candidates[i].embeds {
-						if s := camCosine(face.Embedding, ref); s > bestSim {
-							bestSim, bestIdx = s, i
+						if s := camCosine(face.Embedding, ref); s > avSim {
+							avSim = s
 						}
+					}
+					if avSim > bestSim {
+						runnerUp, bestSim, bestIdx = bestSim, avSim, i
+					} else if avSim > runnerUp {
+						runnerUp = avSim
 					}
 				}
 				if bestSim > bestSimSeen {
 					bestSimSeen = bestSim
 				}
 				if bestIdx < 0 || bestSim < threshold {
+					continue
+				}
+				// Clearing the threshold is not enough. On CCTV-resolution faces
+				// two enrolled people routinely land within a few hundredths of
+				// each other, and taking the argmax then asserts a name on what
+				// is effectively a coin flip — which is how one employee gets
+				// logged as another arriving at 07:39. If the winner cannot beat
+				// the nearest OTHER person by a real margin, the face is
+				// ambiguous: report nobody rather than the wrong somebody.
+				if margin > 0 && runnerUp >= 0 && bestSim-runnerUp < margin {
+					ambiguous++
+					if bestSim-runnerUp < closestGap {
+						closestGap = bestSim - runnerUp
+						closestPair = candidates[bestIdx].av.Name
+					}
 					continue
 				}
 				matched++
@@ -283,7 +324,9 @@ func camObserverRecognizeFaces(ctx context.Context, cfg config, db *sql.DB, cams
 		// threshold / add reference photos) vs "faces=0" (frames too low-res).
 		camlog("info", "observer_faces", map[string]any{
 			"ok": true, "candidates": len(candidates), "detects": detects, "main_hits": mainHits,
-			"faces": facesSeen, "matches": 0, "identities": 0, "best_sim": fmt.Sprintf("%.2f", bestSimSeen), "threshold": threshold,
+			"faces": facesSeen, "matches": 0, "identities": 0, "best_sim": fmt.Sprintf("%.2f", bestSimSeen),
+			"threshold": threshold, "margin": margin, "ambiguous": ambiguous,
+			"closest_gap": fmt.Sprintf("%.3f", closestGap), "closest_to": closestPair,
 		})
 		return nil
 	}

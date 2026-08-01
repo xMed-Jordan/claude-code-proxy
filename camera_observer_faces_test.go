@@ -258,3 +258,69 @@ func TestCamObserverRecognizeFacesSidecarDown(t *testing.T) {
 		t.Fatalf("sidecar-down must return nil (fall back to description-only), got %+v", got)
 	}
 }
+
+// TestCamObserverRecognizeFacesRejectsAmbiguousMatch pins the fix for a real
+// production failure: on 1 Aug 2026 the observer logged "Amani Al-Ahmad arrived
+// at 07:39" when the person was Noor Al-Hami. The winning cosine was 0.5125 —
+// over the 0.50 threshold, but barely ahead of the runner-up. Clearing an
+// absolute floor is not evidence of identity when a DIFFERENT enrolled person
+// scores almost the same; naming the argmax there is a coin flip presented as
+// fact. With a margin configured the face must be reported as nobody.
+func TestCamObserverRecognizeFacesRejectsAmbiguousMatch(t *testing.T) {
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	cfg := newCamFaceTestConfig()
+	cfg.CameraObserverFaceMargin = 0.06
+
+	amani, _ := insertCameraAvatar(db, camAvatar{SiteID: "site_1", Name: "Amani", Type: "human", Enabled: true})
+	if _, err := insertAvatarMedia(db, camAvatarMedia{AvatarID: amani, CaptureID: "c1", Token: "t1",
+		Source: "upload", Embedding: camEmbeddingBlob([]float32{1, 0, 0})}); err != nil {
+		t.Fatalf("media Amani: %v", err)
+	}
+	noor, _ := insertCameraAvatar(db, camAvatar{SiteID: "site_1", Name: "Noor", Type: "human", Enabled: true})
+	if _, err := insertAvatarMedia(db, camAvatarMedia{AvatarID: noor, CaptureID: "c2", Token: "t2",
+		Source: "upload", Embedding: camEmbeddingBlob([]float32{0, 1, 0})}); err != nil {
+		t.Fatalf("media Noor: %v", err)
+	}
+	avatars, _ := listCameraAvatars(db, "site_1", false)
+
+	cam := camera{ID: "cam_1", SiteID: "site_1", Name: "Reception", Enabled: true}
+	dir := t.TempDir()
+	base := time.Date(2026, 8, 1, 7, 39, 0, 0, time.UTC)
+
+	// "tooClose": cos 0.551 vs Amani, 0.521 vs Noor — both clear 0.40, gap 0.03.
+	// "clear":    cos 0.903 vs Amani, 0.201 vs Noor — an unambiguous Amani.
+	script := map[string][]camFace{
+		"tooClose": {{Score: 0.9, Embedding: []float32{0.55, 0.52, 0.65}}},
+		"clear":    {{Score: 0.9, Embedding: []float32{0.90, 0.20, 0.38}}},
+	}
+	orig := camObserverFaceDetectFn
+	defer func() { camObserverFaceDetectFn = orig }()
+	camObserverFaceDetectFn = func(ctx context.Context, c config, img []byte) ([]camFace, error) {
+		return script[string(img)], nil
+	}
+	frame := func(key string) camObserverFrame {
+		return camObserverFrame{Cam: cam, T: base, Path: writeFrameFile(t, dir, key)}
+	}
+
+	amb := map[string][]camObserverFrame{"cam_1": {frame("tooClose")}}
+	if got := camObserverRecognizeFaces(context.Background(), cfg, db, []camera{cam}, amb, avatars, time.UTC); got != nil {
+		t.Fatalf("two people within the margin must yield NO identity, got %+v", got)
+	}
+
+	// The same face is still named when the winner is genuinely ahead.
+	ok := map[string][]camObserverFrame{"cam_1": {frame("clear")}}
+	ids := camObserverRecognizeFaces(context.Background(), cfg, db, []camera{cam}, ok, avatars, time.UTC)
+	if len(ids) != 1 || ids[0].Name != "Amani" {
+		t.Fatalf("clear winner should still be named Amani, got %+v", ids)
+	}
+
+	// Margin 0 keeps the old behaviour, so the guard is opt-out.
+	off := cfg
+	off.CameraObserverFaceMargin = 0
+	if got := camObserverRecognizeFaces(context.Background(), off, db, []camera{cam}, amb, avatars, time.UTC); len(got) != 1 {
+		t.Fatalf("margin=0 must keep the pre-existing argmax behaviour, got %+v", got)
+	}
+}
