@@ -68,11 +68,13 @@ func camSubagentConcurrency(cfg config) int {
 
 // camSubagentMaxTurns resolves a child's per-run turn cap, clamped to 1..12 so a
 // misconfigured override can neither stall a child (0 turns) nor let one run as long
-// as the lead.
+// as the lead. The default is 8: the common identity-then-episodes shape
+// (avatar_info + 2-3 contact sheets + a past_frames verification + annotate) needs
+// 7-8 turns, and at 6 whole fan-outs were finishing "exhausted" mid-scan.
 func camSubagentMaxTurns(cfg config) int {
 	n := cfg.CameraSubagentMaxTurns
 	if n <= 0 {
-		n = 6
+		n = 8
 	}
 	if n > 12 {
 		n = 12
@@ -248,7 +250,7 @@ func camSubagentToolLine(tool string) string {
 	case "avatar_info":
 		return "- avatar_info: args.avatar_id — that avatar's description + reference images (shown next turn).\n"
 	case "avatar_check":
-		return "- avatar_check: args.avatar_id, args.camera_ids (ONE id), args.time (RFC3339) — focused identity comparison at that instant; verdict + annotated frame on a match.\n"
+		return "- avatar_check: args.avatar_id, args.camera_ids (ONE id), args.time (RFC3339, REQUIRED — an omitted time checks NOW, not your task window, and produces evidence from the wrong day) — focused identity comparison at that instant; verdict + annotated frame on a match.\n"
 	case "avatar_find":
 		return "- avatar_find: args.avatar_id, args.camera_ids (ONE id), args.from + args.to (RFC3339) — scan a camera's archive for that avatar; sighting times + annotated sheet.\n"
 	case "annotate":
@@ -300,7 +302,8 @@ func camSubagentSystemPrompt(site camSite, dvrs []CamDVR, childCams []camera, av
 	b.WriteString("PROTOCOL:\n")
 	b.WriteString("- motion_search FIRST (no media cost) to find WHEN activity happened, then past_frames/contact_sheet those exact windows — don't brute-scan.\n")
 	b.WriteString("- Binary-search change points; sample endpoints for durations; escalate to \"main\" on the closest camera for fine detail.\n")
-	b.WriteString("- Cite an annotated frame (or the frame you relied on) for every claim; be economical and answer as soon as you can confidently.\n\n")
+	b.WriteString("- Cite an annotated frame (or the frame you relied on) for every claim; be economical and answer as soon as you can confidently.\n")
+	b.WriteString("- PACE YOURSELF: every turn shows a BUDGET line (tool turns + media fetches used/allowed). Plan so your ANSWER lands before either runs out — findings honestly summarized with partial coverage beat a scan that dies mid-thought.\n\n")
 
 	toolEnum := strings.Join(orderedTools, "|")
 	b.WriteString("OUTPUT: reply with EXACTLY ONE JSON object and nothing else (no prose, no markdown fences):\n")
@@ -606,12 +609,14 @@ func camSubagentCoerceAnswer(act investigateAction) investigateAction {
 // touched (a call to any other tool is corrected in-band, no fetch), tools outside
 // allowedTools are refused (this is where recursion is denied — delegate is never in
 // the set), turns are capped at camSubagentMaxTurns, media at perChildMedia, and the
-// context deadline (already derived from the parent budget) bounds wall-clock. On a
-// clean answer it returns "answered" with the model's filtered evidence; on any bound
-// (turns/budget/analysis wall) it drops a system note, marks the child "exhausted",
-// and returns a PARTIAL verdict (last thought + everything minted so far) so the lead
-// still gets whatever the child found. prog receives the child's key-tool media
-// tagged with the child id (nil-safe).
+// context deadline (already derived from the parent budget) bounds wall-clock. Every
+// turn carries a BUDGET line so the child can pace its scan to finish inside its
+// bounds. On a clean answer it returns "answered" with the model's filtered evidence;
+// at the turn cap or with wall-clock nearly out it takes ONE final no-tools wrap-up
+// turn (camSubagentWrapup) so the verdict is a real findings summary, and only a
+// hard stop (context dead, analysis wall) bails with the last thought
+// (camSubagentBail). Either way the lead gets whatever the child found. prog
+// receives the child's key-tool media tagged with the child id (nil-safe).
 func camRunSubagentLoop(cctx context.Context, cfg config, db *sql.DB, r *http.Request, site camSite, alias, childID, sys string, camByID map[string]camera, dvrByID map[string]CamDVR, childAllowedCams map[string]bool, childActive []camera, allowedTools map[string]bool, childScratch string, perChildMedia int, prog *camProgressNotifier) (status, answer string, evidence []evidenceItem, keyImages []string, fetches int) {
 	maxTurns := camSubagentMaxTurns(cfg)
 	childInv := camInvestigation{ID: childID, SiteID: site.ID, Alias: alias}
@@ -624,10 +629,21 @@ func camRunSubagentLoop(cctx context.Context, cfg config, db *sql.DB, r *http.Re
 			return camSubagentBail(db, childID, msgs, lastImages, mediaUsed, "Sub-investigation time budget elapsed before a conclusion.")
 		}
 		if turns >= maxTurns {
-			return camSubagentBail(db, childID, msgs, lastImages, mediaUsed, "Sub-investigation reached its turn limit before a conclusion.")
+			return camSubagentWrapup(cctx, cfg, db, alias, childID, sys, msgs, lastImages, mediaUsed,
+				"Sub-investigation turn limit reached.")
+		}
+		// Reserve enough wall-clock for the wrap-up's one analysis call: stopping the
+		// scan slightly early to WRITE UP what was found beats scanning to the deadline
+		// and reporting nothing. Only after the first real turn — before that there is
+		// nothing to summarize and the plain bail is the honest outcome.
+		if dl, ok := cctx.Deadline(); ok && turns > 0 && time.Until(dl) < camSubagentWrapupReserve {
+			return camSubagentWrapup(cctx, cfg, db, alias, childID, sys, msgs, lastImages, mediaUsed,
+				"Sub-investigation time budget is nearly exhausted.")
 		}
 
-		userText := camInvestigateTranscriptText(msgs) + "\n\nReply with ONLY the JSON action object now."
+		userText := camInvestigateTranscriptText(msgs) +
+			fmt.Sprintf("\n\nBUDGET: %d of %d tool turns used; %d of %d media fetches used. Deliver your final answer BEFORE these run out.", turns, maxTurns, mediaUsed, perChildMedia) +
+			"\n\nReply with ONLY the JSON action object now."
 		tstart := time.Now()
 		act, raw, repaired, attempts, aerr := camAnalyzeInvestigateAction(cctx, cfg, alias, sys, userText, lastImages)
 		latency := time.Since(tstart).Milliseconds()
@@ -701,6 +717,54 @@ func camRunSubagentLoop(cctx context.Context, cfg config, db *sql.DB, r *http.Re
 		lastImages = attached
 		prog.ObserveMedia(childID, tool, tr.Media) // key tools only; coalesced; nil-safe
 	}
+}
+
+// camSubagentWrapupReserve is the wall-clock headroom kept for a bounded child's
+// final wrap-up analysis call. When less than this remains the loop stops scanning
+// and asks for the summary while there is still time to produce one.
+const camSubagentWrapupReserve = 60 * time.Second
+
+// camSubagentWrapup gives a child that hit a bound (turn cap, low wall-clock) ONE
+// final no-tools turn: "summarize everything you found and cite your evidence NOW".
+// This is the difference between the lead receiving "I need to check 14:36-14:41
+// next" (the child's dangling last thought) and receiving an actual findings report
+// with timestamps and citable frames. The child is still marked "exhausted" — the
+// status honestly tells the lead its coverage is partial — but the verdict body is
+// now a real summary. Any failure in the wrap-up itself (context dead, analysis
+// error, nothing to summarize) falls back to the plain camSubagentBail behavior.
+func camSubagentWrapup(cctx context.Context, cfg config, db *sql.DB, alias, childID, sys string, msgs []camInvestigationMessage, lastImages []string, fetches int, why string) (status, answer string, evidence []evidenceItem, keyImages []string, out int) {
+	if cctx.Err() != nil || camLastThought(msgs) == "" {
+		return camSubagentBail(db, childID, msgs, lastImages, fetches, why+" No wrap-up was possible.")
+	}
+	note := why + " FINAL TURN: no further tool calls will be executed. Reply with action type \"answer\" ONLY — summarize every concrete finding so far (times, who/what, per camera), state plainly which part of the task you did NOT get to, and cite the exact media_url values already shown in TOOL RESULT lines as evidence[]."
+	nm := camAppendInvestigateMessage(db, childID, "system", note, "budget_wrapup", "", 0, nil)
+	msgs = append(msgs, nm)
+
+	userText := camInvestigateTranscriptText(msgs) + "\n\nReply with ONLY the JSON action object now."
+	act, _, _, _, aerr := camAnalyzeInvestigateAction(cctx, cfg, alias, sys, userText, lastImages)
+	if aerr != nil {
+		return camSubagentBail(db, childID, msgs, lastImages, fetches,
+			"Wrap-up analysis failed ("+truncateString(aerr.Error(), 160)+") — reporting the partial findings gathered so far.")
+	}
+	act = camSubagentCoerceAnswer(act)
+	if act.Action.Type != "answer" {
+		// Still trying to call a tool on its final turn: its thought is the closest
+		// thing to a summary it produced — better than nothing, same as the old bail.
+		act.Action.Answer = firstNonEmpty(strings.TrimSpace(act.Thought), camLastThought(msgs))
+	}
+	mintedSet, mintedByToken := camCollectMintedMedia(msgs)
+	ev, dropped := camFilterEvidence(act.Action.Evidence, mintedSet, mintedByToken)
+	if len(ev) == 0 {
+		// The summary cited nothing usable — carry the minted artifacts anyway so the
+		// lead can still see and cite what the child captured.
+		ev = camGatherMintedEvidence(msgs, camSubagentEvidencePerChild)
+	}
+	camAppendInvestigateMessage(db, childID, "ai", camAIMessageContent(act.Thought, act.Action.Answer), "answer", "", 0, ev)
+	_ = setCameraInvestigationStatus(db, childID, "exhausted")
+	camlog("info", "investigate_subagent_done", map[string]any{
+		"child_id": childID, "status": "exhausted", "wrapup": true, "kept": len(ev), "dropped": dropped,
+	})
+	return "exhausted", strings.TrimSpace(act.Action.Answer), ev, camCapImages(lastImages, camSubagentKeyImagePerChild), fetches
 }
 
 // camSubagentBail terminalizes a child that ran out of turns/budget or hit an

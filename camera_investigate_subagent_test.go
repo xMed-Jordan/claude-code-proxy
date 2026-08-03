@@ -341,6 +341,125 @@ func TestCamToolDelegateSubagentAliasOverride(t *testing.T) {
 	}
 }
 
+// delegateWrapupHarness runs camToolDelegate with ONE subtask and a scripted child
+// model, returning the delegate result, the recorded user texts of every child
+// analysis call, and the child's persisted transcript. The scripted first turn
+// requests the forbidden "delegate" tool, which burns a turn via the in-band
+// correction WITHOUT touching any tool backend — so with CameraSubagentMaxTurns=1
+// the second analysis call is always the wrap-up turn.
+func delegateWrapupHarness(t *testing.T, secondReply string, secondErr error) (investigateToolResult, []string, []camInvestigationMessage) {
+	t.Helper()
+	db := openCamTestDB(t)
+	if err := migrateCameraDB(db); err != nil {
+		t.Fatalf("migrateCameraDB: %v", err)
+	}
+	siteID, err := insertCameraSite(db, camSite{Name: "Clinic"})
+	if err != nil {
+		t.Fatalf("insertCameraSite: %v", err)
+	}
+	site := camSite{ID: siteID, Name: "Clinic"}
+	inv := camInvestigation{ID: "inv_lead", SiteID: siteID}
+
+	orig := camInvestigateAnalyzeFn
+	defer func() { camInvestigateAnalyzeFn = orig }()
+	var (
+		mu    sync.Mutex
+		users []string
+	)
+	camInvestigateAnalyzeFn = func(ctx context.Context, c config, alias, sys, user string, images []string) (string, []camAnalyzeAttempt, error) {
+		mu.Lock()
+		call := len(users)
+		users = append(users, user)
+		mu.Unlock()
+		if call == 0 {
+			return `{"thought":"scanning the first chunk","action":{"type":"call_tool","tool":"delegate","args":{}}}`, nil, nil
+		}
+		return secondReply, nil, secondErr
+	}
+
+	cfg := config{CameraSubagentMax: 4, CameraSubagentMaxTurns: 1}
+	cam := camera{ID: "cam1", Name: "Front Door", Enabled: true}
+	sub := investigateSubtask{Question: "who entered", CameraIDs: []string{"cam1"}, From: "2026-07-01T09:00:00Z", To: "2026-07-01T10:00:00Z"}
+	res := camToolDelegate(context.Background(), cfg, db, nil, site, "alias", inv,
+		investigateArgs{Subtasks: []investigateSubtask{sub}}, map[string]camera{"cam1": cam}, nil,
+		map[string]bool{"cam1": true}, []camera{cam}, t.TempDir(), 30, nil)
+
+	children, err := listCameraInvestigationChildren(db, inv.ID)
+	if err != nil || len(children) != 1 {
+		t.Fatalf("children = %v (err %v), want exactly 1", children, err)
+	}
+	if children[0].Status != "exhausted" {
+		t.Errorf("child status = %q, want exhausted (wrap-up never upgrades the status)", children[0].Status)
+	}
+	msgs, err := listCameraInvestigationMessages(db, children[0].ID)
+	if err != nil {
+		t.Fatalf("listCameraInvestigationMessages: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return res, append([]string(nil), users...), msgs
+}
+
+// TestCamSubagentWrapupOnTurnCap is the fix for the "exhausted mid-thought" failure
+// mode: a child that hits its turn cap gets ONE final no-tools turn and its verdict
+// becomes a real findings summary, not its dangling last plan. Also pins the per-turn
+// BUDGET line that lets the child pace itself.
+func TestCamSubagentWrapupOnTurnCap(t *testing.T) {
+	res, users, msgs := delegateWrapupHarness(t,
+		`{"thought":"wrapping up","action":{"type":"answer","answer":"Partial: phone use confirmed at 14:35; 14:36-15:00 was NOT covered."}}`, nil)
+
+	if len(users) != 2 {
+		t.Fatalf("analysis calls = %d, want 2 (one scan turn + one wrap-up turn)", len(users))
+	}
+	if !strings.Contains(users[0], "BUDGET: 0 of 1 tool turns used; 0 of 10 media fetches used") {
+		t.Errorf("turn 1 user text missing the BUDGET line:\n%s", users[0])
+	}
+	if !strings.Contains(users[1], "FINAL TURN") || !strings.Contains(users[1], "turn limit") {
+		t.Errorf("wrap-up user text missing the FINAL TURN instruction:\n%s", users[1])
+	}
+	if !strings.Contains(res.Summary, "EXHAUSTED") || !strings.Contains(res.Summary, "Partial: phone use confirmed at 14:35") {
+		t.Errorf("delegate summary should carry the wrap-up findings under EXHAUSTED: %q", res.Summary)
+	}
+
+	var sawNote, sawAnswer bool
+	for _, m := range msgs {
+		if m.Role == "system" && m.ToolName == "budget_wrapup" {
+			sawNote = true
+		}
+		if m.Role == "ai" && m.ToolName == "answer" && strings.Contains(m.Content, "Partial: phone use confirmed") {
+			sawAnswer = true
+		}
+	}
+	if !sawNote || !sawAnswer {
+		t.Errorf("transcript missing wrap-up rows (note=%v answer=%v): %+v", sawNote, sawAnswer, msgs)
+	}
+}
+
+// TestCamSubagentWrapupToolCoerced: a child that STILL tries to call a tool on its
+// final turn contributes its thought as the verdict — one wrap-up turn, never a loop.
+func TestCamSubagentWrapupToolCoerced(t *testing.T) {
+	res, users, _ := delegateWrapupHarness(t,
+		`{"thought":"So far: A entered at 10:02, B at 10:14.","action":{"type":"call_tool","tool":"snapshot","args":{}}}`, nil)
+	if len(users) != 2 {
+		t.Fatalf("analysis calls = %d, want exactly 2 (the wrap-up must not loop)", len(users))
+	}
+	if !strings.Contains(res.Summary, "So far: A entered at 10:02") {
+		t.Errorf("coerced wrap-up should surface the thought as the verdict: %q", res.Summary)
+	}
+}
+
+// TestCamSubagentWrapupAnalysisError: when the wrap-up call itself dies, the child
+// falls back to the plain bail — last thought as the verdict, loop never crashes.
+func TestCamSubagentWrapupAnalysisError(t *testing.T) {
+	res, users, _ := delegateWrapupHarness(t, "", context.DeadlineExceeded)
+	if len(users) != 2 {
+		t.Fatalf("analysis calls = %d, want 2 (scan + failed wrap-up)", len(users))
+	}
+	if !strings.Contains(res.Summary, "scanning the first chunk") {
+		t.Errorf("failed wrap-up should fall back to the last thought: %q", res.Summary)
+	}
+}
+
 // TestCamToolDelegateRefusals covers the early-return paths that need no model backend:
 // disabled deployment, too little budget remaining, and no valid subtasks.
 func TestCamToolDelegateRefusals(t *testing.T) {

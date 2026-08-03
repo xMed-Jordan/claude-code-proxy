@@ -216,7 +216,7 @@ type config struct {
 	// parent_id) run in-process inside the parent's delegate turn — never via the queue.
 	CameraSubagentMax         int           // PROXY_CAMERA_SUBAGENT_MAX — max subtasks per delegate call (default 4, clamp 0..8; 0 disables delegation)
 	CameraSubagentConcurrency int           // PROXY_CAMERA_SUBAGENT_CONCURRENCY — global ceiling on parallel sub-investigators (default 3)
-	CameraSubagentMaxTurns    int           // PROXY_CAMERA_SUBAGENT_MAX_TURNS — per-child agentic turn cap (default 6, clamp 1..12)
+	CameraSubagentMaxTurns    int           // PROXY_CAMERA_SUBAGENT_MAX_TURNS — per-child agentic turn cap (default 8, clamp 1..12)
 	CameraSubagentMaxMedia    int           // PROXY_CAMERA_SUBAGENT_MAX_MEDIA — per-child device-fetch ceiling (default 10)
 	CameraSubagentBudget      time.Duration // PROXY_CAMERA_SUBAGENT_BUDGET — per-child wall-clock cap, derived under the parent deadline (default 600s)
 	// Camera frame archive → S3-compatible object storage (Hetzner). The archiver
@@ -832,7 +832,7 @@ func loadConfig() config {
 
 		CameraSubagentMax:         parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX", "4"), 4),
 		CameraSubagentConcurrency: parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_CONCURRENCY", "3"), 3),
-		CameraSubagentMaxTurns:    parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX_TURNS", "6"), 6),
+		CameraSubagentMaxTurns:    parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX_TURNS", "8"), 8),
 		CameraSubagentMaxMedia:    parseIntDefault(getenv("PROXY_CAMERA_SUBAGENT_MAX_MEDIA", "10"), 10),
 		CameraSubagentBudget:      parseAgyTimeout(getenv("PROXY_CAMERA_SUBAGENT_BUDGET", "600")),
 
