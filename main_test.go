@@ -750,19 +750,151 @@ func TestDuplicateClaudeWebSearchToolsCollapse(t *testing.T) {
 	}
 }
 
-func TestFastModeMapsClaudeOpus46ToCodexPriority(t *testing.T) {
-	t.Setenv("CODEX_FAST_SERVICE_TIER", "priority")
-	cfg := config{Models: map[string]string{"claude-opus-4-6": "gpt-5.5"}}
-	out := toResponses(cfg, anthropicRequest{
+// fastModeCfg is a config with fast mode switched ON and the live model gate,
+// i.e. the only state in which a service_tier may ever reach the wire.
+func fastModeCfg() config {
+	return config{
+		Models:          map[string]string{"claude-opus-4-6": "gpt-5.5", "spark": "gpt-5.3-codex-spark"},
+		CodexFastMode:   fastModeOn,
+		CodexFastTier:   defaultCodexFastTier,
+		CodexFastModels: defaultCodexFastModels,
+	}
+}
+
+func TestFastModeSendsPriorityWhenEnabled(t *testing.T) {
+	out := toResponses(fastModeCfg(), anthropicRequest{
 		Model:    "claude-opus-4-6",
-		FastMode: true,
+		Speed:    "fast",
+		FastAsk:  fastAskOn,
 		Messages: []anthropicMessage{{Role: "user", Content: "hi"}},
 	})
 	if out.Model != "gpt-5.5" {
 		t.Fatalf("model = %q, want gpt-5.5", out.Model)
 	}
+	// "priority" — NOT "fast". The ChatGPT codex backend 400s on the literal
+	// "fast" ({"detail":"Unsupported service_tier: fast"}).
 	if out.ServiceTier != "priority" {
 		t.Fatalf("service_tier = %q, want priority", out.ServiceTier)
+	}
+}
+
+// Fast mode ships disabled and must stay disabled until a human turns it on,
+// even when the caller explicitly asks for it.
+func TestFastModeOffByDefaultIgnoresCallerRequest(t *testing.T) {
+	cfg := config{Models: map[string]string{"claude-opus-4-6": "gpt-5.5"}, CodexFastModels: defaultCodexFastModels}
+	out := toResponses(cfg, anthropicRequest{
+		Model:    "claude-opus-4-6",
+		Speed:    "fast",
+		FastAsk:  fastAskOn,
+		Messages: []anthropicMessage{{Role: "user", Content: "hi"}},
+	})
+	if out.ServiceTier != "" {
+		t.Fatalf("service_tier = %q, want empty (global switch is off)", out.ServiceTier)
+	}
+	if d := codexFastMode(cfg, fastAskOn, "gpt-5.5"); !d.Suppressed() || d.Reason != "disabled" {
+		t.Fatalf("decision = %+v, want suppressed/disabled", d)
+	}
+}
+
+// A model whose ChatGPT catalog entry does not advertise service_tiers must
+// never receive the field — mirroring what the Codex CLI itself does.
+func TestFastModeSkipsModelsWithoutPrioritySupport(t *testing.T) {
+	cfg := fastModeCfg()
+	out := toResponses(cfg, anthropicRequest{
+		Model:    "spark",
+		FastAsk:  fastAskOn,
+		Messages: []anthropicMessage{{Role: "user", Content: "hi"}},
+	})
+	if out.Model != "gpt-5.3-codex-spark" {
+		t.Fatalf("model = %q", out.Model)
+	}
+	if out.ServiceTier != "" {
+		t.Fatalf("service_tier = %q, want empty for an unsupported model", out.ServiceTier)
+	}
+	if d := codexFastMode(cfg, fastAskOn, "gpt-5.3-codex-spark"); d.Reason != "model_unsupported" {
+		t.Fatalf("reason = %q, want model_unsupported", d.Reason)
+	}
+}
+
+// With the switch on, a caller saying nothing gets fast mode, and a caller
+// saying speed:"standard" opts itself out. That distinction is what lets a
+// single Connect AI service turn fast mode off without touching the server.
+func TestFastModeCallerOptOutAndSilence(t *testing.T) {
+	cfg := fastModeCfg()
+
+	if d := codexFastMode(cfg, fastAskUnset, "gpt-5.5"); d.Tier != "priority" {
+		t.Fatalf("silent caller: tier = %q, want priority", d.Tier)
+	}
+	d := codexFastMode(cfg, fastAskOff, "gpt-5.5")
+	if d.Tier != "" || d.Reason != "caller_opted_out" {
+		t.Fatalf("opted-out caller: %+v, want empty tier / caller_opted_out", d)
+	}
+}
+
+func TestParseFastModeAskReadsSpeedField(t *testing.T) {
+	cases := map[string]fastModeAsk{
+		"fast": fastAskOn, "FAST": fastAskOn, "priority": fastAskOn,
+		"standard": fastAskOff, "normal": fastAskOff, "off": fastAskOff,
+		"": fastAskUnset, "wobble": fastAskUnset,
+	}
+	for in, want := range cases {
+		if got := parseFastModeAsk(in); got != want {
+			t.Fatalf("parseFastModeAsk(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// The retired behaviour: naming claude-opus-4-6 used to silently buy 1.5x-cost
+// requests. Fast mode is manual now, so the model name alone must do nothing.
+func TestModelNameAloneNoLongerEnablesFastMode(t *testing.T) {
+	cfg := fastModeCfg()
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
+	if ask := requestUsesClaudeFastMode(cfg, req, anthropicRequest{Model: "claude-opus-4-6"}); ask != fastAskUnset {
+		t.Fatalf("ask = %v, want unset (no implicit model trigger)", ask)
+	}
+	// ...unless an operator opts back in explicitly.
+	cfg.ClaudeFastModels = []string{"claude-opus-4-6"}
+	if ask := requestUsesClaudeFastMode(cfg, req, anthropicRequest{Model: "claude-opus-4-6[1m]"}); ask != fastAskOn {
+		t.Fatalf("ask = %v, want fast once PROXY_CLAUDE_FAST_MODELS lists it", ask)
+	}
+}
+
+// Turning fast mode off in the control panel must stop the spend on the NEXT
+// request, even though request handlers still hold the config captured at
+// startup. The live switch therefore has to beat cfg in BOTH directions.
+func TestFastModeLiveSwitchOverridesStartupConfig(t *testing.T) {
+	t.Cleanup(func() { codexFastModeSwitch.Store(fastSwitchUnseeded) })
+
+	// Proxy booted with fast mode ON, then an operator saved it OFF.
+	cfg := fastModeCfg()
+	applyUpstreamSwitchesFromEnvMap(map[string]string{"PROXY_CODEX_FAST_MODE": "off"})
+	if d := codexFastMode(cfg, fastAskOn, "gpt-5.5"); d.Tier != "" || d.Reason != "disabled" {
+		t.Fatalf("after live off: %+v, want suppressed/disabled", d)
+	}
+
+	// ...and back on again, without a restart.
+	applyUpstreamSwitchesFromEnvMap(map[string]string{"PROXY_CODEX_FAST_MODE": "on"})
+	if d := codexFastMode(cfg, fastAskOn, "gpt-5.5"); d.Tier != "priority" {
+		t.Fatalf("after live on: %+v, want priority", d)
+	}
+
+	// A .env that never mentions the key is off.
+	applyUpstreamSwitchesFromEnvMap(map[string]string{})
+	if d := codexFastMode(cfg, fastAskOn, "gpt-5.5"); d.Tier != "" {
+		t.Fatalf("missing key: %+v, want suppressed", d)
+	}
+}
+
+func TestNormalizeFastModeDefaultsToOff(t *testing.T) {
+	for _, s := range []string{"", "auto", "maybe", "off", "0", "false"} {
+		if got := normalizeFastMode(s); got != fastModeOff {
+			t.Fatalf("normalizeFastMode(%q) = %q, want off", s, got)
+		}
+	}
+	for _, s := range []string{"on", "1", "true", "always", "ON"} {
+		if got := normalizeFastMode(s); got != fastModeOn {
+			t.Fatalf("normalizeFastMode(%q) = %q, want on", s, got)
+		}
 	}
 }
 

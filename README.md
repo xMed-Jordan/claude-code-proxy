@@ -197,7 +197,30 @@ Custom session IDs can be supplied with `X-Proxy-Session-Id`, `X-Codex-Session-I
 Fast mode and web search are controlled by:
 
 - `OPENAI_CLAUDE_FAST_MODEL=gpt-5.5`
-- `CODEX_FAST_SERVICE_TIER=priority`
+- `PROXY_CODEX_FAST_MODE=off` — master switch for fast mode (OpenAI priority
+  processing). **Off by default and never automatic**, because fast mode is
+  "1.5x speed, increased usage": it spends ChatGPT plan quota faster. While off,
+  a request that asks for it is refused and logged as
+  `fast_mode=suppressed(disabled)`. Turn it on with `on`.
+- `CODEX_FAST_SERVICE_TIER=priority` — the wire value. `priority` is the **only**
+  value the ChatGPT backend accepts; it returns
+  `400 {"detail":"Unsupported service_tier: fast"}` for the literal `fast`,
+  even though OpenAI renamed the feature to "Fast mode" on the developer
+  platform in July 2026.
+- `PROXY_CODEX_FAST_MODELS=` — upstream models permitted to use it. Defaults to
+  the models whose ChatGPT catalog advertises `service_tiers=[priority]`
+  (`gpt-5.4`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-wm`,
+  `gpt-5.6-terra`, `codex-auto-review`); `*` disables the gate. Models outside
+  the list never get the field, matching what the Codex CLI itself does.
+- `PROXY_CLAUDE_FAST_MODELS=` — Anthropic aliases that imply fast mode without
+  sending `speed`. Empty by default: naming a model must never buy a costlier
+  request on its own.
+
+With the switch on, each request decides for itself — `speed:"fast"` opts in,
+`speed:"standard"` opts out, and a request that says nothing inherits on. Usage
+is auditable: applied requests carry `service_tier=priority` in the request log
+and a `service_tier` column in the metrics db, and `/ui/analytics` reports
+`fast_requests` / `fast_rate` per bucket.
 - `CODEX_WEB_SEARCH_TOOL_TYPE=web_search`
 - `CODEX_REASONING_SUMMARY=auto`
 - `CODEX_SESSION_ISOLATION=1`

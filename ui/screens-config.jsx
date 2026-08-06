@@ -281,6 +281,36 @@
               </div>
             </div>
 
+            {/* Fast mode. Off by default and never automatic: the ChatGPT
+                catalog sells it as "1.5x speed, increased usage", so turning it
+                on spends plan quota faster. Wire value is service_tier=priority
+                — the backend rejects the literal "fast". */}
+            <div className="cfg-row">
+              <div className="cfg-label">
+                <span className="cfg-label-name">Fast mode</span>
+                <span className="cfg-label-env mono">PROXY_CODEX_FAST_MODE</span>
+              </div>
+              <div className="cfg-ctl">
+                {(() => {
+                  const on = String(cfg.PROXY_CODEX_FAST_MODE || "off").toLowerCase() === "on";
+                  return (
+                    <>
+                      <Switch
+                        checked={on}
+                        onChange={v => update("PROXY_CODEX_FAST_MODE", v ? "on" : "off")}
+                        label={on ? "Enabled" : "Disabled"}
+                      />
+                      <p className={cx("cfg-hint", on && "cfg-hint-warning")}>
+                        {on
+                          ? "Requests run at OpenAI's priority tier: ~1.5x speed for increased plan usage. Only models that advertise support get it; a caller can still opt out per request."
+                          : "Off — no request buys priority processing, even if it asks. Fast mode costs 1.5x plan usage, so it stays manual."}
+                      </p>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+
           </div>
         </Card>
 

@@ -84,6 +84,12 @@ type config struct {
 	CodexAuthFile     string
 	CodexVersion      string // PROXY_CODEX_VERSION — Codex CLI version advertised upstream; newer models are gated on it
 	CodexSessionFile  string
+	// Fast mode (OpenAI priority processing) — see codex_fastmode.go for why the
+	// wire value is "priority" and why this needs a kill switch at all.
+	CodexFastMode    string   // PROXY_CODEX_FAST_MODE — off (default) | on; never automatic
+	CodexFastTier    string   // CODEX_FAST_SERVICE_TIER — wire value; "priority" is the only one the ChatGPT backend accepts
+	CodexFastModels  []string // PROXY_CODEX_FAST_MODELS — upstream models advertising priority support; nil = no gate
+	ClaudeFastModels []string // PROXY_CLAUDE_FAST_MODELS — Anthropic aliases that imply fast mode without `speed`
 	DBPath            string
 	ProxyKey          string
 	Host              string
@@ -357,7 +363,7 @@ type anthropicRequest struct {
 	Stream       bool                   `json:"stream,omitempty"`
 	Speed        string                 `json:"speed,omitempty"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
-	FastMode     bool                   `json:"-"`
+	FastAsk      fastModeAsk            `json:"-"` // resolved from `speed` / headers; see codex_fastmode.go
 	// ConnectTools is a non-standard catalog of caller tools (Connect's agent
 	// tools) used only by the claude tool loop. Codex never sets it, so it is
 	// inert for every other path. Shape: [{name, description, input_schema}].
@@ -592,6 +598,7 @@ type uiLogRow struct {
 	InputTokens  int    `json:"input_tokens,omitempty"`
 	OutputTokens int    `json:"output_tokens,omitempty"`
 	StopReason   string `json:"stop_reason,omitempty"`
+	ServiceTier  string `json:"service_tier,omitempty"` // "priority" when this request ran in fast mode
 }
 
 type requestStat struct {
@@ -601,6 +608,12 @@ type requestStat struct {
 	InputTokens  int
 	OutputTokens int
 	StopReason   string
+	// ServiceTier is the fast-mode tier actually sent upstream ("priority") or
+	// "" for a normal request. FastSuppressed carries the reason fast mode was
+	// asked for but withheld. Together they are the fast-mode audit trail — see
+	// codex_fastmode.go for why spending on it must be visible.
+	ServiceTier    string
+	FastSuppressed string
 }
 
 type statusRecorder struct {
@@ -715,6 +728,10 @@ func loadConfig() config {
 		CodexAuthFile:     codexAuthFile,
 		CodexVersion:      strings.TrimSpace(getenv("PROXY_CODEX_VERSION", defaultCodexVersion)),
 		CodexSessionFile:  getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
+		CodexFastMode:     normalizeFastMode(getenv("PROXY_CODEX_FAST_MODE", fastModeOff)),
+		CodexFastTier:     strings.TrimSpace(getenv("CODEX_FAST_SERVICE_TIER", defaultCodexFastTier)),
+		CodexFastModels:   parseFastModelList(getenv("PROXY_CODEX_FAST_MODELS", ""), defaultCodexFastModels),
+		ClaudeFastModels:  parseFastModelList(getenv("PROXY_CLAUDE_FAST_MODELS", ""), defaultClaudeFastModels),
 		DBPath:            getenv("PROXY_DB_PATH", ".proxy.db"),
 		ProxyKey:          getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
 		Host:              host,
@@ -1093,12 +1110,19 @@ var (
 	upstreamOffCodex  atomic.Bool
 	upstreamOffClaude atomic.Bool
 	upstreamOffAgy    atomic.Bool
+	// codexFastModeSwitch mirrors PROXY_CODEX_FAST_MODE. It lives beside the kill
+	// switches (rather than being read from cfg) so that turning fast mode on or
+	// off in the control panel stops/starts the 1.5x spend on the very next
+	// request instead of at the next restart. See codex_fastmode.go for the
+	// tri-state encoding.
+	codexFastModeSwitch atomic.Int32
 )
 
 func applyUpstreamSwitches(cfg config) {
 	upstreamOffCodex.Store(cfg.CodexDisabled)
 	upstreamOffClaude.Store(cfg.ClaudeDisabled)
 	upstreamOffAgy.Store(cfg.AgyDisabled)
+	setFastModeSwitch(normalizeFastMode(cfg.CodexFastMode) == fastModeOn)
 }
 
 // applyUpstreamSwitchesFromEnvMap refreshes the live switches from a freshly
@@ -1114,6 +1138,8 @@ func applyUpstreamSwitchesFromEnvMap(m map[string]string) {
 	upstreamOffCodex.Store(off("PROXY_CODEX_ENABLED"))
 	upstreamOffClaude.Store(off("PROXY_CLAUDE_ENABLED"))
 	upstreamOffAgy.Store(off("PROXY_AGY_ENABLED"))
+	// A .env without the key at all means off — the safe, non-spending default.
+	setFastModeSwitch(normalizeFastMode(m["PROXY_CODEX_FAST_MODE"]) == fastModeOn)
 }
 
 func codexIsDisabled() bool  { return upstreamOffCodex.Load() }
@@ -2093,7 +2119,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 			writeAnthropicError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		in.FastMode = requestUsesClaudeFastMode(r, in)
+		in.FastAsk = requestUsesClaudeFastMode(cfg, r, in)
 		traceLogID(traceID, "anthropic.decoded", summarizeAnthropicRequest(in))
 
 		// Forwarded-to = Agy: serve this alias from the local agy (Antigravity)
@@ -2172,11 +2198,11 @@ func handleMessages(cfg config) http.HandlerFunc {
 				traceLogID(traceID, "codex.session", summarizeCodexSession(session))
 			}
 			traceLogID(traceID, "codex.prepared", summarizeResponsesRequest(responsesReq))
-			setRequestStat(r, requestStat{Model: in.Model, Upstream: responsesReq.Model, Stream: in.Stream})
-			note := requestNote(in.Model, responsesReq.Model, in.Stream, requestReasoningEffort(cfg, in))
-			if responsesReq.ServiceTier != "" {
-				note += " service_tier=" + responsesReq.ServiceTier
-			}
+			// Re-derive the fast-mode decision (pure) so the request log records
+			// BOTH what went on the wire and what was asked for but refused.
+			fast := codexFastMode(cfg, in.FastAsk, responsesReq.Model)
+			setRequestStat(r, requestStat{Model: in.Model, Upstream: responsesReq.Model, Stream: in.Stream, ServiceTier: fast.Tier, FastSuppressed: fast.Reason})
+			note := requestNote(in.Model, responsesReq.Model, in.Stream, requestReasoningEffort(cfg, in)) + fast.Note()
 			if session.Enabled {
 				note += " flow=" + session.FlowHash + " codex_session=" + session.CodexSessionID
 				if session.SideThread {
@@ -2406,9 +2432,9 @@ func toResponses(cfg config, in anthropicRequest) responsesRequest {
 		instructions = "You are a helpful coding assistant."
 	}
 	out := responsesRequest{Model: model, Instructions: instructions, MaxOutputTokens: in.MaxTokens, Stream: in.Stream, Store: false}
-	if in.FastMode {
-		out.ServiceTier = getenv("CODEX_FAST_SERVICE_TIER", "priority")
-	}
+	// Fast mode: honours PROXY_CODEX_FAST_MODE and the per-model catalog gate,
+	// and leaves service_tier unset whenever either says no (codex_fastmode.go).
+	out.ServiceTier = codexFastMode(cfg, in.FastAsk, model).Tier
 	if effort := requestReasoningEffort(cfg, in); effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: effort, Summary: requestReasoningSummary(in)}
 	}
@@ -2773,24 +2799,41 @@ func codexSessionFilePath(cfg config) string {
 	return filepath.Clean(cfg.CodexSessionFile)
 }
 
-func requestUsesClaudeFastMode(r *http.Request, in anthropicRequest) bool {
-	if strings.EqualFold(strings.TrimSpace(in.Speed), "fast") {
-		return true
+// requestUsesClaudeFastMode reads the caller's per-request position on fast
+// mode. An explicit `speed` (what Connect's AI-service / gateway-key toggles
+// send) always wins; otherwise an Anthropic-Beta fast-mode header or an alias
+// listed in PROXY_CLAUDE_FAST_MODELS counts as an opt-in. Note that "no opinion"
+// is distinct from "no": with fast mode switched on globally, silence means the
+// request DOES get it, while speed:"standard" opts this one caller out.
+func requestUsesClaudeFastMode(cfg config, r *http.Request, in anthropicRequest) fastModeAsk {
+	if ask := parseFastModeAsk(in.Speed); ask != fastAskUnset {
+		return ask
 	}
-	if isClaudeFastModel(in.Model) {
-		return true
+	if isClaudeFastModel(cfg, in.Model) {
+		return fastAskOn
 	}
 	for _, beta := range r.Header.Values("Anthropic-Beta") {
-		if strings.Contains(strings.ToLower(beta), "fast-mode") && isClaudeFastModel(in.Model) {
+		if strings.Contains(strings.ToLower(beta), "fast-mode") && isClaudeFastModel(cfg, in.Model) {
+			return fastAskOn
+		}
+	}
+	return fastAskUnset
+}
+
+// isClaudeFastModel reports whether the requested Anthropic alias implies fast
+// mode on its own, without the caller sending `speed:"fast"`. Driven by
+// PROXY_CLAUDE_FAST_MODELS so a silent, model-name-based cost can be turned off.
+func isClaudeFastModel(cfg config, model string) bool {
+	model = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(model, "[1m]", "")))
+	if model == "" {
+		return false
+	}
+	for _, fast := range cfg.ClaudeFastModels {
+		if model == fast {
 			return true
 		}
 	}
 	return false
-}
-
-func isClaudeFastModel(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(model, "[1m]", "")))
-	return model == "claude-opus-4-6"
 }
 
 func codexReasoningSummaryMode() string {
@@ -5692,6 +5735,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			InputTokens:  stat.InputTokens,
 			OutputTokens: stat.OutputTokens,
 			StopReason:   stat.StopReason,
+			ServiceTier:  stat.ServiceTier,
 		}
 		appendUILog(row)
 		if isDashboardTraffic(row) {
@@ -5706,6 +5750,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 				Stream:       row.Stream,
 				IsError:      row.Status >= 400,
 				Surface:      surfaceFromPath(row.Path),
+				ServiceTier:  row.ServiceTier,
 			})
 		}
 		requestProviderKeys.Delete(r)
@@ -5742,6 +5787,7 @@ type requestMetric struct {
 	Stream       bool
 	IsError      bool
 	Surface      string // "anthropic" | "openai"
+	ServiceTier  string // "priority" when the request ran in fast mode, else ""
 }
 
 var (
@@ -5801,7 +5847,8 @@ func migrateMetricsDB(db *sql.DB) error {
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			stream INTEGER NOT NULL DEFAULT 0,
 			is_error INTEGER NOT NULL DEFAULT 0,
-			surface TEXT NOT NULL DEFAULT ''
+			surface TEXT NOT NULL DEFAULT '',
+			service_tier TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_metrics_at ON request_metrics(at_unix_ms)`,
 		// Local cache of malware-scan verdicts (keyed by file SHA-256, with the
@@ -5818,7 +5865,26 @@ func migrateMetricsDB(db *sql.DB) error {
 			return err
 		}
 	}
+	// Additive column for databases created before fast-mode accounting existed.
+	// SQLite has no ADD COLUMN IF NOT EXISTS, and a second run legitimately
+	// fails with "duplicate column name" — so this is deliberately best-effort
+	// and must NOT fail the migration (that would disable analytics entirely).
+	if !metricsColumnExists(db, "request_metrics", "service_tier") {
+		_, _ = db.Exec(`ALTER TABLE request_metrics ADD COLUMN service_tier TEXT NOT NULL DEFAULT ''`)
+	}
 	return nil
+}
+
+// metricsColumnExists reports whether a column is already present, so an
+// additive migration can be skipped rather than relying on the error text.
+func metricsColumnExists(db *sql.DB, table, column string) bool {
+	rows, err := db.Query(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, table, column)
+	if err != nil {
+		// Unknown — assume present so we never spam a failing ALTER.
+		return true
+	}
+	defer rows.Close()
+	return rows.Next()
 }
 
 // recordMetric queues a metric for async persistence. Non-blocking: drops the
@@ -5855,15 +5921,15 @@ func metricsWriter() {
 			return
 		}
 		stmt, err := tx.Prepare(`INSERT INTO request_metrics
-			(at_unix_ms,status,duration_ms,model,upstream,input_tokens,output_tokens,stream,is_error,surface)
-			VALUES (?,?,?,?,?,?,?,?,?,?)`)
+			(at_unix_ms,status,duration_ms,model,upstream,input_tokens,output_tokens,stream,is_error,surface,service_tier)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			_ = tx.Rollback()
 			batch = batch[:0]
 			return
 		}
 		for _, m := range batch {
-			_, _ = stmt.Exec(m.AtUnixMS, m.Status, m.DurMS, m.Model, m.Upstream, m.InputTokens, m.OutputTokens, boolToInt(m.Stream), boolToInt(m.IsError), m.Surface)
+			_, _ = stmt.Exec(m.AtUnixMS, m.Status, m.DurMS, m.Model, m.Upstream, m.InputTokens, m.OutputTokens, boolToInt(m.Stream), boolToInt(m.IsError), m.Surface, m.ServiceTier)
 		}
 		_ = stmt.Close()
 		_ = tx.Commit()
@@ -5921,6 +5987,10 @@ type analyticsBucket struct {
 	TokensIn     int   `json:"tokens_in"`
 	TokensOut    int   `json:"tokens_out"`
 	Errors       int   `json:"errors"`
+	// FastRequests counts requests that ran in fast mode (service_tier sent).
+	// Fast mode costs 1.5x plan usage, so it is charted alongside the volume it
+	// was spent on rather than hidden in a total.
+	FastRequests int `json:"fast_requests"`
 }
 
 func parseInt64(s string) int64 {
@@ -5994,7 +6064,7 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 		}
 		start, end, bucketMS := analyticsRange(period, parseInt64(q.Get("from")), parseInt64(q.Get("to")), time.Now())
 
-		emptyTotals := map[string]any{"requests": 0, "avg_latency_ms": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "errors": 0, "error_rate": 0.0}
+		emptyTotals := map[string]any{"requests": 0, "avg_latency_ms": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "errors": 0, "error_rate": 0.0, "fast_requests": 0, "fast_rate": 0.0}
 		resp := map[string]any{
 			"period":    period,
 			"from":      start,
@@ -6025,7 +6095,8 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 			`SELECT (at_unix_ms - ?) / ? AS b,
 			        COUNT(*), COALESCE(SUM(duration_ms),0),
 			        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-			        COALESCE(SUM(is_error),0)
+			        COALESCE(SUM(is_error),0),
+			        COALESCE(SUM(CASE WHEN service_tier <> '' THEN 1 ELSE 0 END),0)
 			 FROM request_metrics
 			 WHERE at_unix_ms >= ? AND at_unix_ms < ?
 			 GROUP BY b ORDER BY b`,
@@ -6036,12 +6107,12 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 		}
 		defer rows.Close()
 
-		var totReq, totIn, totOut, totErr int
+		var totReq, totIn, totOut, totErr, totFast int
 		var totDur int64
 		for rows.Next() {
 			var b, durSum int64
-			var cnt, inTok, outTok, errCnt int
-			if err := rows.Scan(&b, &cnt, &durSum, &inTok, &outTok, &errCnt); err != nil {
+			var cnt, inTok, outTok, errCnt, fastCnt int
+			if err := rows.Scan(&b, &cnt, &durSum, &inTok, &outTok, &errCnt, &fastCnt); err != nil {
 				continue
 			}
 			if b >= 0 && int(b) < nBuckets {
@@ -6050,6 +6121,7 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 				bk.TokensIn = inTok
 				bk.TokensOut = outTok
 				bk.Errors = errCnt
+				bk.FastRequests = fastCnt
 				if cnt > 0 {
 					bk.AvgLatencyMs = durSum / int64(cnt)
 				}
@@ -6058,14 +6130,17 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 			totIn += inTok
 			totOut += outTok
 			totErr += errCnt
+			totFast += fastCnt
 			totDur += durSum
 		}
 
 		avgLat := int64(0)
 		errRate := 0.0
+		fastRate := 0.0
 		if totReq > 0 {
 			avgLat = totDur / int64(totReq)
 			errRate = float64(int(float64(totErr)/float64(totReq)*1000+0.5)) / 10 // 1 decimal %
+			fastRate = float64(int(float64(totFast)/float64(totReq)*1000+0.5)) / 10
 		}
 		resp["buckets"] = buckets
 		resp["totals"] = map[string]any{
@@ -6076,6 +6151,8 @@ func handleUIAnalytics(cfg config) http.HandlerFunc {
 			"tokens_total":   totIn + totOut,
 			"errors":         totErr,
 			"error_rate":     errRate,
+			"fast_requests":  totFast,
+			"fast_rate":      fastRate,
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}
@@ -6188,7 +6265,7 @@ func summarizeAnthropicRequest(in anthropicRequest) map[string]any {
 		"tool_count":   len(in.Tools),
 		"effort":       effort,
 		"speed":        in.Speed,
-		"fast_mode":    in.FastMode,
+		"fast_ask":     in.FastAsk.String(),
 	}
 }
 
@@ -7433,10 +7510,12 @@ func handleUIConfig(cfg config) http.HandlerFunc {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
-			// Upstream enable/disable switches apply live (no restart); other
-			// process-level settings still require a restart.
+			// Upstream enable/disable switches and the fast-mode switch apply live
+			// (no restart) — fast mode especially, because it is a spend control
+			// and "turn it off" must mean now. Other process-level settings still
+			// require a restart.
 			applyUpstreamSwitchesFromEnvMap(current)
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Configuration saved. Upstream enable/disable applies immediately; other settings apply on restart."})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Configuration saved. Upstream enable/disable and fast mode apply immediately; other settings apply on restart."})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}
@@ -8315,7 +8394,7 @@ func readEnvMap() map[string]string {
 }
 
 func writeEnvMap(vals map[string]string) error {
-	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "CODEX_FAST_SERVICE_TIER", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HARD_TOKENS", "CODEX_UPSTREAM_BLOCK_AT_HARD", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
+	keys := []string{"UPSTREAM", "CODEX_BASE_URL", "CODEX_AUTH_FILE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_CLAUDE_SONNET_MODEL", "OPENAI_CLAUDE_SONNET_1M_MODEL", "OPENAI_CLAUDE_HAIKU_MODEL", "OPENAI_CLAUDE_OPUS_MODEL", "OPENAI_CLAUDE_OPUS_1M_MODEL", "OPENAI_CLAUDE_FAST_MODEL", "OPENAI_CLAUDE_CODEX_MODEL", "PROXY_MODEL_ALIASES", "PROXY_MODEL_ALIASES_DISABLED", "PROXY_CODEX_FAST_MODE", "CODEX_FAST_SERVICE_TIER", "PROXY_CODEX_FAST_MODELS", "PROXY_CLAUDE_FAST_MODELS", "CODEX_WEB_SEARCH_TOOL_TYPE", "CODEX_WEB_SEARCH_CONTEXT_SIZE", "CODEX_REASONING_SUMMARY", "CODEX_SESSION_ISOLATION", "CODEX_SESSION_FILE", "CODEX_PROMPT_CACHE_KEY", "CODEX_UPSTREAM_HARD_TOKENS", "CODEX_UPSTREAM_BLOCK_AT_HARD", "CLAUDE_TOOL_ACTIVITY_THINKING", "ANTIGRAVITY_CHROME_PATH", "ANTIGRAVITY_EXTENSION_PATH", "ANTIGRAVITY_BROWSER_PROFILE", "ANTIGRAVITY_BROWSER_MODE", "ANTIGRAVITY_BROWSER_PRELAUNCH_WITH_PROXY", "ANTIGRAVITY_BROWSER_DEBUG_PORT", "ANTIGRAVITY_SCREENSHOT_DIR", "ANTIGRAVITY_BROWSER_FORCE_DEFAULT_CDP", "ANTIGRAVITY_BROWSER_SAFE_DEFAULT_RELAUNCH", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "CLAUDE_CODE_EFFORT_LEVEL", "OPENAI_REASONING_EFFORT", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "PROXY_API_KEY", "PROXY_HOST", "PROXY_PORT", "PROXY_PUBLIC_URL", "PROXY_DB_PATH", "PROXY_AUTO_UPDATE", "PROXY_UPDATE_REPO_DIR", "PROXY_UPDATE_BRANCH", "PROXY_UPDATE_VERSION_URL", "PROXY_UPDATE_STATUS_FILE", "PROXY_DASHBOARD_FULL_SYSTEM_UPDATE", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"}
 	seen := map[string]bool{}
 	var b strings.Builder
 	for _, k := range keys {
