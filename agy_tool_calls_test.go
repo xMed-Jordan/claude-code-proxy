@@ -88,11 +88,7 @@ func TestParseAgyToolCalls_RawJSONFallback(t *testing.T) {
 
 func TestAgyModelFor_Remapping(t *testing.T) {
 	cfg := config{
-		Models: map[string]string{
-			"gemini-3.5-flash-low":  "Gemini 3.5 Flash (Low)",
-			"gemini-3.5-flash-high": "Gemini 3.5 Flash (High)",
-			"gemini-3.6-flash-high": "Gemini 3.6 Flash (High)",
-		},
+		Models: defaultModelAliasesFromValues(func(k, d string) string { return d }),
 	}
 
 	if got := agyModelFor(cfg, "gemini-3.5-flash-low"); got != "Gemini 3.6 Flash (Low)" {
@@ -106,5 +102,23 @@ func TestAgyModelFor_Remapping(t *testing.T) {
 	}
 	if got := agyModelFor(cfg, "gemini-3.5-flash"); got != "gemini-3.6-flash" {
 		t.Errorf("expected gemini-3.6-flash, got %s", got)
+	}
+	if got := agyModelFor(cfg, "gemini-3.7-flash-high"); got != "Gemini 3.7 Flash (High)" {
+		t.Errorf("expected Gemini 3.7 Flash (High), got %s", got)
+	}
+	if got := agyModelFor(cfg, "gemini-3.8-flash-high"); got != "Gemini 3.8 Flash (High)" {
+		t.Errorf("expected Gemini 3.8 Flash (High), got %s", got)
+	}
+}
+
+func TestForwardForAlias_GeminiDefaultsToAgy(t *testing.T) {
+	cfg := config{}
+	for _, alias := range []string{"gemini-3.6-flash-high", "gemini-3.7-flash-high", "gemini-3.8-flash-high", "antigravity-opus"} {
+		if got := forwardForAlias(cfg, alias); got != "agy" {
+			t.Errorf("expected %s to forward to agy, got %s", alias, got)
+		}
+	}
+	if got := forwardForAlias(cfg, "claude-sonnet-4-6"); got != "codex" {
+		t.Errorf("expected claude-sonnet-4-6 to forward to codex, got %s", got)
 	}
 }

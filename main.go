@@ -1053,12 +1053,22 @@ func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
 		"gemini-2.5-flash":          "gemini-2.5-flash",
 		"gemini-2.5-pro":            "gemini-2.5-pro",
 		"gemini-3.5-flash":          "gemini-3.6-flash",
+		"gemini-3.5-flash-high":     "Gemini 3.6 Flash (High)",
+		"gemini-3.5-flash-medium":   "Gemini 3.6 Flash (Medium)",
+		"gemini-3.5-flash-low":      "Gemini 3.6 Flash (Low)",
 		"gemini-3.5-pro":            "gemini-3.1-pro-high",
 		"gemini-3.6-flash":          "gemini-3.6-flash",
 		"gemini-3.6-flash-high":     "Gemini 3.6 Flash (High)",
 		"gemini-3.6-flash-medium":   "Gemini 3.6 Flash (Medium)",
 		"gemini-3.6-flash-low":      "Gemini 3.6 Flash (Low)",
+		"gemini-3.7-flash":          "gemini-3.7-flash",
+		"gemini-3.7-flash-high":     "Gemini 3.7 Flash (High)",
+		"gemini-3.7-flash-medium":   "Gemini 3.7 Flash (Medium)",
+		"gemini-3.7-flash-low":      "Gemini 3.7 Flash (Low)",
+		"gemini-3.8-flash":          "gemini-3.8-flash",
 		"gemini-3.8-flash-high":     "Gemini 3.8 Flash (High)",
+		"gemini-3.8-flash-medium":   "Gemini 3.8 Flash (Medium)",
+		"gemini-3.8-flash-low":      "Gemini 3.8 Flash (Low)",
 	}
 }
 
@@ -1164,6 +1174,10 @@ func forwardForAlias(cfg config, alias string) string {
 		if v, ok := cfg.ModelForward[alias]; ok && v != "" {
 			return normalizeForwardTarget(v)
 		}
+	}
+	low := strings.ToLower(strings.TrimSpace(alias))
+	if strings.HasPrefix(low, "gemini-") || strings.HasPrefix(low, "antigravity-") {
+		return "agy"
 	}
 	return "codex"
 }
