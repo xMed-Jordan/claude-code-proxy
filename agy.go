@@ -557,6 +557,22 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 			sys = toolPrompt + "\n\n" + sys
 		}
 	}
+	if in.Temperature != nil {
+		temp := *in.Temperature
+		var tempDirective string
+		if temp <= 0.3 {
+			tempDirective = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any clinic details, prices, packages, or policies.", temp)
+		} else if temp <= 0.6 {
+			tempDirective = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
+		} else {
+			tempDirective = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
+		}
+		if sys == "" {
+			sys = tempDirective
+		} else {
+			sys = tempDirective + "\n\n" + sys
+		}
+	}
 	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
 		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
@@ -580,11 +596,26 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 
 // flattenOpenAIChatToPrompt renders an OpenAI chat request into a single prompt.
 func flattenOpenAIChatToPrompt(in openAIRequest) string {
+	var sys string
+	if in.Temperature != nil {
+		temp := *in.Temperature
+		if temp <= 0.3 {
+			sys = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any details, prices, or policies.", temp)
+		} else if temp <= 0.6 {
+			sys = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
+		} else {
+			sys = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
+		}
+	}
 	// Fast path: a single user message with no system context.
-	if len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
+	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
 		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
 	var b strings.Builder
+	if sys != "" {
+		b.WriteString(sys)
+		b.WriteString("\n\n")
+	}
 	for _, msg := range in.Messages {
 		text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
 		if text == "" {
@@ -603,8 +634,26 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 // role-tagged (function_call_output items contribute their "output" text).
 func flattenResponsesToPrompt(in responsesRequest) string {
 	var b strings.Builder
+	var sys string
+	if in.Temperature != nil {
+		temp := *in.Temperature
+		if temp <= 0.3 {
+			sys = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any details, prices, or policies.", temp)
+		} else if temp <= 0.6 {
+			sys = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
+		} else {
+			sys = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
+		}
+	}
 	if instr := strings.TrimSpace(in.Instructions); instr != "" {
+		if sys != "" {
+			b.WriteString(sys)
+			b.WriteString("\n\n")
+		}
 		b.WriteString(instr)
+		b.WriteString("\n\n")
+	} else if sys != "" {
+		b.WriteString(sys)
 		b.WriteString("\n\n")
 	}
 	for _, raw := range in.Input {
