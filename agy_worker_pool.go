@@ -54,6 +54,17 @@ var (
 	globalAgyPool   *AgyWorkerPool
 )
 
+// canonicalAgyModel normalizes model identifiers so "Gemini 3.8 Flash (Low)" and "gemini-3.8-flash-low" match.
+func canonicalAgyModel(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, "(", "")
+	s = strings.ReplaceAll(s, ")", "")
+	s = strings.ReplaceAll(s, "3.5", "3.6")
+	return s
+}
+
 // initAgyWorkerPool initializes the global warm worker pool if configured.
 func initAgyWorkerPool(cfg config) {
 	globalAgyPoolMu.Lock()
@@ -97,6 +108,7 @@ func initAgyWorkerPool(cfg config) {
 		idleWorkers:  make(chan *AgyWorker, cfg.AgyWarmWorkers),
 	}
 
+	fmt.Printf("[agy-pool] Initializing %d warm workers for model %q...\n", cfg.AgyWarmWorkers, model)
 	pool.Start()
 	globalAgyPool = pool
 }
@@ -184,6 +196,7 @@ func (p *AgyWorkerPool) replenishOne() {
 	select {
 	case p.idleWorkers <- w:
 		p.activeCount.Add(1)
+		fmt.Printf("[agy-pool] Worker #%d ready in pool (idle/ready count: %d/%d)\n", id, len(p.idleWorkers), p.size)
 	default:
 		w.Close()
 	}
@@ -222,7 +235,7 @@ func (p *AgyWorkerPool) Release(w *AgyWorker) {
 
 // Execute runs a prompt on an acquired warm worker and returns the result.
 func (p *AgyWorkerPool) Execute(ctx context.Context, prompt, requestedModel string) (agyResult, error) {
-	if requestedModel != "" && normalizeAgyModelName(requestedModel) != p.model {
+	if requestedModel != "" && canonicalAgyModel(requestedModel) != canonicalAgyModel(p.model) {
 		return agyResult{}, fmt.Errorf("model %q does not match pool model %q", requestedModel, p.model)
 	}
 
@@ -232,7 +245,11 @@ func (p *AgyWorkerPool) Execute(ctx context.Context, prompt, requestedModel stri
 	}
 	defer p.Release(w)
 
-	return w.Execute(ctx, prompt)
+	res, err := w.Execute(ctx, prompt)
+	if err == nil && res.Ok {
+		fmt.Printf("[agy-pool] Request served by warm worker #%d in %dms\n", w.id, res.DurationMs)
+	}
+	return res, err
 }
 
 // spawnAgyWorker starts a persistent agy process in stream-json mode and waits for init.

@@ -6,6 +6,24 @@ import (
 	"time"
 )
 
+func TestCanonicalAgyModel(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"Gemini 3.8 Flash (Low)", "gemini-3.8-flash-low", true},
+		{"Gemini 3.8 Flash (High)", "gemini-3.8-flash-high", true},
+		{"Gemini 3.7 Flash", "gemini-3.7-flash-high", false},
+		{"gemini-3.5-flash-low", "gemini-3.6-flash-low", true},
+	}
+	for _, c := range cases {
+		got := canonicalAgyModel(c.a) == canonicalAgyModel(c.b)
+		if got != c.want {
+			t.Errorf("canonicalAgyModel(%q) == canonicalAgyModel(%q) got %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
 func TestParseAgyWarmWorkers(t *testing.T) {
 	tests := []struct {
 		in   string
