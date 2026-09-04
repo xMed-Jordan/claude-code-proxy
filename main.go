@@ -752,7 +752,7 @@ func loadConfig() config {
 		AgyTimeout:        parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
 		AgyMedia:          envFlag("PROXY_AGY_MEDIA", true),
 		AgyMediaDir:       strings.TrimSpace(getenv("PROXY_AGY_MEDIA_DIR", "")),
-		AgyMediaModel:     strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.5 Flash (Low)")),
+		AgyMediaModel:     strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.6 Flash (Low)")),
 		AgyMediaTimeout:   parseAgyTimeout(getenv("PROXY_AGY_MEDIA_TIMEOUT", "300")),
 		AgyMediaMaxBytes:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_BYTES", "1GB"), 1<<30),
 		AgyMediaMaxTotal:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
@@ -760,7 +760,7 @@ func loadConfig() config {
 		AgyMediaRetention: parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
 		AgyImage:          envFlag("PROXY_AGY_IMAGE", true),
 		AgyImageDir:       strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
-		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.5 Flash (Low)")),
+		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
 		AgyImageRetention: parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
 
 		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
@@ -1052,8 +1052,13 @@ func defaultModelAliasesFromValues(env envValueFunc) map[string]string {
 		"nano-banana-pro":           "nano-banana-pro",
 		"gemini-2.5-flash":          "gemini-2.5-flash",
 		"gemini-2.5-pro":            "gemini-2.5-pro",
-		"gemini-3.5-flash":          "gemini-3.5-flash",
-		"gemini-3.5-pro":            "gemini-3.5-pro",
+		"gemini-3.5-flash":          "gemini-3.6-flash",
+		"gemini-3.5-pro":            "gemini-3.1-pro-high",
+		"gemini-3.6-flash":          "gemini-3.6-flash",
+		"gemini-3.6-flash-high":     "Gemini 3.6 Flash (High)",
+		"gemini-3.6-flash-medium":   "Gemini 3.6 Flash (Medium)",
+		"gemini-3.6-flash-low":      "Gemini 3.6 Flash (Low)",
+		"gemini-3.8-flash-high":     "Gemini 3.8 Flash (High)",
 	}
 }
 

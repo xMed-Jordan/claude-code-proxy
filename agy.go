@@ -118,11 +118,11 @@ func agyMediaPrep(ctx context.Context, cfg config, basePrompt string, parts []me
 }
 
 // agyModelForRequest resolves the model, defaulting media requests with no
-// explicit Antigravity model to cfg.AgyMediaModel ("Gemini 3.5 Flash (Low)").
+// explicit Antigravity model to cfg.AgyMediaModel ("Gemini 3.6 Flash (Low)").
 func agyModelForRequest(cfg config, alias string, hasMedia bool) string {
 	m := agyModelFor(cfg, alias)
 	if m == "" && hasMedia {
-		return strings.TrimSpace(cfg.AgyMediaModel)
+		return normalizeAgyModelName(cfg.AgyMediaModel)
 	}
 	return m
 }
@@ -319,14 +319,15 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 // rejecting an unknown model.
 func agyModelFor(cfg config, alias string) string {
 	if m := strings.TrimSpace(cfg.AgyModel); m != "" {
-		return m
+		return normalizeAgyModelName(m)
 	}
 	real := strings.TrimSpace(resolveModel(cfg, alias))
 	if real == "" {
 		return ""
 	}
+	real = normalizeAgyModelName(real)
 	// Antigravity model names (from `agy models`) always contain a space, e.g.
-	// "Gemini 3.1 Pro (High)", "Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"
+	// "Gemini 3.6 Pro (High)", "Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"
 	// — forward those verbatim (agy accepts the display name). A bare, space-free
 	// gpt-*/o*/codex token is a Codex id left on an agy alias by mistake; drop it
 	// so agy falls back to its own configured default instead of erroring.
@@ -339,6 +340,19 @@ func agyModelFor(cfg config, alias string) string {
 		}
 	}
 	return real
+}
+
+// normalizeAgyModelName remaps legacy 3.5 model references to 3.6 because agy
+// deprecated and removed 3.5 in favor of 3.6.
+func normalizeAgyModelName(m string) string {
+	m = strings.TrimSpace(m)
+	if m == "" {
+		return ""
+	}
+	if strings.Contains(m, "3.5") {
+		m = strings.ReplaceAll(m, "3.5", "3.6")
+	}
+	return m
 }
 
 // agyRoleLabel maps a chat role to a transcript label for the flattened prompt.
@@ -375,7 +389,20 @@ func contentToTextNoMedia(v any) string {
 			if m, ok := item.(map[string]any); ok {
 				if m["type"] == "text" {
 					parts = append(parts, fmt.Sprint(m["text"]))
-
+					continue
+				}
+				if m["type"] == "tool_use" {
+					name, _ := m["name"].(string)
+					input := m["input"]
+					if input == nil {
+						input = map[string]any{}
+					}
+					toolCallPayload := map[string]any{
+						"tool":  name,
+						"input": input,
+					}
+					b, _ := json.Marshal(toolCallPayload)
+					parts = append(parts, "<tool_call>\n"+string(b)+"\n</tool_call>")
 					continue
 				}
 				if m["type"] == "tool_result" {
@@ -388,7 +415,7 @@ func contentToTextNoMedia(v any) string {
 					if toolUseID != "" {
 						prefix += " (" + toolUseID + ")"
 					}
-					parts = append(parts, prefix+": "+contentStr)
+					parts = append(parts, prefix+":\n"+contentStr)
 					continue
 				}
 				if _, isMedia := mediaPartFromBlock(m); isMedia {
@@ -404,12 +431,30 @@ func contentToTextNoMedia(v any) string {
 		if text, ok := x["text"]; ok {
 			return fmt.Sprint(text)
 		}
+		if x["type"] == "tool_use" {
+			name, _ := x["name"].(string)
+			input := x["input"]
+			if input == nil {
+				input = map[string]any{}
+			}
+			toolCallPayload := map[string]any{
+				"tool":  name,
+				"input": input,
+			}
+			b, _ := json.Marshal(toolCallPayload)
+			return "<tool_call>\n" + string(b) + "\n</tool_call>"
+		}
 		if x["type"] == "tool_result" {
 			contentStr := ""
 			if c, ok := x["content"]; ok {
 				contentStr = contentToTextNoMedia(c)
 			}
-			return "Tool Result: " + contentStr
+			toolUseID, _ := x["tool_use_id"].(string)
+			prefix := "Tool Result"
+			if toolUseID != "" {
+				prefix += " (" + toolUseID + ")"
+			}
+			return prefix + ":\n" + contentStr
 		}
 		if _, isMedia := mediaPartFromBlock(x); isMedia {
 			return ""
@@ -471,6 +516,11 @@ func buildAgyToolsSystemPrompt(tools []anthropicTool) string {
 	}
 	b.WriteString("To invoke a tool, respond with a tool call in this exact format:\n")
 	b.WriteString("<tool_call>\n{\n  \"tool\": \"tool_name\",\n  \"input\": {\n    \"param\": \"value\"\n  }\n}\n</tool_call>\n\n")
+	b.WriteString("Tool Execution Rules:\n")
+	b.WriteString("- When you need information or need to take an action, invoke the relevant tool immediately.\n")
+	b.WriteString("- You can invoke multiple tools in a single response by emitting multiple <tool_call> blocks or a JSON array of tool calls.\n")
+	b.WriteString("- Never fabricate or guess tool results. Wait for the real tool result before responding to the user.\n")
+	b.WriteString("- When all necessary tools have been executed and you are ready to answer the user, provide your final response with no tool calls.\n\n")
 	return b.String()
 }
 
@@ -575,6 +625,92 @@ var (
 // from agy output and returns the remaining text and function_call items.
 func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 	var items []responsesOutputItem
+	var seq int
+
+	addToolItem := func(payload map[string]any) {
+		toolName := ""
+		for _, k := range []string{"tool", "name", "function", "action"} {
+			if s, ok := payload[k].(string); ok && strings.TrimSpace(s) != "" {
+				toolName = strings.TrimSpace(s)
+				break
+			}
+		}
+		if toolName == "" {
+			return
+		}
+
+		var input any
+		for _, k := range []string{"input", "arguments", "parameters", "params"} {
+			if v, ok := payload[k]; ok && v != nil {
+				input = v
+				break
+			}
+		}
+		if str, ok := input.(string); ok {
+			var parsed any
+			if err := json.Unmarshal([]byte(str), &parsed); err == nil {
+				input = parsed
+			}
+		}
+		if input == nil {
+			extra := make(map[string]any)
+			for k, v := range payload {
+				if k != "tool" && k != "name" && k != "function" && k != "action" && k != "type" {
+					extra[k] = v
+				}
+			}
+			if len(extra) > 0 {
+				input = extra
+			} else {
+				input = map[string]any{}
+			}
+		}
+		argsBytes, _ := json.Marshal(input)
+		seq++
+		items = append(items, responsesOutputItem{
+			Type:      "function_call",
+			Name:      toolName,
+			Arguments: string(argsBytes),
+			CallID:    fmt.Sprintf("toolu_%d_%d", time.Now().UnixNano(), seq),
+		})
+	}
+
+	cleanRawJSON := func(raw string) string {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "```") {
+			lines := strings.Split(trimmed, "\n")
+			if len(lines) >= 2 {
+				if strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
+					lines = lines[1:]
+				}
+				if len(lines) > 0 && strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "```") {
+					lines = lines[:len(lines)-1]
+				}
+				trimmed = strings.TrimSpace(strings.Join(lines, "\n"))
+			}
+		}
+		return trimmed
+	}
+
+	processJSON := func(raw string) {
+		clean := cleanRawJSON(raw)
+		if clean == "" {
+			return
+		}
+		if strings.HasPrefix(clean, "[") && strings.HasSuffix(clean, "]") {
+			var arr []map[string]any
+			if err := json.Unmarshal([]byte(clean), &arr); err == nil && len(arr) > 0 {
+				for _, p := range arr {
+					addToolItem(p)
+				}
+				return
+			}
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(clean), &payload); err == nil {
+			addToolItem(payload)
+		}
+	}
 
 	extractFromRegex := func(re *regexp.Regexp, s string) string {
 		matches := re.FindAllStringSubmatchIndex(s, -1)
@@ -586,35 +722,8 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 		for _, m := range matches {
 			clean.WriteString(s[last:m[0]])
 			last = m[1]
-			rawJSON := strings.TrimSpace(s[m[2]:m[3]])
-			var payload map[string]any
-			if err := json.Unmarshal([]byte(rawJSON), &payload); err == nil {
-				toolName := ""
-				if t, ok := payload["tool"].(string); ok {
-					toolName = t
-				} else if n, ok := payload["name"].(string); ok {
-					toolName = n
-				}
-				if toolName != "" {
-					input := payload["input"]
-					if input == nil {
-						input = payload["arguments"]
-					}
-					if input == nil {
-						input = payload["parameters"]
-					}
-					if input == nil {
-						input = map[string]any{}
-					}
-					argsBytes, _ := json.Marshal(input)
-					items = append(items, responsesOutputItem{
-						Type:      "function_call",
-						Name:      toolName,
-						Arguments: string(argsBytes),
-						CallID:    "toolu_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-					})
-				}
-			}
+			rawJSON := s[m[2]:m[3]]
+			processJSON(rawJSON)
 		}
 		clean.WriteString(s[last:])
 		return clean.String()
@@ -625,38 +734,14 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 	cleaned = extractFromRegex(agyToolBracketRe, cleaned)
 	cleaned = extractFromRegex(agyToolFencedRe, cleaned)
 
-	// If no tagged matches found, check if trimmed output is a single JSON object with "tool" and "input"
 	if len(items) == 0 {
-		trimmed := strings.TrimSpace(text)
-		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-			var payload map[string]any
-			if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
-				toolName := ""
-				if t, ok := payload["tool"].(string); ok {
-					toolName = t
-				} else if n, ok := payload["name"].(string); ok {
-					toolName = n
-				}
-				if toolName != "" && (payload["input"] != nil || payload["arguments"] != nil || payload["parameters"] != nil) {
-					input := payload["input"]
-					if input == nil {
-						input = payload["arguments"]
-					}
-					if input == nil {
-						input = payload["parameters"]
-					}
-					if input == nil {
-						input = map[string]any{}
-					}
-					argsBytes, _ := json.Marshal(input)
-					items = append(items, responsesOutputItem{
-						Type:      "function_call",
-						Name:      toolName,
-						Arguments: string(argsBytes),
-						CallID:    "toolu_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-					})
-					cleaned = ""
-				}
+		trimmed := cleanRawJSON(text)
+		if (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) ||
+			(strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")) {
+			beforeCount := len(items)
+			processJSON(trimmed)
+			if len(items) > beforeCount {
+				cleaned = ""
 			}
 		}
 	}
