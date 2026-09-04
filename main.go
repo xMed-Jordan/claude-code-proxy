@@ -108,6 +108,10 @@ type config struct {
 	AgyModel          string        // optional global model override forwarded to agy ("" → agy's own default)
 	AgyConcurrency    int           // max simultaneous agyj subprocesses
 	AgyTimeout        time.Duration // per-call agy execution timeout
+	AgyWarmWorkers    int           // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
+	AgyWorkerModel    string        // PROXY_AGY_WORKER_MODEL — model to prewarm (default gemini-3.8-flash-low)
+	AgyWorkerMaxTurns int           // PROXY_AGY_WORKER_MAX_TURNS — recycle worker after this many turns (default 50)
+	AgyQueueTimeout   time.Duration // PROXY_AGY_QUEUE_TIMEOUT — max duration to wait in queue for an available warm worker
 	AgyMedia          bool          // enable media attachments for agy requests
 	AgyMediaDir       string        // scratch root for materialized media ("" → temp)
 	AgyMediaModel     string        // default Antigravity model for media requests
@@ -750,6 +754,10 @@ func loadConfig() config {
 		AgyModel:          strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
 		AgyConcurrency:    parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
 		AgyTimeout:        parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
+		AgyWarmWorkers:    parseAgyWarmWorkers(getenv("PROXY_AGY_WARM_WORKERS", getenv("AGY_WARM_WORKERS", "0"))),
+		AgyWorkerModel:    strings.TrimSpace(getenv("PROXY_AGY_WORKER_MODEL", getenv("AGY_WORKER_MODEL", "gemini-3.8-flash-low"))),
+		AgyWorkerMaxTurns: parseAgyWorkerMaxTurns(getenv("PROXY_AGY_WORKER_MAX_TURNS", getenv("AGY_WORKER_MAX_TURNS", "50"))),
+		AgyQueueTimeout:   parseAgyTimeout(getenv("PROXY_AGY_QUEUE_TIMEOUT", getenv("AGY_QUEUE_TIMEOUT", "15"))),
 		AgyMedia:          envFlag("PROXY_AGY_MEDIA", true),
 		AgyMediaDir:       strings.TrimSpace(getenv("PROXY_AGY_MEDIA_DIR", "")),
 		AgyMediaModel:     strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.6 Flash (Low)")),

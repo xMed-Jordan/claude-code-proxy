@@ -113,6 +113,7 @@ func runServe() error {
 	}
 	initMetricsDB(cfg)                  // best-effort: Analytics persistence (separate WAL db)
 	initAgy(cfg)                        // size the agy (Antigravity) subprocess concurrency cap
+	initAgyWorkerPool(cfg)              // initialize persistent warm agy worker pool if configured
 	initClaude(cfg)                     // size the Claude Code CLI subprocess concurrency cap
 	applyUpstreamSwitches(cfg)          // seed the live codex/claude/agy enable switches
 	initVT(cfg)                         // seed VirusTotal runtime keys/enabled from config

@@ -64,6 +64,25 @@ func parseAgyTimeout(s string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+func parseAgyWarmWorkers(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n > 64 {
+		n = 64
+	}
+	return n
+}
+
+func parseAgyWorkerMaxTurns(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 1 {
+		return 50
+	}
+	return n
+}
+
 // parseByteSize accepts plain bytes or a K/M/G(B) suffix (e.g. "500MB", "1GB").
 func parseByteSize(s string, def int64) int64 {
 	s = strings.ToUpper(strings.TrimSpace(s))
@@ -800,7 +819,17 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	if err != nil {
 		return agyResult{}, fmt.Errorf("media error: %w", err)
 	}
-	res, err := runAgyj(ctx, cfg, prompt, agyModelForRequest(cfg, modelAlias, len(addDirs) > 0), addDirs)
+	requestedModel := agyModelForRequest(cfg, modelAlias, len(addDirs) > 0)
+	if len(addDirs) == 0 {
+		pool := getAgyWorkerPool()
+		if pool != nil && pool.IsEnabled() {
+			res, poolErr := pool.Execute(ctx, prompt, requestedModel)
+			if poolErr == nil && res.Ok {
+				return res, nil
+			}
+		}
+	}
+	res, err := runAgyj(ctx, cfg, prompt, requestedModel, addDirs)
 	if err != nil {
 		return agyResult{}, fmt.Errorf("backend error: %w", err)
 	}
