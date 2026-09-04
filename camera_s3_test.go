@@ -19,8 +19,8 @@ import (
 // x-amz-acl header AND includes it (sorted) in the signed-headers list — the
 // canned ACL is what makes an uploaded clip anonymously readable at its URL.
 func TestS3SignRequestPublicACL(t *testing.T) {
-	cfg := config{CameraS3AccessKey: "AKIDEXAMPLE", CameraS3Secret: "secret", CameraS3Bucket: "connect-cams", CameraS3Endpoint: "hel1.your-objectstorage.com", CameraS3Region: "hel1"}
-	req, _ := http.NewRequest(http.MethodPut, "https://connect-cams.hel1.your-objectstorage.com/clips/s/c/x.mp4", strings.NewReader("body"))
+	cfg := config{CameraS3AccessKey: "AKIDEXAMPLE", CameraS3Secret: "secret", CameraS3Bucket: "connect-cams2", CameraS3Endpoint: "hel1.your-objectstorage.com", CameraS3Region: "hel1"}
+	req, _ := http.NewRequest(http.MethodPut, "https://connect-cams2.hel1.your-objectstorage.com/clips/s/c/x.mp4", strings.NewReader("body"))
 	s3SignRequest(cfg, req, sha256Hex([]byte("body")), time.Unix(1700000000, 0).UTC(), true)
 	if got := req.Header.Get("X-Amz-Acl"); got != "public-read" {
 		t.Fatalf("X-Amz-Acl = %q, want public-read", got)
@@ -31,7 +31,7 @@ func TestS3SignRequestPublicACL(t *testing.T) {
 	}
 
 	// The non-public path must NOT sign x-amz-acl.
-	req2, _ := http.NewRequest(http.MethodGet, "https://connect-cams.hel1.your-objectstorage.com/clips/s/c/x.mp4", nil)
+	req2, _ := http.NewRequest(http.MethodGet, "https://connect-cams2.hel1.your-objectstorage.com/clips/s/c/x.mp4", nil)
 	s3SignRequest(cfg, req2, sha256Hex(nil), time.Unix(1700000000, 0).UTC(), false)
 	if strings.Contains(req2.Header.Get("Authorization"), "x-amz-acl") {
 		t.Fatal("non-public request must not sign x-amz-acl")
@@ -47,12 +47,12 @@ func TestCamS3ClipKeyAndURL(t *testing.T) {
 	defer func() { cameraCfg.CameraS3Prefix = saved }()
 	cameraCfg.CameraS3Prefix = ""
 
-	cfg := config{CameraS3Bucket: "connect-cams", CameraS3Endpoint: "hel1.your-objectstorage.com"}
+	cfg := config{CameraS3Bucket: "connect-cams2", CameraS3Endpoint: "hel1.your-objectstorage.com"}
 	key := camS3ClipKey("site_A", "cam_B", time.Date(2026, 7, 3, 8, 2, 15, 0, time.UTC))
 	if key != "clips/site_A/cam_B/2026/07/03/080215.mp4" {
 		t.Fatalf("clip key = %q", key)
 	}
-	if url := camS3PublicURL(cfg, key); url != "https://connect-cams.hel1.your-objectstorage.com/clips/site_A/cam_B/2026/07/03/080215.mp4" {
+	if url := camS3PublicURL(cfg, key); url != "https://connect-cams2.hel1.your-objectstorage.com/clips/site_A/cam_B/2026/07/03/080215.mp4" {
 		t.Fatalf("public url = %q", url)
 	}
 }
@@ -194,7 +194,7 @@ func TestCamS3Enabled(t *testing.T) {
 	base := func() config {
 		return config{
 			CameraS3Endpoint:  "hel1.your-objectstorage.com",
-			CameraS3Bucket:    "connect-cams",
+			CameraS3Bucket:    "connect-cams2",
 			CameraS3AccessKey: "AK",
 			CameraS3Secret:    "SK",
 		}

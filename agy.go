@@ -282,6 +282,18 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// If prompt is large (> 64KB) or stream-json CLI is available, execute via stream-json over stdin
+	// to avoid Linux kernel E2BIG ("argument list too long") CLI argument limits.
+	if len(prompt) > 64*1024 || resolveAgyCLIPath(cfg) != "" {
+		res, err := runAgyStreamJSON(cctx, cfg, prompt, model, addDirs)
+		if err == nil {
+			return res, nil
+		}
+		if len(prompt) > 64*1024 {
+			return agyResult{}, fmt.Errorf("stream-json execution failed for large prompt (%d bytes): %w", len(prompt), err)
+		}
+	}
+
 	args := make([]string, 0, 8+2*len(addDirs))
 	if m := strings.TrimSpace(model); m != "" {
 		args = append(args, "--model", m)
@@ -869,13 +881,11 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 		return agyResult{}, fmt.Errorf("media error: %w", err)
 	}
 	requestedModel := agyModelForRequest(cfg, modelAlias, len(addDirs) > 0)
-	if len(addDirs) == 0 {
-		pool := getAgyWorkerPool()
-		if pool != nil && pool.IsEnabled() {
-			res, poolErr := pool.Execute(ctx, prompt, requestedModel)
-			if poolErr == nil && res.Ok {
-				return res, nil
-			}
+	pool := getAgyWorkerPool()
+	if pool != nil && pool.IsEnabled() {
+		res, poolErr := pool.Execute(ctx, prompt, requestedModel)
+		if poolErr == nil && res.Ok {
+			return res, nil
 		}
 	}
 	res, err := runAgyj(ctx, cfg, prompt, requestedModel, addDirs)

@@ -6,7 +6,7 @@ package main
 // keeps its tiny dependency footprint (modernc.org/sqlite + gorilla/websocket).
 //
 // Scope: single-object PUT / GET / HEAD against a virtual-hosted bucket — request
-// host = <bucket>.<endpoint> (e.g. connect-cams.hel1.your-objectstorage.com),
+// host = <bucket>.<endpoint> (e.g. connect-cams2.hel1.your-objectstorage.com),
 // HTTPS only, no multipart, no query signing. Credentials come from config at
 // runtime and are NEVER hardcoded (the secret is injected via .env at deploy).
 //

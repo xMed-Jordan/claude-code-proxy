@@ -171,6 +171,9 @@ func (p *AgyWorkerPool) replenishOne() {
 		return
 	}
 	poolCtx := p.ctx
+	if poolCtx == nil {
+		poolCtx = context.Background()
+	}
 	p.mu.Unlock()
 
 	id := int(p.nextID.Add(1))
@@ -254,6 +257,9 @@ func (p *AgyWorkerPool) Execute(ctx context.Context, prompt, requestedModel stri
 
 // spawnAgyWorker starts a persistent agy process in stream-json mode and waits for init.
 func spawnAgyWorker(poolCtx context.Context, cfg config, id int, model string) (*AgyWorker, error) {
+	if poolCtx == nil {
+		poolCtx = context.Background()
+	}
 	bin := resolveAgyCLIPath(cfg)
 	if bin == "" {
 		return nil, errors.New("agy binary not found")
@@ -512,4 +518,230 @@ func resolveAgyCLIPath(cfg config) string {
 		}
 	}
 	return name
+}
+
+// runAgyStreamJSON executes a single prompt non-interactively using agy's stream-json protocol
+// over stdin and stdout. This completely avoids OS command-line argument limits (MAX_ARG_STRLEN / E2BIG)
+// for large prompts and supports directories passed via --add-dir.
+func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, addDirs []string) (agyResult, error) {
+	bin := resolveAgyCLIPath(cfg)
+	if bin == "" {
+		return agyResult{}, errors.New("agy binary not found")
+	}
+
+	args := []string{
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--dangerously-skip-permissions",
+		"-p=",
+	}
+	if m := strings.TrimSpace(model); m != "" {
+		args = append(args, "--model", m)
+	}
+	for _, d := range addDirs {
+		if d = strings.TrimSpace(d); d != "" {
+			args = append(args, "--add-dir", d)
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = os.TempDir()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return agyResult{}, fmt.Errorf("stdin pipe error: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return agyResult{}, fmt.Errorf("stdout pipe error: %w", err)
+	}
+
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
+		return agyResult{}, fmt.Errorf("failed to start agy: %w", err)
+	}
+
+	t0 := time.Now()
+	reader := bufio.NewReader(stdout)
+
+	// Wait for init event
+	initChan := make(chan error, 1)
+	go func() {
+		for {
+			line, rerr := reader.ReadString('\n')
+			if rerr != nil {
+				initChan <- fmt.Errorf("worker exited before init: %w", rerr)
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var evt struct {
+				Event string `json:"event"`
+				Error string `json:"error,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(line), &evt); err == nil {
+				if evt.Event == "init" {
+					initChan <- nil
+					return
+				}
+				if evt.Event == "result" && evt.Error != "" {
+					initChan <- fmt.Errorf("worker startup error: %s", evt.Error)
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case err := <-initChan:
+		if err != nil {
+			stdin.Close()
+			stdout.Close()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+			return agyResult{}, fmt.Errorf("%w [stderr: %s]", err, truncateString(strings.TrimSpace(stderr.String()), 300))
+		}
+	case <-time.After(30 * time.Second):
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, errors.New("timed out waiting for agy init event")
+	case <-ctx.Done():
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, ctx.Err()
+	}
+
+	// Send user turn via stdin
+	msg := map[string]any{
+		"event": "user",
+		"message": map[string]any{
+			"content": prompt,
+		},
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, fmt.Errorf("marshal stream input error: %w", err)
+	}
+
+	if _, err := stdin.Write(append(payload, '\n')); err != nil {
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, fmt.Errorf("failed to write to agy stdin: %w", err)
+	}
+
+	type streamResult struct {
+		Event  string `json:"event"`
+		Result struct {
+			Status          string  `json:"status"`
+			Response        string  `json:"response"`
+			Error           string  `json:"error"`
+			DurationSeconds float64 `json:"duration_seconds"`
+			Usage           struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"result"`
+	}
+
+	resultChan := make(chan agyResult, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer stdin.Close()
+		defer stdout.Close()
+		for {
+			line, rerr := reader.ReadString('\n')
+			if rerr != nil {
+				if rerr == io.EOF {
+					errChan <- errors.New("agy stdout closed unexpectedly")
+				} else {
+					errChan <- rerr
+				}
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			var sr streamResult
+			if err := json.Unmarshal([]byte(line), &sr); err == nil {
+				if sr.Event == "result" {
+					durMs := int64(sr.Result.DurationSeconds * 1000)
+					if durMs == 0 {
+						durMs = time.Since(t0).Milliseconds()
+					}
+					if sr.Result.Status == "ERROR" {
+						errText := sr.Result.Error
+						if errText == "" {
+							errText = "agy execution failed"
+						}
+						resultChan <- agyResult{
+							Ok:         false,
+							Error:      errText,
+							DurationMs: durMs,
+							Model:      model,
+						}
+					} else {
+						resultChan <- agyResult{
+							Ok:         true,
+							Response:   sr.Result.Response,
+							DurationMs: durMs,
+							Model:      model,
+						}
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case res := <-resultChan:
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return res, nil
+	case err := <-errChan:
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, fmt.Errorf("%w [stderr: %s]", err, truncateString(strings.TrimSpace(stderr.String()), 300))
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return agyResult{}, ctx.Err()
+	}
 }

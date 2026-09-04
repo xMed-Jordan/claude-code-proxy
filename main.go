@@ -862,7 +862,7 @@ func loadConfig() config {
 		CameraSubagentBudget:      parseAgyTimeout(getenv("PROXY_CAMERA_SUBAGENT_BUDGET", "600")),
 
 		CameraS3Endpoint:          strings.TrimSpace(getenv("PROXY_CAM_S3_ENDPOINT", "hel1.your-objectstorage.com")),
-		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams")),
+		CameraS3Bucket:            strings.TrimSpace(getenv("PROXY_CAM_S3_BUCKET", "connect-cams2")),
 		CameraS3Region:            strings.TrimSpace(getenv("PROXY_CAM_S3_REGION", "hel1")),
 		CameraS3AccessKey:         strings.TrimSpace(getenv("PROXY_CAM_S3_ACCESS_KEY", "")),
 		CameraS3Secret:            strings.TrimSpace(getenv("PROXY_CAM_S3_SECRET", "")),
