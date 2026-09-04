@@ -35,6 +35,8 @@ type AgyWorker struct {
 
 // AgyWorkerPool manages a pool of warm background agy workers.
 type AgyWorkerPool struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
 	cfg          config
 	size         int
 	model        string
@@ -82,7 +84,11 @@ func initAgyWorkerPool(cfg config) {
 		maxTurns = 50
 	}
 
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+
 	pool := &AgyWorkerPool{
+		ctx:          poolCtx,
+		cancel:       poolCancel,
 		cfg:          cfg,
 		size:         cfg.AgyWarmWorkers,
 		model:        model,
@@ -127,6 +133,9 @@ func (p *AgyWorkerPool) Stop() {
 		return
 	}
 	p.closed = true
+	if p.cancel != nil {
+		p.cancel()
+	}
 	p.mu.Unlock()
 
 	// Drain and close idle workers
@@ -149,13 +158,11 @@ func (p *AgyWorkerPool) replenishOne() {
 		p.mu.Unlock()
 		return
 	}
+	poolCtx := p.ctx
 	p.mu.Unlock()
 
 	id := int(p.nextID.Add(1))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	w, err := spawnAgyWorker(ctx, p.cfg, id, p.model)
+	w, err := spawnAgyWorker(poolCtx, p.cfg, id, p.model)
 	if err != nil {
 		p.mu.Lock()
 		closed := p.closed
@@ -229,7 +236,7 @@ func (p *AgyWorkerPool) Execute(ctx context.Context, prompt, requestedModel stri
 }
 
 // spawnAgyWorker starts a persistent agy process in stream-json mode and waits for init.
-func spawnAgyWorker(ctx context.Context, cfg config, id int, model string) (*AgyWorker, error) {
+func spawnAgyWorker(poolCtx context.Context, cfg config, id int, model string) (*AgyWorker, error) {
 	bin := resolveAgyCLIPath(cfg)
 	if bin == "" {
 		return nil, errors.New("agy binary not found")
@@ -245,7 +252,7 @@ func spawnAgyWorker(ctx context.Context, cfg config, id int, model string) (*Agy
 		args = append(args, "--model", model)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(poolCtx, bin, args...)
 	cmd.Dir = os.TempDir()
 
 	stdin, err := cmd.StdinPipe()
@@ -306,13 +313,20 @@ func spawnAgyWorker(ctx context.Context, cfg config, id int, model string) (*Agy
 			}
 			return nil, err
 		}
-	case <-ctx.Done():
+	case <-time.After(30 * time.Second):
 		stdin.Close()
 		stdout.Close()
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		return nil, ctx.Err()
+		return nil, errors.New("timed out waiting for worker init event")
+	case <-poolCtx.Done():
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return nil, poolCtx.Err()
 	}
 
 	return &AgyWorker{
