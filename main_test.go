@@ -2183,6 +2183,42 @@ func TestAgyResponseShape(t *testing.T) {
 	}
 }
 
+func TestAgyToolCallResponseShape(t *testing.T) {
+	text := "I will fetch the clinic info.\n<tool_call>\n{\"tool\": \"get_clinic_info\", \"input\": {\"id\": \"123\"}}\n</tool_call>"
+	resp := agyToResponsesResponse(text, "agy-model", 20)
+	out := toAnthropicResponsesResponse(resp, "agy-model")
+	if out["type"] != "message" || out["role"] != "assistant" {
+		t.Fatalf("bad envelope: %#v", out)
+	}
+	content, ok := out["content"].([]any)
+	if !ok || len(content) < 2 {
+		t.Fatalf("content = %#v (expected at least 2 blocks: text + tool_use)", out["content"])
+	}
+	hasText := false
+	hasToolUse := false
+	for _, block := range content {
+		m, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["type"] == "text" && m["text"] == "I will fetch the clinic info." {
+			hasText = true
+		}
+		if m["type"] == "tool_use" && m["name"] == "get_clinic_info" {
+			hasToolUse = true
+		}
+	}
+	if !hasText {
+		t.Fatalf("missing text block in %#v", content)
+	}
+	if !hasToolUse {
+		t.Fatalf("missing tool_use block in %#v", content)
+	}
+	if out["stop_reason"] != "tool_use" {
+		t.Fatalf("stop_reason = %v, want tool_use", out["stop_reason"])
+	}
+}
+
 func TestClaudeModelFor(t *testing.T) {
 	// Global override wins.
 	if got := claudeModelFor(config{ClaudeModel: "opus", Models: map[string]string{"m": "gpt-5.5"}}, "m"); got != "opus" {

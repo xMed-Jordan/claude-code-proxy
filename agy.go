@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -262,17 +263,18 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := make([]string, 0, 6+2*len(addDirs))
+	args := make([]string, 0, 8+2*len(addDirs))
 	if m := strings.TrimSpace(model); m != "" {
 		args = append(args, "--model", m)
 	}
+	// Always allow headless print mode to execute web/network tools and actions
+	args = append(args, "--dangerously-skip-permissions")
 	if media {
 		// Scope agy to exactly this request's files and let it read them without
 		// an interactive permission prompt (which would hang print mode).
 		for _, d := range addDirs {
 			args = append(args, "--add-dir", d)
 		}
-		args = append(args, "--dangerously-skip-permissions")
 	}
 	args = append(args, "-p", prompt)
 
@@ -376,6 +378,19 @@ func contentToTextNoMedia(v any) string {
 
 					continue
 				}
+				if m["type"] == "tool_result" {
+					contentStr := ""
+					if c, ok := m["content"]; ok {
+						contentStr = contentToTextNoMedia(c)
+					}
+					toolUseID, _ := m["tool_use_id"].(string)
+					prefix := "Tool Result"
+					if toolUseID != "" {
+						prefix += " (" + toolUseID + ")"
+					}
+					parts = append(parts, prefix+": "+contentStr)
+					continue
+				}
 				if _, isMedia := mediaPartFromBlock(m); isMedia {
 					continue // handled via --add-dir; never inline base64 as text
 				}
@@ -389,6 +404,13 @@ func contentToTextNoMedia(v any) string {
 		if text, ok := x["text"]; ok {
 			return fmt.Sprint(text)
 		}
+		if x["type"] == "tool_result" {
+			contentStr := ""
+			if c, ok := x["content"]; ok {
+				contentStr = contentToTextNoMedia(c)
+			}
+			return "Tool Result: " + contentStr
+		}
 		if _, isMedia := mediaPartFromBlock(x); isMedia {
 			return ""
 		}
@@ -399,12 +421,73 @@ func contentToTextNoMedia(v any) string {
 	}
 }
 
+// buildAgyToolsSystemPrompt renders tool definitions and call instructions for agy.
+func buildAgyToolsSystemPrompt(tools []anthropicTool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Tools\n\nYou have access to the following tools:\n\n")
+	for _, t := range tools {
+		b.WriteString("## ")
+		b.WriteString(t.Name)
+		b.WriteString("\n")
+		if desc := strings.TrimSpace(t.Description); desc != "" {
+			b.WriteString(desc)
+			b.WriteString("\n")
+		}
+		if t.InputSchema != nil {
+			var schema map[string]any
+			rawBytes, _ := json.Marshal(t.InputSchema)
+			if err := json.Unmarshal(rawBytes, &schema); err == nil {
+				if props, ok := schema["properties"].(map[string]any); ok && len(props) > 0 {
+					b.WriteString("Parameters:\n")
+					for pName, pDef := range props {
+						pType := ""
+						pDesc := ""
+						if pm, ok := pDef.(map[string]any); ok {
+							if ty, ok := pm["type"].(string); ok {
+								pType = ty
+							}
+							if d, ok := pm["description"].(string); ok {
+								pDesc = d
+							}
+						}
+						b.WriteString("- `")
+						b.WriteString(pName)
+						b.WriteString("`")
+						if pType != "" {
+							b.WriteString(" (" + pType + ")")
+						}
+						if pDesc != "" {
+							b.WriteString(": " + pDesc)
+						}
+						b.WriteString("\n")
+					}
+				}
+			}
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("To invoke a tool, respond with a tool call in this exact format:\n")
+	b.WriteString("<tool_call>\n{\n  \"tool\": \"tool_name\",\n  \"input\": {\n    \"param\": \"value\"\n  }\n}\n</tool_call>\n\n")
+	return b.String()
+}
+
 // flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
 // A lone user turn with no system prompt is sent raw; otherwise a role-tagged
 // transcript is built. Media blocks are dropped here (handled via --add-dir);
 // agy reads attachments from the scratch dir, not from the prompt text.
 func flattenAnthropicToPrompt(in anthropicRequest) string {
 	sys := strings.TrimSpace(contentToTextNoMedia(in.System))
+	if len(in.Tools) > 0 {
+		toolPrompt := strings.TrimSpace(buildAgyToolsSystemPrompt(in.Tools))
+		if sys == "" {
+			sys = toolPrompt
+		} else {
+			sys = toolPrompt + "\n\n" + sys
+		}
+	}
 	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
 		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
@@ -482,19 +565,131 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 	return strings.TrimSpace(b.String())
 }
 
+var (
+	agyToolTagRe     = regexp.MustCompile(`(?s)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>`)
+	agyToolBracketRe = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
+	agyToolFencedRe  = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
+)
+
+// parseAgyToolCalls extracts tool calls (<tool_call>, [TOOL_CALL], fenced json, or raw json)
+// from agy output and returns the remaining text and function_call items.
+func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
+	var items []responsesOutputItem
+
+	extractFromRegex := func(re *regexp.Regexp, s string) string {
+		matches := re.FindAllStringSubmatchIndex(s, -1)
+		if len(matches) == 0 {
+			return s
+		}
+		var clean strings.Builder
+		last := 0
+		for _, m := range matches {
+			clean.WriteString(s[last:m[0]])
+			last = m[1]
+			rawJSON := strings.TrimSpace(s[m[2]:m[3]])
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(rawJSON), &payload); err == nil {
+				toolName := ""
+				if t, ok := payload["tool"].(string); ok {
+					toolName = t
+				} else if n, ok := payload["name"].(string); ok {
+					toolName = n
+				}
+				if toolName != "" {
+					input := payload["input"]
+					if input == nil {
+						input = payload["arguments"]
+					}
+					if input == nil {
+						input = payload["parameters"]
+					}
+					if input == nil {
+						input = map[string]any{}
+					}
+					argsBytes, _ := json.Marshal(input)
+					items = append(items, responsesOutputItem{
+						Type:      "function_call",
+						Name:      toolName,
+						Arguments: string(argsBytes),
+						CallID:    "toolu_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+					})
+				}
+			}
+		}
+		clean.WriteString(s[last:])
+		return clean.String()
+	}
+
+	cleaned := text
+	cleaned = extractFromRegex(agyToolTagRe, cleaned)
+	cleaned = extractFromRegex(agyToolBracketRe, cleaned)
+	cleaned = extractFromRegex(agyToolFencedRe, cleaned)
+
+	// If no tagged matches found, check if trimmed output is a single JSON object with "tool" and "input"
+	if len(items) == 0 {
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
+				toolName := ""
+				if t, ok := payload["tool"].(string); ok {
+					toolName = t
+				} else if n, ok := payload["name"].(string); ok {
+					toolName = n
+				}
+				if toolName != "" && (payload["input"] != nil || payload["arguments"] != nil || payload["parameters"] != nil) {
+					input := payload["input"]
+					if input == nil {
+						input = payload["arguments"]
+					}
+					if input == nil {
+						input = payload["parameters"]
+					}
+					if input == nil {
+						input = map[string]any{}
+					}
+					argsBytes, _ := json.Marshal(input)
+					items = append(items, responsesOutputItem{
+						Type:      "function_call",
+						Name:      toolName,
+						Arguments: string(argsBytes),
+						CallID:    "toolu_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+					})
+					cleaned = ""
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(cleaned), items
+}
+
 // agyToResponsesResponse wraps agy's final text in a synthetic responsesResponse
-// (one message/text output item + estimated usage) so it can flow through the
+// (including function_call items if tool calls were emitted) so it can flow through the
 // existing converters and stream emitters.
 func agyToResponsesResponse(text, model string, inputTokens int) responsesResponse {
 	resp := responsesResponse{
 		ID:    "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36),
 		Model: model,
 	}
-	resp.Output = []responsesOutputItem{{
-		Type:    "message",
-		Role:    "assistant",
-		Content: []responsesOutputContent{{Type: "output_text", Text: text}},
-	}}
+
+	cleanText, toolItems := parseAgyToolCalls(text)
+	if cleanText != "" {
+		resp.Output = append(resp.Output, responsesOutputItem{
+			Type:    "message",
+			Role:    "assistant",
+			Content: []responsesOutputContent{{Type: "output_text", Text: cleanText}},
+		})
+	}
+	resp.Output = append(resp.Output, toolItems...)
+	if len(resp.Output) == 0 {
+		resp.Output = []responsesOutputItem{{
+			Type:    "message",
+			Role:    "assistant",
+			Content: []responsesOutputContent{{Type: "output_text", Text: ""}},
+		}}
+	}
+
 	resp.Usage.InputTokens = inputTokens
 	resp.Usage.OutputTokens = estimateTextTokens(text)
 	return resp
@@ -543,9 +738,16 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+	stopReason := "end_turn"
+	for _, item := range resp.Output {
+		if item.Type == "function_call" {
+			stopReason = "tool_use"
+			break
+		}
+	}
 	updateRequestStat(r, func(stat *requestStat) {
 		stat.OutputTokens = resp.Usage.OutputTokens
-		stat.StopReason = "end_turn"
+		stat.StopReason = stopReason
 	})
 	if in.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")

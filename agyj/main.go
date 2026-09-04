@@ -677,6 +677,18 @@ func main() {
 		agyArgs = append(agyArgs, "-p", prompt)
 	}
 
+	// Ensure print/headless mode does not auto-deny read_url, web_search, or file tools
+	hasSkipPerm := false
+	for _, a := range agyArgs {
+		if a == "--dangerously-skip-permissions" {
+			hasSkipPerm = true
+			break
+		}
+	}
+	if !hasSkipPerm {
+		agyArgs = append([]string{"--dangerously-skip-permissions"}, agyArgs...)
+	}
+
 	// --- Extract --conversation <id> if present ---
 	convID := ""
 	convIDArgIdx := -1
