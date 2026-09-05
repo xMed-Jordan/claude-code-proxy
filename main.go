@@ -386,8 +386,11 @@ type anthropicOutputConfig struct {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string           `json:"role"`
+	Name       string           `json:"name,omitempty"`
+	Content    any              `json:"content"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type anthropicTool struct {
@@ -4340,10 +4343,16 @@ func toOpenAI(cfg config, in anthropicRequest) (openAIRequest, error) {
 func convertMessage(msg anthropicMessage) []openAIMessage {
 	blocks, ok := msg.Content.([]any)
 	if !ok {
-		return []openAIMessage{{Role: msg.Role, Content: contentToText(msg.Content)}}
+		return []openAIMessage{{
+			Role:       msg.Role,
+			Name:       msg.Name,
+			Content:    contentToText(msg.Content),
+			ToolCallID: msg.ToolCallID,
+			ToolCalls:  msg.ToolCalls,
+		}}
 	}
 	var parts []map[string]any
-	var toolCalls []openAIToolCall
+	var toolCalls = append([]openAIToolCall{}, msg.ToolCalls...)
 	var out []openAIMessage
 	flushMessage := func() {
 		if len(parts) == 0 && len(toolCalls) == 0 {

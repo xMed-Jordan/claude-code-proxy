@@ -197,4 +197,162 @@ func TestParseAgyToolCalls_StripsSimulatedToolResult(t *testing.T) {
 	}
 }
 
+func TestFlattenAnthropicToPrompt_PreflightAndDuplicateCollapsing(t *testing.T) {
+	req := anthropicRequest{
+		System: "You are a clinic AI assistant.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "احجز لي موعد فايزة"},
+			// First call
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_1",
+					"name":  "get_tool_instructions",
+					"input": map[string]any{"tool_code": "membership_protocol"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_1",
+					"content":     `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol FIRST"}`,
+				},
+			}},
+			// Second identical call (duplicate loop)
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_2",
+					"name":  "get_tool_instructions",
+					"input": map[string]any{"tool_code": "membership_protocol"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_2",
+					"content":     `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol FIRST"}`,
+				},
+			}},
+		},
+	}
+
+	prompt := flattenAnthropicToPrompt(req)
+
+	if !strings.Contains(prompt, "CRITICAL TOOL PREFLIGHT & PROTOCOL RULES:") {
+		t.Errorf("expected CRITICAL TOOL PREFLIGHT & PROTOCOL RULES in prompt")
+	}
+	if !strings.Contains(prompt, "Instructions for the following tools have ALREADY been retrieved in this conversation: [membership_protocol]") {
+		t.Errorf("expected membership_protocol in preflighted tools list")
+	}
+	if !strings.Contains(prompt, "NEVER call `get_tool_instructions` for any of these tools again!") {
+		t.Errorf("expected never call get_tool_instructions instruction")
+	}
+
+	assistantCallCount := strings.Count(prompt, "Assistant: <tool_call>")
+	if assistantCallCount != 1 {
+		t.Errorf("expected duplicate assistant tool call to be collapsed to 1, got %d", assistantCallCount)
+	}
+}
+
+func TestFlattenOpenAIChatToPrompt_PreflightAndDuplicateCollapsing(t *testing.T) {
+	req := openAIRequest{
+		Messages: []openAIMessage{
+			{Role: "user", Content: "احجز لي موعد"},
+			{
+				Role: "assistant",
+				ToolCalls: []openAIToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: openAIToolFunction{
+							Name:      "get_tool_instructions",
+							Arguments: `{"tool_code": "membership_protocol"}`,
+						},
+					},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_1",
+				Content:    `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol"}`,
+			},
+			{
+				Role: "assistant",
+				ToolCalls: []openAIToolCall{
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: openAIToolFunction{
+							Name:      "get_tool_instructions",
+							Arguments: `{"tool_code": "membership_protocol"}`,
+						},
+					},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_2",
+				Content:    `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol"}`,
+			},
+		},
+	}
+
+	prompt := flattenOpenAIChatToPrompt(req)
+
+	if !strings.Contains(prompt, "CRITICAL TOOL PREFLIGHT & PROTOCOL RULES:") {
+		t.Errorf("expected CRITICAL TOOL PREFLIGHT & PROTOCOL RULES in prompt")
+	}
+	if !strings.Contains(prompt, "Instructions for the following tools have ALREADY been retrieved in this conversation: [membership_protocol]") {
+		t.Errorf("expected membership_protocol in preflighted list")
+	}
+
+	assistantCallCount := strings.Count(prompt, "Assistant: <tool_call>")
+	if assistantCallCount != 1 {
+		t.Errorf("expected duplicate assistant tool call to be collapsed to 1, got %d", assistantCallCount)
+	}
+}
+
+func TestFlattenResponsesToPrompt_PreflightAndDuplicateCollapsing(t *testing.T) {
+	req := responsesRequest{
+		Input: []any{
+			map[string]any{"role": "user", "content": "احجز لي موعد"},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "get_tool_instructions",
+				"arguments": `{"tool_code": "membership_protocol"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_1",
+				"output":  `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "get_tool_instructions",
+				"arguments": `{"tool_code": "membership_protocol"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_2",
+				"output":  `{"tool_code": "membership_protocol", "instructions": "Call membership_protocol"}`,
+			},
+		},
+	}
+
+	prompt := flattenResponsesToPrompt(req)
+
+	if !strings.Contains(prompt, "CRITICAL TOOL PREFLIGHT & PROTOCOL RULES:") {
+		t.Errorf("expected CRITICAL TOOL PREFLIGHT & PROTOCOL RULES in prompt")
+	}
+	if !strings.Contains(prompt, "Instructions for the following tools have ALREADY been retrieved in this conversation: [membership_protocol]") {
+		t.Errorf("expected membership_protocol in preflighted list")
+	}
+
+	assistantCallCount := strings.Count(prompt, "Assistant: <tool_call>")
+	if assistantCallCount != 1 {
+		t.Errorf("expected duplicate assistant tool call to be collapsed to 1, got %d", assistantCallCount)
+	}
+}
+
 
