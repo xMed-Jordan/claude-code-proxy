@@ -744,11 +744,12 @@ func buildPreflightDirective(preflightedTools map[string]bool, lastPreflightedTo
 	var pb strings.Builder
 	pb.WriteString("CRITICAL TOOL PREFLIGHT & PROTOCOL RULES:\n")
 	pb.WriteString(fmt.Sprintf("- Instructions for the following tools have ALREADY been retrieved in this conversation: [%s].\n", strings.Join(toolList, ", ")))
+	pb.WriteString("- NEVER call `get_tool_instructions` for any tool more than once in this conversation!\n")
 	pb.WriteString("- NEVER call `get_tool_instructions` for any of these tools again! The preflight cache lasts for the entire conversation.\n")
 	if preflightedTools["membership_protocol"] {
-		pb.WriteString("- If you need to use the membership protocol, invoke `membership_protocol` directly via <tool_call>, or proceed to answer the customer or call the next booking tool.\n")
+		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
 	} else if lastPreflightedTool != "" {
-		pb.WriteString(fmt.Sprintf("- If you were preparing to call '%s', call '%s' directly now with the appropriate parameters.\n", lastPreflightedTool, lastPreflightedTool))
+		pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you were preparing to call '%s', call '%s' directly now via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
 	}
 	return pb.String()
 }
@@ -761,25 +762,6 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 
 	if sys == "" && toolsPrompt == "" && tempDirective == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
 		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
-	}
-
-	var b strings.Builder
-
-	if sys != "" || tempDirective != "" {
-		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
-		if tempDirective != "" {
-			b.WriteString(tempDirective)
-			b.WriteString("\n\n")
-		}
-		if sys != "" {
-			b.WriteString(sys)
-			b.WriteString("\n\n")
-		}
-	}
-
-	if toolsPrompt != "" {
-		b.WriteString(toolsPrompt)
-		b.WriteString("\n\n")
 	}
 
 	var history []string
@@ -876,6 +858,31 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 		history = append(history, agyRoleLabel(role)+": "+content)
 	}
 
+	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+
+	var b strings.Builder
+
+	if sys != "" || tempDirective != "" || preflightDirective != "" {
+		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		if tempDirective != "" {
+			b.WriteString(tempDirective)
+			b.WriteString("\n\n")
+		}
+		if sys != "" {
+			b.WriteString(sys)
+			b.WriteString("\n\n")
+		}
+		if preflightDirective != "" {
+			b.WriteString(preflightDirective)
+			b.WriteString("\n\n")
+		}
+	}
+
+	if toolsPrompt != "" {
+		b.WriteString(toolsPrompt)
+		b.WriteString("\n\n")
+	}
+
 	if len(customerTurns) > 1 {
 		b.WriteString("### CHRONOLOGICAL CUSTOMER STATEMENTS (Review Carefully):\n")
 		for idx, ct := range customerTurns {
@@ -889,8 +896,6 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 		b.WriteString(strings.Join(history, "\n\n"))
 		b.WriteString("\n\n")
 	}
-
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
 
 	if lastCustomerMessage != "" {
 		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
@@ -1064,6 +1069,11 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 		history = append(history, agyRoleLabel(role)+": "+content)
 	}
 
+	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+	if preflightDirective != "" {
+		sysParts = append(sysParts, preflightDirective)
+	}
+
 	var b strings.Builder
 	if len(sysParts) > 0 {
 		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
@@ -1089,8 +1099,6 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 		b.WriteString(strings.Join(history, "\n\n"))
 		b.WriteString("\n\n")
 	}
-
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
 
 	if lastCustomerMessage != "" {
 		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
@@ -1281,6 +1289,11 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		}
 	}
 
+	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+	if preflightDirective != "" {
+		sysParts = append(sysParts, preflightDirective)
+	}
+
 	var b strings.Builder
 	if len(sysParts) > 0 {
 		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
@@ -1306,8 +1319,6 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		b.WriteString(strings.Join(history, "\n\n"))
 		b.WriteString("\n\n")
 	}
-
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
 
 	if lastCustomerMessage != "" {
 		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
