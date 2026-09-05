@@ -729,10 +729,32 @@ func extractPreflightToolCode(text string) string {
 	return ""
 }
 
+// extractToolCallNames extracts the tool names from formatted <tool_call> blocks.
+func extractToolCallNames(text string) []string {
+	var names []string
+	matches := agyToolTagRe.FindAllStringSubmatch(text, -1)
+	for _, m := range matches {
+		if len(m) > 1 {
+			var payload struct {
+				Tool string `json:"tool"`
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(m[1])), &payload); err == nil {
+				if payload.Tool != "" {
+					names = append(names, payload.Tool)
+				} else if payload.Name != "" {
+					names = append(names, payload.Name)
+				}
+			}
+		}
+	}
+	return names
+}
+
 // buildPreflightDirective constructs prompt guidance reminding the model that instructions
 // for certain tools have already been retrieved, preventing preflight loops.
-func buildPreflightDirective(preflightedTools map[string]bool, lastPreflightedTool string) string {
-	if len(preflightedTools) == 0 {
+func buildPreflightDirective(preflightedTools map[string]bool, executedTools map[string]bool, lastPreflightedTool string) string {
+	if len(preflightedTools) == 0 && len(executedTools) == 0 {
 		return ""
 	}
 	var toolList []string
@@ -743,13 +765,21 @@ func buildPreflightDirective(preflightedTools map[string]bool, lastPreflightedTo
 
 	var pb strings.Builder
 	pb.WriteString("CRITICAL TOOL PREFLIGHT & PROTOCOL RULES:\n")
-	pb.WriteString(fmt.Sprintf("- Instructions for the following tools have ALREADY been retrieved in this conversation: [%s].\n", strings.Join(toolList, ", ")))
-	pb.WriteString("- NEVER call `get_tool_instructions` for any tool more than once in this conversation!\n")
-	pb.WriteString("- NEVER call `get_tool_instructions` for any of these tools again! The preflight cache lasts for the entire conversation.\n")
-	if preflightedTools["membership_protocol"] {
+	if len(toolList) > 0 {
+		pb.WriteString(fmt.Sprintf("- Instructions for the following tools have ALREADY been retrieved in this conversation: [%s].\n", strings.Join(toolList, ", ")))
+		pb.WriteString("- NEVER call `get_tool_instructions` for any tool more than once in this conversation!\n")
+		pb.WriteString("- NEVER call `get_tool_instructions` for any of these tools again! The preflight cache lasts for the entire conversation.\n")
+	}
+	if executedTools["membership_protocol"] {
+		pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool.\n")
+	} else if preflightedTools["membership_protocol"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
 	} else if lastPreflightedTool != "" {
-		pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you were preparing to call '%s', call '%s' directly now via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
+		if executedTools[lastPreflightedTool] {
+			pb.WriteString(fmt.Sprintf("- The '%s' tool has ALREADY been executed and returned above. Do NOT call '%s' or `get_tool_instructions` again.\n", lastPreflightedTool, lastPreflightedTool))
+		} else {
+			pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you were preparing to call '%s', call '%s' directly now via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
+		}
 	}
 	return pb.String()
 }
@@ -772,6 +802,7 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 	seenAssistantGreeting := false
 
 	preflightedTools := make(map[string]bool)
+	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
@@ -828,11 +859,16 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 				seenAssistantGreeting = true
 			}
 
-			// Track preflights and collapse consecutive identical tool calls
+			// Track preflights, executed tools, and collapse consecutive identical tool calls
 			if strings.Contains(content, "<tool_call>") {
 				if tc := extractPreflightToolCode(content); tc != "" {
 					preflightedTools[tc] = true
 					lastPreflightedTool = tc
+				}
+				for _, name := range extractToolCallNames(content) {
+					if name != "get_tool_instructions" && name != "" {
+						executedTools[name] = true
+					}
 				}
 				if !isLast && lastAssistantToolCallText != "" && content == lastAssistantToolCallText {
 					suppressNextToolResult = true
@@ -858,7 +894,7 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 		history = append(history, agyRoleLabel(role)+": "+content)
 	}
 
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+	preflightDirective := buildPreflightDirective(preflightedTools, executedTools, lastPreflightedTool)
 
 	var b strings.Builder
 
@@ -959,6 +995,7 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 	seenAssistantGreeting := false
 
 	preflightedTools := make(map[string]bool)
+	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
@@ -1029,6 +1066,10 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 				parts = append(parts, content)
 			}
 			for _, tc := range msg.ToolCalls {
+				name := tc.Function.Name
+				if name != "get_tool_instructions" && name != "" {
+					executedTools[name] = true
+				}
 				var args any = tc.Function.Arguments
 				if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
 					var parsed any
@@ -1037,7 +1078,7 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 					}
 				}
 				callPayload := map[string]any{
-					"tool":  tc.Function.Name,
+					"tool":  name,
 					"input": args,
 				}
 				raw, _ := json.Marshal(callPayload)
@@ -1069,7 +1110,7 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 		history = append(history, agyRoleLabel(role)+": "+content)
 	}
 
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+	preflightDirective := buildPreflightDirective(preflightedTools, executedTools, lastPreflightedTool)
 	if preflightDirective != "" {
 		sysParts = append(sysParts, preflightDirective)
 	}
@@ -1161,6 +1202,7 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 	seenAssistantGreeting := false
 
 	preflightedTools := make(map[string]bool)
+	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
@@ -1181,6 +1223,9 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 
 		if itemType == "function_call" {
 			name, _ := m["name"].(string)
+			if name != "get_tool_instructions" && name != "" {
+				executedTools[name] = true
+			}
 			arguments := m["arguments"]
 			var input any = arguments
 			if argStr, ok := arguments.(string); ok && strings.TrimSpace(argStr) != "" {
@@ -1258,6 +1303,11 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 					preflightedTools[tc] = true
 					lastPreflightedTool = tc
 				}
+				for _, name := range extractToolCallNames(text) {
+					if name != "get_tool_instructions" && name != "" {
+						executedTools[name] = true
+					}
+				}
 				if !isLast && lastAssistantToolCallText != "" && text == lastAssistantToolCallText {
 					suppressNextToolResult = true
 					continue
@@ -1289,7 +1339,7 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		}
 	}
 
-	preflightDirective := buildPreflightDirective(preflightedTools, lastPreflightedTool)
+	preflightDirective := buildPreflightDirective(preflightedTools, executedTools, lastPreflightedTool)
 	if preflightDirective != "" {
 		sysParts = append(sysParts, preflightDirective)
 	}

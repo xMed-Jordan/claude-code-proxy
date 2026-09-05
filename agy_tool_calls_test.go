@@ -355,4 +355,35 @@ func TestFlattenResponsesToPrompt_PreflightAndDuplicateCollapsing(t *testing.T) 
 	}
 }
 
+func TestFlattenAnthropicToPrompt_PostExecutionMembershipProtocol(t *testing.T) {
+	req := anthropicRequest{
+		System: "You are a clinic AI assistant.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "احجز لي موعد"},
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_1",
+					"name":  "membership_protocol",
+					"input": map[string]any{"context": "booking"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_1",
+					"content":     `{"instructions": "Ask which body area and branch"}`,
+				},
+			}},
+		},
+	}
 
+	prompt := flattenAnthropicToPrompt(req)
+
+	if !strings.Contains(prompt, "The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result") {
+		t.Errorf("expected post-execution directive in prompt")
+	}
+	if !strings.Contains(prompt, "Do NOT call `membership_protocol` or `get_tool_instructions` again!") {
+		t.Errorf("expected do not call membership_protocol again instruction")
+	}
+}
