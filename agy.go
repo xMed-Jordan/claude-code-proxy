@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -771,12 +772,16 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 		pb.WriteString("- NEVER call `get_tool_instructions` for any of these tools again! The preflight cache lasts for the entire conversation.\n")
 	}
 	if executedTools["membership_protocol"] {
-		pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool.\n")
+		if executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] {
+			pb.WriteString("- The `membership_protocol` and appointment slots tools have ALREADY been executed. DO NOT call `membership_protocol`, `get_available_slots`, or any other tool! Answer the customer directly in natural Arabic.\n")
+		} else {
+			pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool.\n")
+		}
 	} else if preflightedTools["membership_protocol"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
 	}
 	if executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] {
-		pb.WriteString("- Available appointment slots have ALREADY been retrieved in this conversation. Do NOT call `get_available_slots` or `get_multi_service_slots` again for the same date/branch! Quote the available options to the customer directly in natural Arabic.\n")
+		pb.WriteString("- Available appointment slots have ALREADY been retrieved in this conversation. NEVER call `get_available_slots` or `get_multi_service_slots` again! DO NOT make any tool calls! Respond directly to the customer in natural friendly Arabic quoting the available options from `merged_slots` and ask which time she prefers.\n")
 	}
 	if executedTools["get_customer_packages"] {
 		pb.WriteString("- Customer packages have ALREADY been retrieved in this conversation. Do NOT call `get_customer_packages` or `get_tool_instructions` again.\n")
@@ -1757,6 +1762,47 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	return res, nil
 }
 
+// isRedundantSlotToolCallAnthropic checks if the incoming request ended with a tool result for available slots,
+// but the model redundantly emitted another get_available_slots or get_multi_service_slots tool call.
+func isRedundantSlotToolCallAnthropic(inMessages []anthropicMessage, outputItems []responsesOutputItem) (bool, string, string) {
+	if len(inMessages) == 0 {
+		return false, "", ""
+	}
+	lastMsg := inMessages[len(inMessages)-1]
+	lastContent := contentToTextNoMedia(lastMsg.Content)
+	if !isAnthropicToolResultMessage(lastMsg) && !strings.HasPrefix(lastContent, "[Tool Result") {
+		return false, "", ""
+	}
+	if !strings.Contains(lastContent, `"slots"`) && !strings.Contains(lastContent, `"merged_slots"`) {
+		return false, "", ""
+	}
+
+	hasSlotCall := false
+	for _, item := range outputItems {
+		if item.Type == "function_call" && (item.Name == "get_available_slots" || item.Name == "get_multi_service_slots") {
+			hasSlotCall = true
+			break
+		}
+	}
+	if !hasSlotCall {
+		return false, "", ""
+	}
+
+	var activeRequest string
+	for i := len(inMessages) - 2; i >= 0; i-- {
+		msg := inMessages[i]
+		if strings.EqualFold(msg.Role, "user") && !isAnthropicToolResultMessage(msg) {
+			text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
+			if text != "" && !strings.HasPrefix(text, "[AUTO-CONTEXT") && !strings.HasPrefix(text, "[SYSTEM ERROR") {
+				activeRequest = text
+				break
+			}
+		}
+	}
+
+	return true, lastContent, activeRequest
+}
+
 // serveAgyAnthropic handles /anthropic/v1/messages for an agy-backed alias.
 func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w http.ResponseWriter, r *http.Request) {
 	inputTokens := estimateAnthropicRequestTokens(in)
@@ -1770,6 +1816,41 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+
+	// Safety Guard: Intercept redundant slot retrieval loops immediately
+	if redundant, lastSlotContent, activeCustomerReq := isRedundantSlotToolCallAnthropic(in.Messages, resp.Output); redundant {
+		log.Printf("[agy-guard] Redundant slot retrieval tool call detected in loop. Intercepting with direct slot presentation...")
+		var retryPb strings.Builder
+		retryPb.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		retryPb.WriteString("Generation strictness (temperature=0.3): STRICT DETERMINISTIC FACTUALITY.\n\n")
+		retryPb.WriteString("You are Zeina, the friendly Arabic digital assistant for Shalabi Clinics (اللهجة الأردنية).\n")
+		retryPb.WriteString("CRITICAL DIRECTIVE:\n")
+		retryPb.WriteString("- DO NOT CALL ANY TOOLS! Absolutely no tool calls or JSON blocks allowed.\n")
+		retryPb.WriteString("- No emojis. No repetitive greetings.\n\n")
+		if activeCustomerReq != "" {
+			retryPb.WriteString(fmt.Sprintf("ACTIVE CUSTOMER REQUEST:\n%s\n\n", activeCustomerReq))
+		}
+		retryPb.WriteString("AVAILABLE APPOINTMENT SLOTS (retrieved from system):\n")
+		retryPb.WriteString(lastSlotContent)
+		retryPb.WriteString("\n\n")
+		retryPb.WriteString("CRITICAL INSTRUCTION FOR ZEINA:\n")
+		retryPb.WriteString("Respond directly to the customer in natural friendly Jordanian Arabic quoting the available appointment times from merged_slots (e.g. for today or tomorrow) in time ranges and ask which time she prefers.\n")
+
+		if retryRes, retryErr := agyResolve(ctx, cfg, nil, retryPb.String(), in.Model); retryErr == nil && retryRes.Ok {
+			retryResp := agyToResponsesResponse(retryRes.Response, model, inputTokens)
+			hasToolCall := false
+			for _, item := range retryResp.Output {
+				if item.Type == "function_call" {
+					hasToolCall = true
+					break
+				}
+			}
+			if !hasToolCall && len(retryResp.Output) > 0 {
+				resp = retryResp
+				log.Printf("[agy-guard] Successfully recovered slot loop into direct Arabic text response.")
+			}
+		}
+	}
 	stopReason := "end_turn"
 	for _, item := range resp.Output {
 		if item.Type == "function_call" {

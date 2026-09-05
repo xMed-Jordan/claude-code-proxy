@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -477,5 +479,58 @@ func TestFlattenAnthropicToPrompt_ConsecutiveToolCallCollapsing(t *testing.T) {
 		t.Errorf("expected latest tool call to remain in prompt")
 	}
 }
+
+
+func TestIsRedundantSlotToolCallAnthropic(t *testing.T) {
+	messages := []anthropicMessage{
+		{Role: "user", Content: "عمان جلسة كاملة امتى اقرب موعد"},
+		{Role: "assistant", Content: []any{
+			map[string]any{
+				"type": "tool_use",
+				"name": "get_available_slots",
+				"id":   "call_1",
+			},
+		}},
+		{Role: "user", Content: []any{
+			map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": "call_1",
+				"content":     `{"slots":[{"date":"2026-09-05","merged_slots":[{"time_from":"14:00","time_to":"17:00"}]}]}`,
+			},
+		}},
+	}
+
+	// Case 1: Model emits another get_available_slots
+	outputItems := []responsesOutputItem{
+		{
+			Type: "function_call",
+			Name: "get_available_slots",
+		},
+	}
+	redundant, lastContent, activeReq := isRedundantSlotToolCallAnthropic(messages, outputItems)
+	if !redundant {
+		t.Errorf("expected redundant=true for consecutive slot query call")
+	}
+	if !strings.Contains(lastContent, "14:00") {
+		t.Errorf("expected lastContent to contain slot data, got: %s", lastContent)
+	}
+	if activeReq != "عمان جلسة كاملة امتى اقرب موعد" {
+		t.Errorf("expected activeReq to match, got: %s", activeReq)
+	}
+
+	// Case 2: Model emits normal text response (no tool call)
+	outputItemsNormal := []responsesOutputItem{
+		{
+			Type: "message",
+			Role: "assistant",
+		},
+	}
+	redundant2, _, _ := isRedundantSlotToolCallAnthropic(messages, outputItemsNormal)
+	if redundant2 {
+		t.Errorf("expected redundant=false for normal text response")
+	}
+}
+
+
 
 
