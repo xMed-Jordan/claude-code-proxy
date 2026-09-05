@@ -387,3 +387,95 @@ func TestFlattenAnthropicToPrompt_PostExecutionMembershipProtocol(t *testing.T) 
 		t.Errorf("expected do not call membership_protocol again instruction")
 	}
 }
+
+func TestFlattenAnthropicToPrompt_AvailableSlotsDirective(t *testing.T) {
+	req := anthropicRequest{
+		Model:  "gemini-3.8-flash-medium",
+		System: "You are a clinic AI assistant.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "عمان جلسة كاملة امتى اقرب موعد"},
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_slots_1",
+					"name":  "get_available_slots",
+					"input": map[string]any{"branch_id": "2", "from_date": "2026-09-05", "to_date": "2026-09-06"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_slots_1",
+					"content":     `{"slots":[{"date":"2026-09-05","merged_slots":[{"time_from":"14:00","time_to":"17:00"}]}]}`,
+				},
+			}},
+		},
+	}
+
+	prompt := flattenAnthropicToPrompt(req)
+
+	if !strings.Contains(prompt, "AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!") {
+		t.Errorf("expected slot retrieval header in prompt directive")
+	}
+	if !strings.Contains(prompt, "DO NOT call `get_available_slots` or `get_multi_service_slots` again! DO NOT call any more tools!") {
+		t.Errorf("expected instruction prohibiting calling get_available_slots again")
+	}
+	if !strings.Contains(prompt, "Provide the available slots directly to the customer in natural friendly Arabic") {
+		t.Errorf("expected instruction to provide available slots to customer")
+	}
+}
+
+func TestFlattenAnthropicToPrompt_ConsecutiveToolCallCollapsing(t *testing.T) {
+	req := anthropicRequest{
+		Model:  "gemini-3.8-flash-medium",
+		System: "You are a clinic AI assistant.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "عمان جلسة كاملة امتى اقرب موعد"},
+			// Call 1
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_slots_1",
+					"name":  "get_available_slots",
+					"input": map[string]any{"branch_id": "2", "from_date": "2026-09-05", "to_date": "2026-09-05"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_slots_1",
+					"content":     `{"slots":[]}`,
+				},
+			}},
+			// Call 2 (consecutive repetition to same tool)
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":  "tool_use",
+					"id":    "call_slots_2",
+					"name":  "get_available_slots",
+					"input": map[string]any{"branch_id": "2", "from_date": "2026-09-05", "to_date": "2026-09-06"},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "call_slots_2",
+					"content":     `{"slots":[{"date":"2026-09-05","merged_slots":[{"time_from":"14:00","time_to":"17:00"}]}]}`,
+				},
+			}},
+		},
+	}
+
+	prompt := flattenAnthropicToPrompt(req)
+
+	// Call 1 should have been collapsed out of history
+	if strings.Contains(prompt, "call_slots_1") {
+		t.Errorf("expected earlier consecutive duplicate tool call to be collapsed out of history")
+	}
+	// Call 2 should be present
+	if !strings.Contains(prompt, "call_slots_2") {
+		t.Errorf("expected latest tool call to remain in prompt")
+	}
+}
+
+

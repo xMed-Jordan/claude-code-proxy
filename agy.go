@@ -774,7 +774,14 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 		pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool.\n")
 	} else if preflightedTools["membership_protocol"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
-	} else if lastPreflightedTool != "" {
+	}
+	if executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] {
+		pb.WriteString("- Available appointment slots have ALREADY been retrieved in this conversation. Do NOT call `get_available_slots` or `get_multi_service_slots` again for the same date/branch! Quote the available options to the customer directly in natural Arabic.\n")
+	}
+	if executedTools["get_customer_packages"] {
+		pb.WriteString("- Customer packages have ALREADY been retrieved in this conversation. Do NOT call `get_customer_packages` or `get_tool_instructions` again.\n")
+	}
+	if lastPreflightedTool != "" && lastPreflightedTool != "membership_protocol" && lastPreflightedTool != "get_available_slots" && lastPreflightedTool != "get_multi_service_slots" && lastPreflightedTool != "get_customer_packages" {
 		if executedTools[lastPreflightedTool] {
 			pb.WriteString(fmt.Sprintf("- The '%s' tool has ALREADY been executed and returned above. Do NOT call '%s' or `get_tool_instructions` again.\n", lastPreflightedTool, lastPreflightedTool))
 		} else {
@@ -783,6 +790,53 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 	}
 	return pb.String()
 }
+
+// buildToolResultDirective constructs specific prompt instructions when the conversation's
+// last turn is a tool result, guiding the model to formulate its text response or invoke the
+// strictly necessary next tool, breaking infinite tool repetition loops.
+func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent string, activeCustomerRequest string, preflightDirective string) string {
+	var b strings.Builder
+	b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
+	b.WriteString("The tool has executed and returned data above.\n\n")
+	if activeCustomerRequest != "" {
+		b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
+		b.WriteString(activeCustomerRequest)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+	b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
+	b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+	b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
+
+	isSlotResult := lastExecutedToolName == "get_available_slots" ||
+		lastExecutedToolName == "get_multi_service_slots" ||
+		strings.Contains(lastToolResultContent, `"slots"`) ||
+		strings.Contains(lastToolResultContent, `"merged_slots"`) ||
+		strings.Contains(lastToolResultContent, `"available_slots"`)
+
+	if isSlotResult {
+		b.WriteString("- AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!\n")
+		b.WriteString("- DO NOT call `get_available_slots` or `get_multi_service_slots` again! DO NOT call any more tools!\n")
+		b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the date and time ranges from merged_slots) and ask which time she prefers.\n")
+	} else if lastExecutedToolName == "membership_protocol" || strings.Contains(lastToolResultContent, "MEMBERSHIP PROTOCOL") {
+		b.WriteString("- The `membership_protocol` instructions have been retrieved above. Follow the instructions directly to ask the customer which area and branch she wants to book, or invoke the next booking tool via <tool_call>.\n")
+	} else if lastExecutedToolName != "" {
+		b.WriteString(fmt.Sprintf("- The '%s' tool has executed and returned data above. NEVER call '%s' again with the same parameters!\n", lastExecutedToolName, lastExecutedToolName))
+		b.WriteString("- If the customer's question can now be answered from the returned data (e.g. packages, prices, clinic info), provide your final response to the customer in natural conversation with NO tool calls.\n")
+		b.WriteString("- Only invoke another tool via <tool_call> if a completely different action is strictly required to fulfill the request.\n")
+	} else {
+		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
+		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
+	}
+
+	b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	if preflightDirective != "" {
+		b.WriteString("\n")
+		b.WriteString(preflightDirective)
+	}
+	return b.String()
+}
+
 
 // flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
 func flattenAnthropicToPrompt(in anthropicRequest) string {
@@ -804,6 +858,8 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 	preflightedTools := make(map[string]bool)
 	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
+	var lastToolResultContent string
+	var lastExecutedToolName string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
 
@@ -817,6 +873,7 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 		isToolResult := isAnthropicToolResultMessage(msg) || strings.HasPrefix(content, "[Tool Result")
 
 		if isToolResult {
+			lastToolResultContent = content
 			if tc := extractPreflightToolCode(content); tc != "" {
 				preflightedTools[tc] = true
 				lastPreflightedTool = tc
@@ -865,14 +922,23 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 					preflightedTools[tc] = true
 					lastPreflightedTool = tc
 				}
-				for _, name := range extractToolCallNames(content) {
+				names := extractToolCallNames(content)
+				for _, name := range names {
 					if name != "get_tool_instructions" && name != "" {
 						executedTools[name] = true
 					}
+					if name != "" {
+						lastExecutedToolName = name
+					}
 				}
-				if !isLast && lastAssistantToolCallText != "" && content == lastAssistantToolCallText {
-					suppressNextToolResult = true
-					continue
+				lastNames := extractToolCallNames(lastAssistantToolCallText)
+				isConsecutiveSameTool := len(names) == 1 && len(lastNames) == 1 && names[0] == lastNames[0]
+				if isConsecutiveSameTool {
+					if len(history) >= 2 && strings.HasPrefix(history[len(history)-1], "[Tool Result") && strings.HasPrefix(history[len(history)-2], "Assistant: <tool_call>") {
+						history = history[:len(history)-2]
+					} else if len(history) >= 1 && strings.HasPrefix(history[len(history)-1], "Assistant: <tool_call>") {
+						history = history[:len(history)-1]
+					}
 				}
 				lastAssistantToolCallText = content
 				suppressNextToolResult = false
@@ -948,27 +1014,11 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 			b.WriteString(preflightDirective)
 		}
 	} else if lastTurnIsToolResult {
-		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
-		b.WriteString("The tool has executed and returned data above.\n\n")
-		if activeCustomerRequest != "" {
-			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
-			b.WriteString(activeCustomerRequest)
-			b.WriteString("\n\n")
-		}
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
-		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
-		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
+
 
 	return strings.TrimSpace(b.String())
 }
@@ -997,6 +1047,8 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 	preflightedTools := make(map[string]bool)
 	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
+	var lastToolResultContent string
+	var lastExecutedToolName string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
 
@@ -1013,6 +1065,7 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 		content := strings.TrimSpace(contentToTextNoMedia(msg.Content))
 
 		if role == "tool" {
+			lastToolResultContent = content
 			if tc := extractPreflightToolCode(content); tc != "" {
 				preflightedTools[tc] = true
 				lastPreflightedTool = tc
@@ -1065,10 +1118,15 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 				}
 				parts = append(parts, content)
 			}
+			var callNames []string
 			for _, tc := range msg.ToolCalls {
 				name := tc.Function.Name
-				if name != "get_tool_instructions" && name != "" {
-					executedTools[name] = true
+				if name != "" {
+					callNames = append(callNames, name)
+					if name != "get_tool_instructions" {
+						executedTools[name] = true
+					}
+					lastExecutedToolName = name
 				}
 				var args any = tc.Function.Arguments
 				if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
@@ -1091,9 +1149,14 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 						preflightedTools[tc] = true
 						lastPreflightedTool = tc
 					}
-					if !isLast && lastAssistantToolCallText != "" && assistantText == lastAssistantToolCallText {
-						suppressNextToolResult = true
-						continue
+					lastNames := extractToolCallNames(lastAssistantToolCallText)
+					isConsecutiveSameTool := len(callNames) == 1 && len(lastNames) == 1 && callNames[0] == lastNames[0]
+					if isConsecutiveSameTool {
+						if len(history) >= 2 && strings.HasPrefix(history[len(history)-1], "[Tool Result") && strings.HasPrefix(history[len(history)-2], "Assistant: <tool_call>") {
+							history = history[:len(history)-2]
+						} else if len(history) >= 1 && strings.HasPrefix(history[len(history)-1], "Assistant: <tool_call>") {
+							history = history[:len(history)-1]
+						}
 					}
 					lastAssistantToolCallText = assistantText
 					suppressNextToolResult = false
@@ -1156,27 +1219,11 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 			b.WriteString(preflightDirective)
 		}
 	} else if lastTurnIsToolResult {
-		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
-		b.WriteString("The tool has executed and returned data above.\n\n")
-		if activeCustomerRequest != "" {
-			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
-			b.WriteString(activeCustomerRequest)
-			b.WriteString("\n\n")
-		}
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
-		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
-		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
+
 
 	return strings.TrimSpace(b.String())
 }
@@ -1204,6 +1251,8 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 	preflightedTools := make(map[string]bool)
 	executedTools := make(map[string]bool)
 	var lastPreflightedTool string
+	var lastToolResultContent string
+	var lastExecutedToolName string
 	var lastAssistantToolCallText string
 	suppressNextToolResult := false
 
@@ -1223,8 +1272,11 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 
 		if itemType == "function_call" {
 			name, _ := m["name"].(string)
-			if name != "get_tool_instructions" && name != "" {
-				executedTools[name] = true
+			if name != "" {
+				if name != "get_tool_instructions" {
+					executedTools[name] = true
+				}
+				lastExecutedToolName = name
 			}
 			arguments := m["arguments"]
 			var input any = arguments
@@ -1244,9 +1296,14 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 				preflightedTools[tc] = true
 				lastPreflightedTool = tc
 			}
-			if !isLast && lastAssistantToolCallText != "" && callText == lastAssistantToolCallText {
-				suppressNextToolResult = true
-				continue
+			lastNames := extractToolCallNames(lastAssistantToolCallText)
+			isConsecutiveSameTool := name != "" && len(lastNames) == 1 && name == lastNames[0]
+			if isConsecutiveSameTool {
+				if len(history) >= 2 && strings.HasPrefix(history[len(history)-1], "[Tool Result") && strings.HasPrefix(history[len(history)-2], "Assistant: <tool_call>") {
+					history = history[:len(history)-2]
+				} else if len(history) >= 1 && strings.HasPrefix(history[len(history)-1], "Assistant: <tool_call>") {
+					history = history[:len(history)-1]
+				}
 			}
 			lastAssistantToolCallText = callText
 			suppressNextToolResult = false
@@ -1257,6 +1314,7 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		if itemType == "function_call_output" {
 			callID, _ := m["call_id"].(string)
 			output, _ := m["output"].(string)
+			lastToolResultContent = output
 			if tc := extractPreflightToolCode(output); tc != "" {
 				preflightedTools[tc] = true
 				lastPreflightedTool = tc
@@ -1303,12 +1361,18 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 					preflightedTools[tc] = true
 					lastPreflightedTool = tc
 				}
-				for _, name := range extractToolCallNames(text) {
+				names := extractToolCallNames(text)
+				for _, name := range names {
 					if name != "get_tool_instructions" && name != "" {
 						executedTools[name] = true
 					}
+					if name != "" {
+						lastExecutedToolName = name
+					}
 				}
-				if !isLast && lastAssistantToolCallText != "" && text == lastAssistantToolCallText {
+				lastNames := extractToolCallNames(lastAssistantToolCallText)
+				isConsecutiveSameTool := len(names) == 1 && len(lastNames) == 1 && names[0] == lastNames[0]
+				if !isLast && lastAssistantToolCallText != "" && (text == lastAssistantToolCallText || isConsecutiveSameTool) {
 					suppressNextToolResult = true
 					continue
 				}
@@ -1385,27 +1449,11 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 			b.WriteString(preflightDirective)
 		}
 	} else if lastTurnIsToolResult {
-		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
-		b.WriteString("The tool has executed and returned data above.\n\n")
-		if activeCustomerRequest != "" {
-			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
-			b.WriteString(activeCustomerRequest)
-			b.WriteString("\n\n")
-		}
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
-		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
-		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
+
 
 	return strings.TrimSpace(b.String())
 }
