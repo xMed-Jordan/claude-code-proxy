@@ -497,24 +497,32 @@ func contentToTextNoMedia(v any) string {
 	}
 }
 
-// buildAgyToolsSystemPrompt renders tool definitions and call instructions for agy.
-func buildAgyToolsSystemPrompt(tools []anthropicTool) string {
+// buildAgyToolsPrompt renders tool definitions and call instructions for agy.
+func buildAgyToolsPrompt(tools []responsesTool) string {
 	if len(tools) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("# Tools\n\nYou have access to the following tools:\n\n")
+	b.WriteString("### AVAILABLE TOOLS & INVOCATION RULES\n\n")
+	b.WriteString("CRITICAL TOOL INVOCATION RULES:\n")
+	b.WriteString("- NEVER execute shell commands, bash, python, or run_command. Those tools are strictly forbidden.\n")
+	b.WriteString("- When you need to retrieve or check data (e.g. available appointment slots, customer packages, pricing) or take an action (e.g. create reservation, save memory), you MUST call the relevant tool using this exact format:\n\n")
+	b.WriteString("<tool_call>\n{\n  \"tool\": \"tool_name\",\n  \"input\": {\n    \"param\": \"value\"\n  }\n}\n</tool_call>\n\n")
+	b.WriteString("- You can invoke multiple tools in a single response by emitting multiple <tool_call> blocks or a JSON array of tool calls.\n")
+	b.WriteString("- Never fabricate or guess tool results. Wait for the real tool result before responding.\n")
+	b.WriteString("- When all necessary tools have been executed and you are ready to answer the user, provide your final response in natural conversation with no tool calls.\n\n")
+	b.WriteString("Available Tools:\n\n")
 	for _, t := range tools {
-		b.WriteString("## ")
+		b.WriteString("#### ")
 		b.WriteString(t.Name)
 		b.WriteString("\n")
 		if desc := strings.TrimSpace(t.Description); desc != "" {
 			b.WriteString(desc)
 			b.WriteString("\n")
 		}
-		if t.InputSchema != nil {
+		if t.Parameters != nil {
 			var schema map[string]any
-			rawBytes, _ := json.Marshal(t.InputSchema)
+			rawBytes, _ := json.Marshal(t.Parameters)
 			if err := json.Unmarshal(rawBytes, &schema); err == nil {
 				if props, ok := schema["properties"].(map[string]any); ok && len(props) > 0 {
 					b.WriteString("Parameters:\n")
@@ -545,139 +553,483 @@ func buildAgyToolsSystemPrompt(tools []anthropicTool) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("To invoke a tool, respond with a tool call in this exact format:\n")
-	b.WriteString("<tool_call>\n{\n  \"tool\": \"tool_name\",\n  \"input\": {\n    \"param\": \"value\"\n  }\n}\n</tool_call>\n\n")
-	b.WriteString("Tool Execution Rules:\n")
-	b.WriteString("- When you need information or need to take an action, invoke the relevant tool immediately.\n")
-	b.WriteString("- You can invoke multiple tools in a single response by emitting multiple <tool_call> blocks or a JSON array of tool calls.\n")
-	b.WriteString("- Never fabricate or guess tool results. Wait for the real tool result before responding to the user.\n")
-	b.WriteString("- When all necessary tools have been executed and you are ready to answer the user, provide your final response with no tool calls.\n\n")
 	return b.String()
 }
 
-// flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
-// A lone user turn with no system prompt is sent raw; otherwise a role-tagged
-// transcript is built. Media blocks are dropped here (handled via --add-dir);
-// agy reads attachments from the scratch dir, not from the prompt text.
-func flattenAnthropicToPrompt(in anthropicRequest) string {
-	sys := strings.TrimSpace(contentToTextNoMedia(in.System))
-	if len(in.Tools) > 0 {
-		toolPrompt := strings.TrimSpace(buildAgyToolsSystemPrompt(in.Tools))
-		if sys == "" {
-			sys = toolPrompt
-		} else {
-			sys = toolPrompt + "\n\n" + sys
+func buildAgyAnthropicToolsPrompt(tools []anthropicTool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	rTools := make([]responsesTool, 0, len(tools))
+	for _, t := range tools {
+		rTools = append(rTools, responsesTool{
+			Type:        "function",
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.InputSchema,
+		})
+	}
+	return buildAgyToolsPrompt(rTools)
+}
+
+func buildAgyOpenAIToolsPrompt(tools []openAITool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	rTools := make([]responsesTool, 0, len(tools))
+	for _, t := range tools {
+		rTools = append(rTools, responsesTool{
+			Type:        "function",
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  t.Function.Parameters,
+		})
+	}
+	return buildAgyToolsPrompt(rTools)
+}
+
+func buildAgyToolsSystemPrompt(tools []anthropicTool) string {
+	return buildAgyAnthropicToolsPrompt(tools)
+}
+
+func buildAgyTempDirective(temp *float64) string {
+	if temp == nil {
+		return ""
+	}
+	t := *temp
+	if t <= 0.3 {
+		return fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any clinic details, prices, packages, or policies.", t)
+	} else if t <= 0.6 {
+		return fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", t, t)
+	}
+	return fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", t, t)
+}
+
+func isAnthropicToolResultMessage(msg anthropicMessage) bool {
+	blocks, ok := msg.Content.([]any)
+	if !ok || len(blocks) == 0 {
+		return false
+	}
+	for _, b := range blocks {
+		m, ok := b.(map[string]any)
+		if !ok {
+			return false
+		}
+		if fmt.Sprint(m["type"]) != "tool_result" {
+			return false
 		}
 	}
-	if in.Temperature != nil {
-		temp := *in.Temperature
-		var tempDirective string
-		if temp <= 0.3 {
-			tempDirective = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any clinic details, prices, packages, or policies.", temp)
-		} else if temp <= 0.6 {
-			tempDirective = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
-		} else {
-			tempDirective = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
-		}
-		if sys == "" {
-			sys = tempDirective
-		} else {
-			sys = tempDirective + "\n\n" + sys
-		}
+	return true
+}
+
+func formatAnthropicMessageContent(msg anthropicMessage) string {
+	blocks, ok := msg.Content.([]any)
+	if !ok {
+		return strings.TrimSpace(contentToTextNoMedia(msg.Content))
 	}
-	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
-		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
-	}
-	var b strings.Builder
-	if sys != "" {
-		b.WriteString(sys)
-		b.WriteString("\n\n")
-	}
-	for _, msg := range in.Messages {
-		text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
-		if text == "" {
+
+	var parts []string
+	for _, b := range blocks {
+		m, ok := b.(map[string]any)
+		if !ok {
+			if s := strings.TrimSpace(contentToTextNoMedia(b)); s != "" {
+				parts = append(parts, s)
+			}
 			continue
 		}
-		b.WriteString(agyRoleLabel(msg.Role))
-		b.WriteString(": ")
-		b.WriteString(text)
+		switch fmt.Sprint(m["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
+		case "text":
+			if text := strings.TrimSpace(fmt.Sprint(m["text"])); text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_use":
+			name, _ := m["name"].(string)
+			input := m["input"]
+			if input == nil {
+				input = map[string]any{}
+			}
+			payload := map[string]any{"tool": name, "input": input}
+			raw, _ := json.Marshal(payload)
+			parts = append(parts, "<tool_call>\n"+string(raw)+"\n</tool_call>")
+		case "tool_result":
+			callID, _ := m["tool_use_id"].(string)
+			contentStr := strings.TrimSpace(contentToTextNoMedia(m["content"]))
+			label := "[Tool Result"
+			if callID != "" {
+				label += " (" + callID + ")"
+			}
+			label += "]"
+			parts = append(parts, label+":\n"+contentStr)
+		case "image", "document", "file", "audio", "video":
+			continue
+		default:
+			if s := strings.TrimSpace(contentToTextNoMedia(m)); s != "" {
+				parts = append(parts, s)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+// flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
+func flattenAnthropicToPrompt(in anthropicRequest) string {
+	sys := strings.TrimSpace(contentToTextNoMedia(in.System))
+	toolsPrompt := strings.TrimSpace(buildAgyAnthropicToolsPrompt(in.Tools))
+	tempDirective := buildAgyTempDirective(in.Temperature)
+
+	if sys == "" && toolsPrompt == "" && tempDirective == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
+		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
+	}
+
+	var b strings.Builder
+
+	if sys != "" || tempDirective != "" {
+		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		if tempDirective != "" {
+			b.WriteString(tempDirective)
+			b.WriteString("\n\n")
+		}
+		if sys != "" {
+			b.WriteString(sys)
+			b.WriteString("\n\n")
+		}
+	}
+
+	if toolsPrompt != "" {
+		b.WriteString(toolsPrompt)
 		b.WriteString("\n\n")
 	}
+
+	var history []string
+	var lastCustomerMessage string
+	var activeCustomerRequest string
+	var customerTurns []string
+	lastTurnIsToolResult := false
+	seenAssistantGreeting := false
+
+	for i, msg := range in.Messages {
+		content := formatAnthropicMessageContent(msg)
+		if content == "" {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		isLast := (i == len(in.Messages)-1)
+		isToolResult := isAnthropicToolResultMessage(msg) || strings.HasPrefix(content, "[Tool Result")
+
+		if isToolResult {
+			history = append(history, content)
+			if isLast {
+				lastTurnIsToolResult = true
+			}
+			continue
+		}
+
+		if role == "user" {
+			if strings.HasPrefix(content, "[SYSTEM ERROR:") || strings.Contains(content, "You injected internal reasoning") {
+				continue
+			}
+			if !strings.HasPrefix(content, "[AUTO-CONTEXT") {
+				activeCustomerRequest = content
+				customerTurns = append(customerTurns, content)
+			}
+			if isLast {
+				lastCustomerMessage = content
+			} else {
+				history = append(history, "Customer: "+content)
+			}
+			continue
+		}
+
+		if role == "assistant" {
+			// Suppress repetitive identical greetings/questions to break autoregressive repetition loops
+			if strings.Contains(content, "معك زينة مساعدتك الرقمية") &&
+				(strings.Contains(content, "لأي منطقة") || strings.Contains(content, "بأي فرع")) {
+				if seenAssistantGreeting {
+					continue
+				}
+				seenAssistantGreeting = true
+			}
+			history = append(history, "Assistant: "+content)
+			continue
+		}
+
+		if role == "system" || role == "developer" {
+			history = append(history, "System: "+content)
+			continue
+		}
+
+		history = append(history, agyRoleLabel(role)+": "+content)
+	}
+
+	if len(customerTurns) > 1 {
+		b.WriteString("### CHRONOLOGICAL CUSTOMER STATEMENTS (Review Carefully):\n")
+		for idx, ct := range customerTurns {
+			b.WriteString(fmt.Sprintf("- [Message %d]: %s\n", idx+1, ct))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(history) > 0 {
+		b.WriteString("### CONVERSATION HISTORY\n\n")
+		b.WriteString(strings.Join(history, "\n\n"))
+		b.WriteString("\n\n")
+	}
+
+	if lastCustomerMessage != "" {
+		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
+		b.WriteString("Customer: ")
+		b.WriteString(lastCustomerMessage)
+		b.WriteString("\n\n")
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
+		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	} else if lastTurnIsToolResult {
+		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
+		b.WriteString("The tool has executed and returned data above.\n\n")
+		if activeCustomerRequest != "" {
+			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
+			b.WriteString(activeCustomerRequest)
+			b.WriteString("\n\n")
+		}
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
+		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
+		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	}
+
 	return strings.TrimSpace(b.String())
 }
 
 // flattenOpenAIChatToPrompt renders an OpenAI chat request into a single prompt.
 func flattenOpenAIChatToPrompt(in openAIRequest) string {
-	var sys string
-	if in.Temperature != nil {
-		temp := *in.Temperature
-		if temp <= 0.3 {
-			sys = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any details, prices, or policies.", temp)
-		} else if temp <= 0.6 {
-			sys = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
-		} else {
-			sys = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
-		}
-	}
-	// Fast path: a single user message with no system context.
-	if sys == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
+	toolsPrompt := strings.TrimSpace(buildAgyOpenAIToolsPrompt(in.Tools))
+	tempDirective := buildAgyTempDirective(in.Temperature)
+
+	if toolsPrompt == "" && tempDirective == "" && len(in.Messages) == 1 && strings.EqualFold(in.Messages[0].Role, "user") {
 		return strings.TrimSpace(contentToTextNoMedia(in.Messages[0].Content))
 	}
-	var b strings.Builder
-	if sys != "" {
-		b.WriteString(sys)
-		b.WriteString("\n\n")
-	}
-	for _, msg := range in.Messages {
-		text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
-		if text == "" {
-			continue
-		}
-		b.WriteString(agyRoleLabel(msg.Role))
-		b.WriteString(": ")
-		b.WriteString(text)
-		b.WriteString("\n\n")
-	}
-	return strings.TrimSpace(b.String())
-}
 
-// flattenResponsesToPrompt renders an OpenAI Responses request into a single
-// prompt. Instructions become a leading system block; each input item's text is
-// role-tagged (function_call_output items contribute their "output" text).
-func flattenResponsesToPrompt(in responsesRequest) string {
-	var b strings.Builder
-	var sys string
-	if in.Temperature != nil {
-		temp := *in.Temperature
-		if temp <= 0.3 {
-			sys = fmt.Sprintf("Generation strictness (temperature=%.1f): STRICT DETERMINISTIC FACTUALITY. Rely strictly on retrieved data and tool outputs. Never guess, assume, or fabricate any details, prices, or policies.", temp)
-		} else if temp <= 0.6 {
-			sys = fmt.Sprintf("Generation style (temperature=%.1f): BALANCED CONVERSATIONAL (temperature=%.1f). Maintain a natural, helpful flow while remaining grounded in retrieved tool data.", temp, temp)
-		} else {
-			sys = fmt.Sprintf("Generation style (temperature=%.1f): CREATIVE CONVERSATIONAL (temperature=%.1f). Use diverse phrasing and expressive responses.", temp, temp)
-		}
+	var sysParts []string
+	if tempDirective != "" {
+		sysParts = append(sysParts, tempDirective)
 	}
-	if instr := strings.TrimSpace(in.Instructions); instr != "" {
-		if sys != "" {
-			b.WriteString(sys)
-			b.WriteString("\n\n")
-		}
-		b.WriteString(instr)
-		b.WriteString("\n\n")
-	} else if sys != "" {
-		b.WriteString(sys)
-		b.WriteString("\n\n")
-	}
-	for _, raw := range in.Input {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			if s := strings.TrimSpace(contentToTextNoMedia(raw)); s != "" {
-				b.WriteString(s)
-				b.WriteString("\n\n")
+
+	var history []string
+	var lastCustomerMessage string
+	var activeCustomerRequest string
+	var customerTurns []string
+	lastTurnIsToolResult := false
+	seenAssistantGreeting := false
+
+	for i, msg := range in.Messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role == "system" || role == "developer" {
+			if s := strings.TrimSpace(contentToTextNoMedia(msg.Content)); s != "" {
+				sysParts = append(sysParts, s)
 			}
 			continue
 		}
+
+		isLast := (i == len(in.Messages)-1)
+		content := strings.TrimSpace(contentToTextNoMedia(msg.Content))
+
+		if role == "tool" {
+			callID := msg.ToolCallID
+			label := "[Tool Result"
+			if callID != "" {
+				label += " (" + callID + ")"
+			}
+			label += "]"
+			history = append(history, label+":\n"+content)
+			if isLast {
+				lastTurnIsToolResult = true
+			}
+			continue
+		}
+
+		if role == "user" {
+			if strings.HasPrefix(content, "[SYSTEM ERROR:") || strings.Contains(content, "You injected internal reasoning") {
+				continue
+			}
+			if !strings.HasPrefix(content, "[AUTO-CONTEXT") {
+				activeCustomerRequest = content
+				customerTurns = append(customerTurns, content)
+			}
+			if isLast {
+				lastCustomerMessage = content
+			} else {
+				history = append(history, "Customer: "+content)
+			}
+			continue
+		}
+
+		if role == "assistant" {
+			var parts []string
+			if content != "" {
+				// Suppress repetitive identical greetings/questions to break autoregressive repetition loops
+				if strings.Contains(content, "معك زينة مساعدتك الرقمية") &&
+					(strings.Contains(content, "لأي منطقة") || strings.Contains(content, "بأي فرع")) {
+					if seenAssistantGreeting {
+						continue
+					}
+					seenAssistantGreeting = true
+				}
+				parts = append(parts, content)
+			}
+			for _, tc := range msg.ToolCalls {
+				var args any = tc.Function.Arguments
+				if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
+					var parsed any
+					if err := json.Unmarshal([]byte(argStr), &parsed); err == nil {
+						args = parsed
+					}
+				}
+				callPayload := map[string]any{
+					"tool":  tc.Function.Name,
+					"input": args,
+				}
+				raw, _ := json.Marshal(callPayload)
+				parts = append(parts, "<tool_call>\n"+string(raw)+"\n</tool_call>")
+			}
+			if len(parts) > 0 {
+				history = append(history, "Assistant: "+strings.Join(parts, "\n"))
+			}
+			continue
+		}
+
+		history = append(history, agyRoleLabel(role)+": "+content)
+	}
+
+	var b strings.Builder
+	if len(sysParts) > 0 {
+		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		b.WriteString(strings.Join(sysParts, "\n\n"))
+		b.WriteString("\n\n")
+	}
+
+	if toolsPrompt != "" {
+		b.WriteString(toolsPrompt)
+		b.WriteString("\n\n")
+	}
+
+	if len(customerTurns) > 1 {
+		b.WriteString("### CHRONOLOGICAL CUSTOMER STATEMENTS (Review Carefully):\n")
+		for idx, ct := range customerTurns {
+			b.WriteString(fmt.Sprintf("- [Message %d]: %s\n", idx+1, ct))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(history) > 0 {
+		b.WriteString("### CONVERSATION HISTORY\n\n")
+		b.WriteString(strings.Join(history, "\n\n"))
+		b.WriteString("\n\n")
+	}
+
+	if lastCustomerMessage != "" {
+		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
+		b.WriteString("Customer: ")
+		b.WriteString(lastCustomerMessage)
+		b.WriteString("\n\n")
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
+		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	} else if lastTurnIsToolResult {
+		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
+		b.WriteString("The tool has executed and returned data above.\n\n")
+		if activeCustomerRequest != "" {
+			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
+			b.WriteString(activeCustomerRequest)
+			b.WriteString("\n\n")
+		}
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
+		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
+		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+// flattenResponsesToPrompt renders an OpenAI Responses request into a single prompt.
+func flattenResponsesToPrompt(in responsesRequest) string {
+	toolsPrompt := strings.TrimSpace(buildAgyToolsPrompt(in.Tools))
+	tempDirective := buildAgyTempDirective(in.Temperature)
+
+	var sysParts []string
+	if tempDirective != "" {
+		sysParts = append(sysParts, tempDirective)
+	}
+	if instr := strings.TrimSpace(in.Instructions); instr != "" {
+		sysParts = append(sysParts, instr)
+	}
+
+	var history []string
+	var lastCustomerMessage string
+	var activeCustomerRequest string
+	var customerTurns []string
+	lastTurnIsToolResult := false
+	seenAssistantGreeting := false
+
+	for i, raw := range in.Input {
+		isLast := (i == len(in.Input)-1)
+		m, ok := raw.(map[string]any)
+		if !ok {
+			if s := strings.TrimSpace(contentToTextNoMedia(raw)); s != "" {
+				history = append(history, s)
+			}
+			continue
+		}
+
+		itemType, _ := m["type"].(string)
 		role, _ := m["role"].(string)
+
+		if itemType == "function_call" {
+			name, _ := m["name"].(string)
+			arguments := m["arguments"]
+			var input any = arguments
+			if argStr, ok := arguments.(string); ok && strings.TrimSpace(argStr) != "" {
+				var parsed any
+				if err := json.Unmarshal([]byte(argStr), &parsed); err == nil {
+					input = parsed
+				}
+			}
+			callPayload := map[string]any{
+				"tool":  name,
+				"input": input,
+			}
+			rawB, _ := json.Marshal(callPayload)
+			history = append(history, "Assistant: <tool_call>\n"+string(rawB)+"\n</tool_call>")
+			continue
+		}
+
+		if itemType == "function_call_output" {
+			callID, _ := m["call_id"].(string)
+			output, _ := m["output"].(string)
+			label := "[Tool Result"
+			if callID != "" {
+				label += " (" + callID + ")"
+			}
+			label += "]"
+			history = append(history, label+":\n"+strings.TrimSpace(output))
+			if isLast {
+				lastTurnIsToolResult = true
+			}
+			continue
+		}
+
 		text := strings.TrimSpace(contentToTextNoMedia(m["content"]))
 		if text == "" {
 			if o, ok := m["output"].(string); ok {
@@ -687,19 +1039,168 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		if text == "" {
 			continue
 		}
-		b.WriteString(agyRoleLabel(role))
-		b.WriteString(": ")
-		b.WriteString(text)
+
+		roleLower := strings.ToLower(strings.TrimSpace(role))
+		if roleLower == "assistant" {
+			// Suppress repetitive identical greetings/questions to break autoregressive repetition loops
+			if strings.Contains(text, "معك زينة مساعدتك الرقمية") &&
+				(strings.Contains(text, "لأي منطقة") || strings.Contains(text, "بأي فرع")) {
+				if seenAssistantGreeting {
+					continue
+				}
+				seenAssistantGreeting = true
+			}
+			history = append(history, "Assistant: "+text)
+		} else if roleLower == "system" || roleLower == "developer" {
+			history = append(history, "System: "+text)
+		} else {
+			if strings.HasPrefix(text, "[SYSTEM ERROR:") || strings.Contains(text, "You injected internal reasoning") {
+				continue
+			}
+			if !strings.HasPrefix(text, "[AUTO-CONTEXT") {
+				activeCustomerRequest = text
+				customerTurns = append(customerTurns, text)
+			}
+			if isLast {
+				lastCustomerMessage = text
+			} else {
+				history = append(history, "Customer: "+text)
+			}
+		}
+	}
+
+	var b strings.Builder
+	if len(sysParts) > 0 {
+		b.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		b.WriteString(strings.Join(sysParts, "\n\n"))
 		b.WriteString("\n\n")
 	}
+
+	if toolsPrompt != "" {
+		b.WriteString(toolsPrompt)
+		b.WriteString("\n\n")
+	}
+
+	if len(customerTurns) > 1 {
+		b.WriteString("### CHRONOLOGICAL CUSTOMER STATEMENTS (Review Carefully):\n")
+		for idx, ct := range customerTurns {
+			b.WriteString(fmt.Sprintf("- [Message %d]: %s\n", idx+1, ct))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(history) > 0 {
+		b.WriteString("### CONVERSATION HISTORY\n\n")
+		b.WriteString(strings.Join(history, "\n\n"))
+		b.WriteString("\n\n")
+	}
+
+	if lastCustomerMessage != "" {
+		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
+		b.WriteString("Customer: ")
+		b.WriteString(lastCustomerMessage)
+		b.WriteString("\n\n")
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
+		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	} else if lastTurnIsToolResult {
+		b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
+		b.WriteString("The tool has executed and returned data above.\n\n")
+		if activeCustomerRequest != "" {
+			b.WriteString("ACTIVE CUSTOMER REQUEST BEING PROCESSED:\nCustomer: ")
+			b.WriteString(activeCustomerRequest)
+			b.WriteString("\n\n")
+		}
+		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+		b.WriteString("- You are in the MIDDLE of processing the customer's request. DO NOT reset the conversation.\n")
+		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
+		b.WriteString("- If additional tools are required to fulfill the request, invoke the next tool via <tool_call>.\n")
+		b.WriteString("- Otherwise, provide your final response to the customer in natural conversation based on the retrieved data with no tool calls. Address their specific request directly.\n")
+		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	}
+
 	return strings.TrimSpace(b.String())
 }
 
 var (
-	agyToolTagRe     = regexp.MustCompile(`(?s)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>`)
-	agyToolBracketRe = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
-	agyToolFencedRe  = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
+	agyToolTagRe             = regexp.MustCompile(`(?s)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>`)
+	agyToolBracketRe         = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
+	agyToolFencedRe          = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
+	agyRawJsonToolRe         = regexp.MustCompile(`(?s)\{\s*"(?:tool|name|tool_call|function)"\s*:\s*"[^"]+"\s*,\s*"(?:input|arguments|parameters|params)"\s*:\s*\{[\s\S]*?\}\s*\}`)
+	agyToolResultHeaderRe    = regexp.MustCompile(`(?is)\[Tool Result(?:\s*\([^)]*\))?\]:?`)
 )
+
+func stripSimulatedToolResults(s string) string {
+	for {
+		loc := agyToolResultHeaderRe.FindStringIndex(s)
+		if loc == nil {
+			break
+		}
+		start := loc[0]
+		idx := loc[1]
+
+		// Skip whitespace after header
+		for idx < len(s) && (s[idx] == ' ' || s[idx] == '\t' || s[idx] == '\r' || s[idx] == '\n') {
+			idx++
+		}
+
+		end := idx
+		if idx < len(s) && (s[idx] == '{' || s[idx] == '[') {
+			openChar := s[idx]
+			closeChar := byte('}')
+			if openChar == '[' {
+				closeChar = ']'
+			}
+			depth := 0
+			inString := false
+			escaped := false
+			for i := idx; i < len(s); i++ {
+				c := s[i]
+				if inString {
+					if escaped {
+						escaped = false
+					} else if c == '\\' {
+						escaped = true
+					} else if c == '"' {
+						inString = false
+					}
+					continue
+				}
+				if c == '"' {
+					inString = true
+				} else if c == openChar {
+					depth++
+				} else if c == closeChar {
+					depth--
+					if depth == 0 {
+						end = i + 1
+						break
+					}
+				}
+			}
+			if depth > 0 {
+				end = len(s)
+			}
+		} else {
+			nl := strings.Index(s[idx:], "\n\n")
+			if nl != -1 {
+				end = idx + nl
+			} else {
+				end = len(s)
+			}
+		}
+
+		for end < len(s) && (s[end] == '\r' || s[end] == '\n') {
+			end++
+		}
+
+		s = s[:start] + s[end:]
+	}
+	return s
+}
 
 // parseAgyToolCalls extracts tool calls (<tool_call>, [TOOL_CALL], fenced json, or raw json)
 // from agy output and returns the remaining text and function_call items.
@@ -716,6 +1217,16 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 			}
 		}
 		if toolName == "" {
+			return
+		}
+
+		// Discard internal Antigravity / developer tools if mistakenly emitted
+		switch toolName {
+		case "run_command", "write_to_file", "replace_file_content", "view_file",
+			"list_dir", "find_by_name", "grep_search", "read_url_content",
+			"search_web", "manage_task", "schedule", "send_message",
+			"invoke_subagent", "define_subagent", "manage_subagents",
+			"generate_image", "ask_question", "call_mcp_tool", "list_resources", "read_resource":
 			return
 		}
 
@@ -802,7 +1313,12 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 		for _, m := range matches {
 			clean.WriteString(s[last:m[0]])
 			last = m[1]
-			rawJSON := s[m[2]:m[3]]
+			var rawJSON string
+			if len(m) >= 4 && m[2] >= 0 && m[3] >= 0 {
+				rawJSON = s[m[2]:m[3]]
+			} else {
+				rawJSON = s[m[0]:m[1]]
+			}
 			processJSON(rawJSON)
 		}
 		clean.WriteString(s[last:])
@@ -813,6 +1329,10 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 	cleaned = extractFromRegex(agyToolTagRe, cleaned)
 	cleaned = extractFromRegex(agyToolBracketRe, cleaned)
 	cleaned = extractFromRegex(agyToolFencedRe, cleaned)
+	cleaned = extractFromRegex(agyRawJsonToolRe, cleaned)
+
+	// Strip any simulated tool results that the model hallucinates into text
+	cleaned = stripSimulatedToolResults(cleaned)
 
 	if len(items) == 0 {
 		trimmed := cleanRawJSON(text)
@@ -824,6 +1344,12 @@ func parseAgyToolCalls(text string) (string, []responsesOutputItem) {
 				cleaned = ""
 			}
 		}
+	}
+
+	// If tool calls were extracted, ensure cleanText does not leak stray JSON blocks
+	// that would trigger Connect's looksLikeRawToolCall validation guard.
+	if len(items) > 0 {
+		cleaned = regexp.MustCompile(`(?s)\{[\s\S]*?"(?:name|tool|result|parameters|status)"[\s\S]*?\}`).ReplaceAllString(cleaned, "")
 	}
 
 	return strings.TrimSpace(cleaned), items

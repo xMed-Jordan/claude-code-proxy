@@ -2108,12 +2108,12 @@ func TestFlattenAnthropicToPrompt(t *testing.T) {
 		},
 	}
 	got := flattenAnthropicToPrompt(multi)
-	for _, want := range []string{"You are terse.", "User: Hi", "Assistant: Hello.", "User:", "And now?"} {
+	for _, want := range []string{"You are terse.", "Customer: Hi", "Assistant: Hello.", "And now?"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("prompt missing %q; got:\n%s", want, got)
 		}
 	}
-	if strings.Index(got, "User: Hi") > strings.Index(got, "Assistant: Hello.") {
+	if strings.Index(got, "Customer: Hi") > strings.Index(got, "Assistant: Hello.") {
 		t.Fatalf("turns out of order:\n%s", got)
 	}
 }

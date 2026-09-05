@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -122,3 +123,78 @@ func TestForwardForAlias_GeminiDefaultsToAgy(t *testing.T) {
 		t.Errorf("expected claude-sonnet-4-6 to forward to codex, got %s", got)
 	}
 }
+
+func TestParseAgyToolCalls_DiscardsInternalTools(t *testing.T) {
+	text := "<tool_call>\n{\n  \"tool\": \"run_command\",\n  \"input\": {\"CommandLine\": \"ls -la\"}\n}\n</tool_call>\nHello!"
+	clean, items := parseAgyToolCalls(text)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items because run_command should be discarded, got %d", len(items))
+	}
+	if clean != "Hello!" {
+		t.Errorf("expected 'Hello!', got %q", clean)
+	}
+}
+
+func TestFlattenAnthropicToPrompt_Structuring(t *testing.T) {
+	req := anthropicRequest{
+		System: "You are a clinic AI assistant.",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "Hello, I want to book laser"},
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type": "tool_use",
+					"id":   "toolu_123",
+					"name": "get_services",
+					"input": map[string]any{},
+				},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_123",
+					"content":     `[{"id": 1, "name": "Laser Face"}]`,
+				},
+			}},
+			{Role: "user", Content: "Book face tomorrow at Irbid branch"},
+		},
+	}
+
+	prompt := flattenAnthropicToPrompt(req)
+	if !strings.Contains(prompt, "### SYSTEM INSTRUCTIONS & POLICIES") {
+		t.Errorf("expected system section in prompt")
+	}
+	if !strings.Contains(prompt, "### CONVERSATION HISTORY") {
+		t.Errorf("expected history section in prompt")
+	}
+	if !strings.Contains(prompt, "[Tool Result (toolu_123)]") {
+		t.Errorf("expected structured tool result in prompt")
+	}
+	if !strings.Contains(prompt, "### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION") {
+		t.Errorf("expected current customer message section")
+	}
+	if !strings.Contains(prompt, "Customer: Book face tomorrow at Irbid branch") {
+		t.Errorf("expected last customer message")
+	}
+	if !strings.Contains(prompt, "CRITICAL DIRECTIVE FOR ASSISTANT") {
+		t.Errorf("expected critical directive")
+	}
+}
+
+func TestParseAgyToolCalls_StripsSimulatedToolResult(t *testing.T) {
+	text := "[Tool Result (call_K8q8Z51c6bZ8jY3WvF30rU6R)]:\n{\"name\":\"get_memory\",\"result\":{\"success\":true,\"data\":\"Customer name: Nancy\"}}\n\nHello Nancy, I see your package.\n<tool_call>\n{\"tool\": \"get_available_slots\", \"input\": {\"branch_id\": \"1\"}}\n</tool_call>"
+	clean, items := parseAgyToolCalls(text)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Name != "get_available_slots" {
+		t.Errorf("expected get_available_slots, got %s", items[0].Name)
+	}
+	if strings.Contains(clean, "Tool Result") || strings.Contains(clean, "get_memory") {
+		t.Errorf("simulated tool result should be stripped from clean text; got: %q", clean)
+	}
+	if clean != "Hello Nancy, I see your package." {
+		t.Errorf("expected 'Hello Nancy, I see your package.', got: %q", clean)
+	}
+}
+
+

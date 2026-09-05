@@ -81,7 +81,7 @@ func initAgyWorkerPool(cfg config) {
 
 	model := cfg.AgyWorkerModel
 	if model == "" {
-		model = "gemini-3.8-flash-low"
+		model = "gemini-3.8-flash-medium"
 	}
 	model = normalizeAgyModelName(model)
 
