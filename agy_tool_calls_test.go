@@ -529,6 +529,70 @@ func TestIsRedundantSlotToolCallAnthropic(t *testing.T) {
 	}
 }
 
+func TestBookingConfirmationDirectives(t *testing.T) {
+	// Case 1: Customer confirms booking, create_reservation not preflighted yet
+	lastMsg := "نعم ثبتي هاد الموعد"
+	history := []string{"Assistant: موعد الساعة 2:00 الظهر متوفر بكرة، بتحبي أثبتلك هاد الوقت؟"}
+	preflighted := map[string]bool{"get_available_slots": true}
+	executed := map[string]bool{"get_available_slots": true}
+	directive := buildCustomerTurnDirective(lastMsg, history, preflighted, executed, "")
+
+	if !strings.Contains(directive, "APPOINTMENT CONFIRMATION DETECTED") {
+		t.Fatalf("expected confirmation detected, got: %s", directive)
+	}
+	if !strings.Contains(directive, "create_reservation") || !strings.Contains(directive, "get_tool_instructions") {
+		t.Fatalf("expected preflight create_reservation directive, got: %s", directive)
+	}
+	if !strings.Contains(directive, "DO NOT call `get_available_slots`") {
+		t.Fatalf("expected DO NOT call get_available_slots, got: %s", directive)
+	}
+
+	// Case 2: Customer confirms booking, create_reservation already preflighted
+	preflighted["create_reservation"] = true
+	directive2 := buildCustomerTurnDirective(lastMsg, history, preflighted, executed, "")
+	if !strings.Contains(directive2, "Immediately invoke `create_reservation` via <tool_call>") {
+		t.Fatalf("expected direct create_reservation call directive, got: %s", directive2)
+	}
+
+	// Case 3: Preflight result for create_reservation arrives
+	preflightResultContent := `{"name":"get_tool_instructions","result":{"success":true,"tool":{"code":"create_reservation","name":"Create Reservation"}}}`
+	resDirective := buildToolResultDirective("get_tool_instructions", preflightResultContent, lastMsg, "", "create_reservation")
+	if !strings.Contains(resDirective, "PREFLIGHT COMPLETE: Instructions for 'create_reservation'") {
+		t.Fatalf("expected preflight complete for create_reservation, got: %s", resDirective)
+	}
+	if !strings.Contains(resDirective, "Immediately invoke 'create_reservation' via <tool_call>") {
+		t.Fatalf("expected invoke create_reservation directive, got: %s", resDirective)
+	}
+
+	// Case 4: create_reservation succeeds
+	bookingSuccessContent := `{"status":201,"body":{"success":true,"data":{"reservation_id":390390,"date":"2026-09-08"}}}`
+	resSuccessDirective := buildToolResultDirective("create_reservation", bookingSuccessContent, lastMsg, "", "")
+	if !strings.Contains(resSuccessDirective, "RESERVATION BOOKED SUCCESSFULLY") {
+		t.Fatalf("expected reservation booked successfully, got: %s", resSuccessDirective)
+	}
+	if !strings.Contains(resSuccessDirective, "Confirm the booking directly to the customer") {
+		t.Fatalf("expected confirmation instruction, got: %s", resSuccessDirective)
+	}
+}
+
+func TestRedirectErroneousSlotCallToBooking(t *testing.T) {
+	output := []responsesOutputItem{
+		{
+			Type:      "function_call",
+			Name:      "get_available_slots",
+			Arguments: `{"branch_id":2,"date":"2026-09-08"}`,
+		},
+	}
+	redirectErroneousSlotCallToBooking(output, "نعم ثبتي هاد الموعد")
+	if output[0].Name != "get_tool_instructions" {
+		t.Fatalf("expected redirected name get_tool_instructions, got %s", output[0].Name)
+	}
+	if !strings.Contains(output[0].Arguments, "create_reservation") {
+		t.Fatalf("expected create_reservation in arguments, got %s", output[0].Arguments)
+	}
+}
+
+
 
 
 

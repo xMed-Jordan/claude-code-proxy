@@ -713,18 +713,16 @@ func formatAnthropicMessageContent(msg anthropicMessage) string {
 
 // extractPreflightToolCode finds the tool_code argument from a get_tool_instructions call or result.
 func extractPreflightToolCode(text string) string {
-	if idx := strings.Index(text, `"tool_code"`); idx != -1 {
-		rest := text[idx+11:]
-		rest = strings.TrimLeft(rest, ` :"'`)
-		if end := strings.IndexAny(rest, `"',}`); end != -1 {
-			return strings.TrimSpace(rest[:end])
-		}
-	}
-	if idx := strings.Index(text, `"code"`); idx != -1 {
-		rest := text[idx+6:]
-		rest = strings.TrimLeft(rest, ` :"'`)
-		if end := strings.IndexAny(rest, `"',}`); end != -1 {
-			return strings.TrimSpace(rest[:end])
+	for _, key := range []string{`"tool_code"`, `"tool_name"`, `"code"`} {
+		if idx := strings.Index(text, key); idx != -1 {
+			rest := text[idx+len(key):]
+			rest = strings.TrimLeft(rest, ` :"'`)
+			if end := strings.IndexAny(rest, `"',}`); end != -1 {
+				val := strings.TrimSpace(rest[:end])
+				if val != "" && val != "get_tool_instructions" {
+					return val
+				}
+			}
 		}
 	}
 	return ""
@@ -777,12 +775,15 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
 	}
 	if preflightedTools["get_available_slots"] || executedTools["get_available_slots"] {
-		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_available_slots' again. Call 'get_available_slots' or other booking tools directly via <tool_call> when needed.\n")
+		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_available_slots' again.\n")
 	}
 	if preflightedTools["get_customer_packages"] || executedTools["get_customer_packages"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_customer_packages' again.\n")
 	}
-	if lastPreflightedTool != "" && lastPreflightedTool != "membership_protocol" && lastPreflightedTool != "get_available_slots" && lastPreflightedTool != "get_multi_service_slots" && lastPreflightedTool != "get_customer_packages" {
+	if preflightedTools["create_reservation"] || executedTools["create_reservation"] {
+		pb.WriteString("- Do NOT call `get_tool_instructions` for 'create_reservation' again. Call `create_reservation` directly via <tool_call>.\n")
+	}
+	if lastPreflightedTool != "" && lastPreflightedTool != "membership_protocol" && lastPreflightedTool != "get_available_slots" && lastPreflightedTool != "get_multi_service_slots" && lastPreflightedTool != "get_customer_packages" && lastPreflightedTool != "create_reservation" {
 		pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you need '%s', call '%s' directly via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
 	}
 	return pb.String()
@@ -798,10 +799,50 @@ func stringContainsAny(s string, substrs ...string) bool {
 	return false
 }
 
+// buildCustomerTurnDirective formats prompt instructions when the conversation ends on a customer message.
+func buildCustomerTurnDirective(
+	lastCustomerMessage string,
+	history []string,
+	preflightedTools map[string]bool,
+	executedTools map[string]bool,
+	preflightDirective string,
+) string {
+	var b strings.Builder
+	b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
+	b.WriteString("Customer: ")
+	b.WriteString(lastCustomerMessage)
+	b.WriteString("\n\n")
+	b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
+	b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
+	b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
+
+	isConfirmingBooking := stringContainsAny(lastCustomerMessage, "ثبت", "احجز", "احجزي", "أكد", "اكد", "نعم", "تمام", "أكيد", "اكيد", "اوكي", "ماشي") &&
+		(executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] || strings.Contains(strings.Join(history, " "), "متوفر") || strings.Contains(strings.Join(history, " "), "أثبتلك") || strings.Contains(strings.Join(history, " "), "اثبتلك"))
+
+	if isConfirmingBooking {
+		b.WriteString("- APPOINTMENT CONFIRMATION DETECTED: The customer is confirming/booking the appointment slot discussed or offered above.\n")
+		b.WriteString("- DO NOT call `get_available_slots` or `get_multi_service_slots`! The slot has already been selected and confirmed.\n")
+		if !preflightedTools["create_reservation"] {
+			b.WriteString("- Instructions for `create_reservation` have NOT yet been retrieved in this conversation. Immediately invoke `get_tool_instructions` with tool_code 'create_reservation' via <tool_call> (preflight)!\n")
+		} else {
+			b.WriteString("- Immediately invoke `create_reservation` via <tool_call> with the confirmed branch_id, date, time_from, and time_to to finalize the booking!\n")
+		}
+	} else {
+		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
+	}
+
+	b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
+	if preflightDirective != "" {
+		b.WriteString("\n")
+		b.WriteString(preflightDirective)
+	}
+	return b.String()
+}
+
 // buildToolResultDirective constructs specific prompt instructions when the conversation's
 // last turn is a tool result, guiding the model to formulate its text response or invoke the
 // strictly necessary next tool, breaking infinite tool repetition loops.
-func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent string, activeCustomerRequest string, preflightDirective string) string {
+func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent string, activeCustomerRequest string, preflightDirective string, lastPreflightedTool string) string {
 	var b strings.Builder
 	b.WriteString("### CURRENT STATE & ACTIVE CUSTOMER REQUEST\n\n")
 	b.WriteString("The tool has executed and returned data above.\n\n")
@@ -815,13 +856,39 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 	b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
 	b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time). DO NOT re-ask questions the customer has already answered.\n")
 
+	preflightedCode := extractPreflightToolCode(lastToolResultContent)
+	if preflightedCode == "" && lastExecutedToolName == "get_tool_instructions" {
+		preflightedCode = lastPreflightedTool
+	}
+
 	isSlotResult := lastExecutedToolName == "get_available_slots" ||
 		lastExecutedToolName == "get_multi_service_slots" ||
 		strings.Contains(lastToolResultContent, `"slots"`) ||
 		strings.Contains(lastToolResultContent, `"merged_slots"`) ||
 		strings.Contains(lastToolResultContent, `"available_slots"`)
 
-	if isSlotResult {
+	if preflightedCode != "" || lastExecutedToolName == "get_tool_instructions" {
+		if preflightedCode == "create_reservation" || preflightedCode == "create_retouch_reservation" {
+			b.WriteString(fmt.Sprintf("- PREFLIGHT COMPLETE: Instructions for '%s' have been successfully retrieved above!\n", preflightedCode))
+			b.WriteString(fmt.Sprintf("- Immediately invoke '%s' via <tool_call> with the customer's confirmed appointment branch_id, date, time_from, and time_to to finalize the booking!\n", preflightedCode))
+			b.WriteString("- DO NOT call get_tool_instructions or get_available_slots! DO NOT respond with text until the reservation is created via tool call!\n")
+		} else if preflightedCode != "" {
+			b.WriteString(fmt.Sprintf("- PREFLIGHT COMPLETE: Instructions for '%s' have been successfully retrieved above.\n", preflightedCode))
+			b.WriteString(fmt.Sprintf("- Immediately invoke '%s' via <tool_call> using the parameters specified in the instructions to fulfill the active customer request.\n", preflightedCode))
+			b.WriteString("- DO NOT call get_tool_instructions again.\n")
+		} else {
+			b.WriteString("- PREFLIGHT COMPLETE: Tool instructions retrieved above. Immediately invoke the preflighted tool via <tool_call>.\n")
+		}
+	} else if lastExecutedToolName == "create_reservation" || lastExecutedToolName == "create_retouch_reservation" || strings.Contains(lastToolResultContent, `"reservation_id"`) {
+		if strings.Contains(lastToolResultContent, `"reservation_id"`) || strings.Contains(lastToolResultContent, `"success":true`) {
+			b.WriteString("- RESERVATION BOOKED SUCCESSFULLY: The appointment has been successfully created in the clinic system!\n")
+			b.WriteString("- DO NOT call any more tools! Absolutely NO tool calls or JSON blocks allowed.\n")
+			b.WriteString("- Confirm the booking directly to the customer in natural, warm Jordanian Arabic, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 2:00 بعد الظهر بفرع عمان.').\n")
+			b.WriteString("- No emojis. No repetitive greetings.\n")
+		} else {
+			b.WriteString("- RESERVATION FAILED: The booking tool returned an error. Report the issue politely to the customer without technical details and ask for an alternative time.\n")
+		}
+	} else if isSlotResult {
 		isSelectingOrConfirming := stringContainsAny(activeCustomerRequest, "ثبت", "احجز", "احجزي", "بدي", "الساعة", "نعم", "تمام", "أكيد", "اكيد")
 		if isSelectingOrConfirming {
 			b.WriteString("- APPOINTMENT SLOT DATA RETRIEVED: The customer has specified/confirmed her desired appointment time!\n")
@@ -856,6 +923,21 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 		b.WriteString(preflightDirective)
 	}
 	return b.String()
+}
+
+// redirectErroneousSlotCallToBooking intercepts slot retrieval tool calls when the customer is explicitly confirming booking.
+func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMsg string) {
+	if !stringContainsAny(customerMsg, "ثبت", "احجز", "احجزي", "أكد", "اكد", "نعم", "تمام", "أكيد", "اكيد") {
+		return
+	}
+	for i := range output {
+		if output[i].Type == "function_call" && (output[i].Name == "get_available_slots" || output[i].Name == "get_multi_service_slots") {
+			log.Printf("[agy-guard] Intercepted erroneous slot lookup during booking confirmation; redirecting to preflight create_reservation")
+			output[i].Name = "get_tool_instructions"
+			output[i].Arguments = `{"tool_code":"create_reservation"}`
+			break
+		}
+	}
 }
 
 
@@ -1021,21 +1103,9 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 	}
 
 	if lastCustomerMessage != "" {
-		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
-		b.WriteString("Customer: ")
-		b.WriteString(lastCustomerMessage)
-		b.WriteString("\n\n")
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
-		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildCustomerTurnDirective(lastCustomerMessage, history, preflightedTools, executedTools, preflightDirective))
 	} else if lastTurnIsToolResult {
-		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective, lastPreflightedTool))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
@@ -1226,21 +1296,9 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 	}
 
 	if lastCustomerMessage != "" {
-		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
-		b.WriteString("Customer: ")
-		b.WriteString(lastCustomerMessage)
-		b.WriteString("\n\n")
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
-		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildCustomerTurnDirective(lastCustomerMessage, history, preflightedTools, executedTools, preflightDirective))
 	} else if lastTurnIsToolResult {
-		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective, lastPreflightedTool))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
@@ -1456,21 +1514,9 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 	}
 
 	if lastCustomerMessage != "" {
-		b.WriteString("### CURRENT CUSTOMER MESSAGE & REQUIRED ACTION\n\n")
-		b.WriteString("Customer: ")
-		b.WriteString(lastCustomerMessage)
-		b.WriteString("\n\n")
-		b.WriteString("CRITICAL DIRECTIVE FOR ASSISTANT:\n")
-		b.WriteString("- The assistant has ALREADY introduced itself and greeted the customer. NEVER repeat the greeting, introduction, or persona opening.\n")
-		b.WriteString("- The customer has ALREADY specified their required details (e.g. body area, clinic branch, appointment date/time) in earlier turns or customer statements above. DO NOT re-ask for details already provided!\n")
-		b.WriteString("- If all required information to proceed is available, invoke the relevant tool immediately via <tool_call>.\n")
-		b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-		if preflightDirective != "" {
-			b.WriteString("\n")
-			b.WriteString(preflightDirective)
-		}
+		b.WriteString(buildCustomerTurnDirective(lastCustomerMessage, history, preflightedTools, executedTools, preflightDirective))
 	} else if lastTurnIsToolResult {
-		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective))
+		b.WriteString(buildToolResultDirective(lastExecutedToolName, lastToolResultContent, activeCustomerRequest, preflightDirective, lastPreflightedTool))
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
@@ -1833,6 +1879,19 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		return
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+
+	var activeCustomerReq string
+	for j := len(in.Messages) - 1; j >= 0; j-- {
+		msg := in.Messages[j]
+		if strings.EqualFold(msg.Role, "user") && !isAnthropicToolResultMessage(msg) {
+			text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
+			if text != "" && !strings.HasPrefix(text, "[AUTO-CONTEXT") && !strings.HasPrefix(text, "[SYSTEM ERROR") {
+				activeCustomerReq = text
+				break
+			}
+		}
+	}
+	redirectErroneousSlotCallToBooking(resp.Output, activeCustomerReq)
 
 	// Safety Guard: Intercept redundant slot retrieval loops immediately
 	if redundant, lastSlotContent, activeCustomerReq := isRedundantSlotToolCallAnthropic(in.Messages, resp.Output); redundant {
