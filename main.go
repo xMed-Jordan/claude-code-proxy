@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -3726,7 +3727,7 @@ func anthropicContentBlocks(resp responsesResponse) []any {
 			}
 		case "message":
 			for _, part := range item.Content {
-				cleaned := stripFabricatedToolJSON(part.Text)
+				cleaned := sanitizeCustomerFacingProse(stripFabricatedToolJSON(part.Text))
 				if cleaned != "" {
 					content = append(content, map[string]any{"type": "text", "text": cleaned})
 				}
@@ -4702,7 +4703,7 @@ func toAnthropicResponse(resp openAIResponse, requestedModel string) map[string]
 		if s, ok := map[string]string{"tool_calls": "tool_use", "length": "max_tokens", "stop": "end_turn"}[choice.FinishReason]; ok {
 			stopReason = s
 		}
-		if text := stripFabricatedToolJSON(contentToText(choice.Message.Content)); text != "" {
+		if text := sanitizeCustomerFacingProse(stripFabricatedToolJSON(contentToText(choice.Message.Content))); text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 		for _, tc := range choice.Message.ToolCalls {
@@ -4824,6 +4825,27 @@ func matchJSONBrace(runes []rune, start int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+var (
+	reMarkdownHR        = regexp.MustCompile(`(?m)^\s*-{3,}\s*$`)
+	reColonBlankLine    = regexp.MustCompile(`:\s*\n\n+`)
+	reExcessiveLines    = regexp.MustCompile(`\n{3,}`)
+	reReasoningPreamble = regexp.MustCompile(`^(?:إليك الرد|الرد المناسب|Here\'?s?\s+(?:the|my)\s+(?:response|reply))\s*:?\s*\n+`)
+)
+
+// sanitizeCustomerFacingProse cleans up text to prevent tripping downstream agent platform
+// safety regexes (such as Connect's /^.{20,}(?:\n---\n|\n-{3,}\n|:\s*\n\n)/us which mistakes
+// introductory text ending in colons followed by blank lines for internal thinking/reasoning).
+func sanitizeCustomerFacingProse(s string) string {
+	if s == "" {
+		return s
+	}
+	s = reMarkdownHR.ReplaceAllString(s, "")
+	s = reReasoningPreamble.ReplaceAllString(s, "")
+	s = reColonBlankLine.ReplaceAllString(s, ":\n")
+	s = reExcessiveLines.ReplaceAllString(s, "\n\n")
+	return strings.TrimSpace(s)
 }
 
 func newSSEScanner(r io.Reader) *bufio.Scanner {

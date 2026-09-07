@@ -822,7 +822,8 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 	if isSlotResult {
 		b.WriteString("- AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!\n")
 		b.WriteString("- DO NOT call `get_available_slots` or `get_multi_service_slots` again! DO NOT call any more tools!\n")
-		b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the date and time ranges from merged_slots) and ask which time she prefers.\n")
+		b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the available times from merged_slots) in 1-2 conversational sentences and ask which time she prefers.\n")
+		b.WriteString("- Respond conversationally (e.g. 'تفضلي عزيزتي، أقرب المواعيد المتوفرة لجلسة كاملة هي 11:00 صباحاً أو 2:00 بعد الظهر، أي وقت بناسبك؟'). Avoid markdown bullet lists, excessive blank lines, or introductory headers ending in colons.\n")
 	} else if lastExecutedToolName == "membership_protocol" || strings.Contains(lastToolResultContent, "MEMBERSHIP PROTOCOL") {
 		b.WriteString("- The `membership_protocol` instructions have been retrieved above. Follow the instructions directly to ask the customer which area and branch she wants to book, or invoke the next booking tool via <tool_call>.\n")
 	} else if lastExecutedToolName != "" {
@@ -1703,6 +1704,7 @@ func agyToResponsesResponse(text, model string, inputTokens int) responsesRespon
 	}
 
 	cleanText, toolItems := parseAgyToolCalls(text)
+	cleanText = sanitizeCustomerFacingProse(cleanText)
 	if cleanText != "" {
 		resp.Output = append(resp.Output, responsesOutputItem{
 			Type:    "message",
@@ -1834,7 +1836,7 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		retryPb.WriteString(lastSlotContent)
 		retryPb.WriteString("\n\n")
 		retryPb.WriteString("CRITICAL INSTRUCTION FOR ZEINA:\n")
-		retryPb.WriteString("Respond directly to the customer in natural friendly Jordanian Arabic quoting the available appointment times from merged_slots (e.g. for today or tomorrow) in time ranges and ask which time she prefers.\n")
+		retryPb.WriteString("Respond directly to the customer in natural friendly Jordanian Arabic quoting the available appointment times from merged_slots (e.g. for today or tomorrow) in 1-2 conversational sentences and ask which time she prefers. Avoid markdown bullet lists or introductory headings ending in colons.\n")
 
 		if retryRes, retryErr := agyResolve(ctx, cfg, nil, retryPb.String(), in.Model); retryErr == nil && retryRes.Ok {
 			retryResp := agyToResponsesResponse(retryRes.Response, model, inputTokens)
