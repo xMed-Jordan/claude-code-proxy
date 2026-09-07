@@ -788,6 +788,16 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 	return pb.String()
 }
 
+func stringContainsAny(s string, substrs ...string) bool {
+	sLower := strings.ToLower(s)
+	for _, sub := range substrs {
+		if strings.Contains(sLower, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildToolResultDirective constructs specific prompt instructions when the conversation's
 // last turn is a tool result, guiding the model to formulate its text response or invoke the
 // strictly necessary next tool, breaking infinite tool repetition loops.
@@ -812,10 +822,18 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 		strings.Contains(lastToolResultContent, `"available_slots"`)
 
 	if isSlotResult {
-		b.WriteString("- AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!\n")
-		b.WriteString("- DO NOT call `get_available_slots` or `get_multi_service_slots` again! DO NOT call any more tools!\n")
-		b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the available times from merged_slots) in 1-2 conversational sentences and ask which time she prefers.\n")
-		b.WriteString("- Respond conversationally (e.g. 'تفضلي عزيزتي، أقرب المواعيد المتوفرة لجلسة كاملة هي 11:00 صباحاً أو 2:00 بعد الظهر، أي وقت بناسبك؟'). Avoid markdown bullet lists, excessive blank lines, or introductory headers ending in colons.\n")
+		isSelectingOrConfirming := stringContainsAny(activeCustomerRequest, "ثبت", "احجز", "احجزي", "بدي", "الساعة", "نعم", "تمام", "أكيد", "اكيد")
+		if isSelectingOrConfirming {
+			b.WriteString("- APPOINTMENT SLOT DATA RETRIEVED: The customer has specified/confirmed her desired appointment time!\n")
+			b.WriteString("- DO NOT call `get_available_slots` again.\n")
+			b.WriteString("- Check the returned slots: if the requested time is open, proceed to book using `create_reservation` (or preflight `create_reservation` via `get_tool_instructions` if instructions are needed), or confirm the booking.\n")
+			b.WriteString("- If the requested time is NOT open in the returned slots, politely inform the customer and suggest the remaining open time(s).\n")
+		} else {
+			b.WriteString("- AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!\n")
+			b.WriteString("- DO NOT call `get_available_slots` or `get_multi_service_slots` again! DO NOT call any more tools!\n")
+			b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the available times from merged_slots) in 1-2 conversational sentences and ask which time she prefers.\n")
+			b.WriteString("- Respond conversationally (e.g. 'تفضلي عزيزتي، أقرب المواعيد المتوفرة لجلسة كاملة هي 11:00 صباحاً أو 2:00 بعد الظهر، أي وقت بناسبك؟'). Avoid markdown bullet lists, excessive blank lines, or introductory headers ending in colons.\n")
+		}
 	} else if lastExecutedToolName == "membership_protocol" || strings.Contains(lastToolResultContent, "MEMBERSHIP PROTOCOL") {
 		b.WriteString("- The `membership_protocol` instructions have been retrieved above. Follow the instructions directly to ask the customer which area and branch she wants to book, or invoke the next booking tool via <tool_call>.\n")
 	} else if lastExecutedToolName != "" {
