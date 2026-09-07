@@ -89,6 +89,8 @@ type config struct {
 	CodexFastMode    string   // PROXY_CODEX_FAST_MODE — off (default) | on; never automatic
 	CodexFastTier    string   // CODEX_FAST_SERVICE_TIER — wire value; "priority" is the only one the ChatGPT backend accepts
 	CodexFastModels  []string // PROXY_CODEX_FAST_MODELS — upstream models advertising priority support; nil = no gate
+	CodexWarmWorkers int      // PROXY_CODEX_WARM_WORKERS — number of standby workers for Codex (0 = disabled)
+	CodexQueueTimeout time.Duration // PROXY_CODEX_QUEUE_TIMEOUT — max duration to wait in queue for an available Codex worker
 	ClaudeFastModels []string // PROXY_CLAUDE_FAST_MODELS — Anthropic aliases that imply fast mode without `speed`
 	DBPath            string
 	ProxyKey          string
@@ -738,6 +740,8 @@ func loadConfig() config {
 		CodexFastMode:     normalizeFastMode(getenv("PROXY_CODEX_FAST_MODE", fastModeOff)),
 		CodexFastTier:     strings.TrimSpace(getenv("CODEX_FAST_SERVICE_TIER", defaultCodexFastTier)),
 		CodexFastModels:   parseFastModelList(getenv("PROXY_CODEX_FAST_MODELS", ""), defaultCodexFastModels),
+		CodexWarmWorkers:  parseCodexWarmWorkers(getenv("PROXY_CODEX_WARM_WORKERS", getenv("CODEX_WARM_WORKERS", "7"))),
+		CodexQueueTimeout: parseCodexQueueTimeout(getenv("PROXY_CODEX_QUEUE_TIMEOUT", getenv("CODEX_QUEUE_TIMEOUT", "30"))),
 		ClaudeFastModels:  parseFastModelList(getenv("PROXY_CLAUDE_FAST_MODELS", ""), defaultClaudeFastModels),
 		DBPath:            getenv("PROXY_DB_PATH", ".proxy.db"),
 		ProxyKey:          getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
@@ -3159,10 +3163,22 @@ func callCodex(ctx context.Context, cfg config, out responsesRequest, requestedM
 }
 
 func callCodexResponses(ctx context.Context, cfg config, out responsesRequest) (responsesResponse, int, string, error) {
-	return callCodexResponsesOnce(ctx, cfg, out, true)
+	worker, release, err := AcquireCodexWorker(ctx)
+	if err != nil {
+		return responsesResponse{}, http.StatusBadGateway, "codex " + err.Error(), err
+	}
+	defer release()
+	return callCodexResponsesOnceWithClient(ctx, cfg, out, true, worker.Client())
 }
 
 func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesRequest, allowRetry bool) (responsesResponse, int, string, error) {
+	return callCodexResponsesOnceWithClient(ctx, cfg, out, allowRetry, http.DefaultClient)
+}
+
+func callCodexResponsesOnceWithClient(ctx context.Context, cfg config, out responsesRequest, allowRetry bool, client *http.Client) (responsesResponse, int, string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	out.Stream = true
 	start := time.Now()
 	traceLog(ctx, "codex.request", map[string]any{
@@ -3174,7 +3190,7 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 		traceLog(ctx, "codex.request_error", map[string]any{"error": err.Error()})
 		return responsesResponse{}, http.StatusBadRequest, err.Error(), err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		traceLog(ctx, "codex.transport_error", map[string]any{"error": err.Error(), "duration_ms": time.Since(start).Milliseconds()})
 		return responsesResponse{}, http.StatusBadGateway, err.Error(), err
@@ -3195,7 +3211,7 @@ func callCodexResponsesOnce(ctx context.Context, cfg config, out responsesReques
 		if allowRetry {
 			if retry, ok := retryCodexRequestAfter400(out, resp.StatusCode, msg); ok {
 				traceLog(ctx, "codex.retry", map[string]any{"reason": retry.reason, "payload": summarizeResponsesRequest(retry.request)})
-				return callCodexResponsesOnce(ctx, cfg, retry.request, false)
+				return callCodexResponsesOnceWithClient(ctx, cfg, retry.request, false, client)
 			}
 		}
 		return responsesResponse{}, resp.StatusCode, msg, fmt.Errorf("codex upstream returned %s", resp.Status)
@@ -3338,13 +3354,21 @@ func streamCodex(ctx context.Context, cfg config, out responsesRequest, in anthr
 }
 
 func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
+	worker, release, err := AcquireCodexWorker(ctx)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "codex " + err.Error())
+		return
+	}
+	defer release()
+	client := worker.Client()
+
 	out.Stream = true
 	req, err := newCodexRequest(ctx, cfg, "/responses", out)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
@@ -3415,13 +3439,21 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 }
 
 func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
+	worker, release, err := AcquireCodexWorker(ctx)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "codex " + err.Error())
+		return
+	}
+	defer release()
+	client := worker.Client()
+
 	out.Stream = true
 	req, err := newCodexRequest(ctx, cfg, "/responses", out)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return

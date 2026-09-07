@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 )
