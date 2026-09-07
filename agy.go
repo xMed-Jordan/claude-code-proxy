@@ -826,7 +826,8 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 		if isSelectingOrConfirming {
 			b.WriteString("- APPOINTMENT SLOT DATA RETRIEVED: The customer has specified/confirmed her desired appointment time!\n")
 			b.WriteString("- DO NOT call `get_available_slots` again.\n")
-			b.WriteString("- Check the returned slots: if the requested time is open, proceed to book using `create_reservation` (or preflight `create_reservation` via `get_tool_instructions` if instructions are needed), or confirm the booking.\n")
+			b.WriteString("- If the customer is confirming her appointment, proceed immediately to book using `create_reservation` (or preflight `create_reservation` via `get_tool_instructions` if instructions are needed).\n")
+			b.WriteString("- If the customer is selecting a time option, schedule a follow-up reminder via `schedule_follow_up` and present the pre-booking appointment summary to the customer asking for confirmation (e.g. 'بتأكدي حجز هالموعد؟').\n")
 			b.WriteString("- If the requested time is NOT open in the returned slots, politely inform the customer and suggest the remaining open time(s).\n")
 		} else {
 			b.WriteString("- AVAILABLE APPOINTMENT SLOTS RETRIEVED: The available time slots for the customer's request have ALREADY been retrieved above in the tool result!\n")
@@ -834,6 +835,10 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 			b.WriteString("- Provide the available slots directly to the customer in natural friendly Arabic according to clinic policies (quote the available times from merged_slots) in 1-2 conversational sentences and ask which time she prefers.\n")
 			b.WriteString("- Respond conversationally (e.g. 'تفضلي عزيزتي، أقرب المواعيد المتوفرة لجلسة كاملة هي 11:00 صباحاً أو 2:00 بعد الظهر، أي وقت بناسبك؟'). Avoid markdown bullet lists, excessive blank lines, or introductory headers ending in colons.\n")
 		}
+	} else if lastExecutedToolName == "schedule_follow_up" {
+		b.WriteString("- The follow-up timer has been set successfully.\n")
+		b.WriteString("- DO NOT call any more tools! DO NOT call `get_available_slots` or any other tool!\n")
+		b.WriteString("- Provide the pre-booking appointment summary to the customer now and ask her to confirm the booking (e.g. 'بتأكدي حجز هالموعد؟').\n")
 	} else if lastExecutedToolName == "membership_protocol" || strings.Contains(lastToolResultContent, "MEMBERSHIP PROTOCOL") {
 		b.WriteString("- The `membership_protocol` instructions have been retrieved above. Follow the instructions directly to ask the customer which area and branch she wants to book, or invoke the next booking tool via <tool_call>.\n")
 	} else if lastExecutedToolName != "" {
