@@ -772,26 +772,18 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 		pb.WriteString("- NEVER call `get_tool_instructions` for any of these tools again! The preflight cache lasts for the entire conversation.\n")
 	}
 	if executedTools["membership_protocol"] {
-		if executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] {
-			pb.WriteString("- The `membership_protocol` and appointment slots tools have ALREADY been executed. DO NOT call `membership_protocol`, `get_available_slots`, or any other tool! Answer the customer directly in natural Arabic.\n")
-		} else {
-			pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool.\n")
-		}
+		pb.WriteString("- The `membership_protocol` has ALREADY been executed and its instructions are returned above in the tool result. Do NOT call `membership_protocol` or `get_tool_instructions` again! Follow the protocol instructions directly to answer the customer in natural Arabic (e.g. asking which body area and branch she wants to book) or invoke the next booking tool via <tool_call>.\n")
 	} else if preflightedTools["membership_protocol"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'membership_protocol' again. If you need to use the membership protocol, call `membership_protocol` directly via <tool_call>, or proceed with booking.\n")
 	}
-	if executedTools["get_available_slots"] || executedTools["get_multi_service_slots"] {
-		pb.WriteString("- Available appointment slots have ALREADY been retrieved in this conversation. NEVER call `get_available_slots` or `get_multi_service_slots` again! DO NOT make any tool calls! Respond directly to the customer in natural friendly Arabic quoting the available options from `merged_slots` and ask which time she prefers.\n")
+	if preflightedTools["get_available_slots"] || executedTools["get_available_slots"] {
+		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_available_slots' again. Call 'get_available_slots' or other booking tools directly via <tool_call> when needed.\n")
 	}
-	if executedTools["get_customer_packages"] {
-		pb.WriteString("- Customer packages have ALREADY been retrieved in this conversation. Do NOT call `get_customer_packages` or `get_tool_instructions` again.\n")
+	if preflightedTools["get_customer_packages"] || executedTools["get_customer_packages"] {
+		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_customer_packages' again.\n")
 	}
 	if lastPreflightedTool != "" && lastPreflightedTool != "membership_protocol" && lastPreflightedTool != "get_available_slots" && lastPreflightedTool != "get_multi_service_slots" && lastPreflightedTool != "get_customer_packages" {
-		if executedTools[lastPreflightedTool] {
-			pb.WriteString(fmt.Sprintf("- The '%s' tool has ALREADY been executed and returned above. Do NOT call '%s' or `get_tool_instructions` again.\n", lastPreflightedTool, lastPreflightedTool))
-		} else {
-			pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you were preparing to call '%s', call '%s' directly now via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
-		}
+		pb.WriteString(fmt.Sprintf("- Do NOT call `get_tool_instructions` for '%s' again. If you need '%s', call '%s' directly via <tool_call>.\n", lastPreflightedTool, lastPreflightedTool, lastPreflightedTool))
 	}
 	return pb.String()
 }
