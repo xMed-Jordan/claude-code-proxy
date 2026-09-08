@@ -162,7 +162,7 @@ func TestAgyGenerateCorrectsRepeatedCall(t *testing.T) {
 	if len(trace.Attempts) != 2 {
 		t.Fatalf("attempts = %d, want 2 (one correction)", len(trace.Attempts))
 	}
-	if !strings.Contains(prompts[1], "### CORRECTION FROM THE SYSTEM") || !strings.Contains(prompts[1], "do not repeat the same call") {
+	if !strings.Contains(prompts[1], "### CORRECTION FROM THE SYSTEM") || !strings.Contains(prompts[1], "do not repeat the same call") || strings.Contains(prompts[1], "already SUCCEEDED") {
 		t.Fatalf("second prompt lacks the correction note:\n%s", prompts[1][len(prompts[1])-600:])
 	}
 	if !strings.HasPrefix(prompts[1], prompts[0]) {
@@ -170,6 +170,40 @@ func TestAgyGenerateCorrectsRepeatedCall(t *testing.T) {
 	}
 	if len(resp.Output) != 1 || resp.Output[0].Type != "function_call" || resp.Output[0].Name != "get_tool_instructions" {
 		t.Fatalf("final output = %+v", resp.Output)
+	}
+}
+
+func TestAgyGenerateRepeatAfterSuccessIsNamed(t *testing.T) {
+	in := testBookingRequest()
+	// Current turn: create_reservation already succeeded; the model repeats it.
+	in.Messages = append(in.Messages,
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "c4", "name": "create_reservation", "input": map[string]any{"date": "2026-09-09", "time_from": "09:00"}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "c4", "content": `{"success":true,"data":{"status":201,"body":{"reservation_id":1}}}`}}},
+	)
+	var prompts []string
+	replies := []string{
+		"<tool_call>\n{\"tool\":\"create_reservation\",\"input\":{\"time_from\":\"09:00\",\"date\":\"2026-09-09\"}}\n</tool_call>",
+		"تم تثبيت موعدك الأربعاء الساعة 9:00 صباحاً.",
+	}
+	orig := agyResolveFn
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, prompt, _ string) (agyResult, error) {
+		prompts = append(prompts, prompt)
+		r := replies[0]
+		if len(replies) > 1 {
+			replies = replies[1:]
+		}
+		return agyResult{Ok: true, Response: r}, nil
+	}
+	defer func() { agyResolveFn = orig }()
+	resp, _, err := agyGenerate(context.Background(), config{}, agyGenInputFromAnthropic(in, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prompts) != 2 || !strings.Contains(prompts[1], "already SUCCEEDED") {
+		t.Fatalf("expected the correction to name the prior success; prompts=%d", len(prompts))
+	}
+	if hasAnyToolCall(resp.Output) || !strings.Contains(agyResponseText(resp), "تم تثبيت") {
+		t.Fatalf("unexpected final output %+v", resp.Output)
 	}
 }
 

@@ -284,6 +284,33 @@ func (t *agyTranscript) calledThisTurn(name string, args any) bool {
 	return false
 }
 
+// currentTurnCallSucceeded reports whether an identical call in the current
+// turn has a result that looks like a success ("success":true, or an HTTP
+// 2xx status in the result envelope). Used to word the repeat correction.
+func (t *agyTranscript) currentTurnCallSucceeded(name string, args any) bool {
+	want := canonicalToolArgs(args)
+	for i := t.lastCustomerIndex() + 1; i < len(t.Turns); i++ {
+		tt := t.Turns[i]
+		if tt.Kind != agyTurnToolCall || tt.Tool != name || tt.Args != want {
+			continue
+		}
+		for j := i + 1; j < len(t.Turns); j++ {
+			r := t.Turns[j]
+			if r.Kind == agyTurnToolResult && (r.CallID == tt.CallID || r.CallID == "") {
+				compact := strings.ReplaceAll(r.Text, " ", "")
+				if strings.Contains(compact, `"success":true`) || strings.Contains(compact, `"status":20`) {
+					return true
+				}
+				break
+			}
+			if r.Kind == agyTurnToolCall || r.Kind == agyTurnCustomer {
+				break
+			}
+		}
+	}
+	return false
+}
+
 // previousAssistantText returns the assistant's last customer-facing message
 // before the customer's latest message ("" when there is none).
 func (t *agyTranscript) previousAssistantText() string {
@@ -948,7 +975,11 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 					continue
 				}
 				if in.Transcript.calledThisTurn(item.Name, item.Arguments) {
-					problems = append(problems, fmt.Sprintf("you called %s with exactly these arguments %s already in this turn and its result is in the transcript; do not repeat the same call", item.Name, canonicalToolArgs(item.Arguments)))
+					outcome := "its result is in the transcript"
+					if in.Transcript.currentTurnCallSucceeded(item.Name, item.Arguments) {
+						outcome = "it already SUCCEEDED (see its result in the transcript) and repeating it would perform the same action twice"
+					}
+					problems = append(problems, fmt.Sprintf("you called %s with exactly these arguments %s already in this turn; %s; do not repeat the same call", item.Name, canonicalToolArgs(item.Arguments), outcome))
 					continue
 				}
 			}
