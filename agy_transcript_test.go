@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -397,6 +399,39 @@ func TestRenderAgyPromptSectionOrderAndDigest(t *testing.T) {
 	digest := prompt[iDg:iNext]
 	if strings.Contains(digest, "tool call") && strings.Contains(digest, "get_available_slots") || strings.Contains(digest, "Tool result") || strings.Contains(digest, "merged_starts") {
 		t.Fatalf("digest must not contain tool activity:\n%s", digest)
+	}
+}
+
+func TestAgyAgentArgs(t *testing.T) {
+	cfg := config{AgyAgent: "connect-chat"}
+	if got := strings.Join(agyAgentArgs(cfg, false), " "); got != "--agent connect-chat" {
+		t.Fatalf("chat run args = %q", got)
+	}
+	if got := agyAgentArgs(cfg, true); got != nil {
+		t.Fatalf("media runs must keep agy's default agent, got %v", got)
+	}
+	if got := agyAgentArgs(config{}, false); got != nil {
+		t.Fatalf("empty PROXY_AGY_AGENT must add no flag, got %v", got)
+	}
+}
+
+func TestEnsureAgyAgentDefinition(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	ensureAgyAgentDefinition(config{AgyAgent: agyChatAgentName})
+	path := filepath.Join(home, ".gemini", "config", "agents", agyChatAgentName, "agent.md")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("definition not installed: %v", err)
+	}
+	if string(got) != agyChatAgentDefinition || !strings.Contains(string(got), "tools: []") || strings.Contains(string(got), "commandExecutionPolicy") {
+		t.Fatalf("unexpected definition content:\n%s", got)
+	}
+	// A foreign agent name is left to the operator.
+	ensureAgyAgentDefinition(config{AgyAgent: "custom-thing"})
+	if _, err := os.Stat(filepath.Join(home, ".gemini", "config", "agents", "custom-thing")); err == nil {
+		t.Fatal("must not create definitions for operator-managed agent names")
 	}
 }
 

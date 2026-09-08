@@ -45,6 +45,87 @@ func initAgy(cfg config) {
 		n = 1
 	}
 	agySem = make(chan struct{}, n)
+	ensureAgyAgentDefinition(cfg)
+}
+
+// agyChatAgentName is the custom agy agent used for chat turns. agy is a
+// coding agent: by default every run exposes ~57 built-in tools (run_command,
+// view_file, browser, web search, subagents…) to the model and wraps the
+// prompt in a coding-assistant system prompt. Verified 2026-09-08 on
+// gemini-3.8-flash: on a Connect booking turn the model used view_file and
+// 43× run_command to read its own transcript files from disk before
+// answering — 2–5 minute generations, 250–640k input tokens per turn against
+// the subscription quota, and arbitrary shell execution (as the service user)
+// driven by customer text, all auto-approved by --dangerously-skip-permissions.
+// A Markdown agent with `tools: []` removes those tools and the coding persona;
+// the same turn then takes 5–7s and ~50k tokens.
+const agyChatAgentName = "connect-chat"
+
+// agyChatAgentDefinition is written to ~/.gemini/config/agents/connect-chat/agent.md
+// (agy's user-level customization root, verified with strace) when
+// PROXY_AGY_AGENT is "connect-chat". Frontmatter keys accepted by agy 1.1.27:
+// name, description, mainAgent, subagent, hidden, inheritMcp, tools,
+// excludeTools, model, rules, skills, agents. (`commandExecutionPolicy: deny`
+// makes agy silently drop the agent — do not add it.)
+const agyChatAgentDefinition = `---
+name: connect-chat
+description: Plain conversational assistant used by connect-ai-proxy for customer chat turns. No built-in tools.
+mainAgent: true
+subagent: false
+inheritMcp: false
+tools: []
+---
+# Instructions
+You are a conversational assistant serving one customer chat turn at a time. Each user message you receive is a complete, self-contained turn request: it contains the assistant's own system instructions and policies, the tools it may call (described in the message, invoked ONLY by writing <tool_call> blocks in your reply), the conversation so far, and what to produce next. Follow that message. You have no files, shell, browser, web or other capabilities of your own, and nothing outside the message exists for you; never attempt to read, search or run anything. Produce exactly the assistant's next turn as the message specifies, and nothing else.
+`
+
+// agyAgentArgs returns the --agent flag for a run. Media runs (agy must read
+// the files handed over via --add-dir) keep agy's default agent and its file
+// tools; every other run uses the configured chat agent.
+func agyAgentArgs(cfg config, media bool) []string {
+	if media {
+		return nil
+	}
+	if a := strings.TrimSpace(cfg.AgyAgent); a != "" {
+		return []string{"--agent", a}
+	}
+	return nil
+}
+
+// agyAgentsDir is agy's user-level agents directory.
+func agyAgentsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return "", fmt.Errorf("home directory unknown: %v", err)
+	}
+	return filepath.Join(home, ".gemini", "config", "agents"), nil
+}
+
+// ensureAgyAgentDefinition installs (or refreshes) the built-in chat agent
+// definition so a deployment is self-contained. Other agent names are assumed
+// to be managed by the operator.
+func ensureAgyAgentDefinition(cfg config) {
+	if strings.TrimSpace(cfg.AgyAgent) != agyChatAgentName {
+		return
+	}
+	dir, err := agyAgentsDir()
+	if err != nil {
+		log.Printf("[agy] cannot install the %s agent definition: %v", agyChatAgentName, err)
+		return
+	}
+	path := filepath.Join(dir, agyChatAgentName, "agent.md")
+	if cur, err := os.ReadFile(path); err == nil && string(cur) == agyChatAgentDefinition {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("[agy] cannot create %s: %v", filepath.Dir(path), err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(agyChatAgentDefinition), 0o644); err != nil {
+		log.Printf("[agy] cannot write %s: %v", path, err)
+		return
+	}
+	log.Printf("[agy] installed the %s agent definition at %s", agyChatAgentName, path)
 }
 
 func parseAgyConcurrency(s string) int {
@@ -215,6 +296,12 @@ type agyResult struct {
 	Error      string
 	ExitCode   int
 	DurationMs int64
+	// Real usage reported by agy's stream-json result (0 when unknown, e.g.
+	// the agyj argv path). Input counts EVERY internal model call of the
+	// turn, which is what the subscription quota is charged for.
+	InputTokens    int
+	OutputTokens   int
+	ThinkingTokens int
 }
 
 // agyjOutput mirrors the relevant fields of agyj's stdout JSON (both the success
@@ -348,6 +435,7 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 	}
 	// Always allow headless print mode to execute web/network tools and actions
 	args = append(args, "--dangerously-skip-permissions")
+	args = append(args, agyAgentArgs(cfg, media)...)
 	if media {
 		// Scope agy to exactly this request's files and let it read them without
 		// an interactive permission prompt (which would hang print mode).

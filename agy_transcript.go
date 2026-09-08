@@ -994,6 +994,26 @@ type agyGenAttempt struct {
 	Raw        string
 	Problems   []string
 	DurationMs int64
+	Usage      agyResult // real agy usage for this attempt (tokens; 0 when unknown)
+}
+
+// agyReportedInputTokens prefers agy's real input count (every internal model
+// call of the turn) over the prompt-size estimate.
+func agyReportedInputTokens(res agyResult, prompt string) int {
+	if res.InputTokens > 0 {
+		return res.InputTokens
+	}
+	return estimateTextTokens(prompt)
+}
+
+// agyLogUsage writes one journal line per generation so quota consumption is
+// visible per request (input counts every internal model call; a large gap
+// between input and the prompt size means the runtime looped internally).
+func agyLogUsage(res agyResult, attempt int) {
+	if res.InputTokens == 0 && res.OutputTokens == 0 {
+		return
+	}
+	log.Printf("[agy] generation attempt=%d %dms in=%d out=%d think=%d", attempt, res.DurationMs, res.InputTokens, res.OutputTokens, res.ThinkingTokens)
 }
 
 const agyMaxCorrectionRetries = 2
@@ -1051,7 +1071,8 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		if err != nil {
 			return responsesResponse{}, trace, err
 		}
-		resp := agyToResponsesResponse(res.Response, model, estimateTextTokens(p))
+		resp := agyToResponsesResponse(res.Response, model, agyReportedInputTokens(res, p))
+		agyLogUsage(res, attempt+1)
 		var problems []string
 		kept := resp.Output[:0]
 		for _, item := range resp.Output {
@@ -1081,7 +1102,7 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 			}
 			kept = append(kept, item)
 		}
-		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds()})
+		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 		trace.FinalPrompt = p
 		if len(problems) == 0 {
 			return resp, trace, nil
@@ -1105,8 +1126,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	if err != nil {
 		return responsesResponse{}, trace, err
 	}
-	resp := agyToResponsesResponse(res.Response, model, estimateTextTokens(p))
-	trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: "forced plain-text reply", Raw: res.Response, DurationMs: time.Since(t0).Milliseconds()})
+	resp := agyToResponsesResponse(res.Response, model, agyReportedInputTokens(res, p))
+	agyLogUsage(res, agyMaxCorrectionRetries+2)
+	trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: "forced plain-text reply", Raw: res.Response, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 	trace.FinalPrompt = p
 	if hasAnyToolCall(resp.Output) {
 		kept := resp.Output[:0]

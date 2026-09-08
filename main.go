@@ -112,6 +112,7 @@ type config struct {
 	AgyPromptMode     string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
 	AgyToolResultCap  int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
 	AgyToolCallCap    int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
+	AgyAgent          string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
 	AgyConcurrency    int           // max simultaneous agyj subprocesses
 	AgyTimeout        time.Duration // per-call agy execution timeout
 	AgyWarmWorkers    int           // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
@@ -803,6 +804,7 @@ func loadConfig() config {
 		AgyPromptMode:     parseAgyPromptMode(getenv("PROXY_AGY_PROMPT_MODE", "v2")),
 		AgyToolResultCap:  parseAgyToolResultCap(getenv("PROXY_AGY_TOOL_RESULT_CAP", "0")),
 		AgyToolCallCap:    parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
+		AgyAgent:          strings.TrimSpace(getenv("PROXY_AGY_AGENT", agyChatAgentName)),
 		AgyConcurrency:    parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
 		AgyTimeout:        parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
 		AgyWarmWorkers:    parseAgyWarmWorkers(getenv("PROXY_AGY_WARM_WORKERS", getenv("AGY_WARM_WORKERS", "0"))),

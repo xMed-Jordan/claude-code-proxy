@@ -274,6 +274,7 @@ func spawnAgyWorker(poolCtx context.Context, cfg config, id int, model string) (
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	args = append(args, agyAgentArgs(cfg, false)...) // warm workers only ever serve chat turns
 
 	cmd := exec.CommandContext(poolCtx, bin, args...)
 	cmd.Dir = os.TempDir()
@@ -397,8 +398,9 @@ func (w *AgyWorker) Execute(ctx context.Context, prompt string) (agyResult, erro
 			Error           string  `json:"error"`
 			DurationSeconds float64 `json:"duration_seconds"`
 			Usage           struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens    int `json:"input_tokens"`
+				OutputTokens   int `json:"output_tokens"`
+				ThinkingTokens int `json:"thinking_tokens"`
 			} `json:"usage"`
 		} `json:"result"`
 	}
@@ -442,10 +444,13 @@ func (w *AgyWorker) Execute(ctx context.Context, prompt string) (agyResult, erro
 						}
 					} else {
 						resultChan <- agyResult{
-							Ok:         true,
-							Response:   sr.Result.Response,
-							DurationMs: durMs,
-							Model:      w.model,
+							Ok:             true,
+							Response:       sr.Result.Response,
+							DurationMs:     durMs,
+							Model:          w.model,
+							InputTokens:    sr.Result.Usage.InputTokens,
+							OutputTokens:   sr.Result.Usage.OutputTokens,
+							ThinkingTokens: sr.Result.Usage.ThinkingTokens,
 						}
 					}
 					return
@@ -538,6 +543,7 @@ func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, add
 	if m := strings.TrimSpace(model); m != "" {
 		args = append(args, "--model", m)
 	}
+	args = append(args, agyAgentArgs(cfg, len(addDirs) > 0)...)
 	for _, d := range addDirs {
 		if d = strings.TrimSpace(d); d != "" {
 			args = append(args, "--add-dir", d)
@@ -665,8 +671,9 @@ func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, add
 			Error           string  `json:"error"`
 			DurationSeconds float64 `json:"duration_seconds"`
 			Usage           struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens    int `json:"input_tokens"`
+				OutputTokens   int `json:"output_tokens"`
+				ThinkingTokens int `json:"thinking_tokens"`
 			} `json:"usage"`
 		} `json:"result"`
 	}
@@ -712,10 +719,13 @@ func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, add
 						}
 					} else {
 						resultChan <- agyResult{
-							Ok:         true,
-							Response:   sr.Result.Response,
-							DurationMs: durMs,
-							Model:      model,
+							Ok:             true,
+							Response:       sr.Result.Response,
+							DurationMs:     durMs,
+							Model:          model,
+							InputTokens:    sr.Result.Usage.InputTokens,
+							OutputTokens:   sr.Result.Usage.OutputTokens,
+							ThinkingTokens: sr.Result.Usage.ThinkingTokens,
 						}
 					}
 					return

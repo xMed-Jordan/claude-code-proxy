@@ -32,10 +32,13 @@ package main
 // not ask.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -212,6 +215,74 @@ func simExecute(sc simScenario, preflighted map[string]bool, strict bool, name s
 	return string(b)
 }
 
+// simPostAnthropic sends the turn to a running proxy's /anthropic/v1/messages
+// and maps the Anthropic response back to the responsesResponse shape the
+// simulator works with.
+func simPostAnthropic(base string, cfg config, in anthropicRequest) (responsesResponse, error) {
+	in.Stream = false
+	if in.MaxTokens == 0 {
+		in.MaxTokens = 65536
+	}
+	body, err := json.Marshal(in)
+	if err != nil {
+		return responsesResponse{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/anthropic/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return responsesResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	if k := strings.TrimSpace(cfg.ProxyKey); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+		req.Header.Set("x-api-key", k)
+	}
+	client := &http.Client{Timeout: 15 * time.Minute}
+	res, err := client.Do(req)
+	if err != nil {
+		return responsesResponse{}, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+	if res.StatusCode != http.StatusOK {
+		return responsesResponse{}, fmt.Errorf("proxy HTTP %d: %s", res.StatusCode, truncateString(string(raw), 300))
+	}
+	var out struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return responsesResponse{}, fmt.Errorf("proxy response not JSON: %w", err)
+	}
+	var resp responsesResponse
+	for _, c := range out.Content {
+		switch c.Type {
+		case "text":
+			if strings.TrimSpace(c.Text) != "" {
+				resp.Output = append(resp.Output, responsesOutputItem{Type: "message", Role: "assistant", Content: []responsesOutputContent{{Type: "output_text", Text: c.Text}}})
+			}
+		case "tool_use":
+			args := strings.TrimSpace(string(c.Input))
+			if args == "" {
+				args = "{}"
+			}
+			resp.Output = append(resp.Output, responsesOutputItem{Type: "function_call", Name: c.Name, CallID: firstNonEmpty(c.ID, fmt.Sprintf("toolu_%d", time.Now().UnixNano())), Arguments: args})
+		}
+	}
+	resp.Usage.InputTokens = out.Usage.InputTokens
+	resp.Usage.OutputTokens = out.Usage.OutputTokens
+	return resp, nil
+}
+
 func simPickScript(sc simScenario, used []bool, lastReply string) (int, bool) {
 	for i, e := range sc.Script {
 		if used[i] {
@@ -248,6 +319,8 @@ func runAgySim(args []string) error {
 	cap := -1
 	maxTurns := 0
 	dumpOnly := false
+	viaProxy := ""
+	label := ""
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--model":
@@ -274,6 +347,16 @@ func runAgySim(args []string) error {
 			}
 		case "--dump-only":
 			dumpOnly = true
+		case "--via-proxy":
+			i++
+			if i < len(args) {
+				viaProxy = strings.TrimRight(args[i], "/")
+			}
+		case "--label":
+			i++
+			if i < len(args) {
+				label = args[i]
+			}
 		}
 	}
 
@@ -320,8 +403,13 @@ func runAgySim(args []string) error {
 		_ = os.WriteFile(filepath.Join(outDir, name), []byte(content), 0o644)
 	}
 
-	fmt.Printf("=== agy-sim: model=%s mode=%s tools=%d seed_messages=%d script=%d strict_preflight=%v cap=%d\n",
-		firstNonEmpty(model, "(agy default)"), cfg.AgyPromptMode, len(sc.Tools), len(sc.Messages), len(sc.Script), strict, cfg.AgyToolResultCap)
+	fmt.Printf("=== agy-sim%s: model=%s mode=%s via=%s tools=%d seed_messages=%d script=%d strict_preflight=%v cap=%d\n",
+		func() string {
+			if label != "" {
+				return " [" + label + "]"
+			}
+			return ""
+		}(), firstNonEmpty(model, "(agy default)"), cfg.AgyPromptMode, firstNonEmpty(viaProxy, "direct"), len(sc.Tools), len(sc.Messages), len(sc.Script), strict, cfg.AgyToolResultCap)
 
 	messages := append([]anthropicMessage(nil), sc.Messages...)
 	preflighted := map[string]bool{}
@@ -371,7 +459,11 @@ func runAgySim(args []string) error {
 			var resp responsesResponse
 			var trace *agyGenTrace
 			var gerr error
-			if legacy {
+			if viaProxy != "" {
+				// Exercise the real HTTP path (pool workers, guards, converters)
+				// exactly as Connect does.
+				resp, gerr = simPostAnthropic(viaProxy, cfg, in)
+			} else if legacy {
 				dump(fmt.Sprintf("t%02d_i%02d_prompt.txt", turn, iter), flattenAnthropicToPrompt(in))
 				resp, gerr = agyLegacyAnthropicResponse(context.Background(), cfg, in, firstNonEmpty(model, "agy"), inputTokens)
 			} else {
@@ -391,8 +483,20 @@ func runAgySim(args []string) error {
 				return gerr
 			}
 			attempts := 1
+			usage := ""
 			if trace != nil {
 				attempts = len(trace.Attempts)
+				var in, out, think int
+				for _, a := range trace.Attempts {
+					in += a.Usage.InputTokens
+					out += a.Usage.OutputTokens
+					think += a.Usage.ThinkingTokens
+				}
+				if in > 0 || out > 0 {
+					usage = fmt.Sprintf(" in=%d out=%d think=%d", in, out, think)
+				}
+			} else if resp.Usage.InputTokens > 0 {
+				usage = fmt.Sprintf(" in=%d out=%d", resp.Usage.InputTokens, resp.Usage.OutputTokens)
 			}
 			replyText := agyResponseText(resp)
 			var calls []responsesOutputItem
@@ -401,7 +505,7 @@ func runAgySim(args []string) error {
 					calls = append(calls, item)
 				}
 			}
-			fmt.Printf("  [iter %d] %s attempts=%d tool_calls=%d text=%q\n", iter, time.Since(t0).Round(time.Millisecond), attempts, len(calls), truncateString(replyText, 300))
+			fmt.Printf("  [iter %d] %s attempts=%d%s tool_calls=%d text=%q\n", iter, time.Since(t0).Round(time.Millisecond), attempts, usage, len(calls), truncateString(replyText, 300))
 			for _, c := range calls {
 				fmt.Printf("      → %s %s\n", c.Name, truncateString(c.Arguments, 300))
 			}
