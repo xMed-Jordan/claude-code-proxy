@@ -773,7 +773,9 @@ func buildPreflightDirective(preflightedTools map[string]bool, executedTools map
 	if preflightedTools["get_customer_packages"] || executedTools["get_customer_packages"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'get_customer_packages' again.\n")
 	}
-	if preflightedTools["create_reservation"] || executedTools["create_reservation"] {
+	if executedTools["create_reservation"] || executedTools["create_retouch_reservation"] {
+		pb.WriteString("- The reservation tool has ALREADY been executed! Do NOT call `create_reservation` again!\n")
+	} else if preflightedTools["create_reservation"] || preflightedTools["create_retouch_reservation"] {
 		pb.WriteString("- Do NOT call `get_tool_instructions` for 'create_reservation' again. Call `create_reservation` directly via <tool_call>.\n")
 	}
 	if lastPreflightedTool != "" && lastPreflightedTool != "membership_protocol" && lastPreflightedTool != "get_available_slots" && lastPreflightedTool != "get_multi_service_slots" && lastPreflightedTool != "get_customer_packages" && lastPreflightedTool != "create_reservation" {
@@ -916,7 +918,9 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 	}
 
 	b.WriteString("- NEVER execute shell commands, bash, python, or run_command.\n")
-	if preflightDirective != "" {
+	if isReservationResult && (strings.Contains(lastToolResultContent, `"reservation_id"`) || strings.Contains(lastToolResultContent, `"success":true`)) {
+		// Reservation successfully created: do NOT append preflight directive so model doesn't re-invoke create_reservation!
+	} else if preflightDirective != "" {
 		b.WriteString("\n")
 		b.WriteString(preflightDirective)
 	}
@@ -1878,6 +1882,28 @@ func isRedundantSlotToolCallAnthropic(inMessages []anthropicMessage, outputItems
 	return true, lastContent, activeRequest
 }
 
+func hasAnyToolCall(output []responsesOutputItem) bool {
+	for _, item := range output {
+		if item.Type == "function_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func isReservationBookedSuccessfully(messages []anthropicMessage) (bool, string) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		content := contentToTextNoMedia(msg.Content)
+		if (isAnthropicToolResultMessage(msg) || strings.HasPrefix(content, "[Tool Result")) &&
+			strings.Contains(content, `"reservation_id"`) &&
+			(strings.Contains(content, `"status":201`) || strings.Contains(content, `"success":true`) || strings.Contains(content, "Reservation created successfully")) {
+			return true, content
+		}
+	}
+	return false, ""
+}
+
 // serveAgyAnthropic handles /anthropic/v1/messages for an agy-backed alias.
 func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w http.ResponseWriter, r *http.Request) {
 	inputTokens := estimateAnthropicRequestTokens(in)
@@ -1904,6 +1930,34 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		}
 	}
 	redirectErroneousSlotCallToBooking(resp.Output, activeCustomerReq, in.Messages)
+
+	// Safety Guard: Intercept redundant tool calls after successful reservation creation
+	if booked, resContent := isReservationBookedSuccessfully(in.Messages); booked && hasAnyToolCall(resp.Output) {
+		log.Printf("[agy-guard] Reservation was already created in clinic. Intercepting subsequent tool call with direct confirmation...")
+		var retryPb strings.Builder
+		retryPb.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
+		retryPb.WriteString("Generation strictness (temperature=0.3): STRICT DETERMINISTIC FACTUALITY.\n\n")
+		retryPb.WriteString("You are Zeina, the friendly Arabic digital assistant for Shalabi Clinics (اللهجة الأردنية).\n")
+		retryPb.WriteString("CRITICAL DIRECTIVE:\n")
+		retryPb.WriteString("- DO NOT CALL ANY TOOLS! Absolutely no tool calls or JSON blocks allowed.\n")
+		retryPb.WriteString("- No emojis. No repetitive greetings.\n\n")
+		if activeCustomerReq != "" {
+			retryPb.WriteString(fmt.Sprintf("ACTIVE CUSTOMER REQUEST:\n%s\n\n", activeCustomerReq))
+		}
+		retryPb.WriteString("SUCCESSFUL RESERVATION DETAILS (from clinic system):\n")
+		retryPb.WriteString(resContent)
+		retryPb.WriteString("\n\n")
+		retryPb.WriteString("CRITICAL INSTRUCTION FOR ZEINA:\n")
+		retryPb.WriteString("Confirm the booking directly to the customer in natural, warm Jordanian Arabic in 1-2 conversational sentences, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 11:00 صباحاً بفرع عمان. أهلاً وسهلاً فيكِ!'). Do NOT call any tools. Do NOT quote technical IDs or JSON.\n")
+
+		if retryRes, retryErr := agyResolve(ctx, cfg, nil, retryPb.String(), in.Model); retryErr == nil && retryRes.Ok {
+			retryResp := agyToResponsesResponse(retryRes.Response, model, inputTokens)
+			if !hasAnyToolCall(retryResp.Output) && len(retryResp.Output) > 0 {
+				resp = retryResp
+				log.Printf("[agy-guard] Successfully recovered booking confirmation into direct Arabic text response.")
+			}
+		}
+	}
 
 	// Safety Guard: Intercept redundant slot retrieval loops immediately
 	if redundant, lastSlotContent, activeCustomerReq := isRedundantSlotToolCallAnthropic(in.Messages, resp.Output); redundant {
