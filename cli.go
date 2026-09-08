@@ -42,6 +42,10 @@ func runCLI(args []string) (bool, error) {
 		// Internal: stdio MCP server spawned by the Claude Code CLI for the
 		// claude tool loop. Bridges tool calls back to Connect (see mcpgateway.go).
 		return true, runClaudeMCPGateway()
+	case "agy-sim":
+		// Replay a Connect agent conversation against the agy upstream with
+		// Connect's tool protocol emulated (see agy_sim.go).
+		return true, runAgySim(args[1:])
 	case "sync":
 		if len(args) < 2 {
 			return true, fmt.Errorf("usage: %s sync apply|restore|browser-apply|browser-restore", os.Args[0])
@@ -97,6 +101,7 @@ func printCLIHelp() {
   browser-start [--dry-run]       Start the controlled browser profile
   browser-stop | browser-status   Manage or inspect browser bridge state
   validate                       Run local endpoint validation checks
+  agy-sim <scenario.json>        Replay a Connect conversation against agy (tool protocol emulated)
   build [--all]                  Build current or all platform binaries
   package-extension              Build the local MCPB/DXT browser package
   install-startup                Install optional per-user autostart

@@ -66,6 +66,26 @@ func parseAgyTimeout(s string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// parseAgyPromptMode normalizes PROXY_AGY_PROMPT_MODE: "legacy" keeps the old
+// heuristic flattening; anything else selects the v2 transcript prompt.
+func parseAgyPromptMode(s string) string {
+	if strings.EqualFold(strings.TrimSpace(s), "legacy") {
+		return "legacy"
+	}
+	return "v2"
+}
+
+// parseAgyToolResultCap parses PROXY_AGY_TOOL_RESULT_CAP (chars; 0 = unlimited).
+func parseAgyToolResultCap(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func agyLegacyPrompt(cfg config) bool { return cfg.AgyPromptMode == "legacy" }
+
 func parseAgyWarmWorkers(s string) int {
 	n, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || n < 0 {
@@ -287,9 +307,21 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 	// If prompt is large (> 64KB) or stream-json CLI is available, execute via stream-json over stdin
 	// to avoid Linux kernel E2BIG ("argument list too long") CLI argument limits.
 	if len(prompt) > 64*1024 || resolveAgyCLIPath(cfg) != "" {
-		res, err := runAgyStreamJSON(cctx, cfg, prompt, model, addDirs)
-		if err == nil {
-			return res, nil
+		var res agyResult
+		var err error
+		// agy occasionally needs >30s to print its init event under load; that
+		// is a startup hiccup, not a model failure, so retry the spawn a couple
+		// of times before giving up (each attempt is bounded by cctx).
+		for attempt := 0; attempt < 3; attempt++ {
+			res, err = runAgyStreamJSON(cctx, cfg, prompt, model, addDirs)
+			if err == nil {
+				return res, nil
+			}
+			if cctx.Err() != nil || !strings.Contains(err.Error(), "waiting for agy init event") {
+				break
+			}
+			log.Printf("[agy] stream-json start attempt %d failed (%v); retrying", attempt+1, err)
+			time.Sleep(2 * time.Second)
 		}
 		if len(prompt) > 64*1024 {
 			return agyResult{}, fmt.Errorf("stream-json execution failed for large prompt (%d bytes): %w", len(prompt), err)
@@ -1544,7 +1576,7 @@ var (
 	agyToolBracketRe         = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
 	agyToolFencedRe          = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
 	agyRawJsonToolRe         = regexp.MustCompile(`(?s)\{\s*"(?:tool|name|tool_call|function)"\s*:\s*"[^"]+"\s*,\s*"(?:input|arguments|parameters|params)"\s*:\s*\{[\s\S]*?\}\s*\}`)
-	agyToolResultHeaderRe    = regexp.MustCompile(`(?is)\[Tool Result(?:\s*\([^)]*\))?\]:?`)
+	agyToolResultHeaderRe    = regexp.MustCompile(`(?is)\[(?:Tool Result[^\]\n]*|Result of your [^\]\n]*)\]:?`)
 )
 
 func stripSimulatedToolResults(s string) string {
@@ -1920,10 +1952,62 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := agyResolve(ctx, cfg, collectAnthropicMedia(in), flattenAnthropicToPrompt(in), in.Model)
+	var resp responsesResponse
+	var err error
+	if agyLegacyPrompt(cfg) {
+		resp, err = agyLegacyAnthropicResponse(ctx, cfg, in, model, inputTokens)
+	} else {
+		resp, _, err = agyGenerate(ctx, cfg, agyGenInputFromAnthropic(in, inputTokens))
+	}
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "agy "+err.Error())
 		return
+	}
+	stopReason := "end_turn"
+	for _, item := range resp.Output {
+		if item.Type == "function_call" {
+			stopReason = "tool_use"
+			break
+		}
+	}
+	updateRequestStat(r, func(stat *requestStat) {
+		stat.OutputTokens = resp.Usage.OutputTokens
+		stat.StopReason = stopReason
+	})
+	if in.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		sendAnthropicMessageStart(w, resp.ID, model, inputTokens, 0)
+		writeAnthropicBufferedStreamFrom(ctx, w, resp, 0)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, toAnthropicResponsesResponse(resp, model))
+}
+
+// agyGenInputFromAnthropic maps an Anthropic request onto the v2 generation input.
+func agyGenInputFromAnthropic(in anthropicRequest, inputTokens int) agyGenInput {
+	return agyGenInput{
+		Model:       in.Model,
+		System:      strings.TrimSpace(contentToTextNoMedia(in.System)),
+		Temperature: in.Temperature,
+		Tools:       agyCatalogFromAnthropic(in.Tools),
+		Transcript:  buildAgyTranscriptFromAnthropic(in),
+		Media:       collectAnthropicMedia(in),
+		InputTokens: inputTokens,
+	}
+}
+
+// agyLegacyAnthropicResponse is the pre-v2 path (PROXY_AGY_PROMPT_MODE=legacy):
+// heuristic flattening + booking-specific guards. Kept for rollback only.
+func agyLegacyAnthropicResponse(ctx context.Context, cfg config, in anthropicRequest, model string, inputTokens int) (responsesResponse, error) {
+	res, err := agyResolve(ctx, cfg, collectAnthropicMedia(in), flattenAnthropicToPrompt(in), in.Model)
+	if err != nil {
+		return responsesResponse{}, err
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
 
@@ -2002,30 +2086,7 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 			}
 		}
 	}
-	stopReason := "end_turn"
-	for _, item := range resp.Output {
-		if item.Type == "function_call" {
-			stopReason = "tool_use"
-			break
-		}
-	}
-	updateRequestStat(r, func(stat *requestStat) {
-		stat.OutputTokens = resp.Usage.OutputTokens
-		stat.StopReason = stopReason
-	})
-	if in.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		flusher, _ := w.(http.Flusher)
-		sendAnthropicMessageStart(w, resp.ID, model, inputTokens, 0)
-		writeAnthropicBufferedStreamFrom(ctx, w, resp, 0)
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
-	writeJSON(w, http.StatusOK, toAnthropicResponsesResponse(resp, model))
+	return resp, nil
 }
 
 // serveAgyOpenAIChat handles /openai/v1/chat/completions for an agy-backed alias.
@@ -2035,12 +2096,34 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := agyResolve(ctx, cfg, collectOpenAIChatMedia(in), flattenOpenAIChatToPrompt(in), in.Model)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
-		return
+	var resp responsesResponse
+	var streamText string
+	if agyLegacyPrompt(cfg) {
+		res, err := agyResolve(ctx, cfg, collectOpenAIChatMedia(in), flattenOpenAIChatToPrompt(in), in.Model)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
+			return
+		}
+		resp = agyToResponsesResponse(res.Response, model, inputTokens)
+		streamText = res.Response
+	} else {
+		tr, sysParts := buildAgyTranscriptFromOpenAIChat(in)
+		gen, _, err := agyGenerate(ctx, cfg, agyGenInput{
+			Model:       in.Model,
+			System:      strings.Join(sysParts, "\n\n"),
+			Temperature: in.Temperature,
+			Tools:       agyCatalogFromOpenAI(in.Tools),
+			Transcript:  tr,
+			Media:       collectOpenAIChatMedia(in),
+			InputTokens: inputTokens,
+		})
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
+			return
+		}
+		resp = gen
+		streamText = agyResponseText(resp)
 	}
-	resp := agyToResponsesResponse(res.Response, model, inputTokens)
 	updateRequestStat(r, func(stat *requestStat) {
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = "stop"
@@ -2052,8 +2135,8 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
 		sendOpenAIChatChunk(w, id, created, model, map[string]any{"role": "assistant"}, nil)
-		if res.Response != "" {
-			sendOpenAIChatChunk(w, id, created, model, map[string]any{"content": res.Response}, nil)
+		if streamText != "" {
+			sendOpenAIChatChunk(w, id, created, model, map[string]any{"content": streamText}, nil)
 		}
 		stop := "stop"
 		sendOpenAIChatChunk(w, id, created, model, map[string]any{}, &stop)
@@ -2074,12 +2157,33 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 	setRequestStat(r, requestStat{Model: in.Model, Upstream: "agy", Stream: in.Stream, InputTokens: inputTokens})
 	setRequestNote(r, agyNote(in.Model, in.Stream))
 
-	res, err := agyResolve(ctx, cfg, collectResponsesMedia(in), flattenResponsesToPrompt(in), in.Model)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
-		return
+	var resp responsesResponse
+	var streamText string
+	if agyLegacyPrompt(cfg) {
+		res, err := agyResolve(ctx, cfg, collectResponsesMedia(in), flattenResponsesToPrompt(in), in.Model)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
+			return
+		}
+		resp = agyToResponsesResponse(res.Response, model, inputTokens)
+		streamText = res.Response
+	} else {
+		gen, _, err := agyGenerate(ctx, cfg, agyGenInput{
+			Model:       in.Model,
+			System:      strings.TrimSpace(in.Instructions),
+			Temperature: in.Temperature,
+			Tools:       agyCatalogFromResponses(in.Tools),
+			Transcript:  buildAgyTranscriptFromResponses(in),
+			Media:       collectResponsesMedia(in),
+			InputTokens: inputTokens,
+		})
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "agy "+err.Error())
+			return
+		}
+		resp = gen
+		streamText = agyResponseText(resp)
 	}
-	resp := agyToResponsesResponse(res.Response, model, inputTokens)
 	updateRequestStat(r, func(stat *requestStat) {
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = "stop"
@@ -2092,13 +2196,13 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 			"type":     "response.created",
 			"response": map[string]any{"id": resp.ID, "object": "response", "status": "in_progress", "model": model, "output": []any{}},
 		})
-		if res.Response != "" {
+		if streamText != "" {
 			sendEvent(w, "response.output_text.delta", map[string]any{
 				"type":          "response.output_text.delta",
 				"item_id":       resp.ID,
 				"output_index":  0,
 				"content_index": 0,
-				"delta":         res.Response,
+				"delta":         streamText,
 			})
 		}
 		sendEvent(w, "response.completed", map[string]any{
