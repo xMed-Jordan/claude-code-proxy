@@ -1866,9 +1866,22 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	requestedModel := agyModelForRequest(cfg, modelAlias, len(addDirs) > 0)
 	pool := getAgyWorkerPool()
 	if pool != nil && pool.IsEnabled() {
+		t0 := time.Now()
 		res, poolErr := pool.Execute(ctx, prompt, requestedModel)
-		if poolErr == nil && res.Ok {
+		switch {
+		case poolErr == nil && res.Ok && strings.TrimSpace(res.Response) != "":
 			return res, nil
+		case ctx.Err() != nil:
+			return agyResult{}, ctx.Err()
+		case poolErr != nil:
+			log.Printf("[agy-pool] warm worker unavailable or failed after %s (%v); falling back to a cold agy run", time.Since(t0).Round(time.Millisecond), poolErr)
+		case !res.Ok:
+			log.Printf("[agy-pool] warm worker returned an error after %s (%s); falling back to a cold agy run", time.Since(t0).Round(time.Millisecond), truncateString(res.Error, 200))
+		default:
+			// A SUCCESS result with no text (seen in prod 2026-09-08 16:31: the
+			// model's draft was swallowed by the runtime). Returning it would
+			// hand Connect an empty reply, so treat it like a failure.
+			log.Printf("[agy-pool] warm worker returned an empty response after %s; falling back to a cold agy run", time.Since(t0).Round(time.Millisecond))
 		}
 	}
 	res, err := runAgyj(ctx, cfg, prompt, requestedModel, addDirs)
