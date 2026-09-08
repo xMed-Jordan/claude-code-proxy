@@ -84,6 +84,20 @@ func parseAgyToolResultCap(s string) int {
 	return n
 }
 
+// parseAgyToolCallCap parses PROXY_AGY_TOOL_CALL_CAP: "off"/"-1" disables,
+// 0 or unset → default (3), otherwise the given positive cap.
+func parseAgyToolCallCap(s string) int {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "off" || s == "-1" || s == "none" {
+		return -1
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 func agyLegacyPrompt(cfg config) bool { return cfg.AgyPromptMode == "legacy" }
 
 func parseAgyWarmWorkers(s string) int {
@@ -993,7 +1007,6 @@ func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMs
 	}
 }
 
-
 // flattenAnthropicToPrompt renders an Anthropic request into a single prompt.
 func flattenAnthropicToPrompt(in anthropicRequest) string {
 	sys := strings.TrimSpace(contentToTextNoMedia(in.System))
@@ -1162,7 +1175,6 @@ func flattenAnthropicToPrompt(in anthropicRequest) string {
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
-
 
 	return strings.TrimSpace(b.String())
 }
@@ -1348,7 +1360,6 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 	} else if preflightDirective != "" {
 		b.WriteString(preflightDirective)
 	}
-
 
 	return strings.TrimSpace(b.String())
 }
@@ -1567,16 +1578,15 @@ func flattenResponsesToPrompt(in responsesRequest) string {
 		b.WriteString(preflightDirective)
 	}
 
-
 	return strings.TrimSpace(b.String())
 }
 
 var (
-	agyToolTagRe             = regexp.MustCompile(`(?s)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>`)
-	agyToolBracketRe         = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
-	agyToolFencedRe          = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
-	agyRawJsonToolRe         = regexp.MustCompile(`(?s)\{\s*"(?:tool|name|tool_call|function)"\s*:\s*"[^"]+"\s*,\s*"(?:input|arguments|parameters|params)"\s*:\s*\{[\s\S]*?\}\s*\}`)
-	agyToolResultHeaderRe    = regexp.MustCompile(`(?is)\[(?:Tool Result[^\]\n]*|Result of your [^\]\n]*)\]:?`)
+	agyToolTagRe          = regexp.MustCompile(`(?s)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>`)
+	agyToolBracketRe      = regexp.MustCompile(`(?is)\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]`)
+	agyToolFencedRe       = regexp.MustCompile("(?s)```(?:tool_call|json)?\\s*(\\{\\s*\"(?:tool|name)\"\\s*:[\\s\\S]*?\\})\\s*```")
+	agyRawJsonToolRe      = regexp.MustCompile(`(?s)\{\s*"(?:tool|name|tool_call|function)"\s*:\s*"[^"]+"\s*,\s*"(?:input|arguments|parameters|params)"\s*:\s*\{[\s\S]*?\}\s*\}`)
+	agyToolResultHeaderRe = regexp.MustCompile(`(?is)\[(?:Tool Result[^\]\n]*|Result of your [^\]\n]*)\]:?`)
 )
 
 func stripSimulatedToolResults(s string) string {

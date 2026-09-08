@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -204,6 +205,97 @@ func TestAgyGenerateRepeatAfterSuccessIsNamed(t *testing.T) {
 	}
 	if hasAnyToolCall(resp.Output) || !strings.Contains(agyResponseText(resp), "تم تثبيت") {
 		t.Fatalf("unexpected final output %+v", resp.Output)
+	}
+}
+
+func TestAgyGenerateBlocksRewordedRepeatWithIdenticalResults(t *testing.T) {
+	in := testBookingRequest()
+	in.Tools = append(in.Tools, anthropicTool{Name: "membership_protocol", InputSchema: map[string]any{"type": "object"}})
+	proto := `{"success":true,"data":{"instructions":"` + strings.Repeat("P", 400) + `"}}`
+	// Current turn: membership_protocol already called twice with different
+	// "context" strings, same 200KB-ish output each time.
+	in.Messages = append(in.Messages,
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "m1", "name": "membership_protocol", "input": map[string]any{"context": "book tomorrow"}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "m1", "content": proto}}},
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "m2", "name": "membership_protocol", "input": map[string]any{"context": "member wants booking"}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "m2", "content": proto}}},
+	)
+	tr := buildAgyTranscriptFromAnthropic(in)
+	st := tr.currentTurnToolStats()["membership_protocol"]
+	if st.Count != 2 || !st.IdenticalResults {
+		t.Fatalf("stats = %+v", st)
+	}
+	// The second identical payload must be rendered as a pointer, not repeated.
+	prompt := renderAgyPrompt(config{}, "sys", nil, agyCatalogFromAnthropic(in.Tools), tr)
+	if strings.Count(prompt, strings.Repeat("P", 400)) != 1 || !strings.Contains(prompt, "identical to the result of your earlier membership_protocol call (m1)") {
+		t.Fatalf("identical result not deduplicated in the transcript")
+	}
+	if !strings.Contains(prompt, "In the CURRENT turn (since the customer's latest message) you have already called") {
+		t.Fatalf("state preface lacks current-turn calls")
+	}
+
+	var prompts []string
+	replies := []string{
+		"<tool_call>\n{\"tool\":\"membership_protocol\",\"input\":{\"context\":\"guidelines for booking tomorrow\"}}\n</tool_call>",
+		"تكرمي عزيزتي، بتحبي الجلسة للجسم كامل ولا لمناطق معينة؟",
+	}
+	orig := agyResolveFn
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, prompt, _ string) (agyResult, error) {
+		prompts = append(prompts, prompt)
+		r := replies[0]
+		if len(replies) > 1 {
+			replies = replies[1:]
+		}
+		return agyResult{Ok: true, Response: r}, nil
+	}
+	defer func() { agyResolveFn = orig }()
+	resp, trace, err := agyGenerate(context.Background(), config{}, agyGenInputFromAnthropic(in, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Attempts) != 2 || !strings.Contains(trace.Attempts[0].Problems[0], "exactly the same output each time") {
+		t.Fatalf("reworded repeat not rejected: %+v", trace.Attempts)
+	}
+	if hasAnyToolCall(resp.Output) {
+		t.Fatalf("expected the plain-text second draft, got %+v", resp.Output)
+	}
+}
+
+func TestAgyGenerateEnforcesPerToolCap(t *testing.T) {
+	in := testBookingRequest()
+	// Three slot lookups already made this turn with different dates and results.
+	for i, d := range []string{"2026-09-10", "2026-09-11", "2026-09-12"} {
+		id := fmt.Sprintf("s%d", i)
+		in.Messages = append(in.Messages,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_available_slots", "input": map[string]any{"branch_id": "2", "from_date": d}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": `{"date":"` + d + `","merged_starts":["09:00"]}`}}},
+		)
+	}
+	replies := []string{
+		"<tool_call>\n{\"tool\":\"get_available_slots\",\"input\":{\"branch_id\":\"2\",\"from_date\":\"2026-09-13\"}}\n</tool_call>",
+		"المتاح: 10، 11 و12 أيلول الساعة 9:00. أي يوم بناسبك؟",
+	}
+	orig := agyResolveFn
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, _ string, _ string) (agyResult, error) {
+		r := replies[0]
+		if len(replies) > 1 {
+			replies = replies[1:]
+		}
+		return agyResult{Ok: true, Response: r}, nil
+	}
+	defer func() { agyResolveFn = orig }()
+	_, trace, err := agyGenerate(context.Background(), config{}, agyGenInputFromAnthropic(in, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Attempts) != 2 || !strings.Contains(trace.Attempts[0].Problems[0], "already called get_available_slots 4 times") && !strings.Contains(trace.Attempts[0].Problems[0], "already called get_available_slots 3 times") {
+		t.Fatalf("per-tool cap not enforced: %+v", trace.Attempts)
+	}
+	// Cap disabled → the fourth call passes through.
+	replies = []string{"<tool_call>\n{\"tool\":\"get_available_slots\",\"input\":{\"branch_id\":\"2\",\"from_date\":\"2026-09-13\"}}\n</tool_call>"}
+	resp, trace2, err := agyGenerate(context.Background(), config{AgyToolCallCap: -1}, agyGenInputFromAnthropic(in, 10))
+	if err != nil || len(trace2.Attempts) != 1 || !hasAnyToolCall(resp.Output) {
+		t.Fatalf("cap=-1 should allow the call: err=%v attempts=%d out=%+v", err, len(trace2.Attempts), resp.Output)
 	}
 }
 
