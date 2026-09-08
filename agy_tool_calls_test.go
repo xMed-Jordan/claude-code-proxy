@@ -658,6 +658,21 @@ func TestDumpPrompt641628(t *testing.T) {
 	os.WriteFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\prompt_641628.txt`, []byte(prompt), 0644)
 }
 
+func TestDumpPrompt641633(t *testing.T) {
+	data, err := os.ReadFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\req_641633.json`)
+	if err != nil {
+		t.Skip("req_641633.json not found")
+	}
+	var req anthropicRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		t.Fatal(err)
+	}
+	prompt := flattenAnthropicToPrompt(req)
+	os.WriteFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\prompt_641633.txt`, []byte(prompt), 0644)
+	t.Logf("Dumped prompt_641633.txt len=%d", len(prompt))
+}
+
+
 
 
 

@@ -441,9 +441,46 @@ type openAIFunction struct {
 }
 
 type openAIToolCall struct {
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
-	Function openAIToolFunction `json:"function"`
+	ID         string             `json:"id"`
+	Type       string             `json:"type"`
+	Name       string             `json:"name,omitempty"`
+	Parameters any                `json:"parameters,omitempty"`
+	Function   openAIToolFunction `json:"function,omitempty"`
+}
+
+func (tc openAIToolCall) GetName() string {
+	if tc.Name != "" {
+		return tc.Name
+	}
+	return tc.Function.Name
+}
+
+func (tc openAIToolCall) GetArguments() any {
+	if tc.Parameters != nil {
+		return tc.Parameters
+	}
+	if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
+		var parsed any
+		if err := json.Unmarshal([]byte(argStr), &parsed); err == nil {
+			return parsed
+		}
+		return argStr
+	}
+	return map[string]any{}
+}
+
+func (tc openAIToolCall) GetArgumentsString() string {
+	if tc.Function.Arguments != "" {
+		return tc.Function.Arguments
+	}
+	if tc.Parameters != nil {
+		if s, ok := tc.Parameters.(string); ok {
+			return s
+		}
+		b, _ := json.Marshal(tc.Parameters)
+		return string(b)
+	}
+	return "{}"
 }
 
 type openAIToolFunction struct {
@@ -4191,7 +4228,7 @@ func openAIChatToResponses(cfg config, in openAIRequest) responsesRequest {
 				out.Input = append(out.Input, responseInput{Role: "assistant", Content: content})
 			}
 			for _, tc := range msg.ToolCalls {
-				out.Input = append(out.Input, responseInput{Type: "function_call", CallID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+				out.Input = append(out.Input, responseInput{Type: "function_call", CallID: tc.ID, Name: tc.GetName(), Arguments: tc.GetArgumentsString()})
 			}
 		default:
 			if content := openAIContentToResponses("user", msg.Content); content != nil {

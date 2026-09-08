@@ -679,20 +679,13 @@ func formatAnthropicMessageContent(msg anthropicMessage) string {
 	}
 
 	for _, tc := range msg.ToolCalls {
-		var args any = tc.Function.Arguments
-		if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
-			var parsed any
-			if err := json.Unmarshal([]byte(argStr), &parsed); err == nil {
-				args = parsed
-			}
-		}
-		name := tc.Function.Name
+		name := tc.GetName()
 		if name == "" {
-			name = tc.Type
+			continue
 		}
 		payload := map[string]any{
 			"tool":  name,
-			"input": args,
+			"input": tc.GetArguments(),
 		}
 		raw, _ := json.Marshal(payload)
 		parts = append(parts, "<tool_call>\n"+string(raw)+"\n</tool_call>")
@@ -867,7 +860,21 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 		strings.Contains(lastToolResultContent, `"merged_slots"`) ||
 		strings.Contains(lastToolResultContent, `"available_slots"`)
 
-	if preflightedCode != "" || lastExecutedToolName == "get_tool_instructions" {
+	isReservationResult := lastExecutedToolName == "create_reservation" ||
+		lastExecutedToolName == "create_retouch_reservation" ||
+		strings.Contains(lastToolResultContent, `"reservation_id"`)
+
+	if isReservationResult {
+		if strings.Contains(lastToolResultContent, `"reservation_id"`) || strings.Contains(lastToolResultContent, `"success":true`) {
+			b.WriteString("- RESERVATION BOOKED SUCCESSFULLY: The appointment has been successfully created in the clinic system!\n")
+			b.WriteString("- DO NOT call any more tools! Absolutely NO tool calls or JSON blocks allowed.\n")
+			b.WriteString("- Confirm the booking directly to the customer in natural, warm Jordanian Arabic, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 2:00 بعد الظهر بفرع عمان.').\n")
+			b.WriteString("- No emojis. No repetitive greetings.\n")
+		} else {
+			b.WriteString("- RESERVATION FAILED: The booking tool returned an error. Report the issue politely to the customer without technical details and ask for an alternative time.\n")
+			b.WriteString("- DO NOT call get_tool_instructions or retry the same booking parameters. Respond directly to the customer in natural Arabic.\n")
+		}
+	} else if preflightedCode != "" || lastExecutedToolName == "get_tool_instructions" {
 		if preflightedCode == "create_reservation" || preflightedCode == "create_retouch_reservation" {
 			b.WriteString(fmt.Sprintf("- PREFLIGHT COMPLETE: Instructions for '%s' have been successfully retrieved above!\n", preflightedCode))
 			b.WriteString(fmt.Sprintf("- Immediately invoke '%s' via <tool_call> with the customer's confirmed appointment branch_id, date, time_from, and time_to to finalize the booking!\n", preflightedCode))
@@ -878,16 +885,6 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 			b.WriteString("- DO NOT call get_tool_instructions again.\n")
 		} else {
 			b.WriteString("- PREFLIGHT COMPLETE: Tool instructions retrieved above. Immediately invoke the preflighted tool via <tool_call>.\n")
-		}
-	} else if lastExecutedToolName == "create_reservation" || lastExecutedToolName == "create_retouch_reservation" || strings.Contains(lastToolResultContent, `"reservation_id"`) {
-		if strings.Contains(lastToolResultContent, `"reservation_id"`) || strings.Contains(lastToolResultContent, `"success":true`) {
-			b.WriteString("- RESERVATION BOOKED SUCCESSFULLY: The appointment has been successfully created in the clinic system!\n")
-			b.WriteString("- DO NOT call any more tools! Absolutely NO tool calls or JSON blocks allowed.\n")
-			b.WriteString("- Confirm the booking directly to the customer in natural, warm Jordanian Arabic, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 2:00 بعد الظهر بفرع عمان.').\n")
-			b.WriteString("- No emojis. No repetitive greetings.\n")
-		} else {
-			b.WriteString("- RESERVATION FAILED: The booking tool returned an error. Report the issue politely to the customer without technical details and ask for an alternative time.\n")
-			b.WriteString("- DO NOT call get_tool_instructions or retry the same booking parameters. Respond directly to the customer in natural Arabic.\n")
 		}
 	} else if isSlotResult {
 		isSelectingOrConfirming := stringContainsAny(activeCustomerRequest, "ثبت", "احجز", "احجزي", "بدي", "الساعة", "نعم", "تمام", "أكيد", "اكيد")
@@ -940,6 +937,11 @@ func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMs
 		}
 		for _, name := range extractToolCallNames(content) {
 			if name == "create_reservation" || name == "create_retouch_reservation" {
+				return
+			}
+		}
+		for _, tc := range m.ToolCalls {
+			if name := tc.GetName(); name == "create_reservation" || name == "create_retouch_reservation" {
 				return
 			}
 		}
@@ -1225,7 +1227,7 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 			}
 			var callNames []string
 			for _, tc := range msg.ToolCalls {
-				name := tc.Function.Name
+				name := tc.GetName()
 				if name != "" {
 					callNames = append(callNames, name)
 					if name != "get_tool_instructions" {
@@ -1233,16 +1235,9 @@ func flattenOpenAIChatToPrompt(in openAIRequest) string {
 					}
 					lastExecutedToolName = name
 				}
-				var args any = tc.Function.Arguments
-				if argStr := strings.TrimSpace(tc.Function.Arguments); argStr != "" {
-					var parsed any
-					if err := json.Unmarshal([]byte(argStr), &parsed); err == nil {
-						args = parsed
-					}
-				}
 				callPayload := map[string]any{
 					"tool":  name,
-					"input": args,
+					"input": tc.GetArguments(),
 				}
 				raw, _ := json.Marshal(callPayload)
 				parts = append(parts, "<tool_call>\n"+string(raw)+"\n</tool_call>")
@@ -1848,6 +1843,9 @@ func isRedundantSlotToolCallAnthropic(inMessages []anthropicMessage, outputItems
 	lastMsg := inMessages[len(inMessages)-1]
 	lastContent := contentToTextNoMedia(lastMsg.Content)
 	if !isAnthropicToolResultMessage(lastMsg) && !strings.HasPrefix(lastContent, "[Tool Result") {
+		return false, "", ""
+	}
+	if strings.Contains(lastContent, `"reservation_id"`) {
 		return false, "", ""
 	}
 	if !strings.Contains(lastContent, `"slots"`) && !strings.Contains(lastContent, `"merged_slots"`) {
