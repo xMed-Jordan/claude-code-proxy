@@ -862,12 +862,13 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 		strings.Contains(lastToolResultContent, `"merged_slots"`) ||
 		strings.Contains(lastToolResultContent, `"available_slots"`)
 
-	isReservationResult := lastExecutedToolName == "create_reservation" ||
+	isReservationResult := (lastExecutedToolName == "create_reservation" ||
 		lastExecutedToolName == "create_retouch_reservation" ||
-		strings.Contains(lastToolResultContent, `"reservation_id"`)
+		strings.Contains(lastToolResultContent, "Reservation created successfully")) &&
+		!strings.Contains(lastToolResultContent, `"packages"`)
 
 	if isReservationResult {
-		if strings.Contains(lastToolResultContent, `"reservation_id"`) || strings.Contains(lastToolResultContent, `"success":true`) {
+		if strings.Contains(lastToolResultContent, `"status":201`) || strings.Contains(lastToolResultContent, `"status": 201`) || strings.Contains(lastToolResultContent, "Reservation created successfully") {
 			b.WriteString("- RESERVATION BOOKED SUCCESSFULLY: The appointment has been successfully created in the clinic system!\n")
 			b.WriteString("- DO NOT call any more tools! Absolutely NO tool calls or JSON blocks allowed.\n")
 			b.WriteString("- Confirm the booking directly to the customer in natural, warm Jordanian Arabic, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 2:00 بعد الظهر بفرع عمان.').\n")
@@ -1894,10 +1895,18 @@ func hasAnyToolCall(output []responsesOutputItem) bool {
 func isReservationBookedSuccessfully(messages []anthropicMessage) (bool, string) {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
+		// Stop if we encounter a customer conversational message (start of current turn)
+		if strings.EqualFold(msg.Role, "user") && !isAnthropicToolResultMessage(msg) {
+			text := strings.TrimSpace(contentToTextNoMedia(msg.Content))
+			if !strings.HasPrefix(text, "[Tool Result") {
+				break
+			}
+		}
 		content := contentToTextNoMedia(msg.Content)
 		if (isAnthropicToolResultMessage(msg) || strings.HasPrefix(content, "[Tool Result")) &&
-			strings.Contains(content, `"reservation_id"`) &&
-			(strings.Contains(content, `"status":201`) || strings.Contains(content, `"success":true`) || strings.Contains(content, "Reservation created successfully")) {
+			!strings.Contains(content, `"packages"`) &&
+			(strings.Contains(content, "Reservation created successfully") ||
+				(strings.Contains(content, `"reservation_id"`) && strings.Contains(content, `"reservation_uuid"`) && (strings.Contains(content, `"status":201`) || strings.Contains(content, `"status": 201`)))) {
 			return true, content
 		}
 	}
