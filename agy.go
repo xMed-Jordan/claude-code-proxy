@@ -179,6 +179,18 @@ func parseAgyToolCallCap(s string) int {
 	return n
 }
 
+// parseBoolDefault reads a boolean env value (1/true/yes/on, 0/false/no/off);
+// anything else yields def.
+func parseBoolDefault(s string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
+}
+
 func agyLegacyPrompt(cfg config) bool { return cfg.AgyPromptMode == "legacy" }
 
 func parseAgyWarmWorkers(s string) int {

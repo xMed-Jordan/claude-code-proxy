@@ -402,6 +402,84 @@ func TestRenderAgyPromptSectionOrderAndDigest(t *testing.T) {
 	}
 }
 
+func TestAgyResolveWithFormatRetryAddsNote(t *testing.T) {
+	orig := agyResolveFn
+	defer func() { agyResolveFn = orig }()
+	var prompts []string
+	agyResolveFn = func(ctx context.Context, cfg config, media []mediaPart, prompt, model string) (agyResult, error) {
+		prompts = append(prompts, prompt)
+		if len(prompts) == 1 {
+			return agyResult{}, fmt.Errorf("backend error: Your previous response contained an improperly formatted function call. Please retry with a properly formatted function call. Retries remaining: 3")
+		}
+		return agyResult{Response: "ok"}, nil
+	}
+	res, err := agyResolveWithFormatRetry(context.Background(), config{}, nil, "PROMPT", "m")
+	if err != nil || res.Response != "ok" {
+		t.Fatalf("expected recovery, got res=%+v err=%v", res, err)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(prompts))
+	}
+	if prompts[0] != "PROMPT" {
+		t.Fatalf("first attempt must use the original prompt, got %q", prompts[0])
+	}
+	if !strings.HasPrefix(prompts[1], "PROMPT") || !strings.Contains(prompts[1], "<tool_call> block") {
+		t.Fatalf("retry must re-send the prompt with the native-call note, got %q", prompts[1])
+	}
+	// Other errors are not retried.
+	prompts = nil
+	agyResolveFn = func(ctx context.Context, cfg config, media []mediaPart, prompt, model string) (agyResult, error) {
+		prompts = append(prompts, prompt)
+		return agyResult{}, fmt.Errorf("backend error: quota exhausted")
+	}
+	if _, err := agyResolveWithFormatRetry(context.Background(), config{}, nil, "PROMPT", "m"); err == nil || len(prompts) != 1 {
+		t.Fatalf("unrelated errors must not be retried: err=%v attempts=%d", err, len(prompts))
+	}
+}
+
+func TestRenderJSONReadable(t *testing.T) {
+	in := `{"success":true,"data":{"packages":[{"user_package_id":263669,"name_en":"Full Body - Shalabi Pro","services":[1,2,3],"reservations":[]},{"user_package_id":263662,"name_en":"Full <Face> & more","price":"0.0000"}],"note":null,"ratio":52.85}}`
+	want := "{\n" +
+		" \"success\": true\n" +
+		" \"data\": {\n" +
+		"  \"packages\": [\n" +
+		"   {\n" +
+		"    \"user_package_id\": 263669\n" +
+		"    \"name_en\": \"Full Body - Shalabi Pro\"\n" +
+		"    \"services\": [1, 2, 3]\n" +
+		"    \"reservations\": []\n" +
+		"   }\n" +
+		"   {\n" +
+		"    \"user_package_id\": 263662\n" +
+		"    \"name_en\": \"Full <Face> & more\"\n" +
+		"    \"price\": \"0.0000\"\n" +
+		"   }\n" +
+		"  ]\n" +
+		"  \"note\": null\n" +
+		"  \"ratio\": 52.85\n" +
+		" }\n" +
+		"}"
+	if got := renderJSONReadable(in); got != want {
+		t.Fatalf("readable rendering mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	// Non-JSON and malformed input pass through untouched.
+	for _, s := range []string{"plain text result", "{not json", `{"a":1} trailing`, ""} {
+		if got := renderJSONReadable(s); got != s {
+			t.Fatalf("expected passthrough for %q, got %q", s, got)
+		}
+	}
+	// The transcript renderer applies it only when asked.
+	tr := agyTranscript{}
+	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnCustomer, Text: "hi"})
+	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnToolResult, Tool: "get_customer_packages", CallID: "c1", Text: `{"a":{"b":1}}`})
+	if out := renderAgyTranscript(tr, 0, false); !strings.Contains(out, `{"a":{"b":1}}`) {
+		t.Fatalf("compact rendering expected when readable=false:\n%s", out)
+	}
+	if out := renderAgyTranscript(tr, 0, true); !strings.Contains(out, "{\n \"a\": {\n  \"b\": 1\n }\n}") {
+		t.Fatalf("readable rendering expected when readable=true:\n%s", out)
+	}
+}
+
 func TestAgyAgentArgs(t *testing.T) {
 	cfg := config{AgyAgent: "connect-chat"}
 	if got := strings.Join(agyAgentArgs(cfg, false), " "); got != "--agent connect-chat" {

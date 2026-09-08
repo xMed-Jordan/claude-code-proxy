@@ -111,6 +111,7 @@ type config struct {
 	AgyModel          string        // optional global model override forwarded to agy ("" → agy's own default)
 	AgyPromptMode     string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
 	AgyToolResultCap  int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
+	AgyReadableResults bool         // PROXY_AGY_READABLE_RESULTS — lay JSON tool results out one member per line in the agy prompt (default false; replays showed no accuracy gain)
 	AgyToolCallCap    int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
 	AgyAgent          string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
 	AgyConcurrency    int           // max simultaneous agyj subprocesses
@@ -803,6 +804,7 @@ func loadConfig() config {
 		AgyModel:          strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
 		AgyPromptMode:     parseAgyPromptMode(getenv("PROXY_AGY_PROMPT_MODE", "v2")),
 		AgyToolResultCap:  parseAgyToolResultCap(getenv("PROXY_AGY_TOOL_RESULT_CAP", "0")),
+		AgyReadableResults: parseBoolDefault(getenv("PROXY_AGY_READABLE_RESULTS", "false"), false),
 		AgyToolCallCap:    parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
 		AgyAgent:          strings.TrimSpace(getenv("PROXY_AGY_AGENT", agyChatAgentName)),
 		AgyConcurrency:    parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),

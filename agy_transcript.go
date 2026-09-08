@@ -32,9 +32,11 @@ package main
 // was wrong.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"regexp"
 	"sort"
@@ -716,8 +718,148 @@ func truncateToolResult(s string, capChars int) string {
 	return s[:cut] + fmt.Sprintf(" …[truncated by the system: %d more characters not shown]", len(s)-cut)
 }
 
-// renderAgyTranscript renders the dialogue section.
-func renderAgyTranscript(t agyTranscript, oldResultCap int) string {
+// renderJSONReadable re-renders a JSON tool result so that every object member
+// sits on its own line, indented one space per nesting level, while arrays of
+// scalars stay on one line. Key order and every value are preserved (numbers
+// are copied verbatim, strings re-quoted without HTML escaping); anything that
+// is not exactly one JSON object or array is returned unchanged.
+//
+// Why: a model that has no code interpreter must read a minified 30KB payload
+// holding two dozen records and copy the right record's id into its next
+// call. Without tools, gemini-3.8-flash picked the id of the first record or
+// of the enclosing membership; with the coding tools it used to answer this by
+// running python over the payload (slow, expensive, unsafe). Laid out one
+// member per line, a record's id and its name are adjacent lines, which is
+// what a person would want too. Whitespace costs almost nothing in tokens.
+// Configured via PROXY_AGY_READABLE_RESULTS; off by default because two full
+// B1 replays with it on still booked on the wrong package id (the model reads
+// the protocol's "record the visit on her membership" literally and takes the
+// membership record's id rather than the Full Body package's), so the layout
+// was not the limiting factor.
+func renderJSONReadable(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return s
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var b strings.Builder
+	if err := writeReadableJSONValue(dec, &b, 0); err != nil {
+		return s
+	}
+	if _, err := dec.Token(); err != io.EOF { // trailing content: not a single document
+		return s
+	}
+	return b.String()
+}
+
+func writeReadableJSONValue(dec *json.Decoder, b *strings.Builder, depth int) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	pad := strings.Repeat(" ", depth)
+	switch v := tok.(type) {
+	case json.Delim:
+		switch v {
+		case '{':
+			n := 0
+			for dec.More() {
+				keyTok, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, _ := keyTok.(string)
+				if n == 0 {
+					b.WriteString("{\n")
+				}
+				b.WriteString(pad)
+				b.WriteString(" ")
+				b.WriteString(jsonQuote(key))
+				b.WriteString(": ")
+				if err := writeReadableJSONValue(dec, b, depth+1); err != nil {
+					return err
+				}
+				b.WriteString("\n")
+				n++
+			}
+			if _, err := dec.Token(); err != nil { // '}'
+				return err
+			}
+			if n == 0 {
+				b.WriteString("{}")
+			} else {
+				b.WriteString(pad)
+				b.WriteString("}")
+			}
+		case '[':
+			var items []string
+			scalar := true
+			for dec.More() {
+				var ib strings.Builder
+				if err := writeReadableJSONValue(dec, &ib, depth+1); err != nil {
+					return err
+				}
+				item := ib.String()
+				if (strings.HasPrefix(item, "{") && item != "{}") || (strings.HasPrefix(item, "[") && item != "[]") {
+					scalar = false
+				}
+				items = append(items, item)
+			}
+			if _, err := dec.Token(); err != nil { // ']'
+				return err
+			}
+			switch {
+			case len(items) == 0:
+				b.WriteString("[]")
+			case scalar:
+				b.WriteString("[" + strings.Join(items, ", ") + "]")
+			default:
+				b.WriteString("[\n")
+				for _, item := range items {
+					b.WriteString(pad)
+					b.WriteString(" ")
+					b.WriteString(item)
+					b.WriteString("\n")
+				}
+				b.WriteString(pad)
+				b.WriteString("]")
+			}
+		default:
+			return fmt.Errorf("unexpected delimiter %q", v)
+		}
+	case string:
+		b.WriteString(jsonQuote(v))
+	case json.Number:
+		b.WriteString(v.String())
+	case bool:
+		if v {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case nil:
+		b.WriteString("null")
+	default:
+		return fmt.Errorf("unexpected token %T", tok)
+	}
+	return nil
+}
+
+// jsonQuote quotes s as a JSON string without escaping <, > and &.
+func jsonQuote(s string) string {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return strconv.Quote(s)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderAgyTranscript renders the dialogue section. When readable is set, JSON
+// tool results are laid out one member per line (renderJSONReadable).
+func renderAgyTranscript(t agyTranscript, oldResultCap int, readable bool) string {
 	if len(t.Turns) == 0 {
 		return ""
 	}
@@ -745,6 +887,9 @@ func renderAgyTranscript(t agyTranscript, oldResultCap int) string {
 			} else {
 				if !dup {
 					seenResult[key] = tt.CallID
+				}
+				if readable {
+					text = renderJSONReadable(text)
 				}
 				if i < last {
 					text = truncateToolResult(text, oldResultCap)
@@ -955,7 +1100,7 @@ func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCa
 		b.WriteString(toolsPrompt)
 		b.WriteString("\n\n")
 	}
-	if tr := renderAgyTranscript(t, agyToolResultCap(cfg)); tr != "" {
+	if tr := renderAgyTranscript(t, agyToolResultCap(cfg), cfg.AgyReadableResults); tr != "" {
 		b.WriteString(tr)
 		b.WriteString("\n\n")
 	}
@@ -1153,11 +1298,28 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 // as a 502 to the caller.
 func agyResolveWithFormatRetry(ctx context.Context, cfg config, media []mediaPart, prompt, model string) (agyResult, error) {
 	res, err := agyResolveFn(ctx, cfg, media, prompt, model)
-	if err != nil && ctx.Err() == nil && strings.Contains(strings.ToLower(err.Error()), "improperly formatted function call") {
-		log.Printf("[agy-loop] runtime rejected a malformed native tool call; re-running the turn once")
-		res, err = agyResolveFn(ctx, cfg, media, prompt, model)
+	for attempt := 1; attempt <= agyNativeCallRetries && err != nil && ctx.Err() == nil && isAgyNativeCallRejection(err); attempt++ {
+		log.Printf("[agy-loop] runtime rejected a native function call attempt (%d/%d); re-running the turn with a note", attempt, agyNativeCallRetries)
+		res, err = agyResolveFn(ctx, cfg, media, prompt+agyNativeCallNote, model)
 	}
 	return res, err
+}
+
+// agyNativeCallRetries bounds the re-runs after the runtime rejected a native
+// function call. Under the tool-less agent the model has no native functions
+// at all, so such an attempt is always a slip (typically at the booking step,
+// where it "calls" create_reservation as a function instead of writing the
+// <tool_call> block); a re-run with the note below recovers it.
+const agyNativeCallRetries = 2
+
+const agyNativeCallNote = "\n\n### SYSTEM NOTE (retry of this same turn)\nYour previous attempt at this turn was rejected by the runtime because it tried to invoke a function natively. You have no native functions here. The tools listed under TOOLS are used ONLY by writing a <tool_call> block in your reply text, exactly in the format described there; everything else in your reply is plain text for the customer. Write the turn again.\n"
+
+func isAgyNativeCallRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "improperly formatted function call") || strings.Contains(msg, "malformed function call")
 }
 
 // agyResponseText concatenates the text of message items.
