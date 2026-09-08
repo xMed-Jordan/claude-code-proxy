@@ -887,6 +887,7 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 			b.WriteString("- No emojis. No repetitive greetings.\n")
 		} else {
 			b.WriteString("- RESERVATION FAILED: The booking tool returned an error. Report the issue politely to the customer without technical details and ask for an alternative time.\n")
+			b.WriteString("- DO NOT call get_tool_instructions or retry the same booking parameters. Respond directly to the customer in natural Arabic.\n")
 		}
 	} else if isSlotResult {
 		isSelectingOrConfirming := stringContainsAny(activeCustomerRequest, "ثبت", "احجز", "احجزي", "بدي", "الساعة", "نعم", "تمام", "أكيد", "اكيد")
@@ -925,10 +926,18 @@ func buildToolResultDirective(lastExecutedToolName string, lastToolResultContent
 	return b.String()
 }
 
-// redirectErroneousSlotCallToBooking intercepts slot retrieval tool calls when the customer is explicitly confirming booking.
-func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMsg string) {
+// redirectErroneousSlotCallToBooking intercepts slot retrieval tool calls when the customer is explicitly confirming booking,
+// provided that create_reservation has not already been preflighted or called in this turn.
+func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMsg string, messages []anthropicMessage) {
 	if !stringContainsAny(customerMsg, "ثبت", "احجز", "احجزي", "أكد", "اكد", "نعم", "تمام", "أكيد", "اكيد") {
 		return
+	}
+	// Check if create_reservation has already been preflighted or called in the conversation
+	for _, m := range messages {
+		content := contentToTextNoMedia(m.Content)
+		if strings.Contains(content, "create_reservation") || strings.Contains(content, "create_retouch_reservation") {
+			return
+		}
 	}
 	for i := range output {
 		if output[i].Type == "function_call" && (output[i].Name == "get_available_slots" || output[i].Name == "get_multi_service_slots") {
@@ -1891,7 +1900,7 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 			}
 		}
 	}
-	redirectErroneousSlotCallToBooking(resp.Output, activeCustomerReq)
+	redirectErroneousSlotCallToBooking(resp.Output, activeCustomerReq, in.Messages)
 
 	// Safety Guard: Intercept redundant slot retrieval loops immediately
 	if redundant, lastSlotContent, activeCustomerReq := isRedundantSlotToolCallAnthropic(in.Messages, resp.Output); redundant {

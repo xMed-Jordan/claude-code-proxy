@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -583,13 +585,45 @@ func TestRedirectErroneousSlotCallToBooking(t *testing.T) {
 			Arguments: `{"branch_id":2,"date":"2026-09-08"}`,
 		},
 	}
-	redirectErroneousSlotCallToBooking(output, "نعم ثبتي هاد الموعد")
+	redirectErroneousSlotCallToBooking(output, "نعم ثبتي هاد الموعد", nil)
 	if output[0].Name != "get_tool_instructions" {
 		t.Fatalf("expected redirected name get_tool_instructions, got %s", output[0].Name)
 	}
 	if !strings.Contains(output[0].Arguments, "create_reservation") {
 		t.Fatalf("expected create_reservation in arguments, got %s", output[0].Arguments)
 	}
+
+	// Should not redirect if create_reservation was already present in messages
+	output2 := []responsesOutputItem{
+		{
+			Type:      "function_call",
+			Name:      "get_available_slots",
+			Arguments: `{"branch_id":2,"date":"2026-09-08"}`,
+		},
+	}
+	msgs := []anthropicMessage{
+		{
+			Role:    "assistant",
+			Content: `<tool_call>{"name":"create_reservation"}</tool_call>`,
+		},
+	}
+	redirectErroneousSlotCallToBooking(output2, "نعم ثبتي هاد الموعد", msgs)
+	if output2[0].Name != "get_available_slots" {
+		t.Fatalf("expected name to stay get_available_slots, got %s", output2[0].Name)
+	}
+}
+
+func TestDumpPrompt641045(t *testing.T) {
+	data, err := os.ReadFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\req_641045.json`)
+	if err != nil {
+		t.Skip("req_641045.json not found")
+	}
+	var req anthropicRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		t.Fatal(err)
+	}
+	prompt := flattenAnthropicToPrompt(req)
+	os.WriteFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\prompt_641045.txt`, []byte(prompt), 0644)
 }
 
 
