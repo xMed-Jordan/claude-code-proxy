@@ -593,7 +593,7 @@ func TestRedirectErroneousSlotCallToBooking(t *testing.T) {
 		t.Fatalf("expected create_reservation in arguments, got %s", output[0].Arguments)
 	}
 
-	// Should not redirect if create_reservation was already present in messages
+	// Should not redirect if create_reservation was already called
 	output2 := []responsesOutputItem{
 		{
 			Type:      "function_call",
@@ -611,6 +611,25 @@ func TestRedirectErroneousSlotCallToBooking(t *testing.T) {
 	if output2[0].Name != "get_available_slots" {
 		t.Fatalf("expected name to stay get_available_slots, got %s", output2[0].Name)
 	}
+
+	// Should still redirect when create_reservation is only mentioned in documentation text of another tool
+	data, err := os.ReadFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\req_641628.json`)
+	if err == nil {
+		var req anthropicRequest
+		if err := json.Unmarshal(data, &req); err == nil {
+			output3 := []responsesOutputItem{
+				{
+					Type:      "function_call",
+					Name:      "get_available_slots",
+					Arguments: `{"branch_id":2,"date":"2026-09-08"}`,
+				},
+			}
+			redirectErroneousSlotCallToBooking(output3, "نعم ثبتي هاد الموعد", req.Messages)
+			if output3[0].Name != "get_tool_instructions" {
+				t.Fatalf("expected redirected name get_tool_instructions for req_641628, got %s", output3[0].Name)
+			}
+		}
+	}
 }
 
 func TestDumpPrompt641045(t *testing.T) {
@@ -624,6 +643,19 @@ func TestDumpPrompt641045(t *testing.T) {
 	}
 	prompt := flattenAnthropicToPrompt(req)
 	os.WriteFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\prompt_641045.txt`, []byte(prompt), 0644)
+}
+
+func TestDumpPrompt641628(t *testing.T) {
+	data, err := os.ReadFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\req_641628.json`)
+	if err != nil {
+		t.Skip("req_641628.json not found")
+	}
+	var req anthropicRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		t.Fatal(err)
+	}
+	prompt := flattenAnthropicToPrompt(req)
+	os.WriteFile(`C:\Users\hrash\.gemini\antigravity\brain\a7cfc635-dd9c-43d2-a6f6-3dfeb5345200\scratch\prompt_641628.txt`, []byte(prompt), 0644)
 }
 
 

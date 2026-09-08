@@ -935,8 +935,13 @@ func redirectErroneousSlotCallToBooking(output []responsesOutputItem, customerMs
 	// Check if create_reservation has already been preflighted or called in the conversation
 	for _, m := range messages {
 		content := contentToTextNoMedia(m.Content)
-		if strings.Contains(content, "create_reservation") || strings.Contains(content, "create_retouch_reservation") {
+		if tc := extractPreflightToolCode(content); tc == "create_reservation" || tc == "create_retouch_reservation" {
 			return
+		}
+		for _, name := range extractToolCallNames(content) {
+			if name == "create_reservation" || name == "create_retouch_reservation" {
+				return
+			}
 		}
 	}
 	for i := range output {
