@@ -1115,8 +1115,8 @@ const (
 	agyLevelHistory
 	agyLevelProse
 	agyLevelFields  // drop the heaviest column of a record list, keeping every record
-	agyLevelRecords // drop records
 	agyLevelOldest  // drop the oldest tool results outright, oldest first
+	agyLevelRecords // drop records from a list. Last resort of all.
 )
 
 // agyDroppedResultNote replaces a tool result that had to go entirely. The call
@@ -1322,8 +1322,15 @@ func shrinkJSONOnce(root *any, level int) bool {
 const agyOmissionMarker = "[system note: "
 
 // agyMinRecordKeys is the number of fields a record keeps whatever happens, so
-// that thinning never leaves an unidentifiable object.
-const agyMinRecordKeys = 4
+// that thinning never leaves an unidentifiable object. Two is deliberate: an id
+// and a name are what the next tool call needs, and everything else must be
+// spendable before a record is dropped. Production 2026-09-09 (conv 9f24dc22):
+// with this at 4, the packages payload could not shrink past ~3,600 bytes
+// without dropping records, the turn had ~1,000 bytes to give it, so 24 of the
+// 25 records went and the model booked on the only survivor — the membership
+// record — and every create_reservation failed with "the selected therapist
+// does not provide this service".
+const agyMinRecordKeys = 2
 
 // dropHeaviestColumn removes, from the heaviest array of objects, the single
 // field that costs the most across its elements, and notes it. Ids and short
@@ -1352,6 +1359,7 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 		return false
 	}
 	weight := map[string]int{}
+	distinct := map[string]map[string]bool{}
 	keys := 0
 	for _, item := range refs[best].arr {
 		obj, ok := item.(map[string]any)
@@ -1373,22 +1381,41 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 			if err != nil {
 				continue
 			}
-			w := len(raw)
-			if agyIdentifyingField(k) {
-				// An id or a name is how the model refers to this record in its
-				// next tool call; make it the last column to go.
-				w /= 8
+			weight[k] += len(raw)
+			if distinct[k] == nil {
+				distinct[k] = map[string]bool{}
 			}
-			weight[k] += w
+			distinct[k][string(raw)] = true
 		}
 	}
 	if keys <= agyMinRecordKeys || len(weight) == 0 {
 		return false
 	}
-	heaviest, heaviestWeight := "", 0
-	for k, w := range weight {
-		if w > heaviestWeight || (w == heaviestWeight && k > heaviest) {
-			heaviest, heaviestWeight = k, w
+	// Spend columns in order of how little they say about a record:
+	//   1. anything that is not an id or a name — the bulk, and replaceable;
+	//   2. ids and names that hold the SAME value in every record, which
+	//      therefore distinguish nothing (membership_id: 27 across all of them);
+	//   3. only then a real identifier, heaviest first.
+	// Without this an id of six characters loses to a name of twenty-five and
+	// the record stops being nameable at all (prod 2026-09-09: the surviving
+	// columns were group_id, membership_id and section_id).
+	heaviest, heaviestWeight := "", -1
+	for tier := 0; tier < 3 && heaviest == ""; tier++ {
+		for k, w := range weight {
+			ident := agyIdentifyingField(k)
+			switch tier {
+			case 0:
+				if ident {
+					continue
+				}
+			case 1:
+				if !ident || len(distinct[k]) > 1 {
+					continue
+				}
+			}
+			if w > heaviestWeight || (w == heaviestWeight && k > heaviest) {
+				heaviest, heaviestWeight = k, w
+			}
 		}
 	}
 	if heaviest == "" {

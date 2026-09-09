@@ -437,8 +437,9 @@ func TestCompactJSONForPromptKeepsRecordsDropsHistory(t *testing.T) {
 			t.Fatalf("name of record %d lost", i)
 		}
 	}
-	if !strings.Contains(out, agyOmissionMarker) {
-		t.Fatalf("no omission marker in:\n%s", truncateString(out, 800))
+	// Something must say what was given up: thinned history, or dropped columns.
+	if !strings.Contains(out, agyOmissionMarker) && !strings.Contains(out, agyDroppedFieldsKey) {
+		t.Fatalf("nothing records what was dropped:\n%s", truncateString(out, 800))
 	}
 	// Valid JSON out.
 	var v any
@@ -669,6 +670,63 @@ func TestCompactJSONThinsBulkiestNestingFirst(t *testing.T) {
 	}
 	if !strings.Contains(out, agyOmissionMarker) {
 		t.Fatalf("expected the bulky list to be thinned:\n%s", truncateString(out, 600))
+	}
+}
+
+// Stale lookups must be given up ENTIRELY before the live record list loses a
+// single record. Production 2026-09-09 (conv 9f24dc22) had it the other way
+// round: the packages list was crushed from 28KB to ~1KB, losing 24 of 25
+// records, while a dozen superseded results still held ~1.2KB each — so the
+// only package id left was the membership record and every booking failed.
+func TestFitAgySacrificesStaleResultsBeforeRecords(t *testing.T) {
+	msgs := []anthropicMessage{{Role: "user", Content: "احجزيلي"}}
+	// A dozen earlier lookups of assorted tools, each worth about a kilobyte.
+	for i := 0; i < 12; i++ {
+		id := fmt.Sprintf("x%d", i)
+		msgs = append(msgs,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": fmt.Sprintf("lookup_%d", i), "input": map[string]any{"n": i}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"n":%d,"notes":"%s"}`, i, strings.Repeat("تفاصيل ", 400))}}},
+		)
+	}
+	// Then the record list the next call has to name something from.
+	msgs = append(msgs,
+		anthropicMessage{Role: "user", Content: "اه ثبتيه"},
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "pk", "name": "get_customer_packages", "input": map[string]any{}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "pk", "content": buildPackagesResult(24, 10)}}},
+	)
+	tr := buildAgyTranscriptFromAnthropic(anthropicRequest{Messages: msgs})
+	full := len(renderAgyTranscript(tr, 0, false))
+	budget := full / 6
+	fitted, _ := fitAgyTranscript(tr, 0, false, budget)
+	got := renderAgyTranscript(fitted, 0, false)
+	if len(got) > budget {
+		t.Fatalf("%d bytes over budget %d", len(got)-budget, budget)
+	}
+	for i := 0; i < 24; i++ {
+		if !strings.Contains(got, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d was dropped while stale lookups still held bytes:\n%s", 263660+i, truncateString(got, 1200))
+		}
+		if !strings.Contains(got, fmt.Sprintf(`"name_en":"Package %d"`, i)) {
+			t.Fatalf("record %d lost its name, so it can no longer be chosen", i)
+		}
+	}
+	// And the bytes came from the stale lookups, which are marked as reduced.
+	if !strings.Contains(got, agyDroppedResultNote) && !strings.Contains(got, "call the tool again") {
+		t.Fatal("expected the stale lookups to pay for it")
+	}
+	var staleBytes, recordBytes int
+	for _, tt := range fitted.Turns {
+		if tt.Kind != agyTurnToolResult {
+			continue
+		}
+		if tt.Tool == "get_customer_packages" {
+			recordBytes = len(tt.Text)
+		} else {
+			staleBytes += len(tt.Text)
+		}
+	}
+	if recordBytes <= staleBytes/len(fitted.Turns) {
+		t.Fatalf("the record list (%d bytes) was squeezed harder than the stale lookups (%d bytes total)", recordBytes, staleBytes)
 	}
 }
 
