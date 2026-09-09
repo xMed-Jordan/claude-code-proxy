@@ -799,6 +799,7 @@ func renderAgyToolCatalog(tools []agyToolCatalog, detailed map[string]bool, comp
 	b.WriteString("- A response that calls tools must contain ONLY <tool_call> blocks (one block per call, several blocks allowed) and nothing else.\n")
 	b.WriteString("- After you emit tool calls, STOP. The system runs them and sends you their results in the transcript. Never write or guess a tool result yourself.\n")
 	b.WriteString("- Use only tool names listed here and only the parameters in each tool's input schema.\n")
+	b.WriteString("- Send a parameter only when you have a real value for it: from the customer, from a tool result, or from the tool's own instructions. If a parameter is marked required but nothing gives you a value for it, send an empty string. Never invent a value, guess one, or fill a parameter with a plausible-looking placeholder — a made-up value is rejected by the tool's API and the call fails.\n")
 	b.WriteString("- The list below is the complete set of tools you have. Do not use shell commands, files, code execution, web search or any other capability of the runtime you are running in.\n")
 	b.WriteString("- When no (further) tool call is needed, answer the customer in plain text with no <tool_call> block.\n\n")
 	b.WriteString("Available tools:\n\n")
@@ -1945,7 +1946,11 @@ func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agy
 		// shortened result adds a line to the state block saying so. Measure the
 		// assembled prompt and give back the overshoot until it really fits.
 		var notes []string
-		for attempt := 0; attempt < 4 && room > agyMinTranscriptFloor; attempt++ {
+		// >= and not >: when the caller's own system prompt leaves less than the
+		// floor and room was clamped up to it just above, a > guard skipped the
+		// fitting entirely and sent the whole transcript unfitted — the one case
+		// the clamp exists to rescue.
+		for attempt := 0; attempt < 4 && room >= agyMinTranscriptFloor; attempt++ {
 			fitted, n := fitAgyTranscript(t, agyToolResultCap(cfg), cfg.AgyReadableResults, room)
 			over := len(assembleAgyPrompt(howToRead, sysBlock.String(), toolsPrompt, fitted, cfg)) - budget
 			if over <= 0 || attempt == 3 {
@@ -2117,6 +2122,10 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	}
 	stats := in.Transcript.currentTurnToolStats()
 	callCap := agyToolCallCap(cfg)
+	// Values this conversation's own tool APIs have already refused, so an
+	// invented parameter is dropped rather than retried until the turn dies
+	// (agy_args.go).
+	rejections := agyRejectedArgs(in.Transcript)
 
 	var notes []string
 	var lastResp responsesResponse
@@ -2153,6 +2162,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 					problems = append(problems, fmt.Sprintf("tool %q does not exist; only the tools listed in the TOOLS section can be called", item.Name))
 					hardProblem = true
 					continue
+				}
+				// An argument whose exact value this tool's API already refused
+				// cannot succeed, and re-sending it burns the turn against
+				// Connect's repeat guard. Drop it and let the call through: the
+				// parameter the model could not know a value for is exactly the
+				// one the tool is willing to do without.
+				if cleaned, dropped := agyStripRejectedArgs(rejections, item.Name, item.Arguments); len(dropped) > 0 {
+					log.Printf("[agy-args] %s: dropped %s — this conversation's API already refused that value", item.Name, strings.Join(dropped, ", "))
+					item.Arguments = cleaned
 				}
 				// A tool whose result the system shortened is exempt from the
 				// repeat rules: the transcript no longer holds what it is being
