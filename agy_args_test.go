@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -203,5 +207,206 @@ func TestAgyStillFitsWhenTheCallerLeavesNoRoom(t *testing.T) {
 		if !strings.Contains(prompt, "طيب احجزيلي على باقة الجسم كامل") {
 			t.Fatalf("budget %d lost the customer's own words", budget)
 		}
+	}
+}
+
+// loadConnectCatalog reads the 63 tool schemas Connect actually sends for the
+// Shalabi agent, captured from getNativeToolSchemas on 2026-09-10.
+func loadConnectCatalog(t *testing.T) []anthropicTool {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "connect_tools.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tools []anthropicTool
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 63 {
+		t.Fatalf("expected the 63-tool catalog, got %d", len(tools))
+	}
+	return tools
+}
+
+func catalogByName(tools []agyToolCatalog, name string) (agyToolCatalog, bool) {
+	for _, t := range tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return agyToolCatalog{}, false
+}
+
+func schemaRequired(t *testing.T, schema any) []string {
+	t.Helper()
+	m, ok := schema.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	if reqs, ok := m["required"].([]any); ok {
+		for _, r := range reqs {
+			if s, ok := r.(string); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// On the real catalog the repair must fire on the generated schemas and leave
+// the hand-written ones exactly as they came.
+func TestSchemaRepairOnTheRealConnectCatalog(t *testing.T) {
+	tools := agyRepairToolSchemas(agyCatalogFromAnthropic(loadConnectCatalog(t)))
+
+	// Generated: every parameter required, every description the same template.
+	for _, name := range []string{
+		"get_available_slots", "create_reservation", "create_multi_service_reservation",
+		"purchase_membership", "upgrade_membership", "create_customer", "add_item_to_cart",
+	} {
+		tool, ok := catalogByName(tools, name)
+		if !ok {
+			t.Fatalf("%s missing from the catalog", name)
+		}
+		if req := schemaRequired(t, tool.Schema); len(req) != 0 {
+			t.Fatalf("%s kept a generated required list: %v", name, req)
+		}
+		// The parameters themselves must all survive — only the claim about
+		// them is dropped.
+		props, _, ok := agySchemaParts(tool.Schema)
+		if !ok {
+			t.Fatalf("%s lost its properties", name)
+		}
+		if name == "get_available_slots" {
+			for _, p := range []string{"from_date", "to_date", "branch_id", "service_ids", "appointment_type", "duration", "room_id"} {
+				if _, has := props[p]; !has {
+					t.Fatalf("get_available_slots lost parameter %s", p)
+				}
+			}
+		}
+	}
+
+	// Hand-written: descriptions written for this tool, so the requirement is real.
+	for _, tc := range []struct {
+		name string
+		want []string
+	}{
+		{"save_memory", []string{"memory_type", "content"}},
+		{"delete_memory", []string{"memory_type", "search"}},
+		{"get_memory", []string{"memory_type"}},
+		{"get_tool_instructions", []string{"tool_code"}},
+		{"send_media", []string{"items"}},
+	} {
+		tool, ok := catalogByName(tools, tc.name)
+		if !ok {
+			t.Fatalf("%s missing from the catalog", tc.name)
+		}
+		got := schemaRequired(t, tool.Schema)
+		sort.Strings(got)
+		want := append([]string(nil), tc.want...)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: a hand-written requirement was dropped: got %v want %v", tc.name, got, want)
+		}
+	}
+}
+
+// The invented value in production came from appointment_type being presented
+// as required. After the repair the catalog the model reads must not say so,
+// while still listing the parameter as available.
+func TestRepairedCatalogNoLongerDemandsTheInventedParameter(t *testing.T) {
+	tools := agyRepairToolSchemas(agyCatalogFromAnthropic(loadConnectCatalog(t)))
+	full := renderAgyToolCatalog(tools, nil, false)
+	if !strings.Contains(full, "appointment_type") {
+		t.Fatal("the parameter must still be offered")
+	}
+	if strings.Contains(full, `"required":["from_date"`) || strings.Contains(full, `"appointment_type","retouch_reservation_id"`) {
+		t.Fatalf("the generated required list survived into the prompt")
+	}
+	// Compact mode marks required parameters with a star; the generated ones
+	// must no longer carry it, the hand-written ones must.
+	compact := renderAgyToolCatalog(tools, map[string]bool{}, true)
+	for _, line := range strings.Split(compact, "\n") {
+		if strings.HasPrefix(line, "- get_available_slots ") && strings.Contains(line, "*") {
+			t.Fatalf("generated parameters still marked required: %s", line)
+		}
+		if strings.HasPrefix(line, "- save_memory ") && !strings.Contains(line, "*") {
+			t.Fatalf("a real requirement lost its marker: %s", line)
+		}
+	}
+}
+
+// The rule is about the shape of the catalog, not about Connect: a catalog of
+// hand-written schemas is never touched, however many parameters are required.
+func TestSchemaRepairLeavesHandWrittenCatalogsAlone(t *testing.T) {
+	tools := agyRepairToolSchemas(agyCatalogFromAnthropic([]anthropicTool{
+		{Name: "send_email", InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"to":      map[string]any{"type": "string", "description": "Recipient address."},
+				"subject": map[string]any{"type": "string", "description": "Subject line, kept under 80 characters."},
+			},
+			"required": []any{"to", "subject"},
+		}},
+		{Name: "create_ticket", InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"title":    map[string]any{"type": "string", "description": "One-line summary of the problem."},
+				"severity": map[string]any{"type": "string", "description": "One of sev1, sev2, sev3."},
+			},
+			"required": []any{"title", "severity"},
+		}},
+	}))
+	for _, tool := range tools {
+		if len(schemaRequired(t, tool.Schema)) != 2 {
+			t.Fatalf("%s: a hand-written required list was dropped", tool.Name)
+		}
+	}
+}
+
+// A generator's fingerprint is the wording repeating across tools, not any
+// particular words: the same shape in another vocabulary is repaired too.
+func TestSchemaRepairRecognisesAnyGenerator(t *testing.T) {
+	mk := func(name string, params ...string) anthropicTool {
+		props := map[string]any{}
+		var req []any
+		for _, p := range params {
+			props[p] = map[string]any{"type": "string", "description": "Champ " + p + " de la requête"}
+			req = append(req, p)
+		}
+		return anthropicTool{Name: name, InputSchema: map[string]any{"type": "object", "properties": props, "required": req}}
+	}
+	tools := agyRepairToolSchemas(agyCatalogFromAnthropic([]anthropicTool{
+		mk("reserver_creneau", "date", "duree", "salle"),
+		mk("annuler_creneau", "reservation_id"),
+	}))
+	for _, tool := range tools {
+		if req := schemaRequired(t, tool.Schema); len(req) != 0 {
+			t.Fatalf("%s: a generated list in another language survived: %v", tool.Name, req)
+		}
+		if props, _, ok := agySchemaParts(tool.Schema); !ok || len(props) == 0 {
+			t.Fatalf("%s lost its parameters", tool.Name)
+		}
+	}
+}
+
+// The repair is on by default and PROXY_AGY_SCHEMA_REPAIR=false turns it off,
+// which is also how the live A/B below was run.
+func TestSchemaRepairCanBeSwitchedOff(t *testing.T) {
+	tools := agyCatalogFromAnthropic(loadConnectCatalog(t))
+	tr := agyTranscript{}
+	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnCustomer, Text: "شو المتاح بكرا؟"})
+
+	on := renderAgyPrompt(config{}, "You are Zeina.", nil, tools, tr)
+	off := renderAgyPrompt(config{AgySchemaRepairOff: true}, "You are Zeina.", nil, tools, tr)
+
+	if strings.Contains(on, `"appointment_type","retouch_reservation_id"`) {
+		t.Fatal("the generated required list survived with the repair on")
+	}
+	if !strings.Contains(off, `"appointment_type","retouch_reservation_id"`) {
+		t.Fatal("switching the repair off must present the caller's schema unchanged")
+	}
+	if len(on) >= len(off) {
+		t.Fatalf("the repair should also shorten the catalog: on=%d off=%d", len(on), len(off))
 	}
 }

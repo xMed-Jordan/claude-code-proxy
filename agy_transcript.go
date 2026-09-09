@@ -1889,6 +1889,12 @@ func agyToolsInPlay(t agyTranscript) map[string]bool {
 // window, and reports which tools had their results shortened or dropped in the
 // process — the caller must exempt those from its "do not repeat a call" rules.
 func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) (string, map[string]bool) {
+	// A required list that names every parameter and describes none of them is
+	// a generator's default, not a requirement, and obeying it is what makes a
+	// model invent values (agy_args.go).
+	if !cfg.AgySchemaRepairOff {
+		tools = agyRepairToolSchemas(tools)
+	}
 	system = strings.TrimSpace(system)
 	tempDirective := buildAgyTempDirective(temp)
 	toolsPrompt := renderAgyToolCatalog(tools, nil, false)

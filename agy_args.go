@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 )
@@ -247,4 +248,153 @@ func agyStripRejectedArgs(rejections agyArgRejections, tool, argsJSON string) (s
 		delete(args, k)
 	}
 	return canonicalToolArgs(args), dropped
+}
+
+// A tool schema that marks every one of its parameters required, and describes
+// each of them with the same boilerplate the rest of the catalog uses, is not
+// stating a requirement — it is a generator that had nothing to say. Connect
+// builds one for every HTTP tool by scanning the request template for
+// {{placeholders}}: all of them land in `required`, each described as "Value for
+// X parameter". The tool's real instructions say the opposite for several of
+// them, so the model is told it MUST send a parameter nothing defines, and it
+// invents a value.
+//
+// Dropping such a list is what stops the invention at the source, before the
+// model drafts anything. The two conditions below are what make that safe, and
+// both are read off the catalog in front of us rather than from any knowledge of
+// this platform:
+//
+//   - Every parameter is required. A list naming all of them constrains nothing
+//     that leaving it out would not, so no information is lost by dropping it.
+//   - Every parameter's description is boilerplate: once the parameter's own
+//     name is removed, the same wording appears under other tools too. A
+//     description written for this tool is information; one shared with forty
+//     other tools is a template.
+//
+// Hand-written schemas fail the second test and keep their required lists:
+// across the 63 tools Connect sends, save_memory, get_tool_instructions,
+// send_media and get_memory all describe their parameters in their own words
+// and are left exactly as they came.
+
+// agyDescTemplate reduces a parameter description to the wording it shares with
+// other parameters: its own name blanked out, lowercased, whitespace collapsed.
+func agyDescTemplate(name, desc string) string {
+	d := strings.ToLower(strings.TrimSpace(desc))
+	if d == "" {
+		return ""
+	}
+	if n := strings.ToLower(strings.TrimSpace(name)); n != "" {
+		d = strings.ReplaceAll(d, n, "@")
+	}
+	return strings.Join(strings.Fields(d), " ")
+}
+
+// agySchemaParts pulls the properties map and required set out of a schema.
+func agySchemaParts(schema any) (map[string]any, map[string]bool, bool) {
+	m, ok := schema.(map[string]any)
+	if !ok {
+		return nil, nil, false
+	}
+	props, ok := m["properties"].(map[string]any)
+	if !ok || len(props) == 0 {
+		return nil, nil, false
+	}
+	required := map[string]bool{}
+	switch reqs := m["required"].(type) {
+	case []any:
+		for _, r := range reqs {
+			if s, isStr := r.(string); isStr {
+				required[s] = true
+			}
+		}
+	case []string:
+		for _, s := range reqs {
+			required[s] = true
+		}
+	}
+	return props, required, true
+}
+
+// agyPropDescription reads a property's description, whatever shape it arrived in.
+func agyPropDescription(def any) string {
+	m, ok := def.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m["description"].(string)
+	return s
+}
+
+// agyBoilerplateTemplates returns the description wordings that appear under
+// more than one tool, which is what makes them boilerplate rather than
+// documentation. An empty description says nothing either way and counts too.
+func agyBoilerplateTemplates(tools []agyToolCatalog) map[string]bool {
+	perTemplate := map[string]map[string]bool{}
+	for _, t := range tools {
+		props, _, ok := agySchemaParts(t.Schema)
+		if !ok {
+			continue
+		}
+		for name, def := range props {
+			tpl := agyDescTemplate(name, agyPropDescription(def))
+			if perTemplate[tpl] == nil {
+				perTemplate[tpl] = map[string]bool{}
+			}
+			perTemplate[tpl][t.Name] = true
+		}
+	}
+	out := map[string]bool{"": true}
+	for tpl, tools := range perTemplate {
+		if len(tools) > 1 {
+			out[tpl] = true
+		}
+	}
+	return out
+}
+
+// agyRepairToolSchemas drops the required list of every tool whose list names
+// all of its parameters and whose parameters are all described in boilerplate.
+// The properties themselves are untouched: the model still sees every parameter
+// the tool accepts, and the tool's own instructions still say which ones matter.
+func agyRepairToolSchemas(tools []agyToolCatalog) []agyToolCatalog {
+	if len(tools) == 0 {
+		return tools
+	}
+	boilerplate := agyBoilerplateTemplates(tools)
+	var repaired []string
+	out := make([]agyToolCatalog, len(tools))
+	copy(out, tools)
+	for i, t := range out {
+		props, required, ok := agySchemaParts(t.Schema)
+		if !ok || len(required) == 0 || len(required) != len(props) {
+			continue
+		}
+		informative := false
+		for name, def := range props {
+			if !boilerplate[agyDescTemplate(name, agyPropDescription(def))] {
+				informative = true
+				break
+			}
+		}
+		if informative {
+			continue
+		}
+		m := t.Schema.(map[string]any)
+		clone := make(map[string]any, len(m))
+		for k, v := range m {
+			if k == "required" {
+				continue
+			}
+			clone[k] = v
+		}
+		out[i].Schema = clone
+		repaired = append(repaired, t.Name)
+	}
+	if len(repaired) > 0 {
+		sort.Strings(repaired)
+		log.Printf("[agy-schema] %d of %d tools marked every parameter required with boilerplate descriptions; dropped those lists so the model is not pushed to invent values (%s%s)",
+			len(repaired), len(tools), strings.Join(repaired[:min(4, len(repaired))], ", "),
+			map[bool]string{true: ", …"}[len(repaired) > 4])
+	}
+	return out
 }

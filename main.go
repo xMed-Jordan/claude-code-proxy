@@ -115,6 +115,7 @@ type config struct {
 	AgyPromptBudget    int           // PROXY_AGY_PROMPT_BUDGET — byte budget for the rendered agy prompt; agy silently truncates above ~191KB (-1 disables the fitting)
 	AgyCompact         bool          // PROXY_AGY_COMPACT — when even fitting cannot make the prompt fit, summarise the oldest part of the dialogue and continue from the brief
 	AgyPersonaGuardOff bool          // PROXY_AGY_PERSONA_GUARD=false — stop rejecting replies that describe the runtime (agy's coding-agent framing) instead of answering as the caller's assistant
+	AgySchemaRepairOff bool          // PROXY_AGY_SCHEMA_REPAIR=false — keep a caller's required list even when it names every parameter and describes none of them (which makes models invent values)
 	AgyToolCallCap     int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
 	AgyAgent           string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
 	AgyConcurrency     int           // max simultaneous agyj subprocesses
@@ -811,6 +812,7 @@ func loadConfig() config {
 		AgyPromptBudget:    parseIntDefault(getenv("PROXY_AGY_PROMPT_BUDGET", "0"), 0),
 		AgyCompact:         parseBoolDefault(getenv("PROXY_AGY_COMPACT", "true"), true),
 		AgyPersonaGuardOff: !parseBoolDefault(getenv("PROXY_AGY_PERSONA_GUARD", "true"), true),
+		AgySchemaRepairOff: !parseBoolDefault(getenv("PROXY_AGY_SCHEMA_REPAIR", "true"), true),
 		AgyToolCallCap:     parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
 		AgyAgent:           strings.TrimSpace(getenv("PROXY_AGY_AGENT", agyChatAgentName)),
 		AgyConcurrency:     parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
