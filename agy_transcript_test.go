@@ -522,6 +522,64 @@ func TestFitAgyTranscriptProtectsCurrentTurn(t *testing.T) {
 	}
 }
 
+// What fitting is allowed to touch: tool RESULTS only. Customer and assistant
+// messages, system notes and tool CALLS must survive byte for byte, however
+// tight the budget — losing a customer's own words would be a different class
+// of bug from dropping a stale lookup.
+func TestFitAgyTranscriptNeverTouchesMessagesOrCalls(t *testing.T) {
+	longCustomer := "بدي احجز " + strings.Repeat("موعد بكرا الصبح وبعدها استفسار طويل جدا. ", 60)
+	longAssistant := "تكرمي " + strings.Repeat("هاد شرح مفصل عن الباقات والعضويات. ", 60)
+	args := `{"branch_id":"2","from_date":"2026-09-10","service_ids":"1","note":"` + strings.Repeat("x", 400) + `"}`
+	in := anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: "[AUTO-CONTEXT " + strings.Repeat("system note text. ", 60) + "]"},
+		{Role: "user", Content: longCustomer},
+		{Role: "assistant", Content: longAssistant},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "c1", "name": "get_available_slots", "input": json.RawMessage(args)}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "c1", "content": buildPackagesResult(24, 12)}}},
+		{Role: "user", Content: "الساعة 1"},
+	}}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	fitted, notes := fitAgyTranscript(tr, 0, false, 3000) // brutally small
+	if len(notes) == 0 {
+		t.Fatal("expected the tool result to be compacted")
+	}
+	got := renderAgyTranscript(fitted, 0, false)
+	for _, want := range []string{longCustomer, longAssistant, "الساعة 1", "system note text."} {
+		if !strings.Contains(got, strings.TrimSpace(want)) {
+			t.Fatalf("conversation text was altered; missing %q", truncateString(want, 60))
+		}
+	}
+	if !strings.Contains(got, `"from_date":"2026-09-10"`) || !strings.Contains(got, strings.Repeat("x", 400)) {
+		t.Fatalf("tool call arguments were altered:\n%s", truncateString(got, 800))
+	}
+	// And the result did shrink.
+	for _, tt := range fitted.Turns {
+		if tt.Kind == agyTurnToolResult && len(tt.Text) >= len(buildPackagesResult(24, 12)) {
+			t.Fatal("the tool result should have been compacted")
+		}
+	}
+}
+
+// Under pressure the nested arrays that carry a lookup's actual answer are
+// thinned like any other nesting. This test pins that behaviour so the
+// trade-off is visible rather than assumed.
+func TestCompactJSONThinsBulkiestNestingFirst(t *testing.T) {
+	slots := `{"data":{"slots":[{"date":"2026-09-10","merged_starts":["13:00"],"merged_slots":[{"time_from":"13:00","time_to":"14:00"}],` +
+		`"therapists":[{"therapist_id":53722,"therapist_name":"هبة","available_starts":["13:00"]}]}],` +
+		`"therapists_summary":{"53010":{"therapist_id":53010,"services":[` + strings.TrimSuffix(strings.Repeat("101,", 300), ",") + `]}}}}`
+	out, ok := compactJSONForPrompt(slots, len(slots)/2, agyLevelHistory)
+	if !ok {
+		t.Fatal("expected compaction")
+	}
+	// The bulky id list is what pays; the answer of the lookup survives.
+	if !strings.Contains(out, `"merged_starts":["13:00"]`) {
+		t.Fatalf("the lookup's answer was thinned before the bulky list:\n%s", truncateString(out, 600))
+	}
+	if !strings.Contains(out, agyOmissionMarker) {
+		t.Fatalf("expected the bulky list to be thinned:\n%s", truncateString(out, 600))
+	}
+}
+
 func TestCompactJSONDropsColumnsBeforeRecords(t *testing.T) {
 	// Records with an id, a name and several bulky columns. Squeezed hard, the
 	// ids and names must be the last things standing.
