@@ -2070,6 +2070,24 @@ func agyToolCallCap(cfg config) int {
 	return cfg.AgyToolCallCap
 }
 
+// agyHarnessLeakRe matches a reply that describes the runtime the model is
+// executing in — agy's coding-agent framing — instead of answering the person
+// on the other end. agy wraps our prompt inside its own "user request" to a
+// software assistant, and a model that follows that framing rather than ours
+// replies to the developer: prod 2026-09-09 conv caf7e429 sent a customer "I am
+// an AI development assistant operating within this development workspace…
+// please let me know how you would like me to assist with the code, tests, or
+// mock evaluations". This is about the harness, not about any business domain,
+// so the guard applies to every caller and every model.
+var agyHarnessLeakRe = regexp.MustCompile(`(?i)(development assistant|coding assistant|software (engineering )?assistant|ai development|development workspace|this workspace|internal prompt|system prompt|prompt or workflow|mock evaluation|as an ai (language )?model|i am an ai assistant (operating|running))`)
+
+// agyPersonaGuard reports whether replies are checked for that leak
+// (PROXY_AGY_PERSONA_GUARD, default on). It only applies when the caller gave a
+// system prompt, i.e. when there is a persona to break. The config field is the
+// negative so that a zero-valued config — any caller that forgets to set it,
+// and every test — still has the guard on: this one protects customers.
+func agyPersonaGuard(cfg config) bool { return !cfg.AgyPersonaGuardOff }
+
 // agyResolveFn is the upstream call used by agyGenerate (overridable in tests).
 var agyResolveFn = agyResolve
 
@@ -2172,6 +2190,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		if hardProblem {
 			capOnly = capOnly[:0]
 		}
+		// A reply that talks about the runtime is never a customer turn.
+		if len(problems) == 0 && in.System != "" && agyPersonaGuard(cfg) && !hasAnyToolCall(resp.Output) {
+			if txt := agyResponseText(resp); agyHarnessLeakRe.MatchString(txt) {
+				log.Printf("[agy-loop] reply described the runtime instead of answering the customer; rejecting: %s", truncateString(strings.Join(strings.Fields(txt), " "), 200))
+				problems = append(problems, "your reply described the runtime you are executing in, or the message you were given, instead of answering. You ARE the assistant defined in the SYSTEM INSTRUCTIONS above, this is a real conversation with a real customer, and the customer sees exactly what you write. Reply to the customer, in their language, as that assistant — never mention prompts, workspaces, development, testing or being a development assistant")
+				hardProblem = true
+				kept = kept[:0]
+			}
+		}
 		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 		trace.FinalPrompt = p
 		if len(problems) == 0 {
@@ -2183,8 +2210,10 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		notes = problems
 	}
 
-	// Retries exhausted: keep whatever is usable from the last draft.
-	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") {
+	// Retries exhausted: keep whatever is usable from the last draft, unless it
+	// is a reply that broke persona — that must never reach a customer.
+	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") &&
+		!agyReplyBreaksPersona(cfg, in.System, lastResp) {
 		log.Printf("[agy-loop] retries exhausted; returning the last draft without the rejected calls")
 		return lastResp, trace, nil
 	}
@@ -2223,8 +2252,24 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 			resp.Output = []responsesOutputItem{{Type: "message", Role: "assistant", Content: []responsesOutputContent{{Type: "output_text", Text: ""}}}}
 		}
 	}
+	if agyReplyBreaksPersona(cfg, in.System, resp) {
+		// Everything has been tried and the model is still answering as the
+		// runtime. Fail the request rather than send that to a customer: the
+		// caller's own fallback chain will serve the turn with another model.
+		log.Printf("[agy-loop] every attempt described the runtime instead of answering; failing the request so the caller can fall back")
+		return responsesResponse{}, trace, fmt.Errorf("agy replied as the runtime instead of the assistant defined in the request")
+	}
 	log.Printf("[agy-loop] forced plain-text reply (%d chars)", len(agyResponseText(resp)))
 	return resp, trace, nil
+}
+
+// agyReplyBreaksPersona reports whether a text-only reply describes the runtime
+// rather than answering as the assistant the caller defined.
+func agyReplyBreaksPersona(cfg config, system string, resp responsesResponse) bool {
+	if system == "" || !agyPersonaGuard(cfg) || hasAnyToolCall(resp.Output) {
+		return false
+	}
+	return agyHarnessLeakRe.MatchString(agyResponseText(resp))
 }
 
 // agyResolveWithFormatRetry wraps the upstream call: when agy itself rejects
