@@ -331,6 +331,89 @@ func (t *agyTranscript) currentTurnToolStats() map[string]agyToolStat {
 	return stats
 }
 
+// agyCallOutcome pairs a current-turn tool call with what its result looked
+// like: Failure is a short excerpt when the result is an error envelope
+// ("success":false, an HTTP 4xx/5xx status, or a non-null "error"), else "".
+type agyCallOutcome struct {
+	Call    agyTurn
+	Failure string
+}
+
+var agyResultHTTPErrorRe = regexp.MustCompile(`"status":\s*"?([45]\d\d)`)
+
+// currentTurnCallOutcomes lists the current turn's calls with their outcome so
+// the state block can mark failed calls explicitly. A model reading a 33KB
+// transcript can miss that its slots lookup came back as HTTP 422 and answer
+// as if it had data (prod 2026-09-08 conv 58311: after a 422 for an invalid
+// appointment_type the reply listed invented morning/afternoon/evening
+// availability). Purely mechanical: nothing here knows what the tool does.
+func (t *agyTranscript) currentTurnCallOutcomes() []agyCallOutcome {
+	var out []agyCallOutcome
+	for i := t.lastCustomerIndex() + 1; i < len(t.Turns); i++ {
+		tt := t.Turns[i]
+		if tt.Kind != agyTurnToolCall {
+			continue
+		}
+		oc := agyCallOutcome{Call: tt}
+		for j := i + 1; j < len(t.Turns); j++ {
+			r := t.Turns[j]
+			if r.Kind == agyTurnToolResult && (r.CallID == tt.CallID || r.CallID == "") {
+				oc.Failure = toolResultFailure(r.Text)
+				break
+			}
+			if r.Kind == agyTurnToolCall || r.Kind == agyTurnCustomer {
+				break
+			}
+		}
+		out = append(out, oc)
+	}
+	return out
+}
+
+// toolResultFailure returns a short description when a tool result looks like
+// an error envelope, else "". The excerpt prefers the envelope's own message.
+func toolResultFailure(result string) string {
+	compact := strings.ReplaceAll(result, " ", "")
+	failed := strings.Contains(compact, `"success":false`)
+	if !failed {
+		if m := agyResultHTTPErrorRe.FindStringSubmatch(compact); m != nil {
+			failed = true
+		}
+	}
+	if !failed && strings.HasPrefix(strings.TrimSpace(result), "{") && !strings.Contains(compact, `"success":true`) {
+		// An "error" that is not null/empty in an envelope without success:true.
+		if idx := strings.Index(compact, `"error":`); idx >= 0 {
+			rest := compact[idx+len(`"error":`):]
+			if !strings.HasPrefix(rest, "null") && !strings.HasPrefix(rest, `""`) && !strings.HasPrefix(rest, "{}") && !strings.HasPrefix(rest, "[]") {
+				failed = true
+			}
+		}
+	}
+	if !failed {
+		return ""
+	}
+	var parts []string
+	if m := agyResultHTTPErrorRe.FindStringSubmatch(compact); m != nil {
+		parts = append(parts, "HTTP "+m[1])
+	}
+	for _, key := range []string{`"message":"`, `"error":"`, `"hint":"`} {
+		if idx := strings.Index(result, key); idx >= 0 {
+			s := result[idx+len(key):]
+			if end := strings.Index(s, `"`); end > 0 {
+				s = s[:end]
+			}
+			if s = strings.TrimSpace(s); s != "" {
+				parts = append(parts, truncateString(s, 160))
+				break
+			}
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, truncateString(strings.Join(strings.Fields(result), " "), 160))
+	}
+	return strings.Join(parts, ": ")
+}
+
 // currentTurnCallSucceeded reports whether an identical call in the current
 // turn has a result that looks like a success ("success":true, or an HTTP
 // 2xx status in the result envelope). Used to word the repeat correction.
@@ -959,14 +1042,24 @@ func renderAgyStatePreface(t agyTranscript, hasTools bool) string {
 			b.WriteString(strings.Join(pre, ", "))
 			b.WriteString(".\n")
 		}
-		if calls := t.currentTurnCalls(); len(calls) > 0 {
+		if calls := t.currentTurnCallOutcomes(); len(calls) > 0 {
 			b.WriteString("In the CURRENT turn (since the customer's latest message) you have already called, with their results in the transcript: ")
 			parts := make([]string, 0, len(calls))
+			failed := 0
 			for _, c := range calls {
-				parts = append(parts, c.Tool+" "+truncateString(c.Args, 120))
+				line := c.Call.Tool + " " + truncateString(c.Call.Args, 120)
+				if c.Failure != "" {
+					line += " → FAILED (" + c.Failure + ")"
+					failed++
+				}
+				parts = append(parts, line)
 			}
 			b.WriteString(strings.Join(parts, "; "))
-			b.WriteString(". Do not call any of these again this turn — rewording an argument does not make it a new call; call a tool again only for genuinely different data.\n")
+			b.WriteString(". Do not call any of these again this turn — rewording an argument does not make it a new call; call a tool again only for genuinely different data.")
+			if failed > 0 {
+				b.WriteString(" A call marked FAILED returned an error instead of data, so you do NOT have that data: correct the arguments and call the tool again, or tell the customer you could not retrieve it — never answer as if the call had succeeded.")
+			}
+			b.WriteString("\n")
 		}
 	}
 	if prev := t.previousAssistantText(); prev != "" {
@@ -1007,14 +1100,19 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 			}
 		}
 	}
-	calls := t.currentTurnCalls()
+	calls := t.currentTurnCallOutcomes()
 	if len(calls) > 0 {
-		b.WriteString("- Tool calls already made since the customer's latest message (their results are in the transcript; do NOT call any of them again this turn — a reworded argument is the same call; use their results):\n")
+		b.WriteString("- Tool calls already made since the customer's latest message (their results are in the transcript; do NOT call any of them again this turn — a reworded argument is the same call; use their results). A call marked FAILED returned an error, not data — you do not have that data; fix the arguments and call again, or tell the customer, but never answer as if it had succeeded:\n")
 		for _, c := range calls {
 			b.WriteString("  • ")
-			b.WriteString(c.Tool)
+			b.WriteString(c.Call.Tool)
 			b.WriteString(" ")
-			b.WriteString(c.Args)
+			b.WriteString(c.Call.Args)
+			if c.Failure != "" {
+				b.WriteString(" → FAILED (")
+				b.WriteString(c.Failure)
+				b.WriteString(")")
+			}
 			b.WriteString("\n")
 		}
 	}
@@ -1163,16 +1261,21 @@ func agyLogUsage(res agyResult, attempt int) {
 
 const agyMaxCorrectionRetries = 2
 
-// agyToolCallCap is the maximum number of calls to ONE tool within a single
-// turn before further calls are rejected (PROXY_AGY_TOOL_CALL_CAP, default 3;
-// 0 disables). Connect's own loop cap is 27 iterations, far too late when each
-// iteration appends a 200KB result.
+// agyToolCallCap is the number of calls to ONE tool within a single turn after
+// which further calls with NEW arguments are pushed back with a correction
+// note (PROXY_AGY_TOOL_CALL_CAP, default 6; 0 disables). Repeats with identical
+// arguments or identical results are rejected outright regardless of the cap;
+// this only guards against open-ended paging. It is deliberately above the
+// number of distinct tools a single turn legitimately preflights (a booking
+// turn fetches instructions for 4–5 tools), and a call the model insists on
+// after the notes is let through (see agyGenerate). Connect's own loop cap is
+// 27 iterations, far too late when each iteration appends a 200KB result.
 func agyToolCallCap(cfg config) int {
 	if cfg.AgyToolCallCap < 0 {
 		return 0
 	}
 	if cfg.AgyToolCallCap == 0 {
-		return 3
+		return 6
 	}
 	return cfg.AgyToolCallCap
 }
@@ -1205,6 +1308,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	var notes []string
 	var lastResp responsesResponse
 	haveResp := false
+	// Calls rejected ONLY by the per-tool cap (new arguments, no repeated
+	// result). Unlike identical repeats these may be legitimate — Connect's
+	// get_tool_instructions is called once per distinct tool, and a turn that
+	// needs four tools needs four fetches — so if the model keeps insisting
+	// after the correction notes, the last such draft is let through instead
+	// of forcing an empty plain-text reply (prod 2026-09-08 conv 58311: the
+	// 4th distinct fetch was rejected 3×, the forced reply came back empty,
+	// and Connect's next iteration re-asked the customer everything).
+	var capOnly []responsesOutputItem
 	for attempt := 0; attempt <= agyMaxCorrectionRetries; attempt++ {
 		p := prompt
 		if len(notes) > 0 {
@@ -1220,10 +1332,13 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		agyLogUsage(res, attempt+1)
 		var problems []string
 		kept := resp.Output[:0]
+		capOnly = capOnly[:0]
+		hardProblem := false
 		for _, item := range resp.Output {
 			if item.Type == "function_call" {
 				if len(known) > 0 && !known[item.Name] {
 					problems = append(problems, fmt.Sprintf("tool %q does not exist; only the tools listed in the TOOLS section can be called", item.Name))
+					hardProblem = true
 					continue
 				}
 				if in.Transcript.calledThisTurn(item.Name, item.Arguments) {
@@ -1232,6 +1347,7 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 						outcome = "it already SUCCEEDED (see its result in the transcript) and repeating it would perform the same action twice"
 					}
 					problems = append(problems, fmt.Sprintf("you called %s with exactly these arguments %s already in this turn; %s; do not repeat the same call", item.Name, canonicalToolArgs(item.Arguments), outcome))
+					hardProblem = true
 					continue
 				}
 				// Same tool, reworded arguments: the loop that identical-argument
@@ -1239,13 +1355,18 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				// with a different "context" string each time, 218KB result each).
 				if st := stats[item.Name]; st.IdenticalResults {
 					problems = append(problems, fmt.Sprintf("you already called %s %d times this turn and it returned exactly the same output each time — its output does not depend on the wording of its arguments; use the result already in the transcript and do not call it again this turn", item.Name, st.Count))
+					hardProblem = true
 					continue
 				} else if callCap > 0 && st.Count >= callCap {
-					problems = append(problems, fmt.Sprintf("you already called %s %d times this turn; do not call it again in this turn — use the results already in the transcript", item.Name, st.Count))
+					problems = append(problems, fmt.Sprintf("you already called %s %d times this turn; do not call it again in this turn unless it is genuinely needed for different data — use the results already in the transcript", item.Name, st.Count))
+					capOnly = append(capOnly, item)
 					continue
 				}
 			}
 			kept = append(kept, item)
+		}
+		if hardProblem {
+			capOnly = capOnly[:0]
 		}
 		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 		trace.FinalPrompt = p
@@ -1261,6 +1382,17 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// Retries exhausted: keep whatever is usable from the last draft.
 	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") {
 		log.Printf("[agy-loop] retries exhausted; returning the last draft without the rejected calls")
+		return lastResp, trace, nil
+	}
+	// The model insisted, with new arguments and no repeated result, on a call
+	// over the per-tool cap: let it through rather than answer with nothing.
+	if haveResp && len(capOnly) > 0 {
+		names := make([]string, 0, len(capOnly))
+		for _, item := range capOnly {
+			names = append(names, item.Name)
+		}
+		log.Printf("[agy-loop] retries exhausted; allowing the over-cap call(s) the model insisted on (%s)", strings.Join(names, ", "))
+		lastResp.Output = append([]responsesOutputItem(nil), capOnly...)
 		return lastResp, trace, nil
 	}
 

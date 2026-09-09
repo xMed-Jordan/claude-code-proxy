@@ -286,7 +286,7 @@ func TestAgyGenerateEnforcesPerToolCap(t *testing.T) {
 		return agyResult{Ok: true, Response: r}, nil
 	}
 	defer func() { agyResolveFn = orig }()
-	_, trace, err := agyGenerate(context.Background(), config{}, agyGenInputFromAnthropic(in, 10))
+	_, trace, err := agyGenerate(context.Background(), config{AgyToolCallCap: 3}, agyGenInputFromAnthropic(in, 10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,6 +399,78 @@ func TestRenderAgyPromptSectionOrderAndDigest(t *testing.T) {
 	digest := prompt[iDg:iNext]
 	if strings.Contains(digest, "tool call") && strings.Contains(digest, "get_available_slots") || strings.Contains(digest, "Tool result") || strings.Contains(digest, "merged_starts") {
 		t.Fatalf("digest must not contain tool activity:\n%s", digest)
+	}
+}
+
+func TestToolResultFailureAndStateMarker(t *testing.T) {
+	cases := map[string]string{
+		`{"success":false,"data":{"status":422,"body":{"message":"The selected appointment type is invalid.","errors":{"appointment_type":["The selected appointment type is invalid."]}}},"error":"HTTP 422","status":422,"retryable":false,"hint":"The request was rejected"}`: "HTTP 422: The selected appointment type is invalid.",
+		`{"success":true,"data":{"status":200,"body":{"success":true,"data":{"slots":[]}}},"error":null}`: "",
+		`{"success":true,"data":{"status":"200","body":{"error":"nothing"}}}`:                             "",
+		`{"error":"tool not available in this simulation","success":false}`:                               "tool not available in this simulation",
+		`plain text result`: "",
+	}
+	for in, want := range cases {
+		if got := toolResultFailure(in); got != want {
+			t.Fatalf("toolResultFailure(%s) = %q, want %q", in, got, want)
+		}
+	}
+	in := anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: "بدي احجز الخميس"},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "s1", "name": "get_available_slots", "input": map[string]any{"appointment_type": "normal", "from_date": "2026-09-10"}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "s1", "content": `{"success":false,"data":{"status":422,"body":{"message":"The selected appointment type is invalid."}},"error":"HTTP 422"}`}}},
+	}}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	oc := tr.currentTurnCallOutcomes()
+	if len(oc) != 1 || oc[0].Failure == "" {
+		t.Fatalf("outcomes = %+v", oc)
+	}
+	prompt := renderAgyPrompt(config{}, "sys", nil, agyCatalogFromAnthropic([]anthropicTool{{Name: "get_available_slots"}}), tr)
+	state := prompt[strings.Index(prompt, "### CURRENT STATE"):strings.Index(prompt, "### SYSTEM INSTRUCTIONS")]
+	if !strings.Contains(state, "get_available_slots") || !strings.Contains(state, "→ FAILED (HTTP 422: The selected appointment type is invalid.)") || !strings.Contains(state, "never answer as if the call had succeeded") {
+		t.Fatalf("state block must mark the failed call:\n%s", state)
+	}
+	next := prompt[strings.Index(prompt, "### YOUR NEXT TURN"):]
+	if !strings.Contains(next, "→ FAILED (HTTP 422") {
+		t.Fatalf("next-turn block must mark the failed call:\n%s", next)
+	}
+}
+
+func TestAgyGenerateLetsInsistedOverCapCallThrough(t *testing.T) {
+	// Three earlier get_tool_instructions calls this turn (distinct args and
+	// results); the model insists on a fourth, for yet another tool.
+	in := anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "book tomorrow"}}}
+	for i, code := range []string{"a", "b", "c"} {
+		id := fmt.Sprintf("i%d", i)
+		in.Messages = append(in.Messages,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_tool_instructions", "input": map[string]any{"tool_code": code}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": `{"success":true,"instructions":"how to use ` + code + `"}`}}},
+		)
+	}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	orig := agyResolveFn
+	defer func() { agyResolveFn = orig }()
+	calls := 0
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, prompt, _ string) (agyResult, error) {
+		calls++
+		return agyResult{Response: `<tool_call>{"tool":"get_tool_instructions","input":{"tool_code":"d"}}</tool_call>`}, nil
+	}
+	cfg := config{AgyToolCallCap: 3}
+	resp, _, err := agyGenerate(context.Background(), cfg, agyGenInput{Transcript: tr, Tools: []agyToolCatalog{{Name: "get_tool_instructions"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != agyMaxCorrectionRetries+1 {
+		t.Fatalf("upstream calls = %d, want %d (no forced plain-text run)", calls, agyMaxCorrectionRetries+1)
+	}
+	if !hasAnyToolCall(resp.Output) || resp.Output[0].Name != "get_tool_instructions" || !strings.Contains(resp.Output[0].Arguments, `"d"`) {
+		t.Fatalf("expected the insisted over-cap call to be let through, got %+v", resp.Output)
+	}
+	// Default cap is 6: three earlier calls do not even trigger a note.
+	calls = 0
+	resp, _, err = agyGenerate(context.Background(), config{}, agyGenInput{Transcript: tr, Tools: []agyToolCatalog{{Name: "get_tool_instructions"}}})
+	if err != nil || calls != 1 || !hasAnyToolCall(resp.Output) {
+		t.Fatalf("default cap must allow a 4th distinct call at once: calls=%d err=%v out=%+v", calls, err, resp.Output)
 	}
 }
 
