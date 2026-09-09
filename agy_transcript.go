@@ -1887,25 +1887,43 @@ func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agy
 			log.Printf("[agy-prompt] WARNING: the system prompt and tool catalog alone (%d bytes) leave %d bytes of the %d-byte budget for the conversation", fixed+len(toolsPrompt), room, budget)
 			room = agyMinTranscriptFloor
 		}
-		fitted, notes := fitAgyTranscript(t, agyToolResultCap(cfg), cfg.AgyReadableResults, room)
+		// Fitting changes the blocks that were measured to size it: every
+		// shortened result adds a line to the state block saying so. Measure the
+		// assembled prompt and give back the overshoot until it really fits.
+		var notes []string
+		for attempt := 0; attempt < 4 && room > agyMinTranscriptFloor; attempt++ {
+			fitted, n := fitAgyTranscript(t, agyToolResultCap(cfg), cfg.AgyReadableResults, room)
+			over := len(assembleAgyPrompt(howToRead, sysBlock.String(), toolsPrompt, fitted, cfg)) - budget
+			if over <= 0 || attempt == 3 {
+				t, notes = fitted, n
+				break
+			}
+			room -= over
+			if room < agyMinTranscriptFloor {
+				room = agyMinTranscriptFloor
+			}
+		}
 		if len(notes) > 0 {
 			log.Printf("[agy-prompt] transcript compacted to fit %d bytes: %s", room, strings.Join(notes, ", "))
 		}
-		t = fitted
 	}
 
+	return assembleAgyPrompt(howToRead, sysBlock.String(), toolsPrompt, t, cfg), t.reducedTools()
+}
+
+// assembleAgyPrompt writes the sections in their fixed order. Order matters
+// (verified on gemini-3.8-flash / 3.1-pro, 2026-09-08): the state preface MUST
+// precede the system prompt. With it after the persona, every model restarted
+// the persona's "on booking → open protocol X" flow even though X was already
+// in the transcript; with it first, 8/9 trials produced the correct next step.
+func assembleAgyPrompt(howToRead, sysBlock, toolsPrompt string, t agyTranscript, cfg config) string {
 	var b strings.Builder
 	b.WriteString(howToRead)
-	// Order matters (verified on gemini-3.8-flash / 3.1-pro, 2026-09-08): the
-	// state preface MUST precede the system prompt. With it after the persona,
-	// every model restarted the persona's "on booking → open protocol X" flow
-	// even though X was already in the transcript; with it first, 8/9 trials
-	// produced the correct next step.
 	if state := renderAgyStatePreface(t, toolsPrompt != ""); state != "" {
 		b.WriteString(state)
 		b.WriteString("\n\n")
 	}
-	b.WriteString(sysBlock.String())
+	b.WriteString(sysBlock)
 	if toolsPrompt != "" {
 		b.WriteString(toolsPrompt)
 		b.WriteString("\n\n")
@@ -1919,7 +1937,7 @@ func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agy
 		b.WriteString("\n\n")
 	}
 	b.WriteString(renderAgyNextTurn(t, toolsPrompt != ""))
-	return strings.TrimSpace(b.String()), t.reducedTools()
+	return strings.TrimSpace(b.String())
 }
 
 // renderAgyPrompt assembles the full v2 prompt.

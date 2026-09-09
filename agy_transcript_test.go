@@ -797,6 +797,12 @@ func TestRenderAgyPromptFitsBudget(t *testing.T) {
 	unfitted := renderAgyPrompt(config{AgyPromptBudget: -1}, system, nil, tools, tr)
 	budget := 60000
 	got := renderAgyPrompt(config{AgyPromptBudget: budget}, system, nil, tools, tr)
+	// The state block grows as results are shortened; the budget must hold anyway.
+	for _, b := range []int{45000, 60000, 90000} {
+		if p := renderAgyPrompt(config{AgyPromptBudget: b}, system, nil, tools, tr); len(p) > b {
+			t.Fatalf("prompt %d bytes exceeds budget %d after the annotations were added", len(p), b)
+		}
+	}
 	if len(unfitted) <= budget {
 		t.Fatalf("fixture does not exceed the budget (%d bytes); the test proves nothing", len(unfitted))
 	}
