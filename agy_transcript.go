@@ -716,7 +716,59 @@ func agyCatalogFromResponses(tools []responsesTool) []agyToolCatalog {
 	return out
 }
 
-func renderAgyToolCatalog(tools []agyToolCatalog) string {
+// agySchemaParamNames lists a JSON-schema object's property names, required
+// ones first, so a compacted entry stays callable without its full schema.
+func agySchemaParamNames(schema any) []string {
+	m, ok := schema.(map[string]any)
+	if !ok {
+		return nil
+	}
+	props, ok := m["properties"].(map[string]any)
+	if !ok || len(props) == 0 {
+		return nil
+	}
+	required := map[string]bool{}
+	if reqs, ok := m["required"].([]any); ok {
+		for _, r := range reqs {
+			if s, ok := r.(string); ok {
+				required[s] = true
+			}
+		}
+	}
+	var req, opt []string
+	for name := range props {
+		if required[name] {
+			req = append(req, name)
+		} else {
+			opt = append(opt, name)
+		}
+	}
+	sort.Strings(req)
+	sort.Strings(opt)
+	for i, name := range req {
+		req[i] = name + "*"
+	}
+	return append(req, opt...)
+}
+
+// firstSentence returns the leading sentence of s, capped, for compact entries.
+func firstSentence(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if i := strings.IndexAny(s, ".\n"); i > 0 && i < max {
+		s = s[:i+1]
+	}
+	return truncateString(s, max)
+}
+
+// renderAgyToolCatalog renders the tool section. In compact mode only the tools
+// in detailed keep their full input schema; the rest are listed with a one-line
+// description and their parameter names (required marked with *). The full
+// catalog of 63 Connect tools is ~44KB, a quarter of agy's whole input window,
+// and a turn typically uses six of them; the compact form keeps every tool
+// callable while freeing that space for the conversation. Connect's own flow
+// covers the rest: get_tool_instructions returns a tool's parameters before its
+// first use.
+func renderAgyToolCatalog(tools []agyToolCatalog, detailed map[string]bool, compact bool) string {
 	if len(tools) == 0 {
 		return ""
 	}
@@ -731,7 +783,12 @@ func renderAgyToolCatalog(tools []agyToolCatalog) string {
 	b.WriteString("- The list below is the complete set of tools you have. Do not use shell commands, files, code execution, web search or any other capability of the runtime you are running in.\n")
 	b.WriteString("- When no (further) tool call is needed, answer the customer in plain text with no <tool_call> block.\n\n")
 	b.WriteString("Available tools:\n\n")
+	var brief []agyToolCatalog
 	for _, t := range tools {
+		if compact && !detailed[t.Name] {
+			brief = append(brief, t)
+			continue
+		}
 		b.WriteString("#### ")
 		b.WriteString(t.Name)
 		b.WriteString("\n")
@@ -747,6 +804,23 @@ func renderAgyToolCatalog(tools []agyToolCatalog) string {
 			}
 		}
 		b.WriteString("\n")
+	}
+	if len(brief) > 0 {
+		b.WriteString("The tools below are listed with their parameter names only (a * marks a required one). They are callable exactly like the ones above; call get_tool_instructions with the tool's name first to get its full instructions and parameter descriptions.\n\n")
+		for _, t := range brief {
+			b.WriteString("- ")
+			b.WriteString(t.Name)
+			if d := firstSentence(t.Description, 80); d != "" {
+				b.WriteString(" — ")
+				b.WriteString(d)
+			}
+			if names := agySchemaParamNames(t.Schema); len(names) > 0 {
+				b.WriteString(" [params: ")
+				b.WriteString(strings.Join(names, ", "))
+				b.WriteString("]")
+			}
+			b.WriteString("\n")
+		}
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -938,6 +1012,534 @@ func jsonQuote(s string) string {
 		return strconv.Quote(s)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Fitting the prompt into agy's input window
+// ---------------------------------------------------------------------------
+//
+// agy silently truncates the user message it forwards to the model and marks
+// the cut with "<truncated N bytes>". Measured on ai-api1 2026-09-09 with the
+// tool-less agent: a 392,989-byte booking prompt reached the model as ~191,577
+// bytes, i.e. everything after the persona and the tool catalog was gone —
+// packages, slots, the dialogue digest and the whole YOUR NEXT TURN block. The
+// model then answered from fragments: it booked the membership record instead
+// of the Full Body package, invented availability, and copied a therapist id
+// out of an old reservation. Asked to explain itself it said so plainly ("the
+// JSON output of get_customer_packages was cut off at <truncated 202410
+// bytes>"). It is also why the coding agent used to be MORE accurate: it read
+// the full transcript from disk with python instead of from its context.
+//
+// So the proxy must do the cutting itself, deliberately, keeping what the turn
+// needs. Everything below is mechanical: sizes and nesting only, no knowledge
+// of what any tool means.
+
+// agyPromptBudget is the byte budget for the rendered prompt
+// (PROXY_AGY_PROMPT_BUDGET, 0 disables the fitting entirely).
+func agyPromptBudget(cfg config) int {
+	if cfg.AgyPromptBudget < 0 {
+		return 0
+	}
+	if cfg.AgyPromptBudget == 0 {
+		return defaultAgyPromptBudget
+	}
+	return cfg.AgyPromptBudget
+}
+
+// defaultAgyPromptBudget sits under agy's measured ceiling. Bisected on
+// ai-api1 2026-09-09 with a marker on the final line: 186,000 and 190,000 bytes
+// come back, 194,000 does not — matching the 191,577 bytes kept from the
+// 392,989-byte prompt above.
+const defaultAgyPromptBudget = 186000
+
+// agyMinResultBytes is the floor a single tool result is never compacted below.
+const agyMinResultBytes = 1200
+
+// agyMinTranscriptBytes is the room the transcript must get before the tool
+// catalog is compacted to make space.
+const agyMinTranscriptBytes = 30000
+
+// agyMinTranscriptFloor is the smallest transcript room worth aiming for when
+// the caller's system prompt has already eaten the budget.
+const agyMinTranscriptFloor = 4000
+
+// agyMinStringBytes is the floor a single JSON string is not shortened below.
+const agyMinStringBytes = 400
+
+// marshalJSONNoHTML encodes v without escaping <, > and &, which would inflate
+// Arabic-free payloads and change quoted text.
+func marshalJSONNoHTML(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// compactJSONForPrompt shrinks a JSON tool result toward maxBytes by pruning
+// its heaviest arrays instead of cutting the text mid-value. Deeper arrays go
+// first, so a list of records loses the bulky history nested inside each record
+// (which the turn rarely needs) before it loses any record (which carries the
+// ids and names the turn is about). Every prune leaves a marker saying how many
+// entries were dropped. Returns the original string when it cannot help.
+// Compaction levels, applied across the whole transcript in order, so the
+// cheapest information is always spent first:
+//
+//	agyLevelHistory — thin the arrays nested inside records (a package's past
+//	                  reservations, a therapist's shifts). Records and prose intact.
+//	agyLevelProse   — additionally shorten long strings (instruction sheets).
+//	agyLevelRecords — additionally drop records. Last resort.
+const (
+	agyLevelSuperseded = iota // older results of a tool that has been called again since
+	agyLevelHistory
+	agyLevelProse
+	agyLevelFields // drop the heaviest column of a record list, keeping every record
+	agyLevelRecords
+)
+
+// agyKeepRecentPerTool is how many results of the same tool stay full-size. A
+// booking turn may look up slots five or six times; the older lookups are
+// superseded by the newest and are the cheapest bytes in the transcript, but
+// left alone they crowd out the record lists the turn actually books from.
+const agyKeepRecentPerTool = 2
+
+func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if maxBytes <= 0 || len(raw) <= maxBytes || len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return raw, false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return raw, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return raw, false
+	}
+	best := raw
+	changed := false
+	for i := 0; i < 500; i++ {
+		out, err := marshalJSONNoHTML(v)
+		if err != nil {
+			break
+		}
+		if changed && len(out) < len(best) {
+			best = string(out)
+		}
+		if len(out) <= maxBytes {
+			break
+		}
+		if !shrinkJSONOnce(&v, level) {
+			break
+		}
+		changed = true
+	}
+	if !changed || len(best) >= len(raw) {
+		return raw, false
+	}
+	return best, true
+}
+
+// jsonRef locates one shrinkable node inside a decoded JSON document.
+type jsonRef struct {
+	isString bool
+	depth    int
+	size     int
+	setArr   func([]any)
+	setStr   func(string)
+	arr      []any
+	str      string
+}
+
+// agyLongStringBytes is the length above which a JSON string is treated as
+// prose to be shortened rather than structure to be preserved.
+const agyLongStringBytes = 1000
+
+// pruneHeaviestArray takes one bite out of the document and reports whether it
+// changed anything. Long strings go first: an instruction sheet delivered as
+// one 117KB string degrades gracefully when shortened, whereas dropping an
+// element from a list of records destroys a whole entity — and it is exactly
+// those records (a package, a slot, a therapist) that the next tool call has to
+// name. Production 2026-09-09: with records dropped first, the model reported
+// "23 of the 24 package entries were truncated" and booked the only membership
+// record still visible.
+func shrinkJSONOnce(root *any, level int) bool {
+	var refs []jsonRef
+	var walk func(node any, depth int, setArr func([]any), setStr func(string))
+	walk = func(node any, depth int, setArr func([]any), setStr func(string)) {
+		switch n := node.(type) {
+		case []any:
+			if setArr != nil && len(n) > 0 {
+				if raw, err := marshalJSONNoHTML(n); err == nil {
+					refs = append(refs, jsonRef{depth: depth, size: len(raw), setArr: setArr, arr: n})
+				}
+			}
+			for i := range n {
+				i := i
+				walk(n[i], depth+1, func(v []any) { n[i] = v }, func(s string) { n[i] = s })
+			}
+		case map[string]any:
+			for k := range n {
+				k := k
+				walk(n[k], depth+1, func(v []any) { n[k] = v }, func(s string) { n[k] = s })
+			}
+		case string:
+			if setStr != nil && len(n) > agyLongStringBytes {
+				refs = append(refs, jsonRef{isString: true, depth: depth, size: len(n), setStr: setStr, str: n})
+			}
+		}
+	}
+	walk(*root, 0, func(v []any) { *root = v }, nil)
+	if len(refs) == 0 {
+		return false
+	}
+	// Prose before structure: halve the longest long string first.
+	var longest *jsonRef
+	for i := range refs {
+		if !refs[i].isString || level < agyLevelProse {
+			continue
+		}
+		if longest == nil || refs[i].size > longest.size {
+			longest = &refs[i]
+		}
+	}
+	if longest != nil {
+		keep := longest.size / 2
+		if keep < agyMinStringBytes {
+			keep = agyMinStringBytes
+		}
+		if keep < longest.size {
+			for keep > 0 && keep < len(longest.str) && (longest.str[keep]&0xC0) == 0x80 {
+				keep-- // never split a UTF-8 rune
+			}
+			longest.setStr(fmt.Sprintf("%s… [system note: %d characters dropped by the system to fit the context window]", longest.str[:keep], longest.size-keep))
+			return true
+		}
+	}
+	// Before any record is dropped, take the heaviest column off the record
+	// list: 25 packages each keeping their id and name are worth far more to
+	// the next tool call than 12 packages keeping every field.
+	if level >= agyLevelFields {
+		if dropHeaviestColumn(refs) {
+			return true
+		}
+	}
+
+	// No prose left to shorten: fall back to thinning arrays. Below the record
+	// level the shallowest array is the record list itself and is left alone,
+	// so only the history nested inside records is thinned.
+	minDepth := -1
+	for _, r := range refs {
+		if r.isString {
+			continue
+		}
+		if minDepth < 0 || r.depth < minDepth {
+			minDepth = r.depth
+		}
+	}
+	var arrays []jsonRef
+	for _, r := range refs {
+		if r.isString {
+			continue
+		}
+		if level < agyLevelRecords && r.depth == minDepth {
+			continue
+		}
+		arrays = append(arrays, r)
+	}
+	refs = arrays
+	if len(refs) == 0 {
+		return false
+	}
+	// Deepest first, then heaviest: nested history goes before top-level records.
+	sort.SliceStable(refs, func(i, j int) bool {
+		if refs[i].depth != refs[j].depth {
+			return refs[i].depth > refs[j].depth
+		}
+		return refs[i].size > refs[j].size
+	})
+	for _, ref := range refs {
+		// Fold any marker this array already carries, so repeated passes keep
+		// making progress instead of rewriting the same two elements forever.
+		items := ref.arr
+		alreadyDropped := 0
+		if n := len(items); n > 0 {
+			if s, ok := items[n-1].(string); ok && strings.HasPrefix(s, agyOmissionMarker) {
+				if m := agyOmissionCountRe.FindStringSubmatch(s); m != nil {
+					alreadyDropped, _ = strconv.Atoi(m[1])
+				}
+				items = items[:n-1]
+			}
+		}
+		if len(items) == 0 {
+			continue // nothing but a marker left here
+		}
+		keep := len(items) / 2
+		next := make([]any, 0, keep+1)
+		next = append(next, items[:keep]...)
+		next = append(next, fmt.Sprintf("%s%d entries dropped by the system to fit the context window]", agyOmissionMarker, alreadyDropped+len(items)-keep))
+		ref.setArr(next)
+		return true
+	}
+	return false
+}
+
+const agyOmissionMarker = "[system note: "
+
+// agyMinRecordKeys is the number of fields a record keeps whatever happens, so
+// that thinning never leaves an unidentifiable object.
+const agyMinRecordKeys = 4
+
+// dropHeaviestColumn removes, from the heaviest array of objects, the single
+// field that costs the most across its elements, and notes it. Ids and short
+// names are the cheapest fields, so they are the last to go — which is what
+// the model needs to name a record in its next tool call.
+func dropHeaviestColumn(refs []jsonRef) bool {
+	best, bestSize := -1, 0
+	for i, r := range refs {
+		if r.isString || len(r.arr) < 2 {
+			continue
+		}
+		objects := 0
+		for _, item := range r.arr {
+			if _, ok := item.(map[string]any); ok {
+				objects++
+			}
+		}
+		if objects < 2 {
+			continue
+		}
+		if r.size > bestSize {
+			best, bestSize = i, r.size
+		}
+	}
+	if best < 0 {
+		return false
+	}
+	weight := map[string]int{}
+	keys := 0
+	for _, item := range refs[best].arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		n := len(obj)
+		if _, marked := obj[agyDroppedFieldsKey]; marked {
+			n--
+		}
+		if n > keys {
+			keys = n
+		}
+		for k, v := range obj {
+			if k == agyDroppedFieldsKey {
+				continue // never drop the note about what was dropped
+			}
+			raw, err := marshalJSONNoHTML(v)
+			if err != nil {
+				continue
+			}
+			w := len(raw)
+			if agyIdentifyingField(k) {
+				// An id or a name is how the model refers to this record in its
+				// next tool call; make it the last column to go.
+				w /= 8
+			}
+			weight[k] += w
+		}
+	}
+	if keys <= agyMinRecordKeys || len(weight) == 0 {
+		return false
+	}
+	heaviest, heaviestWeight := "", 0
+	for k, w := range weight {
+		if w > heaviestWeight || (w == heaviestWeight && k > heaviest) {
+			heaviest, heaviestWeight = k, w
+		}
+	}
+	if heaviest == "" {
+		return false
+	}
+	for _, item := range refs[best].arr {
+		if obj, ok := item.(map[string]any); ok {
+			delete(obj, heaviest)
+		}
+	}
+	if obj, ok := refs[best].arr[0].(map[string]any); ok {
+		note, _ := obj[agyDroppedFieldsKey].(string)
+		if note != "" {
+			note += ", "
+		}
+		obj[agyDroppedFieldsKey] = note + heaviest
+	}
+	return true
+}
+
+// agyDroppedFieldsKey names the field that records which columns were removed.
+const agyDroppedFieldsKey = "_fields_dropped_by_the_system"
+
+// agyIdentifyingField reports whether a field name looks like an identifier or
+// a label — the two things a caller needs in order to refer to a record. This
+// is about the shape of data in general, not about any particular tool.
+func agyIdentifyingField(key string) bool {
+	k := strings.ToLower(key)
+	switch {
+	case k == "id" || k == "uuid" || k == "code" || k == "key":
+		return true
+	case strings.HasSuffix(k, "_id") || strings.HasSuffix(k, "_uuid") || strings.HasSuffix(k, "_code"):
+		return true
+	case strings.Contains(k, "name") || strings.Contains(k, "title") || strings.Contains(k, "label"):
+		return true
+	}
+	return false
+}
+
+var agyOmissionCountRe = regexp.MustCompile(`^\[system note: (\d+) entries dropped`)
+
+// agyProseBytes reports the length of the longest long string inside a JSON
+// tool result, i.e. how many bytes it can still give up without losing a
+// record. Non-JSON text counts as prose in full.
+func agyProseBytes(raw string) int {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		if len(raw) > agyLongStringBytes {
+			return len(raw)
+		}
+		return 0
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return 0
+	}
+	longest := 0
+	var walk func(any)
+	walk = func(node any) {
+		switch n := node.(type) {
+		case string:
+			if len(n) > longest {
+				longest = len(n)
+			}
+		case []any:
+			for _, x := range n {
+				walk(x)
+			}
+		case map[string]any:
+			for _, x := range n {
+				walk(x)
+			}
+		}
+	}
+	walk(v)
+	if longest > agyLongStringBytes {
+		return longest
+	}
+	return 0
+}
+
+// fitAgyTranscript compacts tool results until the rendered transcript fits
+// budget, largest first and earlier turns before the current one, so the data
+// the model is about to act on is the last thing to lose detail. Returns the
+// adjusted transcript and one line per compacted result for the log.
+func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget int) (agyTranscript, []string) {
+	if budget <= 0 || len(t.Turns) == 0 {
+		return t, nil
+	}
+	out := t
+	out.Turns = append([]agyTurn(nil), t.Turns...)
+	last := out.lastCustomerIndex()
+	// Which results are superseded: all but the most recent few per tool.
+	superseded := map[int]bool{}
+	seenPerTool := map[string]int{}
+	for i := len(out.Turns) - 1; i >= 0; i-- {
+		tt := out.Turns[i]
+		if tt.Kind != agyTurnToolResult || tt.Tool == "" {
+			continue
+		}
+		seenPerTool[tt.Tool]++
+		if seenPerTool[tt.Tool] > agyKeepRecentPerTool {
+			superseded[i] = true
+		}
+	}
+	shrunk := map[int][2]int{} // turn index → {original, current} bytes
+	for level := agyLevelSuperseded; level <= agyLevelRecords; level++ {
+		exhausted := map[int]bool{}
+		for i := 0; i < 300; i++ {
+			size := len(renderAgyTranscript(out, oldResultCap, readable))
+			if size <= budget {
+				level = agyLevelRecords + 1 // done
+				break
+			}
+			over := size - budget
+			// Earlier turns give up their bytes before the current turn's.
+			idx, bestSize := -1, 0
+			for pass := 0; pass < 2 && idx < 0; pass++ {
+				for j, tt := range out.Turns {
+					if tt.Kind != agyTurnToolResult || exhausted[j] || len(tt.Text) <= agyMinResultBytes {
+						continue
+					}
+					if (j > last) != (pass == 1) {
+						continue
+					}
+					if level == agyLevelSuperseded && !superseded[j] {
+						continue
+					}
+					if len(tt.Text) > bestSize {
+						bestSize, idx = len(tt.Text), j
+					}
+				}
+			}
+			if idx < 0 {
+				break // nothing left at this level
+			}
+			target := bestSize - over
+			if target < bestSize/2 {
+				target = bestSize / 2
+			}
+			if target < agyMinResultBytes {
+				target = agyMinResultBytes
+			}
+			if level == agyLevelSuperseded {
+				// Stale by definition: cut straight to the floor, whatever it holds.
+				text := truncateToolResult(out.Turns[idx].Text, agyMinResultBytes)
+				if len(text) >= len(out.Turns[idx].Text) {
+					exhausted[idx] = true
+					continue
+				}
+				if _, seen := shrunk[idx]; !seen {
+					shrunk[idx] = [2]int{len(out.Turns[idx].Text), len(text)}
+				} else {
+					shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
+				}
+				out.Turns[idx].Text = text
+				continue
+			}
+			text, ok := compactJSONForPrompt(out.Turns[idx].Text, target, level)
+			if (!ok || len(text) >= len(out.Turns[idx].Text)) && level == agyLevelRecords {
+				// Not JSON, or JSON that cannot give up anything else.
+				text = truncateToolResult(out.Turns[idx].Text, target)
+			}
+			if len(text) >= len(out.Turns[idx].Text) {
+				exhausted[idx] = true
+				continue
+			}
+			if _, seen := shrunk[idx]; !seen {
+				shrunk[idx] = [2]int{len(out.Turns[idx].Text), len(text)}
+			} else {
+				shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
+			}
+			out.Turns[idx].Text = text
+		}
+	}
+	var notes []string
+	for idx, sizes := range shrunk {
+		notes = append(notes, fmt.Sprintf("%s %d→%d", firstNonEmpty(out.Turns[idx].Tool, "result"), sizes[0], sizes[1]))
+	}
+	sort.Strings(notes)
+	return out, notes
 }
 
 // renderAgyTranscript renders the dialogue section. When readable is set, JSON
@@ -1152,11 +1754,26 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 	return strings.TrimSpace(b.String())
 }
 
-// renderAgyPrompt assembles the full v2 prompt.
+// agyToolsInPlay names the tools this conversation has already touched, which
+// are the ones whose full schema is worth its bytes.
+func agyToolsInPlay(t agyTranscript) map[string]bool {
+	inPlay := map[string]bool{"get_tool_instructions": true}
+	for _, name := range t.preflightedTools() {
+		inPlay[name] = true
+	}
+	for _, tt := range t.Turns {
+		if tt.Kind == agyTurnToolCall && tt.Tool != "" {
+			inPlay[tt.Tool] = true
+		}
+	}
+	return inPlay
+}
+
+// renderAgyPrompt assembles the full v2 prompt, fitted to agy's input window.
 func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) string {
 	system = strings.TrimSpace(system)
 	tempDirective := buildAgyTempDirective(temp)
-	toolsPrompt := renderAgyToolCatalog(tools)
+	toolsPrompt := renderAgyToolCatalog(tools, nil, false)
 
 	// Bare single-turn chat with no system/tools keeps the raw prompt (Test page).
 	if system == "" && toolsPrompt == "" && tempDirective == "" && len(t.Turns) == 1 && t.Turns[0].Kind == agyTurnCustomer {
@@ -1192,6 +1809,33 @@ func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCa
 	if state := renderAgyStatePreface(t, toolsPrompt != ""); state != "" {
 		b.WriteString(state)
 		b.WriteString("\n\n")
+	}
+	// Everything except the tool catalog and the transcript is fixed cost: the
+	// persona is the caller's and is never trimmed. What is left of the budget
+	// buys the catalog first (compacted if it does not fit) and the transcript
+	// second, so the turn's own data survives instead of being cut blindly by
+	// agy at whatever byte its window happens to end on.
+	if budget := agyPromptBudget(cfg); budget > 0 {
+		fixed := b.Len() + len(sysBlock.String()) + len(renderAgyDialogueDigest(t)) + len(renderAgyNextTurn(t, toolsPrompt != "")) + 8
+		if toolsPrompt != "" && fixed+len(toolsPrompt)+agyMinTranscriptBytes > budget {
+			if compacted := renderAgyToolCatalog(tools, agyToolsInPlay(t), true); len(compacted) < len(toolsPrompt) {
+				log.Printf("[agy-prompt] tool catalog compacted %d→%d bytes to fit the input window", len(toolsPrompt), len(compacted))
+				toolsPrompt = compacted
+			}
+		}
+		room := budget - fixed - len(toolsPrompt)
+		if room < agyMinTranscriptFloor {
+			// The caller's own system prompt does not leave room for a
+			// conversation. Compact the transcript to its floor anyway — agy
+			// would otherwise cut it at an arbitrary byte — and say so.
+			log.Printf("[agy-prompt] WARNING: the system prompt and tool catalog alone (%d bytes) leave %d bytes of the %d-byte budget for the conversation", fixed+len(toolsPrompt), room, budget)
+			room = agyMinTranscriptFloor
+		}
+		fitted, notes := fitAgyTranscript(t, agyToolResultCap(cfg), cfg.AgyReadableResults, room)
+		if len(notes) > 0 {
+			log.Printf("[agy-prompt] transcript compacted to fit %d bytes: %s", room, strings.Join(notes, ", "))
+		}
+		t = fitted
 	}
 	b.WriteString(sysBlock.String())
 	if toolsPrompt != "" {

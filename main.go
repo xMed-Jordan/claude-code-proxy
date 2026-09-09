@@ -75,63 +75,64 @@ type updateLatestCache struct {
 }
 
 type config struct {
-	OpenAIAPIKey      string
-	OpenAIBaseURL     string
-	Upstream          string
-	CodexDisabled     bool // PROXY_CODEX_ENABLED=0 → refuse codex routing (zero value = enabled)
-	ClaudeDisabled    bool // PROXY_CLAUDE_ENABLED=0 → refuse the claude upstream
-	AgyDisabled       bool // PROXY_AGY_ENABLED=0 → refuse the agy upstream
-	CodexBaseURL      string
-	CodexAuthFile     string
-	CodexVersion      string // PROXY_CODEX_VERSION — Codex CLI version advertised upstream; newer models are gated on it
-	CodexSessionFile  string
+	OpenAIAPIKey     string
+	OpenAIBaseURL    string
+	Upstream         string
+	CodexDisabled    bool // PROXY_CODEX_ENABLED=0 → refuse codex routing (zero value = enabled)
+	ClaudeDisabled   bool // PROXY_CLAUDE_ENABLED=0 → refuse the claude upstream
+	AgyDisabled      bool // PROXY_AGY_ENABLED=0 → refuse the agy upstream
+	CodexBaseURL     string
+	CodexAuthFile    string
+	CodexVersion     string // PROXY_CODEX_VERSION — Codex CLI version advertised upstream; newer models are gated on it
+	CodexSessionFile string
 	// Fast mode (OpenAI priority processing) — see codex_fastmode.go for why the
 	// wire value is "priority" and why this needs a kill switch at all.
-	CodexFastMode    string   // PROXY_CODEX_FAST_MODE — off (default) | on; never automatic
-	CodexFastTier    string   // CODEX_FAST_SERVICE_TIER — wire value; "priority" is the only one the ChatGPT backend accepts
-	CodexFastModels  []string // PROXY_CODEX_FAST_MODELS — upstream models advertising priority support; nil = no gate
-	CodexWarmWorkers int      // PROXY_CODEX_WARM_WORKERS — number of standby workers for Codex (0 = disabled)
-	CodexQueueTimeout time.Duration // PROXY_CODEX_QUEUE_TIMEOUT — max duration to wait in queue for an available Codex worker
-	ClaudeFastModels []string // PROXY_CLAUDE_FAST_MODELS — Anthropic aliases that imply fast mode without `speed`
-	DBPath            string
-	ProxyKey          string
-	Host              string
-	Port              string
-	PublicURL         string
-	Models            map[string]string
-	ModelContexts     map[string]string
-	ModelCustom       map[string]bool
-	ModelForward      map[string]string
-	ModelDefault      map[string]bool // alias → is the default choice (overrides the built-in seed)
-	ModelRecommended  map[string]bool // alias → is the recommended choice
-	ClaudeDefaults    map[string]string
-	ReasoningEffort   string
-	AgyBin            string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
-	AgyCLI            string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
-	AgyModel          string        // optional global model override forwarded to agy ("" → agy's own default)
-	AgyPromptMode     string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
-	AgyToolResultCap  int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
-	AgyReadableResults bool         // PROXY_AGY_READABLE_RESULTS — lay JSON tool results out one member per line in the agy prompt (default false; replays showed no accuracy gain)
-	AgyToolCallCap    int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
-	AgyAgent          string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
-	AgyConcurrency    int           // max simultaneous agyj subprocesses
-	AgyTimeout        time.Duration // per-call agy execution timeout
-	AgyWarmWorkers    int           // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
-	AgyWorkerModel    string        // PROXY_AGY_WORKER_MODEL — model to prewarm (default gemini-3.8-flash-medium)
-	AgyWorkerMaxTurns int           // PROXY_AGY_WORKER_MAX_TURNS — recycle worker after this many turns (default 50)
-	AgyQueueTimeout   time.Duration // PROXY_AGY_QUEUE_TIMEOUT — max duration to wait in queue for an available warm worker
-	AgyMedia          bool          // enable media attachments for agy requests
-	AgyMediaDir       string        // scratch root for materialized media ("" → temp)
-	AgyMediaModel     string        // default Antigravity model for media requests
-	AgyMediaTimeout   time.Duration // per-call timeout for media (heavier) requests
-	AgyMediaMaxBytes  int64         // max bytes per attached/extracted file
-	AgyMediaMaxTotal  int64         // max total bytes materialized per request
-	AgyMediaAllowURLs bool          // allow downloading media from remote URLs
-	AgyMediaRetention time.Duration // keep materialized files this long for reuse
-	AgyImage          bool          // enable the agy image-generation endpoint
-	AgyImageDir       string        // served root for generated images ("" → temp)
-	AgyImageModel     string        // default Antigravity model for image generation
-	AgyImageRetention time.Duration // keep generated images this long for reuse
+	CodexFastMode      string        // PROXY_CODEX_FAST_MODE — off (default) | on; never automatic
+	CodexFastTier      string        // CODEX_FAST_SERVICE_TIER — wire value; "priority" is the only one the ChatGPT backend accepts
+	CodexFastModels    []string      // PROXY_CODEX_FAST_MODELS — upstream models advertising priority support; nil = no gate
+	CodexWarmWorkers   int           // PROXY_CODEX_WARM_WORKERS — number of standby workers for Codex (0 = disabled)
+	CodexQueueTimeout  time.Duration // PROXY_CODEX_QUEUE_TIMEOUT — max duration to wait in queue for an available Codex worker
+	ClaudeFastModels   []string      // PROXY_CLAUDE_FAST_MODELS — Anthropic aliases that imply fast mode without `speed`
+	DBPath             string
+	ProxyKey           string
+	Host               string
+	Port               string
+	PublicURL          string
+	Models             map[string]string
+	ModelContexts      map[string]string
+	ModelCustom        map[string]bool
+	ModelForward       map[string]string
+	ModelDefault       map[string]bool // alias → is the default choice (overrides the built-in seed)
+	ModelRecommended   map[string]bool // alias → is the recommended choice
+	ClaudeDefaults     map[string]string
+	ReasoningEffort    string
+	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
+	AgyCLI             string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
+	AgyModel           string        // optional global model override forwarded to agy ("" → agy's own default)
+	AgyPromptMode      string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
+	AgyToolResultCap   int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
+	AgyReadableResults bool          // PROXY_AGY_READABLE_RESULTS — lay JSON tool results out one member per line in the agy prompt (default false; replays showed no accuracy gain)
+	AgyPromptBudget    int           // PROXY_AGY_PROMPT_BUDGET — byte budget for the rendered agy prompt; agy silently truncates above ~191KB (-1 disables the fitting)
+	AgyToolCallCap     int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
+	AgyAgent           string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
+	AgyConcurrency     int           // max simultaneous agyj subprocesses
+	AgyTimeout         time.Duration // per-call agy execution timeout
+	AgyWarmWorkers     int           // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
+	AgyWorkerModel     string        // PROXY_AGY_WORKER_MODEL — model to prewarm (default gemini-3.8-flash-medium)
+	AgyWorkerMaxTurns  int           // PROXY_AGY_WORKER_MAX_TURNS — recycle worker after this many turns (default 50)
+	AgyQueueTimeout    time.Duration // PROXY_AGY_QUEUE_TIMEOUT — max duration to wait in queue for an available warm worker
+	AgyMedia           bool          // enable media attachments for agy requests
+	AgyMediaDir        string        // scratch root for materialized media ("" → temp)
+	AgyMediaModel      string        // default Antigravity model for media requests
+	AgyMediaTimeout    time.Duration // per-call timeout for media (heavier) requests
+	AgyMediaMaxBytes   int64         // max bytes per attached/extracted file
+	AgyMediaMaxTotal   int64         // max total bytes materialized per request
+	AgyMediaAllowURLs  bool          // allow downloading media from remote URLs
+	AgyMediaRetention  time.Duration // keep materialized files this long for reuse
+	AgyImage           bool          // enable the agy image-generation endpoint
+	AgyImageDir        string        // served root for generated images ("" → temp)
+	AgyImageModel      string        // default Antigravity model for image generation
+	AgyImageRetention  time.Duration // keep generated images this long for reuse
 	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
 	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
 	// Claude subscription (long-lived OAuth token from `claude setup-token`).
@@ -773,58 +774,59 @@ func loadConfig() config {
 	claudeDefaults := claudeDefaultsFromValues(env)
 	models, modelContexts, modelCustom, modelForward, modelDefault, modelRecommended := modelAliasesFromValues(env)
 	return config{
-		OpenAIAPIKey:      os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:     baseURL,
-		Upstream:          strings.ToLower(getenv("UPSTREAM", "codex")),
-		CodexBaseURL:      strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
-		CodexAuthFile:     codexAuthFile,
-		CodexVersion:      strings.TrimSpace(getenv("PROXY_CODEX_VERSION", defaultCodexVersion)),
-		CodexSessionFile:  getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
-		CodexFastMode:     normalizeFastMode(getenv("PROXY_CODEX_FAST_MODE", fastModeOff)),
-		CodexFastTier:     strings.TrimSpace(getenv("CODEX_FAST_SERVICE_TIER", defaultCodexFastTier)),
-		CodexFastModels:   parseFastModelList(getenv("PROXY_CODEX_FAST_MODELS", ""), defaultCodexFastModels),
-		CodexWarmWorkers:  parseCodexWarmWorkers(getenv("PROXY_CODEX_WARM_WORKERS", getenv("CODEX_WARM_WORKERS", "7"))),
-		CodexQueueTimeout: parseCodexQueueTimeout(getenv("PROXY_CODEX_QUEUE_TIMEOUT", getenv("CODEX_QUEUE_TIMEOUT", "30"))),
-		ClaudeFastModels:  parseFastModelList(getenv("PROXY_CLAUDE_FAST_MODELS", ""), defaultClaudeFastModels),
-		DBPath:            getenv("PROXY_DB_PATH", ".proxy.db"),
-		ProxyKey:          getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
-		Host:              host,
-		Port:              port,
-		PublicURL:         publicURL,
-		ReasoningEffort:   normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
-		ClaudeDefaults:    claudeDefaults,
-		Models:            models,
-		ModelContexts:     modelContexts,
-		ModelCustom:       modelCustom,
-		ModelForward:      modelForward,
-		ModelDefault:      modelDefault,
-		ModelRecommended:  modelRecommended,
-		AgyBin:            strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
-		AgyCLI:            strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
-		AgyModel:          strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
-		AgyPromptMode:     parseAgyPromptMode(getenv("PROXY_AGY_PROMPT_MODE", "v2")),
-		AgyToolResultCap:  parseAgyToolResultCap(getenv("PROXY_AGY_TOOL_RESULT_CAP", "0")),
+		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:      baseURL,
+		Upstream:           strings.ToLower(getenv("UPSTREAM", "codex")),
+		CodexBaseURL:       strings.TrimRight(getenv("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"), "/"),
+		CodexAuthFile:      codexAuthFile,
+		CodexVersion:       strings.TrimSpace(getenv("PROXY_CODEX_VERSION", defaultCodexVersion)),
+		CodexSessionFile:   getenv("CODEX_SESSION_FILE", ".proxy.sessions.json"),
+		CodexFastMode:      normalizeFastMode(getenv("PROXY_CODEX_FAST_MODE", fastModeOff)),
+		CodexFastTier:      strings.TrimSpace(getenv("CODEX_FAST_SERVICE_TIER", defaultCodexFastTier)),
+		CodexFastModels:    parseFastModelList(getenv("PROXY_CODEX_FAST_MODELS", ""), defaultCodexFastModels),
+		CodexWarmWorkers:   parseCodexWarmWorkers(getenv("PROXY_CODEX_WARM_WORKERS", getenv("CODEX_WARM_WORKERS", "7"))),
+		CodexQueueTimeout:  parseCodexQueueTimeout(getenv("PROXY_CODEX_QUEUE_TIMEOUT", getenv("CODEX_QUEUE_TIMEOUT", "30"))),
+		ClaudeFastModels:   parseFastModelList(getenv("PROXY_CLAUDE_FAST_MODELS", ""), defaultClaudeFastModels),
+		DBPath:             getenv("PROXY_DB_PATH", ".proxy.db"),
+		ProxyKey:           getenv("PROXY_API_KEY", os.Getenv("LITELLM_MASTER_KEY")),
+		Host:               host,
+		Port:               port,
+		PublicURL:          publicURL,
+		ReasoningEffort:    normalizeReasoningEffort(getenv("CLAUDE_CODE_EFFORT_LEVEL", getenv("OPENAI_REASONING_EFFORT", "xhigh"))),
+		ClaudeDefaults:     claudeDefaults,
+		Models:             models,
+		ModelContexts:      modelContexts,
+		ModelCustom:        modelCustom,
+		ModelForward:       modelForward,
+		ModelDefault:       modelDefault,
+		ModelRecommended:   modelRecommended,
+		AgyBin:             strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
+		AgyCLI:             strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
+		AgyModel:           strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
+		AgyPromptMode:      parseAgyPromptMode(getenv("PROXY_AGY_PROMPT_MODE", "v2")),
+		AgyToolResultCap:   parseAgyToolResultCap(getenv("PROXY_AGY_TOOL_RESULT_CAP", "0")),
 		AgyReadableResults: parseBoolDefault(getenv("PROXY_AGY_READABLE_RESULTS", "false"), false),
-		AgyToolCallCap:    parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
-		AgyAgent:          strings.TrimSpace(getenv("PROXY_AGY_AGENT", agyChatAgentName)),
-		AgyConcurrency:    parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
-		AgyTimeout:        parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
-		AgyWarmWorkers:    parseAgyWarmWorkers(getenv("PROXY_AGY_WARM_WORKERS", getenv("AGY_WARM_WORKERS", "0"))),
-		AgyWorkerModel:    strings.TrimSpace(getenv("PROXY_AGY_WORKER_MODEL", getenv("AGY_WORKER_MODEL", "gemini-3.8-flash-medium"))),
-		AgyWorkerMaxTurns: parseAgyWorkerMaxTurns(getenv("PROXY_AGY_WORKER_MAX_TURNS", getenv("AGY_WORKER_MAX_TURNS", "50"))),
-		AgyQueueTimeout:   parseAgyTimeout(getenv("PROXY_AGY_QUEUE_TIMEOUT", getenv("AGY_QUEUE_TIMEOUT", "15"))),
-		AgyMedia:          envFlag("PROXY_AGY_MEDIA", true),
-		AgyMediaDir:       strings.TrimSpace(getenv("PROXY_AGY_MEDIA_DIR", "")),
-		AgyMediaModel:     strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.6 Flash (Low)")),
-		AgyMediaTimeout:   parseAgyTimeout(getenv("PROXY_AGY_MEDIA_TIMEOUT", "300")),
-		AgyMediaMaxBytes:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_BYTES", "1GB"), 1<<30),
-		AgyMediaMaxTotal:  parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
-		AgyMediaAllowURLs: envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
-		AgyMediaRetention: parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
-		AgyImage:          envFlag("PROXY_AGY_IMAGE", true),
-		AgyImageDir:       strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
-		AgyImageModel:     strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
-		AgyImageRetention: parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
+		AgyPromptBudget:    parseIntDefault(getenv("PROXY_AGY_PROMPT_BUDGET", "0"), 0),
+		AgyToolCallCap:     parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
+		AgyAgent:           strings.TrimSpace(getenv("PROXY_AGY_AGENT", agyChatAgentName)),
+		AgyConcurrency:     parseAgyConcurrency(getenv("PROXY_AGY_CONCURRENCY", "2")),
+		AgyTimeout:         parseAgyTimeout(getenv("PROXY_AGY_TIMEOUT", "180")),
+		AgyWarmWorkers:     parseAgyWarmWorkers(getenv("PROXY_AGY_WARM_WORKERS", getenv("AGY_WARM_WORKERS", "0"))),
+		AgyWorkerModel:     strings.TrimSpace(getenv("PROXY_AGY_WORKER_MODEL", getenv("AGY_WORKER_MODEL", "gemini-3.8-flash-medium"))),
+		AgyWorkerMaxTurns:  parseAgyWorkerMaxTurns(getenv("PROXY_AGY_WORKER_MAX_TURNS", getenv("AGY_WORKER_MAX_TURNS", "50"))),
+		AgyQueueTimeout:    parseAgyTimeout(getenv("PROXY_AGY_QUEUE_TIMEOUT", getenv("AGY_QUEUE_TIMEOUT", "15"))),
+		AgyMedia:           envFlag("PROXY_AGY_MEDIA", true),
+		AgyMediaDir:        strings.TrimSpace(getenv("PROXY_AGY_MEDIA_DIR", "")),
+		AgyMediaModel:      strings.TrimSpace(getenv("PROXY_AGY_MEDIA_MODEL", "Gemini 3.6 Flash (Low)")),
+		AgyMediaTimeout:    parseAgyTimeout(getenv("PROXY_AGY_MEDIA_TIMEOUT", "300")),
+		AgyMediaMaxBytes:   parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_BYTES", "1GB"), 1<<30),
+		AgyMediaMaxTotal:   parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
+		AgyMediaAllowURLs:  envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
+		AgyMediaRetention:  parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
+		AgyImage:           envFlag("PROXY_AGY_IMAGE", true),
+		AgyImageDir:        strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
+		AgyImageModel:      strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
+		AgyImageRetention:  parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
 
 		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
 		ClaudeModel:        strings.TrimSpace(getenv("PROXY_CLAUDE_MODEL", "")),
@@ -3404,7 +3406,7 @@ func streamCodex(ctx context.Context, cfg config, out responsesRequest, in anthr
 func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
 	worker, release, err := AcquireCodexWorker(ctx)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "codex " + err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, "codex "+err.Error())
 		return
 	}
 	defer release()
@@ -3489,7 +3491,7 @@ func streamCodexResponsesRaw(ctx context.Context, cfg config, out responsesReque
 func streamCodexAsOpenAIChat(ctx context.Context, cfg config, out responsesRequest, w http.ResponseWriter) {
 	worker, release, err := AcquireCodexWorker(ctx)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "codex " + err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, "codex "+err.Error())
 		return
 	}
 	defer release()

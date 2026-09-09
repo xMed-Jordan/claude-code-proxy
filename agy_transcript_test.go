@@ -402,6 +402,272 @@ func TestRenderAgyPromptSectionOrderAndDigest(t *testing.T) {
 	}
 }
 
+// buildPackagesResult mimics the shape that broke bookings in production: a
+// list of records whose ids and names are small, each dragging a long history.
+func buildPackagesResult(records, historyPerRecord int) string {
+	var pkgs []string
+	for i := 0; i < records; i++ {
+		var res []string
+		for j := 0; j < historyPerRecord; j++ {
+			res = append(res, fmt.Sprintf(`{"reservation_id":%d,"date":"2026-08-%02d","status":"Canceled","therapist_id":539%02d,"therapist_name_ar":"اسم الأخصائية","notes":"%s"}`, 380000+i*100+j, (j%28)+1, j, strings.Repeat("ملاحظة ", 8)))
+		}
+		pkgs = append(pkgs, fmt.Sprintf(`{"user_package_id":%d,"service_id":%d,"name_en":"Package %d","reservations":[%s]}`, 263660+i, i+1, i, strings.Join(res, ",")))
+	}
+	return fmt.Sprintf(`{"success":true,"data":{"body":{"data":{"packages":[%s]}}}}`, strings.Join(pkgs, ","))
+}
+
+func TestCompactJSONForPromptKeepsRecordsDropsHistory(t *testing.T) {
+	raw := buildPackagesResult(24, 12)
+	if len(raw) < 40000 {
+		t.Fatalf("fixture too small: %d", len(raw))
+	}
+	out, ok := compactJSONForPrompt(raw, 9000, agyLevelRecords)
+	if !ok {
+		t.Fatal("expected compaction")
+	}
+	if len(out) > 9000 {
+		t.Fatalf("compacted to %d bytes, want <= 9000", len(out))
+	}
+	// Every record id and name must survive: those are what the next call needs.
+	for i := 0; i < 24; i++ {
+		if !strings.Contains(out, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d lost:\n%s", 263660+i, truncateString(out, 1500))
+		}
+		if !strings.Contains(out, fmt.Sprintf(`"name_en":"Package %d"`, i)) {
+			t.Fatalf("name of record %d lost", i)
+		}
+	}
+	if !strings.Contains(out, agyOmissionMarker) {
+		t.Fatalf("no omission marker in:\n%s", truncateString(out, 800))
+	}
+	// Valid JSON out.
+	var v any
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("compacted result is not valid JSON: %v", err)
+	}
+	// Nothing to do when it already fits, and non-JSON passes through.
+	if _, ok := compactJSONForPrompt(raw, len(raw)+1, agyLevelRecords); ok {
+		t.Fatal("must not touch a result that already fits")
+	}
+	if got, ok := compactJSONForPrompt("plain text", 3, agyLevelRecords); ok || got != "plain text" {
+		t.Fatal("non-JSON must pass through unchanged")
+	}
+}
+
+func TestCompactJSONForPromptShortensProseBeforeRecords(t *testing.T) {
+	// One result holding both an instruction sheet and a list of records: the
+	// prose must give up its bytes first, every record must survive.
+	protocol := strings.Repeat("قاعدة من قواعد البروتوكول. ", 3000)
+	raw := fmt.Sprintf(`{"instructions":%s,"packages":[%s]}`,
+		jsonQuote(protocol),
+		`{"user_package_id":263669,"name_en":"Full Body - Shalabi Pro"},{"user_package_id":263661,"name_en":"Membership: Shalabi Pro"},{"user_package_id":263662,"name_en":"Full Face - Shalabi Pro"}`)
+	out, ok := compactJSONForPrompt(raw, 6000, agyLevelProse)
+	if !ok || len(out) > 6000 {
+		t.Fatalf("compaction ok=%v size=%d (from %d)", ok, len(out), len(raw))
+	}
+	for _, want := range []string{`"user_package_id":263669`, `"Full Body - Shalabi Pro"`, `"user_package_id":263661`, `"user_package_id":263662`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("record data %q lost while prose was available to cut:\n%s", want, truncateString(out, 900))
+		}
+	}
+	if !strings.Contains(out, "characters dropped by the system") {
+		t.Fatalf("expected the prose to carry the omission note:\n%s", truncateString(out, 600))
+	}
+	var v any
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+}
+
+func TestFitAgyTranscriptProtectsCurrentTurn(t *testing.T) {
+	big := buildPackagesResult(20, 10)
+	in := anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: "احجزيلي"},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "old", "name": "get_customer_packages", "input": map[string]any{}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "old", "content": big}}},
+		{Role: "assistant", Content: "أي وقت بناسبك؟"},
+		{Role: "user", Content: "بكرا"},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "now", "name": "get_available_slots", "input": map[string]any{}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "now", "content": buildPackagesResult(6, 6)}}},
+	}}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	before := len(renderAgyTranscript(tr, 0, false))
+	budget := before / 3
+	fitted, notes := fitAgyTranscript(tr, 0, false, budget)
+	got := len(renderAgyTranscript(fitted, 0, false))
+	if got > budget {
+		t.Fatalf("transcript %d bytes still over budget %d (from %d)", got, budget, before)
+	}
+	if len(notes) == 0 {
+		t.Fatal("expected compaction notes")
+	}
+	// The earlier result must have given up more than the current turn's.
+	var oldLen, nowLen int
+	for _, tt := range fitted.Turns {
+		if tt.Kind == agyTurnToolResult {
+			switch tt.CallID {
+			case "old":
+				oldLen = len(tt.Text)
+			case "now":
+				nowLen = len(tt.Text)
+			}
+		}
+	}
+	if oldLen == 0 || nowLen == 0 {
+		t.Fatalf("results missing after fitting: old=%d now=%d", oldLen, nowLen)
+	}
+	origNow := len(buildPackagesResult(6, 6))
+	if nowLen != origNow {
+		t.Fatalf("current-turn result was compacted (%d→%d) while an earlier one was available", origNow, nowLen)
+	}
+}
+
+func TestCompactJSONDropsColumnsBeforeRecords(t *testing.T) {
+	// Records with an id, a name and several bulky columns. Squeezed hard, the
+	// ids and names must be the last things standing.
+	var recs []string
+	for i := 0; i < 25; i++ {
+		recs = append(recs, fmt.Sprintf(`{"user_package_id":%d,"name_en":"Package %d","added_date":"2026-07-19","expiry_at":"2027-07-18","agent_hint":"the notes are for internal use only and are quite verbose","price":"0.0000","paid":"0.0000","unpaid":"0.0000"}`, 263660+i, i))
+	}
+	raw := fmt.Sprintf(`{"packages":[%s]}`, strings.Join(recs, ","))
+	out, ok := compactJSONForPrompt(raw, len(raw)/3, agyLevelFields)
+	if !ok {
+		t.Fatal("expected compaction")
+	}
+	for i := 0; i < 25; i++ {
+		if !strings.Contains(out, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d dropped although columns were still available:\n%s", 263660+i, truncateString(out, 800))
+		}
+	}
+	if !strings.Contains(out, agyDroppedFieldsKey) {
+		t.Fatalf("no note about the dropped columns:\n%s", truncateString(out, 600))
+	}
+	if !strings.Contains(out, `"name_en":"Package 24"`) {
+		t.Fatalf("names should outlive the bulky columns:\n%s", truncateString(out, 600))
+	}
+	var v any
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+}
+
+func TestFitAgyTranscriptFloorsSupersededLookupsFirst(t *testing.T) {
+	// Six slot lookups and one package list. The stale lookups must be spent
+	// before the record list gives up a single record.
+	msgs := []anthropicMessage{{Role: "user", Content: "احجزيلي"}}
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("s%d", i)
+		msgs = append(msgs,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_available_slots", "input": map[string]any{"from_date": fmt.Sprintf("2026-09-%02d", 10+i)}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"day":%d,"slots":[%s]}`, i, strings.TrimSuffix(strings.Repeat(`{"time_from":"09:00","time_to":"10:00","therapist_name":"اسم الأخصائية الطويل هنا"},`, 60), ","))}}},
+		)
+	}
+	msgs = append(msgs,
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "pk", "name": "get_customer_packages", "input": map[string]any{}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "pk", "content": buildPackagesResult(24, 8)}}},
+	)
+	tr := buildAgyTranscriptFromAnthropic(anthropicRequest{Messages: msgs})
+	full := len(renderAgyTranscript(tr, 0, false))
+	budget := full / 3
+	fitted, _ := fitAgyTranscript(tr, 0, false, budget)
+	got := renderAgyTranscript(fitted, 0, false)
+	if len(got) > budget {
+		t.Fatalf("%d bytes over budget %d", len(got)-budget, budget)
+	}
+	for i := 0; i < 24; i++ {
+		if !strings.Contains(got, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d dropped while stale lookups were still full", 263660+i)
+		}
+	}
+	// The two most recent lookups keep their detail; older ones are floored.
+	if !strings.Contains(got, `"day":5`) || !strings.Contains(got, `"day":4`) {
+		t.Fatal("the most recent lookups should keep their content")
+	}
+}
+
+func TestFitAgyTranscriptSpendsHistoryBeforeProse(t *testing.T) {
+	// A protocol sheet and a record list with history. Trimming the history
+	// alone is enough to fit, so the protocol text must come through intact.
+	protocol := fmt.Sprintf(`{"success":true,"data":{"instructions":%s}}`, jsonQuote(strings.Repeat("قاعدة أساسية من البروتوكول. ", 400)))
+	in := anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: "احجزيلي"},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "a", "name": "membership_protocol", "input": map[string]any{}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "a", "content": protocol}}},
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "b", "name": "get_customer_packages", "input": map[string]any{}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "b", "content": buildPackagesResult(24, 12)}}},
+	}}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	full := len(renderAgyTranscript(tr, 0, false))
+	budget := len(protocol) + 12000
+	if budget >= full {
+		t.Fatalf("fixture does not need fitting: full=%d budget=%d", full, budget)
+	}
+	fitted, notes := fitAgyTranscript(tr, 0, false, budget)
+	got := renderAgyTranscript(fitted, 0, false)
+	if len(got) > budget {
+		t.Fatalf("still %d bytes over budget %d", len(got)-budget, budget)
+	}
+	if len(notes) == 0 {
+		t.Fatal("expected compaction notes")
+	}
+	// Prose untouched.
+	if strings.Contains(got, "characters dropped by the system") {
+		t.Fatal("the protocol prose was cut although history was still available")
+	}
+	// Every record still there.
+	for i := 0; i < 24; i++ {
+		if !strings.Contains(got, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d dropped while history was still available", 263660+i)
+		}
+	}
+	if !strings.Contains(got, agyOmissionMarker) {
+		t.Fatal("expected history to be thinned")
+	}
+}
+
+func TestRenderAgyPromptFitsBudget(t *testing.T) {
+	in := testBookingRequest()
+	in.Messages = append(in.Messages,
+		anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "p1", "name": "get_customer_packages", "input": map[string]any{}}}},
+		anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "p1", "content": buildPackagesResult(24, 14)}}},
+	)
+	// A persona and a catalog of the same order as production.
+	system := strings.Repeat("سياسة العيادة رقم واحد. ", 300)
+	var tools []agyToolCatalog
+	for i := 0; i < 60; i++ {
+		tools = append(tools, agyToolCatalog{
+			Name:        fmt.Sprintf("tool_%02d", i),
+			Description: strings.Repeat("what this tool does, at length. ", 12),
+			Schema:      map[string]any{"type": "object", "required": []any{"branch_id"}, "properties": map[string]any{"branch_id": map[string]any{"type": "string", "description": strings.Repeat("value for branch_id. ", 10)}, "from_date": map[string]any{"type": "string", "description": strings.Repeat("value for from_date. ", 10)}}},
+		})
+	}
+	tools = append(tools, agyToolCatalog{Name: "get_available_slots", Schema: map[string]any{"type": "object"}}, agyToolCatalog{Name: "get_customer_packages", Schema: map[string]any{"type": "object"}}, agyToolCatalog{Name: "get_tool_instructions", Schema: map[string]any{"type": "object"}})
+	tr := buildAgyTranscriptFromAnthropic(in)
+
+	unfitted := renderAgyPrompt(config{AgyPromptBudget: -1}, system, nil, tools, tr)
+	budget := 60000
+	got := renderAgyPrompt(config{AgyPromptBudget: budget}, system, nil, tools, tr)
+	if len(unfitted) <= budget {
+		t.Fatalf("fixture does not exceed the budget (%d bytes); the test proves nothing", len(unfitted))
+	}
+	if len(got) > budget {
+		t.Fatalf("prompt %d bytes exceeds budget %d (unfitted %d)", len(got), budget, len(unfitted))
+	}
+	// Compacted catalog: tools in play keep their schema, the rest stay callable.
+	if !strings.Contains(got, "[params: branch_id*, from_date]") {
+		t.Fatalf("compact catalog entry missing:\n%s", truncateString(got, 3000))
+	}
+	for _, want := range []string{"get_customer_packages", "get_available_slots", "### CONVERSATION SO FAR", "### YOUR NEXT TURN", "user_package_id"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fitted prompt lost %q", want)
+		}
+	}
+	// The persona is never trimmed.
+	if !strings.Contains(got, strings.TrimSpace(system)) {
+		t.Fatal("system prompt must survive verbatim")
+	}
+}
+
 func TestToolResultFailureAndStateMarker(t *testing.T) {
 	cases := map[string]string{
 		`{"success":false,"data":{"status":422,"body":{"message":"The selected appointment type is invalid.","errors":{"appointment_type":["The selected appointment type is invalid."]}}},"error":"HTTP 422","status":422,"retryable":false,"hint":"The request was rejected"}`: "HTTP 422: The selected appointment type is invalid.",
