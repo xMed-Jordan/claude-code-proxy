@@ -1366,6 +1366,7 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 	}
 	weight := map[string]int{}
 	distinct := map[string]map[string]bool{}
+	scalarCol := map[string]bool{}
 	keys := 0
 	for _, item := range refs[best].arr {
 		obj, ok := item.(map[string]any)
@@ -1390,43 +1391,53 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 			weight[k] += len(raw)
 			if distinct[k] == nil {
 				distinct[k] = map[string]bool{}
+				scalarCol[k] = true
 			}
 			distinct[k][string(raw)] = true
+			switch v.(type) {
+			case map[string]any, []any:
+				scalarCol[k] = false
+			}
 		}
 	}
 	if keys <= agyMinRecordKeys || len(weight) == 0 {
 		return false
 	}
-	// Spend columns in order of how little they say about a record:
-	//   1. anything that is not an id or a name — the bulk, and replaceable;
-	//   2. ids and names that hold the SAME value in every record, which
-	//      therefore distinguish nothing (membership_id: 27 across all of them);
-	//   3. only then a real identifier, heaviest first.
-	// Without this an id of six characters loses to a name of twenty-five and
-	// the record stops being nameable at all (prod 2026-09-09: the surviving
-	// columns were group_id, membership_id and section_id).
-	heaviest, heaviestWeight := "", -1
-	for tier := 0; tier < 3 && heaviest == ""; tier++ {
-		for k, w := range weight {
-			ident := agyIdentifyingField(k)
-			switch tier {
-			case 0:
-				if ident {
-					continue
-				}
-			case 1:
-				if !ident || len(distinct[k]) > 1 {
-					continue
-				}
-			}
-			if w > heaviestWeight || (w == heaviestWeight && k > heaviest) {
-				heaviest, heaviestWeight = k, w
-			}
+	// Which column to spend is decided by how much it distinguishes one record
+	// from another, not by what it is called. A column holding the same value in
+	// every record separates nothing and is free to drop; a column holding a
+	// different value in every record is what the next call will use to name
+	// the record it wants. Between two columns that distinguish equally, the
+	// bulkier one goes first.
+	//
+	// This replaces a field-name heuristic (id/uuid/code/name/title) that only
+	// worked for APIs that happen to use those English words, and that ranked a
+	// 25-byte name above a 6-byte id, leaving records present but unnameable.
+	// Counting distinct values needs no vocabulary and holds for any payload.
+	type colStat struct {
+		name     string
+		weight   int
+		distinct int
+		scalar   bool
+	}
+	stats := make([]colStat, 0, len(weight))
+	for k, w := range weight {
+		stats = append(stats, colStat{name: k, weight: w, distinct: len(distinct[k]), scalar: scalarCol[k]})
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		a, b := stats[i], stats[j]
+		if a.scalar != b.scalar {
+			return !a.scalar // structures (nested objects/arrays) go before plain values
 		}
-	}
-	if heaviest == "" {
-		return false
-	}
+		if a.distinct != b.distinct {
+			return a.distinct < b.distinct // least distinguishing first
+		}
+		if a.weight != b.weight {
+			return a.weight > b.weight // among equals, the bulkier one
+		}
+		return a.name < b.name
+	})
+	heaviest := stats[0].name
 	for _, item := range refs[best].arr {
 		if obj, ok := item.(map[string]any); ok {
 			delete(obj, heaviest)
@@ -1444,22 +1455,6 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 
 // agyDroppedFieldsKey names the field that records which columns were removed.
 const agyDroppedFieldsKey = "_fields_dropped_by_the_system"
-
-// agyIdentifyingField reports whether a field name looks like an identifier or
-// a label — the two things a caller needs in order to refer to a record. This
-// is about the shape of data in general, not about any particular tool.
-func agyIdentifyingField(key string) bool {
-	k := strings.ToLower(key)
-	switch {
-	case k == "id" || k == "uuid" || k == "code" || k == "key":
-		return true
-	case strings.HasSuffix(k, "_id") || strings.HasSuffix(k, "_uuid") || strings.HasSuffix(k, "_code"):
-		return true
-	case strings.Contains(k, "name") || strings.Contains(k, "title") || strings.Contains(k, "label"):
-		return true
-	}
-	return false
-}
 
 var agyOmissionCountRe = regexp.MustCompile(`^\[system note: (\d+) entries dropped`)
 
@@ -1530,47 +1525,59 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 		}
 	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
-	for level := agyLevelSuperseded; level <= agyLevelOldest; level++ {
-		exhausted := map[int]bool{}
-		for i := 0; i < 300; i++ {
-			size := len(renderAgyTranscript(out, oldResultCap, readable))
-			if size <= budget {
-				level = agyLevelRecords + 1 // done
-				break
-			}
-			over := size - budget
-			// Last resort in a long conversation: rather than let agy cut the
-			// newest messages off the end, drop whole results starting with the
-			// oldest. The dialogue itself is never touched — a customer's own
-			// words are the one thing the turn cannot be rebuilt without.
-			if level == agyLevelOldest {
-				dropped := -1
-				for j, tt := range out.Turns {
-					if tt.Kind == agyTurnToolResult && len(tt.Text) > len(agyDroppedResultNote) {
-						dropped = j
-						break
-					}
+	// Two phases, and the split is the important part. Everything a previous
+	// turn fetched is spent — down to a one-line reference — before anything
+	// the CURRENT turn fetched gives up a byte. A result from an earlier turn
+	// can always be fetched again; the result the model is about to act on
+	// cannot be reconstructed from anywhere. This is what stops a live record
+	// list being thinned while a dozen stale lookups still hold their bytes,
+	// and it needs no knowledge of what any tool returns.
+	for phase := 0; phase < 2; phase++ {
+		for level := agyLevelSuperseded; level <= agyLevelOldest; level++ {
+			exhausted := map[int]bool{}
+			inPhase := func(j int) bool {
+				if phase == 0 {
+					return j <= last // fetched before the customer's latest message
 				}
-				if dropped < 0 {
+				return j > last // fetched by the turn being answered now
+			}
+			for i := 0; i < 300; i++ {
+				size := len(renderAgyTranscript(out, oldResultCap, readable))
+				if size <= budget {
+					level, phase = agyLevelRecords+1, 2 // done
 					break
 				}
-				if _, seen := shrunk[dropped]; !seen {
-					shrunk[dropped] = [2]int{len(out.Turns[dropped].Text), len(agyDroppedResultNote)}
-				} else {
-					shrunk[dropped] = [2]int{shrunk[dropped][0], len(agyDroppedResultNote)}
+				over := size - budget
+				// Last resort in a long conversation: rather than let agy cut the
+				// newest messages off the end, drop whole results starting with the
+				// oldest. The dialogue itself is never touched — a customer's own
+				// words are the one thing the turn cannot be rebuilt without.
+				if level == agyLevelOldest {
+					dropped := -1
+					for j, tt := range out.Turns {
+						if tt.Kind == agyTurnToolResult && inPhase(j) && len(tt.Text) > len(agyDroppedResultNote) {
+							dropped = j
+							break
+						}
+					}
+					if dropped < 0 {
+						break
+					}
+					if _, seen := shrunk[dropped]; !seen {
+						shrunk[dropped] = [2]int{len(out.Turns[dropped].Text), len(agyDroppedResultNote)}
+					} else {
+						shrunk[dropped] = [2]int{shrunk[dropped][0], len(agyDroppedResultNote)}
+					}
+					out.Turns[dropped].Text = agyDroppedResultNote
+					out.Turns[dropped].Reduced = true
+					continue
 				}
-				out.Turns[dropped].Text = agyDroppedResultNote
-				out.Turns[dropped].Reduced = true
-				continue
-			}
-			// Earlier turns give up their bytes before the current turn's.
-			idx, bestSize := -1, 0
-			for pass := 0; pass < 2 && idx < 0; pass++ {
+				idx, bestSize := -1, 0
 				for j, tt := range out.Turns {
 					if tt.Kind != agyTurnToolResult || exhausted[j] || len(tt.Text) <= agyMinResultBytes {
 						continue
 					}
-					if (j > last) != (pass == 1) {
+					if !inPhase(j) {
 						continue
 					}
 					if level == agyLevelSuperseded && !superseded[j] {
@@ -1580,20 +1587,37 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 						bestSize, idx = len(tt.Text), j
 					}
 				}
-			}
-			if idx < 0 {
-				break // nothing left at this level
-			}
-			target := bestSize - over
-			if target < bestSize/2 {
-				target = bestSize / 2
-			}
-			if target < agyMinResultBytes {
-				target = agyMinResultBytes
-			}
-			if level == agyLevelSuperseded {
-				// Stale by definition: cut straight to the floor, whatever it holds.
-				text := truncateToolResult(out.Turns[idx].Text, agyMinResultBytes)
+				if idx < 0 {
+					break // nothing left at this level in this phase
+				}
+				target := bestSize - over
+				if target < bestSize/2 {
+					target = bestSize / 2
+				}
+				if target < agyMinResultBytes {
+					target = agyMinResultBytes
+				}
+				if level == agyLevelSuperseded {
+					// Stale by definition: cut straight to the floor, whatever it holds.
+					text := truncateToolResult(out.Turns[idx].Text, agyMinResultBytes)
+					if len(text) >= len(out.Turns[idx].Text) {
+						exhausted[idx] = true
+						continue
+					}
+					if _, seen := shrunk[idx]; !seen {
+						shrunk[idx] = [2]int{len(out.Turns[idx].Text), len(text)}
+					} else {
+						shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
+					}
+					out.Turns[idx].Text = text
+					out.Turns[idx].Reduced = true
+					continue
+				}
+				text, ok := compactJSONForPrompt(out.Turns[idx].Text, target, level)
+				if (!ok || len(text) >= len(out.Turns[idx].Text)) && level == agyLevelRecords {
+					// Not JSON, or JSON that cannot give up anything else.
+					text = truncateToolResult(out.Turns[idx].Text, target)
+				}
 				if len(text) >= len(out.Turns[idx].Text) {
 					exhausted[idx] = true
 					continue
@@ -1605,24 +1629,7 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 				}
 				out.Turns[idx].Text = text
 				out.Turns[idx].Reduced = true
-				continue
 			}
-			text, ok := compactJSONForPrompt(out.Turns[idx].Text, target, level)
-			if (!ok || len(text) >= len(out.Turns[idx].Text)) && level == agyLevelRecords {
-				// Not JSON, or JSON that cannot give up anything else.
-				text = truncateToolResult(out.Turns[idx].Text, target)
-			}
-			if len(text) >= len(out.Turns[idx].Text) {
-				exhausted[idx] = true
-				continue
-			}
-			if _, seen := shrunk[idx]; !seen {
-				shrunk[idx] = [2]int{len(out.Turns[idx].Text), len(text)}
-			} else {
-				shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
-			}
-			out.Turns[idx].Text = text
-			out.Turns[idx].Reduced = true
 		}
 	}
 	var notes []string
