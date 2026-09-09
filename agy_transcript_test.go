@@ -560,6 +560,98 @@ func TestFitAgyTranscriptNeverTouchesMessagesOrCalls(t *testing.T) {
 	}
 }
 
+// A long conversation must still deliver every customer message. Tool results
+// are given up entirely, oldest first, rather than letting the newest messages
+// fall off the end of agy's window.
+func TestFitAgyTranscriptKeepsWholeDialogueInLongConversation(t *testing.T) {
+	var msgs []anthropicMessage
+	for turn := 0; turn < 40; turn++ {
+		msgs = append(msgs, anthropicMessage{Role: "user", Content: fmt.Sprintf("رسالة الزبونة رقم %d، وفيها تفاصيل مهمة عن طلبها.", turn)})
+		id := fmt.Sprintf("t%d", turn)
+		msgs = append(msgs,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_customer_packages", "input": map[string]any{"turn": turn}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"lookup":%d,"payload":%s}`, turn, buildPackagesResult(20, 6))}}},
+			anthropicMessage{Role: "assistant", Content: fmt.Sprintf("رد المساعدة رقم %d على الزبونة.", turn)},
+		)
+	}
+	tr := buildAgyTranscriptFromAnthropic(anthropicRequest{Messages: msgs})
+	budget := 20000
+	fitted, _ := fitAgyTranscript(tr, 0, false, budget)
+	got := renderAgyTranscript(fitted, 0, false)
+	if len(got) > budget {
+		t.Fatalf("long conversation still %d bytes over budget %d", len(got)-budget, budget)
+	}
+	for turn := 0; turn < 40; turn++ {
+		for _, want := range []string{
+			fmt.Sprintf("رسالة الزبونة رقم %d", turn),
+			fmt.Sprintf("رد المساعدة رقم %d", turn),
+			fmt.Sprintf(`"turn":%d`, turn), // the call itself, with its arguments
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("turn %d lost %q from the dialogue", turn, want)
+			}
+		}
+	}
+	if !strings.Contains(got, agyDroppedResultNote) {
+		t.Fatal("expected whole results to be dropped with a note")
+	}
+}
+
+// When the system shortens a result, it must also tell the agent that the data
+// is incomplete and that calling again is allowed — and must then not block
+// that call as a repeat. Otherwise the agent is pointed at data that is no
+// longer there and forbidden from fetching it.
+func TestReducedResultsAreAnnouncedAndRecallable(t *testing.T) {
+	big := buildPackagesResult(24, 12)
+	in := anthropicRequest{
+		Tools: []anthropicTool{{Name: "get_customer_packages", InputSchema: map[string]any{"type": "object"}}},
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "شو الباقات عندي؟"},
+			{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "p1", "name": "get_customer_packages", "input": map[string]any{"customer_uuid": "X"}}}},
+			{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "p1", "content": big}}},
+			{Role: "assistant", Content: "عندك عدة باقات."},
+			{Role: "user", Content: "طيب احجزيلي على باقة الجسم كامل"},
+		},
+	}
+	tr := buildAgyTranscriptFromAnthropic(in)
+	cfg := config{AgyPromptBudget: 9000}
+	prompt, reduced := renderAgyPromptFitted(cfg, "You are Zeina.", nil, agyCatalogFromAnthropic(in.Tools), tr)
+	if !reduced["get_customer_packages"] {
+		t.Fatalf("the shortened tool was not reported as reduced: %v", reduced)
+	}
+	for _, want := range []string{
+		"call the tool again", // next to the data itself
+		"INCOMPLETE",          // in the state block
+		"شو الباقات عندي؟",    // the customer's words are untouched
+		"طيب احجزيلي على باقة الجسم كامل", // including the latest
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q", want)
+		}
+	}
+	// Re-calling that tool must NOT be rejected as a repeat.
+	orig := agyResolveFn
+	defer func() { agyResolveFn = orig }()
+	calls := 0
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, _ string, _ string) (agyResult, error) {
+		calls++
+		return agyResult{Ok: true, Response: `<tool_call>{"tool":"get_customer_packages","input":{"customer_uuid":"X"}}</tool_call>`}, nil
+	}
+	resp, trace, err := agyGenerate(context.Background(), cfg, agyGenInputFromAnthropic(in, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("the re-call was corrected %d times; it should be allowed at once", calls-1)
+	}
+	if !hasAnyToolCall(resp.Output) {
+		t.Fatalf("the re-call was dropped: %+v", resp.Output)
+	}
+	if len(trace.Attempts) > 0 && len(trace.Attempts[0].Problems) > 0 {
+		t.Fatalf("unexpected problems: %v", trace.Attempts[0].Problems)
+	}
+}
+
 // Under pressure the nested arrays that carry a lookup's actual answer are
 // thinned like any other nesting. This test pins that behaviour so the
 // trade-off is visible rather than assumed.

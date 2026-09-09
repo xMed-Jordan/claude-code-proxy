@@ -58,16 +58,31 @@ const (
 
 // agyTurn is one transcript entry.
 type agyTurn struct {
-	Kind   agyTurnKind
-	Text   string // customer / assistant / system-note text, or tool-result content
-	Tool   string // tool name (tool call + tool result)
-	Args   string // canonical JSON arguments (tool call)
-	CallID string // tool_use id (tool call + tool result)
+	Kind    agyTurnKind
+	Text    string // customer / assistant / system-note text, or tool-result content
+	Tool    string // tool name (tool call + tool result)
+	Args    string // canonical JSON arguments (tool call)
+	CallID  string // tool_use id (tool call + tool result)
+	Reduced bool   // tool result: shortened or dropped to fit the input window
 }
 
 // agyTranscript is the structured view of an incoming request.
 type agyTranscript struct {
 	Turns []agyTurn
+}
+
+// reducedTools names the tools whose results were shortened or dropped to fit
+// the input window. Those tools must be exempt from "you already ran this, do
+// not run it again": the data the model was pointed at is no longer all there,
+// so calling again is the correct move, not a loop.
+func (t *agyTranscript) reducedTools() map[string]bool {
+	out := map[string]bool{}
+	for _, tt := range t.Turns {
+		if tt.Kind == agyTurnToolResult && tt.Reduced && tt.Tool != "" {
+			out[tt.Tool] = true
+		}
+	}
+	return out
 }
 
 var (
@@ -461,6 +476,7 @@ func (t *agyTranscript) previousAssistantText() string {
 // model can see what it already knows without re-reading the whole transcript.
 func (t *agyTranscript) executedToolSummary() []string {
 	li := t.lastCustomerIndex()
+	reduced := t.reducedTools()
 	type key struct{ tool, args string }
 	counts := map[key]int{}
 	var order []key
@@ -480,6 +496,9 @@ func (t *agyTranscript) executedToolSummary() []string {
 		line := k.tool + " " + truncateString(k.args, 160)
 		if counts[k] > 1 {
 			line += fmt.Sprintf(" (×%d)", counts[k])
+		}
+		if reduced[k.tool] {
+			line += " — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows"
 		}
 		out = append(out, line)
 	}
@@ -1095,9 +1114,22 @@ const (
 	agyLevelSuperseded = iota // older results of a tool that has been called again since
 	agyLevelHistory
 	agyLevelProse
-	agyLevelFields // drop the heaviest column of a record list, keeping every record
-	agyLevelRecords
+	agyLevelFields  // drop the heaviest column of a record list, keeping every record
+	agyLevelRecords // drop records
+	agyLevelOldest  // drop the oldest tool results outright, oldest first
 )
+
+// agyDroppedResultNote replaces a tool result that had to go entirely. The call
+// that produced it stays in the transcript, so the model still knows the tool
+// ran and with which arguments, and can call it again if it needs the data.
+const agyDroppedResultNote = "[system note: this result is not shown any more — it was dropped to fit the context window. The call above did run; call the tool again if you need its data.]"
+
+// agyRecallNote is appended to a result the system had to shorten, so the model
+// is told in the same place it reads the data that the data is incomplete and
+// that calling again is allowed. Without it the state block's "you already ran
+// this, do not run it again" would point at a result that no longer holds what
+// it claims.
+const agyRecallNote = "\n[system note: this result was shortened by the system to fit the context window, so it is NOT the complete output. If you need what is missing, call the tool again — that is not a repeat call.]"
 
 // agyKeepRecentPerTool is how many results of the same tool stay full-size. A
 // booking turn may look up slots five or six times; the older lookups are
@@ -1465,7 +1497,7 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 		}
 	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
-	for level := agyLevelSuperseded; level <= agyLevelRecords; level++ {
+	for level := agyLevelSuperseded; level <= agyLevelOldest; level++ {
 		exhausted := map[int]bool{}
 		for i := 0; i < 300; i++ {
 			size := len(renderAgyTranscript(out, oldResultCap, readable))
@@ -1474,6 +1506,30 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 				break
 			}
 			over := size - budget
+			// Last resort in a long conversation: rather than let agy cut the
+			// newest messages off the end, drop whole results starting with the
+			// oldest. The dialogue itself is never touched — a customer's own
+			// words are the one thing the turn cannot be rebuilt without.
+			if level == agyLevelOldest {
+				dropped := -1
+				for j, tt := range out.Turns {
+					if tt.Kind == agyTurnToolResult && len(tt.Text) > len(agyDroppedResultNote) {
+						dropped = j
+						break
+					}
+				}
+				if dropped < 0 {
+					break
+				}
+				if _, seen := shrunk[dropped]; !seen {
+					shrunk[dropped] = [2]int{len(out.Turns[dropped].Text), len(agyDroppedResultNote)}
+				} else {
+					shrunk[dropped] = [2]int{shrunk[dropped][0], len(agyDroppedResultNote)}
+				}
+				out.Turns[dropped].Text = agyDroppedResultNote
+				out.Turns[dropped].Reduced = true
+				continue
+			}
 			// Earlier turns give up their bytes before the current turn's.
 			idx, bestSize := -1, 0
 			for pass := 0; pass < 2 && idx < 0; pass++ {
@@ -1515,6 +1571,7 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 					shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
 				}
 				out.Turns[idx].Text = text
+				out.Turns[idx].Reduced = true
 				continue
 			}
 			text, ok := compactJSONForPrompt(out.Turns[idx].Text, target, level)
@@ -1532,6 +1589,7 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 				shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
 			}
 			out.Turns[idx].Text = text
+			out.Turns[idx].Reduced = true
 		}
 	}
 	var notes []string
@@ -1578,6 +1636,9 @@ func renderAgyTranscript(t agyTranscript, oldResultCap int, readable bool) strin
 				}
 				if i < last {
 					text = truncateToolResult(text, oldResultCap)
+				}
+				if tt.Reduced && tt.Text != agyDroppedResultNote {
+					text += agyRecallNote
 				}
 			}
 		}
@@ -1632,7 +1693,7 @@ func renderAgyStatePreface(t agyTranscript, hasTools bool) string {
 	b.WriteString("This is an ongoing conversation, not its start. ")
 	if hasTools {
 		if done := t.executedToolSummary(); len(done) > 0 {
-			b.WriteString("You have ALREADY executed these tools earlier in this conversation; their complete outputs are in the CONVERSATION SO FAR section and any instructions or protocols they returned are already loaded and in effect, so do not open, preflight or run them again just to re-read them:\n")
+			b.WriteString("You have ALREADY executed these tools earlier in this conversation; their outputs are in the CONVERSATION SO FAR section and any instructions or protocols they returned are already loaded and in effect, so do not open, preflight or run them again just to re-read what is still shown there. Where a line below says its result is INCOMPLETE, the opposite applies: the system shortened that output to fit this message, and you should call the tool again when you need what it no longer shows.\n")
 			for _, d := range done {
 				b.WriteString("  • ")
 				b.WriteString(d)
@@ -1694,7 +1755,7 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 	}
 	if hasTools {
 		if done := t.executedToolSummary(); len(done) > 0 {
-			b.WriteString("- Tools already executed earlier in this conversation, listed below. Their COMPLETE original outputs are in the transcript above (\"Result of your … call\" entries are full outputs, never summaries). If your system instructions mention cached data or summaries of recent tool results, they refer to exactly these calls, and the detail those summaries omit is already available to you in the transcript — there is nothing to call again for it. Instructions or protocols that a tool returned are already loaded and remain in effect for the whole conversation. Do NOT call a tool again, and do NOT call get_tool_instructions for it, just to re-read what is already in the transcript; re-run a tool only when its data is live and may have changed, or when you need it with different arguments:\n")
+			b.WriteString("- Tools already executed earlier in this conversation, listed below. Their outputs are in the transcript above (\"Result of your … call\" entries are the tool's own output, never your summary of it). If your system instructions mention cached data or summaries of recent tool results, they refer to exactly these calls. Instructions or protocols that a tool returned are already loaded and remain in effect for the whole conversation. Do NOT call a tool again, and do NOT call get_tool_instructions for it, just to re-read what is still shown in the transcript; re-run a tool when its data is live and may have changed, when you need it with different arguments, or when its result below is marked INCOMPLETE and you need the part that is missing:\n")
 			for _, d := range done {
 				b.WriteString("  • ")
 				b.WriteString(d)
@@ -1769,15 +1830,17 @@ func agyToolsInPlay(t agyTranscript) map[string]bool {
 	return inPlay
 }
 
-// renderAgyPrompt assembles the full v2 prompt, fitted to agy's input window.
-func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) string {
+// renderAgyPromptFitted assembles the full v2 prompt, fitted to agy's input
+// window, and reports which tools had their results shortened or dropped in the
+// process — the caller must exempt those from its "do not repeat a call" rules.
+func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) (string, map[string]bool) {
 	system = strings.TrimSpace(system)
 	tempDirective := buildAgyTempDirective(temp)
 	toolsPrompt := renderAgyToolCatalog(tools, nil, false)
 
 	// Bare single-turn chat with no system/tools keeps the raw prompt (Test page).
 	if system == "" && toolsPrompt == "" && tempDirective == "" && len(t.Turns) == 1 && t.Turns[0].Kind == agyTurnCustomer {
-		return t.Turns[0].Text
+		return t.Turns[0].Text, nil
 	}
 
 	var sysBlock strings.Builder
@@ -1793,30 +1856,23 @@ func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCa
 		}
 	}
 
-	var b strings.Builder
 	// agy delivers this text to the model inside its own coding-agent harness
 	// (as a "user request"). Say up front what this message is, so the model
 	// adopts the role defined here instead of treating the content as pasted
 	// material to comment on.
-	b.WriteString("### HOW TO READ THIS MESSAGE\n\n")
-	b.WriteString("This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules), its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. ")
-	b.WriteString("You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.\n\n")
-	// Order matters (verified on gemini-3.8-flash / 3.1-pro, 2026-09-08): the
-	// state preface MUST precede the system prompt. With it after the persona,
-	// every model restarted the persona's "on booking → open protocol X" flow
-	// even though X was already in the transcript; with it first, 8/9 trials
-	// produced the correct next step.
-	if state := renderAgyStatePreface(t, toolsPrompt != ""); state != "" {
-		b.WriteString(state)
-		b.WriteString("\n\n")
-	}
+	const howToRead = "### HOW TO READ THIS MESSAGE\n\n" +
+		"This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules), its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. " +
+		"You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.\n\n"
+
 	// Everything except the tool catalog and the transcript is fixed cost: the
 	// persona is the caller's and is never trimmed. What is left of the budget
 	// buys the catalog first (compacted if it does not fit) and the transcript
 	// second, so the turn's own data survives instead of being cut blindly by
-	// agy at whatever byte its window happens to end on.
+	// agy at whatever byte its window happens to end on. The state block is
+	// rendered again after fitting, so it can say which results were shortened.
 	if budget := agyPromptBudget(cfg); budget > 0 {
-		fixed := b.Len() + len(sysBlock.String()) + len(renderAgyDialogueDigest(t)) + len(renderAgyNextTurn(t, toolsPrompt != "")) + 8
+		fixed := len(howToRead) + len(renderAgyStatePreface(t, toolsPrompt != "")) + len(sysBlock.String()) +
+			len(renderAgyDialogueDigest(t)) + len(renderAgyNextTurn(t, toolsPrompt != "")) + 16
 		if toolsPrompt != "" && fixed+len(toolsPrompt)+agyMinTranscriptBytes > budget {
 			if compacted := renderAgyToolCatalog(tools, agyToolsInPlay(t), true); len(compacted) < len(toolsPrompt) {
 				log.Printf("[agy-prompt] tool catalog compacted %d→%d bytes to fit the input window", len(toolsPrompt), len(compacted))
@@ -1837,6 +1893,18 @@ func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCa
 		}
 		t = fitted
 	}
+
+	var b strings.Builder
+	b.WriteString(howToRead)
+	// Order matters (verified on gemini-3.8-flash / 3.1-pro, 2026-09-08): the
+	// state preface MUST precede the system prompt. With it after the persona,
+	// every model restarted the persona's "on booking → open protocol X" flow
+	// even though X was already in the transcript; with it first, 8/9 trials
+	// produced the correct next step.
+	if state := renderAgyStatePreface(t, toolsPrompt != ""); state != "" {
+		b.WriteString(state)
+		b.WriteString("\n\n")
+	}
 	b.WriteString(sysBlock.String())
 	if toolsPrompt != "" {
 		b.WriteString(toolsPrompt)
@@ -1851,7 +1919,13 @@ func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCa
 		b.WriteString("\n\n")
 	}
 	b.WriteString(renderAgyNextTurn(t, toolsPrompt != ""))
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(b.String()), t.reducedTools()
+}
+
+// renderAgyPrompt assembles the full v2 prompt.
+func renderAgyPrompt(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) string {
+	prompt, _ := renderAgyPromptFitted(cfg, system, temp, tools, t)
+	return prompt
 }
 
 // ---------------------------------------------------------------------------
@@ -1938,7 +2012,7 @@ var agyResolveFn = agyResolve
 //
 // Nothing here knows about bookings, slots or any business rule.
 func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResponse, *agyGenTrace, error) {
-	prompt := renderAgyPrompt(cfg, in.System, in.Temperature, in.Tools, in.Transcript)
+	prompt, reduced := renderAgyPromptFitted(cfg, in.System, in.Temperature, in.Tools, in.Transcript)
 	trace := &agyGenTrace{Prompt: prompt}
 	model := firstNonEmpty(in.Model, "agy")
 
@@ -1983,6 +2057,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				if len(known) > 0 && !known[item.Name] {
 					problems = append(problems, fmt.Sprintf("tool %q does not exist; only the tools listed in the TOOLS section can be called", item.Name))
 					hardProblem = true
+					continue
+				}
+				// A tool whose result the system shortened is exempt from the
+				// repeat rules: the transcript no longer holds what it is being
+				// told to reuse, so calling again is the correct move. Only a
+				// call that already SUCCEEDED as an action is still refused,
+				// since repeating that would perform it twice.
+				if reduced[item.Name] && !in.Transcript.currentTurnCallSucceeded(item.Name, item.Arguments) {
+					kept = append(kept, item)
 					continue
 				}
 				if in.Transcript.calledThisTurn(item.Name, item.Arguments) {
