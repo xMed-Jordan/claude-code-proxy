@@ -1071,8 +1071,14 @@ func agyPromptBudget(cfg config) int {
 // 392,989-byte prompt above.
 const defaultAgyPromptBudget = 186000
 
-// agyMinResultBytes is the floor a single tool result is never compacted below.
-const agyMinResultBytes = 1200
+// agyMinResultBytes is the floor a single tool result is never compacted below
+// while it is still being shrunk in place. Deliberately small: a booking turn
+// carries a dozen instruction results whose content the TOOLS section already
+// states, and at a 1,200-byte floor those alone locked up ~10KB of the ~30KB
+// the conversation gets — enough to cost the packages list its records
+// (prod 2026-09-09 conv 9f24dc22). A result cut to this size keeps its opening
+// and carries the note saying it is incomplete and may be fetched again.
+const agyMinResultBytes = 400
 
 // agyMinTranscriptBytes is the room the transcript must get before the tool
 // catalog is compacted to make space.
