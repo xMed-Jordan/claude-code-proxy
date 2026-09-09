@@ -735,6 +735,44 @@ func TestFitAgySacrificesStaleResultsBeforeRecords(t *testing.T) {
 // column named "status" is the same in every record and says nothing. What
 // survives is decided by how much a column distinguishes one record from
 // another, so this payload behaves like any other.
+// One live copy per tool, and it is the newest. Re-fetching the same tool must
+// not multiply what the prompt has to carry — production conv ed674543 carried
+// five copies of a 117KB protocol and six of a 28KB package list in a single
+// booking turn, which is what starved the data the booking needed.
+func TestFitAgyKeepsOneLiveCopyPerTool(t *testing.T) {
+	var msgs []anthropicMessage
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("p%d", i)
+		msgs = append(msgs,
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "big_protocol", "input": map[string]any{"n": i}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"copy":%d,"text":"%s"}`, i, strings.Repeat("قاعدة من البروتوكول. ", 500))}}},
+		)
+	}
+	msgs = append(msgs, anthropicMessage{Role: "user", Content: "اه ثبتيه"})
+	tr := buildAgyTranscriptFromAnthropic(anthropicRequest{Messages: msgs})
+	full := len(renderAgyTranscript(tr, 0, false))
+	budget := full / 4
+	fitted, _ := fitAgyTranscript(tr, 0, false, budget)
+	got := renderAgyTranscript(fitted, 0, false)
+	if len(got) > budget {
+		t.Fatalf("%d bytes over budget %d", len(got)-budget, budget)
+	}
+	// The newest copy is the live state and keeps real content; the four stale
+	// copies are spent, so the cost does not grow with re-fetching.
+	live := 0
+	for _, tt := range fitted.Turns {
+		if tt.Kind == agyTurnToolResult && len(tt.Text) > 2*agyMinResultBytes {
+			live++
+		}
+	}
+	if live != 1 {
+		t.Fatalf("expected exactly one live copy of the tool, got %d", live)
+	}
+	if !strings.Contains(got, `"copy":4`) {
+		t.Fatalf("the live copy should be the newest one:\n%s", truncateString(got, 700))
+	}
+}
+
 func TestCompactJSONIsIndependentOfFieldNames(t *testing.T) {
 	var recs []string
 	for i := 0; i < 20; i++ {
@@ -824,9 +862,19 @@ func TestFitAgyTranscriptFloorsSupersededLookupsFirst(t *testing.T) {
 			t.Fatalf("record %d dropped while stale lookups were still full", 263660+i)
 		}
 	}
-	// The two most recent lookups keep their detail; older ones are floored.
-	if !strings.Contains(got, `"day":5`) || !strings.Contains(got, `"day":4`) {
-		t.Fatal("the most recent lookups should keep their content")
+	// The newest lookup is the live state of that tool and keeps its content;
+	// the older copies of the same tool are stale and are spent first.
+	if !strings.Contains(got, `"day":5`) {
+		t.Fatal("the newest lookup should keep its content")
+	}
+	stale := 0
+	for _, d := range []string{`"day":0`, `"day":1`, `"day":2`, `"day":3`} {
+		if !strings.Contains(got, d) {
+			stale++
+		}
+	}
+	if stale == 0 {
+		t.Fatal("stale copies of the same tool should have been spent first")
 	}
 }
 

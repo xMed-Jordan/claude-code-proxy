@@ -1137,11 +1137,13 @@ const agyDroppedResultNote = "[system note: this result is not shown any more �
 // it claims.
 const agyRecallNote = "\n[system note: this result was shortened by the system to fit the context window, so it is NOT the complete output. If you need what is missing, call the tool again — that is not a repeat call.]"
 
-// agyKeepRecentPerTool is how many results of the same tool stay full-size. A
-// booking turn may look up slots five or six times; the older lookups are
-// superseded by the newest and are the cheapest bytes in the transcript, but
-// left alone they crowd out the record lists the turn actually books from.
-const agyKeepRecentPerTool = 2
+// agyKeepRecentPerTool is how many results of the same tool are treated as
+// live. One: a tool describes some resource, and its newest result is the
+// current state of that resource — every older result of the same tool is a
+// stale copy of the same thing and is the cheapest byte in the transcript.
+// Production 2026-09-09 (conv ed674543) carried five copies of a 117KB protocol
+// and six of a 28KB package list in one booking turn.
+const agyKeepRecentPerTool = 1
 
 func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
 	trimmed := strings.TrimSpace(raw)
@@ -1525,26 +1527,38 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 		}
 	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
-	// Two phases, and the split is the important part. Everything a previous
-	// turn fetched is spent — down to a one-line reference — before anything
-	// the CURRENT turn fetched gives up a byte. A result from an earlier turn
-	// can always be fetched again; the result the model is about to act on
-	// cannot be reconstructed from anywhere. This is what stops a live record
-	// list being thinned while a dozen stale lookups still hold their bytes,
-	// and it needs no knowledge of what any tool returns.
-	for phase := 0; phase < 2; phase++ {
+	// Three phases, and the order is the whole design. What gets spent first is
+	// decided by how reconstructible it is, which needs no knowledge of what any
+	// tool returns:
+	//
+	//	0. stale copies — an older result of a tool that has been called again
+	//	   since. The newer call already replaced it, so it costs nothing to lose.
+	//	1. the live result of a tool the CURRENT turn has not consulted. It can
+	//	   be fetched again if the model needs it.
+	//	2. the results the current turn just fetched — the state it is acting on,
+	//	   which nothing else can reconstruct. Last, and usually untouched.
+	//
+	// Keeping one live copy per tool also stops a feedback loop: reference away
+	// what the previous turn fetched and the model simply fetches it again next
+	// turn, which is how one booking ended up carrying five copies of a 117KB
+	// protocol (prod conv ed674543).
+	for phase := 0; phase < 3; phase++ {
 		for level := agyLevelSuperseded; level <= agyLevelOldest; level++ {
 			exhausted := map[int]bool{}
 			inPhase := func(j int) bool {
-				if phase == 0 {
-					return j <= last // fetched before the customer's latest message
+				switch phase {
+				case 0:
+					return superseded[j] // a stale copy of a tool called again since
+				case 1:
+					return !superseded[j] && j <= last // live, but not from this turn
+				default:
+					return !superseded[j] && j > last // the state being acted on
 				}
-				return j > last // fetched by the turn being answered now
 			}
 			for i := 0; i < 300; i++ {
 				size := len(renderAgyTranscript(out, oldResultCap, readable))
 				if size <= budget {
-					level, phase = agyLevelRecords+1, 2 // done
+					level, phase = agyLevelRecords+1, 3 // done
 					break
 				}
 				over := size - budget
