@@ -2030,6 +2030,11 @@ var agyResolveFn = agyResolve
 //
 // Nothing here knows about bookings, slots or any business rule.
 func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResponse, *agyGenTrace, error) {
+	// When the dialogue itself has outgrown the window, replace its oldest part
+	// with a written brief and carry on from there (agy_compact.go).
+	if compacted, did := agyCompactIfNeeded(ctx, cfg, in); did {
+		in.Transcript = compacted
+	}
 	prompt, reduced := renderAgyPromptFitted(cfg, in.System, in.Temperature, in.Tools, in.Transcript)
 	trace := &agyGenTrace{Prompt: prompt}
 	model := firstNonEmpty(in.Model, "agy")
