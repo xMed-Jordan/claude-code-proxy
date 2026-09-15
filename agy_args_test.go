@@ -396,3 +396,19 @@ func TestHarnessPhrasesCoverTheEvaluationFraming(t *testing.T) {
 		}
 	}
 }
+
+// A request carrying attachments must never be served from the warm pool:
+// warm workers get the prompt but not the attachment directories, so they would
+// answer about a file they cannot open.
+func TestMediaRequestsNeverUseTheWarmPool(t *testing.T) {
+	if agyCanUseWarmPool(nil, nil) {
+		t.Fatal("a nil pool is not usable")
+	}
+	pool := &AgyWorkerPool{}
+	if agyCanUseWarmPool(pool, []string{"/tmp/agy-media-123"}) {
+		t.Fatal("a request with attachments must skip the warm pool")
+	}
+	if agyCanUseWarmPool(pool, []string{}) != pool.IsEnabled() {
+		t.Fatal("a request without attachments should follow the pool's own enabled state")
+	}
+}

@@ -1953,6 +1953,23 @@ func agyNote(alias string, stream bool) string {
 // it materializes media and runs agy on the flattened prompt as usual. A non-nil
 // error means the caller should surface it so the client's fallback (e.g. Vertex)
 // can take over.
+
+// agyCanUseWarmPool reports whether a request may be served from the warm pool.
+//
+// Warm workers are started ahead of time, with the tool-less connect-chat agent
+// and no attachment directories, and Execute only takes the prompt — addDirs is
+// passed to runAgyj on the cold path alone. So a request carrying media MUST NOT
+// go to a warm worker: it would answer about a PDF or an image it cannot open,
+// from the prompt text alone, and sound perfectly confident doing it.
+//
+// Today that is masked because the media model (PROXY_AGY_MEDIA_MODEL,
+// gemini-3.8-flash-high) differs from the pool model, so media never matches.
+// The masking is a coincidence and the obvious reaction to a slow media call —
+// warm the pool on the media model — would remove it.
+func agyCanUseWarmPool(pool *AgyWorkerPool, addDirs []string) bool {
+	return pool != nil && pool.IsEnabled() && len(addDirs) == 0
+}
+
 func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, modelAlias string) (agyResult, error) {
 	if transcript, ok, err := agyAudioTranscript(ctx, cfg, parts); err != nil {
 		return agyResult{}, fmt.Errorf("transcription error: %w", err)
@@ -1965,7 +1982,7 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	}
 	requestedModel := agyModelForRequest(cfg, modelAlias, len(addDirs) > 0)
 	pool := getAgyWorkerPool()
-	if pool != nil && pool.IsEnabled() {
+	if agyCanUseWarmPool(pool, addDirs) {
 		t0 := time.Now()
 		res, poolErr := pool.Execute(ctx, prompt, requestedModel)
 		switch {
