@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -254,159 +253,146 @@ func schemaRequired(t *testing.T, schema any) []string {
 	return out
 }
 
-// On the real catalog the repair must fire on the generated schemas and leave
-// the hand-written ones exactly as they came.
-func TestSchemaRepairOnTheRealConnectCatalog(t *testing.T) {
-	tools := agyRepairToolSchemas(agyCatalogFromAnthropic(loadConnectCatalog(t)))
-
-	// Generated: every parameter required, every description the same template.
-	for _, name := range []string{
-		"get_available_slots", "create_reservation", "create_multi_service_reservation",
-		"purchase_membership", "upgrade_membership", "create_customer", "add_item_to_cart",
-	} {
-		tool, ok := catalogByName(tools, name)
+// v0.20.0 dropped the required list of every schema whose list named all of its
+// parameters in boilerplate, reasoning that such a list states nothing. On the
+// real catalog that included get_available_slots.service_ids, which the tool's
+// instructions do require: over the five days it was live, the same model went
+// from sending service_ids on 27/27 slot searches to 579/643, and a search
+// without it is priced for the wrong session length, so the agent offered times
+// that could not then be booked (conv 58846, 2026-09-12). The caller's schema
+// must reach the model exactly as the caller wrote it.
+func TestCallerSchemasReachTheModelUnchanged(t *testing.T) {
+	raw := loadConnectCatalog(t)
+	tools := agyCatalogFromAnthropic(raw)
+	if len(tools) != len(raw) {
+		t.Fatalf("catalog lost tools: %d -> %d", len(raw), len(tools))
+	}
+	for i, tool := range tools {
+		props, required, ok := agySchemaParts(tool.Schema)
 		if !ok {
-			t.Fatalf("%s missing from the catalog", name)
+			continue
 		}
-		if req := schemaRequired(t, tool.Schema); len(req) != 0 {
-			t.Fatalf("%s kept a generated required list: %v", name, req)
-		}
-		// The parameters themselves must all survive — only the claim about
-		// them is dropped.
-		props, _, ok := agySchemaParts(tool.Schema)
-		if !ok {
-			t.Fatalf("%s lost its properties", name)
-		}
-		if name == "get_available_slots" {
-			for _, p := range []string{"from_date", "to_date", "branch_id", "service_ids", "appointment_type", "duration", "room_id"} {
-				if _, has := props[p]; !has {
-					t.Fatalf("get_available_slots lost parameter %s", p)
-				}
-			}
+		wantProps, wantRequired, _ := agySchemaParts(raw[i].InputSchema)
+		if len(props) != len(wantProps) || len(required) != len(wantRequired) {
+			t.Fatalf("%s: schema altered (props %d->%d, required %d->%d)",
+				tool.Name, len(wantProps), len(props), len(wantRequired), len(required))
 		}
 	}
-
-	// Hand-written: descriptions written for this tool, so the requirement is real.
-	for _, tc := range []struct {
-		name string
-		want []string
-	}{
-		{"save_memory", []string{"memory_type", "content"}},
-		{"delete_memory", []string{"memory_type", "search"}},
-		{"get_memory", []string{"memory_type"}},
-		{"get_tool_instructions", []string{"tool_code"}},
-		{"send_media", []string{"items"}},
-	} {
-		tool, ok := catalogByName(tools, tc.name)
-		if !ok {
-			t.Fatalf("%s missing from the catalog", tc.name)
-		}
-		got := schemaRequired(t, tool.Schema)
-		sort.Strings(got)
-		want := append([]string(nil), tc.want...)
-		sort.Strings(want)
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Fatalf("%s: a hand-written requirement was dropped: got %v want %v", tc.name, got, want)
-		}
-	}
-}
-
-// The invented value in production came from appointment_type being presented
-// as required. After the repair the catalog the model reads must not say so,
-// while still listing the parameter as available.
-func TestRepairedCatalogNoLongerDemandsTheInventedParameter(t *testing.T) {
-	tools := agyRepairToolSchemas(agyCatalogFromAnthropic(loadConnectCatalog(t)))
-	full := renderAgyToolCatalog(tools, nil, false)
-	if !strings.Contains(full, "appointment_type") {
-		t.Fatal("the parameter must still be offered")
-	}
-	if strings.Contains(full, `"required":["from_date"`) || strings.Contains(full, `"appointment_type","retouch_reservation_id"`) {
-		t.Fatalf("the generated required list survived into the prompt")
-	}
-	// Compact mode marks required parameters with a star; the generated ones
-	// must no longer carry it, the hand-written ones must.
-	compact := renderAgyToolCatalog(tools, map[string]bool{}, true)
-	for _, line := range strings.Split(compact, "\n") {
-		if strings.HasPrefix(line, "- get_available_slots ") && strings.Contains(line, "*") {
-			t.Fatalf("generated parameters still marked required: %s", line)
-		}
-		if strings.HasPrefix(line, "- save_memory ") && !strings.Contains(line, "*") {
-			t.Fatalf("a real requirement lost its marker: %s", line)
-		}
-	}
-}
-
-// The rule is about the shape of the catalog, not about Connect: a catalog of
-// hand-written schemas is never touched, however many parameters are required.
-func TestSchemaRepairLeavesHandWrittenCatalogsAlone(t *testing.T) {
-	tools := agyRepairToolSchemas(agyCatalogFromAnthropic([]anthropicTool{
-		{Name: "send_email", InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"to":      map[string]any{"type": "string", "description": "Recipient address."},
-				"subject": map[string]any{"type": "string", "description": "Subject line, kept under 80 characters."},
-			},
-			"required": []any{"to", "subject"},
-		}},
-		{Name: "create_ticket", InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"title":    map[string]any{"type": "string", "description": "One-line summary of the problem."},
-				"severity": map[string]any{"type": "string", "description": "One of sev1, sev2, sev3."},
-			},
-			"required": []any{"title", "severity"},
-		}},
-	}))
+	// The parameter the regression turned loose, spelled out.
+	var slots agyToolCatalog
 	for _, tool := range tools {
-		if len(schemaRequired(t, tool.Schema)) != 2 {
-			t.Fatalf("%s: a hand-written required list was dropped", tool.Name)
+		if tool.Name == "get_available_slots" {
+			slots = tool
 		}
 	}
-}
-
-// A generator's fingerprint is the wording repeating across tools, not any
-// particular words: the same shape in another vocabulary is repaired too.
-func TestSchemaRepairRecognisesAnyGenerator(t *testing.T) {
-	mk := func(name string, params ...string) anthropicTool {
-		props := map[string]any{}
-		var req []any
-		for _, p := range params {
-			props[p] = map[string]any{"type": "string", "description": "Champ " + p + " de la requête"}
-			req = append(req, p)
-		}
-		return anthropicTool{Name: name, InputSchema: map[string]any{"type": "object", "properties": props, "required": req}}
+	_, required, ok := agySchemaParts(slots.Schema)
+	if !ok || !required["service_ids"] {
+		t.Fatalf("service_ids must still reach the model as required: %v", required)
 	}
-	tools := agyRepairToolSchemas(agyCatalogFromAnthropic([]anthropicTool{
-		mk("reserver_creneau", "date", "duree", "salle"),
-		mk("annuler_creneau", "reservation_id"),
-	}))
-	for _, tool := range tools {
-		if req := schemaRequired(t, tool.Schema); len(req) != 0 {
-			t.Fatalf("%s: a generated list in another language survived: %v", tool.Name, req)
-		}
-		if props, _, ok := agySchemaParts(tool.Schema); !ok || len(props) == 0 {
-			t.Fatalf("%s lost its parameters", tool.Name)
-		}
-	}
-}
-
-// The repair is on by default and PROXY_AGY_SCHEMA_REPAIR=false turns it off,
-// which is also how the live A/B below was run.
-func TestSchemaRepairCanBeSwitchedOff(t *testing.T) {
-	tools := agyCatalogFromAnthropic(loadConnectCatalog(t))
+	// And it must survive into the prompt the model actually reads.
 	tr := agyTranscript{}
-	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnCustomer, Text: "شو المتاح بكرا؟"})
-
-	on := renderAgyPrompt(config{}, "You are Zeina.", nil, tools, tr)
-	off := renderAgyPrompt(config{AgySchemaRepairOff: true}, "You are Zeina.", nil, tools, tr)
-
-	if strings.Contains(on, `"appointment_type","retouch_reservation_id"`) {
-		t.Fatal("the generated required list survived with the repair on")
+	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnCustomer, Text: "بدي احجز فل بدي"})
+	if p := renderAgyPrompt(config{}, "You are Zeina.", nil, tools, tr); !strings.Contains(p, "service_ids") {
+		t.Fatal("service_ids is not in the rendered catalog")
 	}
-	if !strings.Contains(off, `"appointment_type","retouch_reservation_id"`) {
-		t.Fatal("switching the repair off must present the caller's schema unchanged")
+}
+
+// The reply a patient received on 2026-09-13 (conv 58921): an English paragraph
+// written to an imagined evaluator, glued in front of the correct Arabic answer.
+const leakedPreamble = "It looks like there's an active automated workflow / benchmark prompt structure being passed here without direct tool access to the clinic systems (the available tools provided in the environment are restricted to background task management). If you are evaluating or testing the assistant turn, here is the direct, compliant response for Zeina:\n***\n" +
+	"يا أهلا وسهلا! معك زينة مساعدتك الرقمية من Shalabi Clinics. عضوية Shalabi Pro بتغطي الجسم الكامل، وسعرها السنوي 180 دينار. بتحبي أحجزلك موعد؟"
+
+func arabicTranscript() agyTranscript {
+	tr := agyTranscript{}
+	tr.Turns = append(tr.Turns,
+		agyTurn{Kind: agyTurnCustomer, Text: "مرحبا حابة أعرف تفاصيل عضوية الليزر بلا حدود"},
+		agyTurn{Kind: agyTurnCustomer, Text: "كم جلسة الديرما بن للوجه"},
+	)
+	return tr
+}
+
+func TestForeignPreambleIsCaughtWithoutKnowingThePhrases(t *testing.T) {
+	tr := arabicTranscript()
+	if !agyReplyHasForeignPreamble(tr, leakedPreamble) {
+		t.Fatalf("the leak was not recognised by shape (longest latin run = %d)", agyLongestLatinRun(leakedPreamble))
 	}
-	if len(on) >= len(off) {
-		t.Fatalf("the repair should also shorten the catalog: on=%d off=%d", len(on), len(off))
+	// Ordinary replies to the same customer, including ones carrying English
+	// brand names, device names and a URL, must pass.
+	for _, ok := range []string{
+		"يا أهلا وسهلا بتول! معك زينة مساعدتك الرقمية من Shalabi Clinics. كيف بقدر أساعدك؟",
+		"موقعنا بفرع عمّان: الرابية - شارع صقلية. رابط الموقع: https://share.google/iVyVlotMOkDl9lzI4 بتحبي أثبتلك الموعد؟",
+		"بفرع عمّان عنا جهازين: Candela GentleMax Pro (أمريكي) بيعتمد موجة Alexandrite، و Duetto MT Evo (إيطالي) بتقنية مزدوجة بتدمج موجتي Alexandrite و Nd:YAG، ومناسب لكل درجات البشرة.",
+		"عضوية Shalabi Pro بتغطي الجسم الكامل 18 منطقة، وعندنا كمان Shalabi Light و Ultra و Max.",
+	} {
+		if agyReplyHasForeignPreamble(tr, ok) {
+			t.Fatalf("false positive on an ordinary reply (latin run %d): %s", agyLongestLatinRun(ok), ok)
+		}
+	}
+}
+
+// A customer who writes in English gets English answers; the check stands down.
+func TestForeignPreambleStandsDownForEnglishCustomers(t *testing.T) {
+	tr := agyTranscript{}
+	tr.Turns = append(tr.Turns, agyTurn{Kind: agyTurnCustomer,
+		Text: "Hello, I would like to know the details of the unlimited laser membership and the Dermapen sessions please."})
+	if agyReplyHasForeignPreamble(tr, leakedPreamble) {
+		t.Fatal("an English-speaking customer must not make English replies suspicious")
+	}
+	// And with no customer text at all there is nothing to compare against.
+	if agyReplyHasForeignPreamble(agyTranscript{}, leakedPreamble) {
+		t.Fatal("an empty transcript must not trigger the check")
+	}
+}
+
+// End to end: the leak is rejected and the retry produces a clean Arabic reply.
+func TestAgyRejectsTheForeignPreambleAndRecovers(t *testing.T) {
+	orig := agyResolveFn
+	defer func() { agyResolveFn = orig }()
+	var n int
+	agyResolveFn = func(_ context.Context, _ config, _ []mediaPart, _ string, _ string) (agyResult, error) {
+		n++
+		if n == 1 {
+			return agyResult{Ok: true, Response: leakedPreamble}, nil
+		}
+		return agyResult{Ok: true, Response: "يا أهلا وسهلا! عضوية Shalabi Pro سعرها السنوي 180 دينار. بتحبي أحجزلك موعد؟"}, nil
+	}
+	in := agyGenInput{
+		System:     "أنت زينة، مساعدة رقمية في عيادات شلبي. جاوبي الزبونة بالعربي.",
+		Tools:      []agyToolCatalog{{Name: "get_membership_plans", Schema: map[string]any{"type": "object"}}},
+		Transcript: arabicTranscript(),
+	}
+	resp, _, err := agyGenerate(context.Background(), config{}, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := agyResponseText(resp)
+	if strings.Contains(got, "benchmark") || strings.Contains(got, "evaluating") {
+		t.Fatalf("the preamble reached the customer: %q", got)
+	}
+	if !strings.Contains(got, "180") {
+		t.Fatalf("expected the corrected Arabic reply, got %q", got)
+	}
+}
+
+// The phrase list must also know this family, so the leak is caught twice over.
+func TestHarnessPhrasesCoverTheEvaluationFraming(t *testing.T) {
+	for _, s := range []string{
+		"It looks like there's an active automated workflow / benchmark prompt structure being passed here",
+		"without direct tool access to the clinic systems",
+		"the available tools provided in the environment are restricted",
+		"If you are evaluating or testing the assistant turn",
+	} {
+		if !agyHarnessLeakRe.MatchString(s) {
+			t.Fatalf("not detected as runtime talk: %q", s)
+		}
+	}
+	for _, s := range []string{
+		"أهلاً فيكِ، كيف بقدر أساعدك؟",
+		"Your appointment is confirmed for Thursday at 1 PM.",
+		"سعر جلسة الفل بدي 55 دينار.",
+	} {
+		if agyHarnessLeakRe.MatchString(s) {
+			t.Fatalf("false positive on an ordinary reply: %q", s)
+		}
 	}
 }

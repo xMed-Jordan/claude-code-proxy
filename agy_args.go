@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Tool schemas can mark a parameter required that the tool's own instructions
@@ -250,46 +251,9 @@ func agyStripRejectedArgs(rejections agyArgRejections, tool, argsJSON string) (s
 	return canonicalToolArgs(args), dropped
 }
 
-// A tool schema that marks every one of its parameters required, and describes
-// each of them with the same boilerplate the rest of the catalog uses, is not
-// stating a requirement — it is a generator that had nothing to say. Connect
-// builds one for every HTTP tool by scanning the request template for
-// {{placeholders}}: all of them land in `required`, each described as "Value for
-// X parameter". The tool's real instructions say the opposite for several of
-// them, so the model is told it MUST send a parameter nothing defines, and it
-// invents a value.
-//
-// Dropping such a list is what stops the invention at the source, before the
-// model drafts anything. The two conditions below are what make that safe, and
-// both are read off the catalog in front of us rather than from any knowledge of
-// this platform:
-//
-//   - Every parameter is required. A list naming all of them constrains nothing
-//     that leaving it out would not, so no information is lost by dropping it.
-//   - Every parameter's description is boilerplate: once the parameter's own
-//     name is removed, the same wording appears under other tools too. A
-//     description written for this tool is information; one shared with forty
-//     other tools is a template.
-//
-// Hand-written schemas fail the second test and keep their required lists:
-// across the 63 tools Connect sends, save_memory, get_tool_instructions,
-// send_media and get_memory all describe their parameters in their own words
-// and are left exactly as they came.
-
-// agyDescTemplate reduces a parameter description to the wording it shares with
-// other parameters: its own name blanked out, lowercased, whitespace collapsed.
-func agyDescTemplate(name, desc string) string {
-	d := strings.ToLower(strings.TrimSpace(desc))
-	if d == "" {
-		return ""
-	}
-	if n := strings.ToLower(strings.TrimSpace(name)); n != "" {
-		d = strings.ReplaceAll(d, n, "@")
-	}
-	return strings.Join(strings.Fields(d), " ")
-}
-
-// agySchemaParts pulls the properties map and required set out of a schema.
+// agySchemaParts pulls the properties map and required set out of a tool schema.
+// Used by the tests that lock down what the caller's schema must still say when
+// it reaches the model.
 func agySchemaParts(schema any) (map[string]any, map[string]bool, bool) {
 	m, ok := schema.(map[string]any)
 	if !ok {
@@ -315,86 +279,98 @@ func agySchemaParts(schema any) (map[string]any, map[string]bool, bool) {
 	return props, required, true
 }
 
-// agyPropDescription reads a property's description, whatever shape it arrived in.
-func agyPropDescription(def any) string {
-	m, ok := def.(map[string]any)
-	if !ok {
-		return ""
+// ---------------------------------------------------------------------------
+// Persona leak: the shape, not the words
+// ---------------------------------------------------------------------------
+
+// A model that has decided it is being evaluated writes to the evaluator first
+// and to the customer second, and the two audiences show up as two languages in
+// one message. Prod 2026-09-13 conv 58921 reached a patient as ~370 characters
+// of English — "It looks like there's an active automated workflow / benchmark
+// prompt structure being passed here without direct tool access to the clinic
+// systems … here is the direct, compliant response for Zeina:" — glued in front
+// of the correct Arabic answer. The phrase list did not have those words, and
+// never will have the next set.
+//
+// The shape is checkable without them: the customer has written only in one
+// script all conversation, and the reply carries a long uninterrupted passage in
+// a different one plus the real answer in theirs. Brand names, device names and
+// URLs are short; a paragraph addressed to somebody else is not. Nothing here
+// knows Arabic, English or any business domain — it compares the reply's scripts
+// against the customer's own.
+
+// agyForeignPreambleBytes is the shortest run of other-script prose worth
+// treating as a passage rather than a name. The leak was 370; the longest
+// legitimate run in the same clinic's replies (a maps URL, "Candela GentleMax
+// Pro", "Duetto MT Evo … Nd:YAG") is under 60.
+const agyForeignPreambleBytes = 200
+
+// agyMinAnswerLetters is how much of the customer's own script the reply must
+// also carry before a foreign passage counts as a preamble glued to an answer.
+const agyMinAnswerLetters = 40
+
+// agyScriptCounts returns how many letters of a text are Latin and how many
+// belong to some other alphabet. Digits, spaces and punctuation count as
+// neither, so they never tip the balance.
+func agyScriptCounts(s string) (latin, other int) {
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			continue
+		}
+		if r < unicode.MaxASCII || unicode.Is(unicode.Latin, r) {
+			latin++
+		} else {
+			other++
+		}
 	}
-	s, _ := m["description"].(string)
-	return s
+	return latin, other
 }
 
-// agyBoilerplateTemplates returns the description wordings that appear under
-// more than one tool, which is what makes them boilerplate rather than
-// documentation. An empty description says nothing either way and counts too.
-func agyBoilerplateTemplates(tools []agyToolCatalog) map[string]bool {
-	perTemplate := map[string]map[string]bool{}
-	for _, t := range tools {
-		props, _, ok := agySchemaParts(t.Schema)
-		if !ok {
+// agyLongestLatinRun measures the longest stretch of text that contains Latin
+// letters and no letters of any other script. Punctuation, digits and spaces
+// continue a run; a letter from another script ends it.
+func agyLongestLatinRun(s string) int {
+	best, cur := 0, 0
+	for _, r := range s {
+		if unicode.IsLetter(r) && !(r < unicode.MaxASCII || unicode.Is(unicode.Latin, r)) {
+			cur = 0
 			continue
 		}
-		for name, def := range props {
-			tpl := agyDescTemplate(name, agyPropDescription(def))
-			if perTemplate[tpl] == nil {
-				perTemplate[tpl] = map[string]bool{}
-			}
-			perTemplate[tpl][t.Name] = true
+		cur += utf8.RuneLen(r)
+		if cur > best {
+			best = cur
 		}
 	}
-	out := map[string]bool{"": true}
-	for tpl, tools := range perTemplate {
-		if len(tools) > 1 {
-			out[tpl] = true
-		}
-	}
-	return out
+	return best
 }
 
-// agyRepairToolSchemas drops the required list of every tool whose list names
-// all of its parameters and whose parameters are all described in boilerplate.
-// The properties themselves are untouched: the model still sees every parameter
-// the tool accepts, and the tool's own instructions still say which ones matter.
-func agyRepairToolSchemas(tools []agyToolCatalog) []agyToolCatalog {
-	if len(tools) == 0 {
-		return tools
-	}
-	boilerplate := agyBoilerplateTemplates(tools)
-	var repaired []string
-	out := make([]agyToolCatalog, len(tools))
-	copy(out, tools)
-	for i, t := range out {
-		props, required, ok := agySchemaParts(t.Schema)
-		if !ok || len(required) == 0 || len(required) != len(props) {
+// agyCustomerWritesNonLatin reports whether every customer message in this
+// conversation is written in a non-Latin script. A customer who writes in
+// English at all makes an English reply ordinary, and the check stands down.
+func agyCustomerWritesNonLatin(t agyTranscript) bool {
+	var latin, other int
+	for _, turn := range t.Turns {
+		if turn.Kind != agyTurnCustomer {
 			continue
 		}
-		informative := false
-		for name, def := range props {
-			if !boilerplate[agyDescTemplate(name, agyPropDescription(def))] {
-				informative = true
-				break
-			}
-		}
-		if informative {
-			continue
-		}
-		m := t.Schema.(map[string]any)
-		clone := make(map[string]any, len(m))
-		for k, v := range m {
-			if k == "required" {
-				continue
-			}
-			clone[k] = v
-		}
-		out[i].Schema = clone
-		repaired = append(repaired, t.Name)
+		l, o := agyScriptCounts(stripCustomerHeader(turn.Text))
+		latin += l
+		other += o
 	}
-	if len(repaired) > 0 {
-		sort.Strings(repaired)
-		log.Printf("[agy-schema] %d of %d tools marked every parameter required with boilerplate descriptions; dropped those lists so the model is not pushed to invent values (%s%s)",
-			len(repaired), len(tools), strings.Join(repaired[:min(4, len(repaired))], ", "),
-			map[bool]string{true: ", …"}[len(repaired) > 4])
+	// Enough of their words to judge, and overwhelmingly not Latin. Names and
+	// brand words they type in English are what the margin is for.
+	return other >= 20 && latin*4 < other
+}
+
+// agyReplyHasForeignPreamble reports whether a reply pairs a long passage in a
+// script the customer never writes with a real answer in the script they do —
+// the two-audiences shape of a leaked runtime preamble.
+func agyReplyHasForeignPreamble(t agyTranscript, reply string) bool {
+	if !agyCustomerWritesNonLatin(t) {
+		return false
 	}
-	return out
+	if _, other := agyScriptCounts(reply); other < agyMinAnswerLetters {
+		return false
+	}
+	return agyLongestLatinRun(reply) >= agyForeignPreambleBytes
 }

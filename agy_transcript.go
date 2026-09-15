@@ -1889,12 +1889,6 @@ func agyToolsInPlay(t agyTranscript) map[string]bool {
 // window, and reports which tools had their results shortened or dropped in the
 // process — the caller must exempt those from its "do not repeat a call" rules.
 func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) (string, map[string]bool) {
-	// A required list that names every parameter and describes none of them is
-	// a generator's default, not a requirement, and obeying it is what makes a
-	// model invent values (agy_args.go).
-	if !cfg.AgySchemaRepairOff {
-		tools = agyRepairToolSchemas(tools)
-	}
 	system = strings.TrimSpace(system)
 	tempDirective := buildAgyTempDirective(temp)
 	toolsPrompt := renderAgyToolCatalog(tools, nil, false)
@@ -2090,7 +2084,7 @@ func agyToolCallCap(cfg config) int {
 // please let me know how you would like me to assist with the code, tests, or
 // mock evaluations". This is about the harness, not about any business domain,
 // so the guard applies to every caller and every model.
-var agyHarnessLeakRe = regexp.MustCompile(`(?i)(development assistant|coding assistant|software (engineering )?assistant|ai development|development workspace|this workspace|internal prompt|system prompt|prompt or workflow|mock evaluation|as an ai (language )?model|i am an ai assistant (operating|running))`)
+var agyHarnessLeakRe = regexp.MustCompile(`(?i)(development assistant|coding assistant|software (engineering )?assistant|ai development|development workspace|this workspace|internal prompt|system prompt|prompt structure|prompt or workflow|automated workflow|mock evaluation|benchmark|assistant turn|tool access|the available tools|provided in the environment|if you are (evaluating|testing|developing|debugging)|evaluating or testing|as an ai (language )?model|i am an ai assistant (operating|running))`)
 
 // agyPersonaGuard reports whether replies are checked for that leak
 // (PROXY_AGY_PERSONA_GUARD, default on). It only applies when the caller gave a
@@ -2216,7 +2210,16 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		}
 		// A reply that talks about the runtime is never a customer turn.
 		if len(problems) == 0 && in.System != "" && agyPersonaGuard(cfg) && !hasAnyToolCall(resp.Output) {
-			if txt := agyResponseText(resp); agyHarnessLeakRe.MatchString(txt) {
+			txt := agyResponseText(resp)
+			leaked := agyHarnessLeakRe.MatchString(txt)
+			if !leaked && agyReplyHasForeignPreamble(in.Transcript, txt) {
+				// No phrase matched, but the reply is addressed to two
+				// audiences at once: a long passage in a script this customer
+				// never writes, in front of the answer in the one they do.
+				log.Printf("[agy-loop] reply glued a %d-byte passage in another script onto the customer's answer; rejecting", agyLongestLatinRun(txt))
+				leaked = true
+			}
+			if leaked {
 				log.Printf("[agy-loop] reply described the runtime instead of answering the customer; rejecting: %s", truncateString(strings.Join(strings.Fields(txt), " "), 200))
 				problems = append(problems, "your reply described the runtime you are executing in, or the message you were given, instead of answering. You ARE the assistant defined in the SYSTEM INSTRUCTIONS above, this is a real conversation with a real customer, and the customer sees exactly what you write. Reply to the customer, in their language, as that assistant — never mention prompts, workspaces, development, testing or being a development assistant")
 				hardProblem = true
