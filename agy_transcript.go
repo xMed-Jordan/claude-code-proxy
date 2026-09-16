@@ -800,6 +800,7 @@ func renderAgyToolCatalog(tools []agyToolCatalog, detailed map[string]bool, comp
 	b.WriteString("- After you emit tool calls, STOP. The system runs them and sends you their results in the transcript. Never write or guess a tool result yourself.\n")
 	b.WriteString("- Use only tool names listed here and only the parameters in each tool's input schema.\n")
 	b.WriteString("- Send a parameter only when you have a real value for it: from the customer, from a tool result, or from the tool's own instructions. If a parameter is marked required but nothing gives you a value for it, send an empty string. Never invent a value, guess one, or fill a parameter with a plausible-looking placeholder — a made-up value is rejected by the tool's API and the call fails.\n")
+	b.WriteString("- An empty string is for a parameter you genuinely have no value for. It is not a way to simplify a call: if you sent a value for a parameter earlier in this conversation and it still applies, send that same value again. Blanking it out changes what the tool is asked, and its answer will no longer match the question you meant.\n")
 	b.WriteString("- The list below is the complete set of tools you have. Do not use shell commands, files, code execution, web search or any other capability of the runtime you are running in.\n")
 	b.WriteString("- When no (further) tool call is needed, answer the customer in plain text with no <tool_call> block.\n\n")
 	b.WriteString("Available tools:\n\n")

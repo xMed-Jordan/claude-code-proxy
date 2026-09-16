@@ -412,3 +412,21 @@ func TestMediaRequestsNeverUseTheWarmPool(t *testing.T) {
 		t.Fatal("a request without attachments should follow the pool's own enabled state")
 	}
 }
+
+// The empty-string escape hatch must not read as "blank anything you are unsure
+// of". Prod 2026-09-16 conv 59532: the agent searched slots with service_ids="1",
+// then re-searched the same day with service_ids="" — the server then priced a
+// default session length, offered 10:00, and the 60-minute booking was refused
+// because 10:00 was never a real start for that service.
+func TestCatalogRuleKeepsValuesAlreadyInUse(t *testing.T) {
+	out := renderAgyToolCatalog([]agyToolCatalog{{Name: "get_available_slots", Description: "Get slots."}}, nil, false)
+	for _, want := range []string{
+		"send an empty string",        // the hatch still exists
+		"genuinely have no value for", // but it is narrowed
+		"send that same value again",  // and re-use is spelled out
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("tool-calling rules missing %q:\n%s", want, out)
+		}
+	}
+}
