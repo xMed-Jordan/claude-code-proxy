@@ -2136,6 +2136,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// a reply carrying one is reading the clinic's own records to the customer
 	// (agy_disclosure.go).
 	internalOnly := agyInternalOnlyValues(in.Transcript)
+	// Every clock time this conversation's tools have mentioned, so a booking
+	// cannot start at one none of them ever offered (agy_slots.go).
+	offeredTimes := agyTimesToolsMentioned(in.Transcript)
 
 	var notes []string
 	var lastResp responsesResponse
@@ -2189,6 +2192,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				// parameter was for (agy_truth.go).
 				if shapes := agyArgShapeProblems(argKinds, item.Name, item.Arguments); len(shapes) > 0 {
 					problems = append(problems, shapes...)
+					hardProblem = true
+					continue
+				}
+				// Booking a start time no tool ever offered. Caught here rather
+				// than left to the API, so the turn still has room to come back
+				// to the customer with a time that exists (agy_slots.go).
+				if bad := agyUnofferedStarts(offeredTimes, item.Arguments); len(bad) > 0 && agyTruthGuard(cfg) {
+					log.Printf("[agy-slots] %s: %s was never offered by any tool result in this conversation; rejecting", item.Name, strings.Join(bad, ", "))
+					problems = append(problems, fmt.Sprintf("you are calling %s with %s, but no tool result in this conversation ever offered that start time. The times the tools did give you are: %s. Do not book a time the customer suggested unless a tool listed it — tell her that time is not free and offer her the ones that are", item.Name, strings.Join(bad, ", "), agySomeOfferedTimes(offeredTimes, 12)))
 					hardProblem = true
 					continue
 				}
