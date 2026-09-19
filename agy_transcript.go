@@ -2127,6 +2127,11 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// invented parameter is dropped rather than retried until the turn dies
 	// (agy_args.go).
 	rejections := agyRejectedArgs(in.Transcript)
+	// The container shape each tool's own instructions document for each of its
+	// parameters. Harvested from the full transcript, so it survives the
+	// shortening the prompt fitter may apply to those same results
+	// (agy_truth.go).
+	argKinds := agyDocumentedArgKinds(in.Transcript)
 
 	var notes []string
 	var lastResp responsesResponse
@@ -2172,6 +2177,16 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				if cleaned, dropped := agyStripRejectedArgs(rejections, item.Name, item.Arguments); len(dropped) > 0 {
 					log.Printf("[agy-args] %s: dropped %s — this conversation's API already refused that value", item.Name, strings.Join(dropped, ", "))
 					item.Arguments = cleaned
+				}
+				// A parameter sent as a list where the tool documents a keyed
+				// object (or the reverse) is not a call that fails loudly: the
+				// API may read it positionally, find nothing under the key it
+				// wanted, and succeed having silently skipped what that
+				// parameter was for (agy_truth.go).
+				if shapes := agyArgShapeProblems(argKinds, item.Name, item.Arguments); len(shapes) > 0 {
+					problems = append(problems, shapes...)
+					hardProblem = true
+					continue
 				}
 				// A tool whose result the system shortened is exempt from the
 				// repeat rules: the transcript no longer holds what it is being
@@ -2227,6 +2242,17 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				kept = kept[:0]
 			}
 		}
+		// A reply that tells the customer an action was carried out, when the
+		// call that would have carried it out failed in this very turn.
+		if len(problems) == 0 {
+			if unperformed := agyReplyClaimsUnperformed(cfg, in.Transcript, resp); len(unperformed) > 0 {
+				log.Printf("[agy-loop] reply claims an action that %s did not perform this turn; rejecting: %s",
+					strings.Join(unperformed, ", "), truncateString(strings.Join(strings.Fields(agyResponseText(resp)), " "), 200))
+				problems = append(problems, fmt.Sprintf("your reply tells the customer that something has been done, but %s failed in this turn and nothing was carried out. The customer acts on what you write. Either call the tool again with corrected arguments, or tell the customer plainly that it did not go through and what you need from them — never describe a failed action as completed", strings.Join(unperformed, ", ")))
+				hardProblem = true
+				kept = kept[:0]
+			}
+		}
 		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 		trace.FinalPrompt = p
 		if len(problems) == 0 {
@@ -2241,7 +2267,8 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// Retries exhausted: keep whatever is usable from the last draft, unless it
 	// is a reply that broke persona — that must never reach a customer.
 	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") &&
-		!agyReplyBreaksPersona(cfg, in.System, lastResp) {
+		!agyReplyBreaksPersona(cfg, in.System, lastResp) &&
+		len(agyReplyClaimsUnperformed(cfg, in.Transcript, lastResp)) == 0 {
 		log.Printf("[agy-loop] retries exhausted; returning the last draft without the rejected calls")
 		return lastResp, trace, nil
 	}
@@ -2259,6 +2286,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 
 	// Last resort: ask for a plain-text reply using the results already present.
 	p := prompt + "\n\n### CORRECTION FROM THE SYSTEM (not from the customer)\n\nYour previous drafts only repeated tool calls whose results are already in the transcript. Do NOT call any tool now. Using the tool results above, reply to the customer in plain text, following the system instructions."
+	if unperformed := in.Transcript.unperformedThisTurn(); agyTruthGuard(cfg) && len(unperformed) > 0 {
+		p += fmt.Sprintf(" %s failed in this turn and nothing it would have done was carried out — your reply must not say otherwise.", strings.Join(unperformed, ", "))
+	}
 	t0 := time.Now()
 	res, err := agyResolveWithFormatRetry(ctx, cfg, in.Media, p, in.Model)
 	if err != nil {
@@ -2286,6 +2316,14 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		// caller's own fallback chain will serve the turn with another model.
 		log.Printf("[agy-loop] every attempt described the runtime instead of answering; failing the request so the caller can fall back")
 		return responsesResponse{}, trace, fmt.Errorf("agy replied as the runtime instead of the assistant defined in the request")
+	}
+	if unperformed := agyReplyClaimsUnperformed(cfg, in.Transcript, resp); len(unperformed) > 0 {
+		// Everything has been tried and the model still reports a failed action
+		// as done. A customer who is told her appointment is booked stops
+		// checking, so fail the request instead: the caller's fallback chain
+		// serves the turn, and its safety net says nothing rather than a lie.
+		log.Printf("[agy-loop] every attempt claimed an action %s did not perform; failing the request so the caller can fall back", strings.Join(unperformed, ", "))
+		return responsesResponse{}, trace, fmt.Errorf("agy reported %s as completed although it failed in this turn", strings.Join(unperformed, ", "))
 	}
 	log.Printf("[agy-loop] forced plain-text reply (%d chars)", len(agyResponseText(resp)))
 	return resp, trace, nil
