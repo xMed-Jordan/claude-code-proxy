@@ -2132,6 +2132,10 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// shortening the prompt fitter may apply to those same results
 	// (agy_truth.go).
 	argKinds := agyDocumentedArgKinds(in.Transcript)
+	// Values that exist in this conversation only inside a staff annotation, so
+	// a reply carrying one is reading the clinic's own records to the customer
+	// (agy_disclosure.go).
+	internalOnly := agyInternalOnlyValues(in.Transcript)
 
 	var notes []string
 	var lastResp responsesResponse
@@ -2242,6 +2246,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				kept = kept[:0]
 			}
 		}
+		// A reply that reads the clinic's own staff notes back to the customer.
+		if len(problems) == 0 {
+			if leaked := agyReplyLeaksInternal(cfg, internalOnly, resp); len(leaked) > 0 {
+				log.Printf("[agy-loop] reply disclosed staff-record value(s) %s; rejecting", strings.Join(leaked, ", "))
+				problems = append(problems, fmt.Sprintf("your reply gives the customer %s, which exists in this conversation only inside a staff note on her record. Those notes are written by the team for the team — settings, measurements, skipped areas, corrections, mistakes. Read them to decide what to do, never repeat, quote or translate what is in them. Tell her those details are in her file and the clinic can go through them with her", strings.Join(leaked, ", ")))
+				hardProblem = true
+				kept = kept[:0]
+			}
+		}
 		// A reply that tells the customer an action was carried out, when the
 		// call that would have carried it out failed in this very turn.
 		if len(problems) == 0 {
@@ -2268,7 +2281,8 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// is a reply that broke persona — that must never reach a customer.
 	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") &&
 		!agyReplyBreaksPersona(cfg, in.System, lastResp) &&
-		len(agyReplyClaimsUnperformed(cfg, in.Transcript, lastResp)) == 0 {
+		len(agyReplyClaimsUnperformed(cfg, in.Transcript, lastResp)) == 0 &&
+		len(agyReplyLeaksInternal(cfg, internalOnly, lastResp)) == 0 {
 		log.Printf("[agy-loop] retries exhausted; returning the last draft without the rejected calls")
 		return lastResp, trace, nil
 	}
@@ -2316,6 +2330,12 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		// caller's own fallback chain will serve the turn with another model.
 		log.Printf("[agy-loop] every attempt described the runtime instead of answering; failing the request so the caller can fall back")
 		return responsesResponse{}, trace, fmt.Errorf("agy replied as the runtime instead of the assistant defined in the request")
+	}
+	if leaked := agyReplyLeaksInternal(cfg, internalOnly, resp); len(leaked) > 0 {
+		// A staff note read out to a patient cannot be taken back, and the
+		// caller's safety net saying nothing is the better outcome.
+		log.Printf("[agy-loop] every attempt disclosed staff-record value(s) %s; failing the request so the caller can fall back", strings.Join(leaked, ", "))
+		return responsesResponse{}, trace, fmt.Errorf("agy disclosed staff-record values (%s) to the customer", strings.Join(leaked, ", "))
 	}
 	if unperformed := agyReplyClaimsUnperformed(cfg, in.Transcript, resp); len(unperformed) > 0 {
 		// Everything has been tried and the model still reports a failed action
