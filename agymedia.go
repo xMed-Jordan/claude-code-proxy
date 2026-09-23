@@ -598,6 +598,76 @@ func safeMediaName(filename string, i int, ext string) string {
 	return fmt.Sprintf("%d-%s", i, base)
 }
 
+// agyMediaViewEligible reports whether every item is a directly viewable
+// image — the only case the view-only agent (whose sole tool is view_file)
+// is proven to handle. bmp/tif/tiff/heic are NOT included: agy's view_file
+// has not been confirmed to render them, so they stay on the default-agent
+// path rather than silently failing inside a tool-less agent. A PDF, even
+// though it is "just" a document, is excluded here too — it needs its own
+// eligibility gate (rendering, in a later change) before it can go view-only.
+func agyMediaViewEligible(items []mediaItem) bool {
+	if len(items) == 0 {
+		return false
+	}
+	for _, it := range items {
+		if !isViewEligibleImage(it) {
+			return false
+		}
+	}
+	return true
+}
+
+// isViewEligibleImage reports whether a single materialized item is an image
+// in one of the extensions view_file is proven to open directly.
+func isViewEligibleImage(it mediaItem) bool {
+	if it.Kind != "image" {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(it.Path)) {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif":
+		return true
+	}
+	return false
+}
+
+// mediaItemKinds renders the distinct kinds present in items, in first-seen
+// order, for a one-line log ("pdf,audio") — never file names or content.
+func mediaItemKinds(items []mediaItem) string {
+	seen := map[string]bool{}
+	var order []string
+	for _, it := range items {
+		if it.Kind != "" && !seen[it.Kind] {
+			seen[it.Kind] = true
+			order = append(order, it.Kind)
+		}
+	}
+	return strings.Join(order, ",")
+}
+
+// buildMediaViewPrompt is the prompt used for a view-only agent run
+// (agyMediaViewEligible). Unlike buildMediaPrompt it never mentions running
+// code — the agent it is sent to has no tool but view_file.
+func buildMediaViewPrompt(items []mediaItem, userText string) string {
+	var b strings.Builder
+	b.WriteString("The following file(s) are already placed on disk for you to look at. Open each one exactly once with view_file and answer the request below using what you actually see in them:\n")
+	for _, it := range items {
+		b.WriteString("- ")
+		b.WriteString(it.Path)
+		if it.Name != "" && it.Name != filepath.Base(it.Path) {
+			b.WriteString(" — " + it.Name)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("view_file is your only tool: you cannot run commands or code, edit, crop, rotate, enlarge or convert an image, list directories, or search, and you must never open any path not listed above. If an image is sideways or upside down, read it as it is. If part of it is too small or unclear to read, say so instead of trying to work around it.\n")
+	b.WriteString("\nRequest: ")
+	if strings.TrimSpace(userText) != "" {
+		b.WriteString(userText)
+	} else {
+		b.WriteString("Describe the contents of the attached file(s).")
+	}
+	return b.String()
+}
+
 func buildMediaPrompt(items []mediaItem, userText string) string {
 	var b strings.Builder
 	b.WriteString("Read and analyze the following local file(s) by opening them with your tools ")

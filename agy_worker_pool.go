@@ -525,15 +525,11 @@ func resolveAgyCLIPath(cfg config) string {
 	return name
 }
 
-// runAgyStreamJSON executes a single prompt non-interactively using agy's stream-json protocol
-// over stdin and stdout. This completely avoids OS command-line argument limits (MAX_ARG_STRLEN / E2BIG)
-// for large prompts and supports directories passed via --add-dir.
-func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, addDirs []string) (agyResult, error) {
-	bin := resolveAgyCLIPath(cfg)
-	if bin == "" {
-		return agyResult{}, errors.New("agy binary not found")
-	}
-
+// agyStreamJSONArgs builds the argv for a stream-json agy invocation. Pure
+// (no I/O) so the argument order/shape can be tested directly: model (if
+// set), then agentArgs verbatim (nil = agy's own default agent), then every
+// non-blank addDirs entry as its own --add-dir flag.
+func agyStreamJSONArgs(model string, addDirs, agentArgs []string) []string {
 	args := []string{
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
@@ -543,12 +539,26 @@ func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, add
 	if m := strings.TrimSpace(model); m != "" {
 		args = append(args, "--model", m)
 	}
-	args = append(args, agyAgentArgs(cfg, len(addDirs) > 0)...)
+	args = append(args, agentArgs...)
 	for _, d := range addDirs {
 		if d = strings.TrimSpace(d); d != "" {
 			args = append(args, "--add-dir", d)
 		}
 	}
+	return args
+}
+
+// runAgyStreamJSON executes a single prompt non-interactively using agy's stream-json protocol
+// over stdin and stdout. This completely avoids OS command-line argument limits (MAX_ARG_STRLEN / E2BIG)
+// for large prompts and supports directories passed via --add-dir. agentArgs is the --agent
+// selection to use verbatim (nil = agy's own default agent for the run).
+func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, addDirs, agentArgs []string) (agyResult, error) {
+	bin := resolveAgyCLIPath(cfg)
+	if bin == "" {
+		return agyResult{}, errors.New("agy binary not found")
+	}
+
+	args := agyStreamJSONArgs(model, addDirs, agentArgs)
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = os.TempDir()

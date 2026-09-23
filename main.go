@@ -132,6 +132,7 @@ type config struct {
 	AgyMediaMaxTotal   int64         // max total bytes materialized per request
 	AgyMediaAllowURLs  bool          // allow downloading media from remote URLs
 	AgyMediaRetention  time.Duration // keep materialized files this long for reuse
+	AgyMediaAgent      string        // PROXY_AGY_MEDIA_AGENT — agy agent for a media run whose attachments are all view-eligible (agyMediaViewEligible); "connect-media-view" (default, self-installed, view_file only) or "" for agy's default coding agent (rollback switch, no rebuild needed)
 	AgyImage           bool          // enable the agy image-generation endpoint
 	AgyImageDir        string        // served root for generated images ("" → temp)
 	AgyImageModel      string        // default Antigravity model for image generation
@@ -829,6 +830,7 @@ func loadConfig() config {
 		AgyMediaMaxTotal:   parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
 		AgyMediaAllowURLs:  envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
 		AgyMediaRetention:  parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
+		AgyMediaAgent:      strings.TrimSpace(getenv("PROXY_AGY_MEDIA_AGENT", agyMediaViewAgentName)),
 		AgyImage:           envFlag("PROXY_AGY_IMAGE", true),
 		AgyImageDir:        strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
 		AgyImageModel:      strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
