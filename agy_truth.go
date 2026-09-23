@@ -254,18 +254,32 @@ func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // is not listed: the retry did the work.
 func (t *agyTranscript) unperformedThisTurn() []string {
 	failed, succeeded := map[string]bool{}, map[string]bool{}
-	start := t.lastCustomerIndex() + 1
+	start := t.currentTurnOpen() + 1
 	for i := start; i < len(t.Turns); i++ {
 		tt := t.Turns[i]
 		if tt.Kind != agyTurnToolCall || tt.Tool == "" {
 			continue
 		}
+		// Calls made together come before all of their results. With ids a
+		// result is found past its sibling calls; without them only a result
+		// right behind the call can be its own.
+		pastSibling := false
 		for j := i + 1; j < len(t.Turns); j++ {
 			r := t.Turns[j]
-			if r.Kind == agyTurnToolCall || r.Kind == agyTurnCustomer {
+			if r.Kind == agyTurnCustomer {
 				break
 			}
-			if r.Kind != agyTurnToolResult || (r.CallID != "" && tt.CallID != "" && r.CallID != tt.CallID) {
+			if r.Kind == agyTurnToolCall {
+				if tt.CallID == "" {
+					break
+				}
+				pastSibling = true
+				continue
+			}
+			if r.Kind != agyTurnToolResult {
+				continue
+			}
+			if tt.CallID != "" && r.CallID != tt.CallID && (r.CallID != "" || pastSibling) {
 				continue
 			}
 			var parsed any

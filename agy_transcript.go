@@ -123,7 +123,7 @@ func (t *agyTranscript) addCustomer(text string) {
 	if text == "" {
 		return
 	}
-	if strings.HasPrefix(text, "[AUTO-CONTEXT") || strings.HasPrefix(text, "[SYSTEM ERROR") || strings.HasPrefix(text, "[SYSTEM NOTE") {
+	if strings.HasPrefix(text, "[AUTO-CONTEXT") || strings.HasPrefix(text, "[SYSTEM ERROR") || strings.HasPrefix(text, "[SYSTEM NOTE") || agySteeringNoteRe.MatchString(text) {
 		t.Turns = append(t.Turns, agyTurn{Kind: agyTurnSystemNote, Text: text})
 		return
 	}
@@ -277,11 +277,70 @@ func (t *agyTranscript) lastCustomerIndex() int {
 	return -1
 }
 
-// currentTurnCalls returns the tool calls made since the customer's latest
-// message, i.e. the calls of the turn the model is currently completing.
+// agySteeringNoteRe matches the note Connect puts in front of customer messages
+// it folds into a turn that is still running ("steering"): "[SYSTEM] The
+// customer sent 1 more message(s) while you were still working. They are
+// included below. Answer the whole conversation in ONE reply …". It is the
+// system talking, not the customer.
+var agySteeringNoteRe = regexp.MustCompile(`^\[SYSTEM\] The customer sent \d+ more message\(s\) while you were still working`)
+
+// currentTurnOpen returns the index of the customer message that opened the
+// turn the model is completing (-1 if none) — usually the latest one. But a
+// customer who writes again while a turn is still running does not start a new
+// turn: Connect appends the message after the latest tool result, behind a
+// steering note, and asks for ONE reply to the original request and the
+// addition. Until the model answers, everything it did before that message is
+// still this turn's work, a booking that failed included. Prod 2026-09-23 conv
+// 61071: create_reservation failed, the customer then asked about a price, and
+// "تم تثبيت موعدك" went out because the failure now sat before "the customer's
+// latest message" — outside every check that looks at the current turn.
+func (t *agyTranscript) currentTurnOpen() int {
+	open := t.lastCustomerIndex()
+	for open > 0 {
+		i := open - 1
+		for i >= 0 && t.Turns[i].Kind == agyTurnCustomer {
+			i--
+		}
+		if i < 0 || t.Turns[i].Kind != agyTurnSystemNote || !agySteeringNoteRe.MatchString(t.Turns[i].Text) {
+			return open
+		}
+		prev := -1
+		for j := i - 1; j >= 0; j-- {
+			if t.Turns[j].Kind == agyTurnCustomer {
+				prev = j
+				break
+			}
+		}
+		if prev < 0 {
+			return open
+		}
+		open = prev
+	}
+	return open
+}
+
+// currentTurnCustomerTexts returns what the customer wrote in the turn the
+// model is completing, oldest first: the message that opened it and any folded
+// in while it ran.
+func (t *agyTranscript) currentTurnCustomerTexts() []string {
+	open := t.currentTurnOpen()
+	if open < 0 {
+		return nil
+	}
+	var out []string
+	for i := open; i < len(t.Turns); i++ {
+		if t.Turns[i].Kind == agyTurnCustomer {
+			out = append(out, strings.Join(strings.Fields(stripCustomerHeader(t.Turns[i].Text)), " "))
+		}
+	}
+	return out
+}
+
+// currentTurnCalls returns the tool calls made since the customer's message
+// opened the turn the model is currently completing.
 func (t *agyTranscript) currentTurnCalls() []agyTurn {
 	var out []agyTurn
-	for i := t.lastCustomerIndex() + 1; i < len(t.Turns); i++ {
+	for i := t.currentTurnOpen() + 1; i < len(t.Turns); i++ {
 		if t.Turns[i].Kind == agyTurnToolCall {
 			out = append(out, t.Turns[i])
 		}
@@ -303,7 +362,7 @@ func (t *agyTranscript) calledThisTurn(name string, args any) bool {
 
 // agyToolStat summarises one tool's activity in the current turn.
 type agyToolStat struct {
-	Count            int  // calls made since the customer's latest message
+	Count            int  // calls made in the current turn
 	IdenticalResults bool // ≥2 calls returned byte-identical output (args don't matter)
 }
 
@@ -313,7 +372,7 @@ type agyToolStat struct {
 func (t *agyTranscript) currentTurnToolStats() map[string]agyToolStat {
 	stats := map[string]agyToolStat{}
 	results := map[string][]string{}
-	start := t.lastCustomerIndex() + 1
+	start := t.currentTurnOpen() + 1
 	for i := start; i < len(t.Turns); i++ {
 		tt := t.Turns[i]
 		if tt.Kind != agyTurnToolCall {
@@ -364,7 +423,7 @@ var agyResultHTTPErrorRe = regexp.MustCompile(`"status":\s*"?([45]\d\d)`)
 // availability). Purely mechanical: nothing here knows what the tool does.
 func (t *agyTranscript) currentTurnCallOutcomes() []agyCallOutcome {
 	var out []agyCallOutcome
-	for i := t.lastCustomerIndex() + 1; i < len(t.Turns); i++ {
+	for i := t.currentTurnOpen() + 1; i < len(t.Turns); i++ {
 		tt := t.Turns[i]
 		if tt.Kind != agyTurnToolCall {
 			continue
@@ -434,7 +493,7 @@ func toolResultFailure(result string) string {
 // 2xx status in the result envelope). Used to word the repeat correction.
 func (t *agyTranscript) currentTurnCallSucceeded(name string, args any) bool {
 	want := canonicalToolArgs(args)
-	for i := t.lastCustomerIndex() + 1; i < len(t.Turns); i++ {
+	for i := t.currentTurnOpen() + 1; i < len(t.Turns); i++ {
 		tt := t.Turns[i]
 		if tt.Kind != agyTurnToolCall || tt.Tool != name || tt.Args != want {
 			continue
@@ -457,9 +516,10 @@ func (t *agyTranscript) currentTurnCallSucceeded(name string, args any) bool {
 }
 
 // previousAssistantText returns the assistant's last customer-facing message
-// before the customer's latest message ("" when there is none).
+// before the customer's message that opened the current turn ("" when there is
+// none).
 func (t *agyTranscript) previousAssistantText() string {
-	li := t.lastCustomerIndex()
+	li := t.currentTurnOpen()
 	for i := li - 1; i >= 0; i-- {
 		if t.Turns[i].Kind == agyTurnAssistant {
 			return t.Turns[i].Text
@@ -471,11 +531,11 @@ func (t *agyTranscript) previousAssistantText() string {
 	return ""
 }
 
-// executedToolSummary lists the tools executed before the customer's latest
-// message as "name args" lines (deduplicated, with a repeat count), so the
+// executedToolSummary lists the tools executed before the current turn opened
+// as "name args" lines (deduplicated, with a repeat count), so the
 // model can see what it already knows without re-reading the whole transcript.
 func (t *agyTranscript) executedToolSummary() []string {
-	li := t.lastCustomerIndex()
+	li := t.currentTurnOpen()
 	reduced := t.reducedTools()
 	type key struct{ tool, args string }
 	counts := map[key]int{}
@@ -1082,6 +1142,11 @@ const defaultAgyPromptBudget = 186000
 // and carries the note saying it is incomplete and may be fetched again.
 const agyMinResultBytes = 400
 
+// agyKeepFailureBytes is the largest failed result the fitter never reduces.
+// Error envelopes are a few hundred bytes; an error page bigger than this is
+// compacted like any other result.
+const agyKeepFailureBytes = 4096
+
 // agyMinTranscriptBytes is the room the transcript must get before the tool
 // catalog is compacted to make space.
 const agyMinTranscriptBytes = 30000
@@ -1561,9 +1626,21 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 	}
 	out := t
 	out.Turns = append([]agyTurn(nil), t.Turns...)
-	last := out.lastCustomerIndex()
+	last := out.currentTurnOpen()
 	// Which results are stale copies of a newer one (agySupersededResults).
 	superseded := agySupersededResults(out.Turns)
+	// A failed call's result is a few hundred bytes that say what did NOT
+	// happen. Nothing can rebuild it, and once it is gone the model reads the
+	// dropped-result note ("the call above did run") as success and the
+	// FAILED mark disappears from the state block. Prod 2026-09-23 conv 61071:
+	// create_reservation's 739-byte refusal was dropped to fit and the reply
+	// confirmed the booking. Only a stale copy (phase 0) may lose one.
+	failure := map[int]bool{}
+	for j, tt := range out.Turns {
+		if tt.Kind == agyTurnToolResult && len(tt.Text) <= agyKeepFailureBytes && toolResultFailure(tt.Text) != "" {
+			failure[j] = true
+		}
+	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
 	// Three phases, and the order is the whole design. What gets spent first is
 	// decided by how reconstructible it is, which needs no knowledge of what any
@@ -1588,9 +1665,9 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 				case 0:
 					return superseded[j] // a stale copy of a tool called again since
 				case 1:
-					return !superseded[j] && j <= last // live, but not from this turn
+					return !superseded[j] && !failure[j] && j <= last // live, but not from this turn
 				default:
-					return !superseded[j] && j > last // the state being acted on
+					return !superseded[j] && !failure[j] && j > last // the state being acted on
 				}
 			}
 			for i := 0; i < 300; i++ {
@@ -1698,7 +1775,7 @@ func renderAgyTranscript(t agyTranscript, oldResultCap int, readable bool) strin
 	if len(t.Turns) == 0 {
 		return ""
 	}
-	last := t.lastCustomerIndex()
+	last := t.currentTurnOpen()
 	var b strings.Builder
 	b.WriteString("### CONVERSATION SO FAR\n\n")
 	b.WriteString("Transcript between the customer and you (the assistant), oldest first. \"You called tool\" entries are tool calls you made earlier, and \"Result of your … call\" entries are the complete original outputs of those calls (not summaries). \"System note\" entries come from the system, not from the customer, and the customer cannot see them.\n\n")
@@ -1798,7 +1875,7 @@ func renderAgyStatePreface(t agyTranscript, hasTools bool) string {
 			b.WriteString(".\n")
 		}
 		if calls := t.currentTurnCallOutcomes(); len(calls) > 0 {
-			b.WriteString("In the CURRENT turn (since the customer's latest message) you have already called, with their results in the transcript: ")
+			b.WriteString("In the CURRENT turn (since the customer's message you are answering) you have already called, with their results in the transcript: ")
 			parts := make([]string, 0, len(calls))
 			failed := 0
 			for _, c := range calls {
@@ -1822,10 +1899,20 @@ func renderAgyStatePreface(t agyTranscript, hasTools bool) string {
 		b.WriteString(truncateString(strings.Join(strings.Fields(prev), " "), 400))
 		b.WriteString("\"\n")
 	}
-	if li := t.lastCustomerIndex(); li >= 0 {
+	switch msgs := t.currentTurnCustomerTexts(); {
+	case len(msgs) == 1:
 		b.WriteString("The customer's reply you are answering now: \"")
-		b.WriteString(truncateString(strings.Join(strings.Fields(stripCustomerHeader(t.Turns[li].Text)), " "), 400))
+		b.WriteString(truncateString(msgs[0], 400))
 		b.WriteString("\"\n")
+	case len(msgs) > 1:
+		b.WriteString("The customer's reply you are answering now, and what they added while you were working on it — answer all of it in one reply: ")
+		for i, m := range msgs {
+			if i > 0 {
+				b.WriteString(" / ")
+			}
+			b.WriteString("\"" + truncateString(m, 400) + "\"")
+		}
+		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -1857,7 +1944,7 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 	}
 	calls := t.currentTurnCallOutcomes()
 	if len(calls) > 0 {
-		b.WriteString("- Tool calls already made since the customer's latest message (their results are in the transcript; do NOT call any of them again this turn — a reworded argument is the same call; use their results). A call marked FAILED returned an error, not data — you do not have that data; fix the arguments and call again, or tell the customer, but never answer as if it had succeeded:\n")
+		b.WriteString("- Tool calls already made since the customer's message you are answering (their results are in the transcript; do NOT call any of them again this turn — a reworded argument is the same call; use their results). A call marked FAILED returned an error, not data — you do not have that data; fix the arguments and call again, or tell the customer, but never answer as if it had succeeded:\n")
 		for _, c := range calls {
 			b.WriteString("  • ")
 			b.WriteString(c.Call.Tool)
@@ -1891,11 +1978,17 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 		b.WriteString(strings.Join(strings.Fields(prev), " "))
 		b.WriteString("\n")
 	}
-	if li := t.lastCustomerIndex(); li >= 0 {
-		b.WriteString("\nThe customer's reply to it — the message you are answering now:\n")
-		b.WriteString("Customer: ")
-		b.WriteString(strings.Join(strings.Fields(stripCustomerHeader(t.Turns[li].Text)), " "))
-		b.WriteString("\n")
+	if msgs := t.currentTurnCustomerTexts(); len(msgs) > 0 {
+		if len(msgs) == 1 {
+			b.WriteString("\nThe customer's reply to it — the message you are answering now:\n")
+		} else {
+			b.WriteString("\nThe customer's reply to it, and what they added while you were working on it — answer all of it in one reply:\n")
+		}
+		for _, m := range msgs {
+			b.WriteString("Customer: ")
+			b.WriteString(m)
+			b.WriteString("\n")
+		}
 	}
 	b.WriteString("\nWrite the assistant's next turn now, following the system instructions above:\n")
 	if hasTools {

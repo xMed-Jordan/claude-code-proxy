@@ -232,7 +232,7 @@ func TestAgyGenerateBlocksRewordedRepeatWithIdenticalResults(t *testing.T) {
 	if strings.Count(prompt, strings.Repeat("P", 400)) != 1 || !strings.Contains(prompt, "identical to the result of your earlier membership_protocol call (m1)") {
 		t.Fatalf("identical result not deduplicated in the transcript")
 	}
-	if !strings.Contains(prompt, "In the CURRENT turn (since the customer's latest message) you have already called") {
+	if !strings.Contains(prompt, "In the CURRENT turn (since the customer's message you are answering) you have already called") {
 		t.Fatalf("state preface lacks current-turn calls")
 	}
 
