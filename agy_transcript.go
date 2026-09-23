@@ -1286,6 +1286,7 @@ func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
 // jsonRef locates one shrinkable node inside a decoded JSON document.
 type jsonRef struct {
 	isString bool
+	inList   bool // a string inside a record of a list: that record's prose
 	depth    int
 	size     int
 	setArr   func([]any)
@@ -1298,6 +1299,23 @@ type jsonRef struct {
 // prose to be shortened rather than structure to be preserved.
 const agyLongStringBytes = 1000
 
+// agyRecordProseBytes is the length above which a string inside a record of a
+// list — a service's description, a visit's note — is that record's prose, and
+// agyRecordProseFloor is what it keeps. Such text is shortened before any
+// nested list is thinned: in a catalog the nested list is the thing on offer.
+// Prod 2026-09-21 conv 60746: the summer offer's 26 services each kept ~900
+// bytes of marketing copy while every packages list — price, package id and
+// package_branch_ids ",1," (Irbid only) — was emptied, and the model, left with
+// the services' ",1,2,4," branch lists, sold the offer in Amman. The threshold
+// sits above floor + marker so a shortened string is never picked again.
+const (
+	agyRecordProseBytes = 240
+	agyRecordProseFloor = 120
+)
+
+// agyProseMarkerRe finds the note a shortened string ends with.
+var agyProseMarkerRe = regexp.MustCompile(`… \[system note: (\d+) characters dropped[^\]]*\]$`)
+
 // pruneHeaviestArray takes one bite out of the document and reports whether it
 // changed anything. Long strings go first: an instruction sheet delivered as
 // one 117KB string degrades gracefully when shortened, whereas dropping an
@@ -1308,8 +1326,8 @@ const agyLongStringBytes = 1000
 // record still visible.
 func shrinkJSONOnce(root *any, level int) bool {
 	var refs []jsonRef
-	var walk func(node any, depth int, setArr func([]any), setStr func(string))
-	walk = func(node any, depth int, setArr func([]any), setStr func(string)) {
+	var walk func(node any, depth int, inList bool, setArr func([]any), setStr func(string))
+	walk = func(node any, depth int, inList bool, setArr func([]any), setStr func(string)) {
 		switch n := node.(type) {
 		case []any:
 			if setArr != nil && len(n) > 0 {
@@ -1319,45 +1337,74 @@ func shrinkJSONOnce(root *any, level int) bool {
 			}
 			for i := range n {
 				i := i
-				walk(n[i], depth+1, func(v []any) { n[i] = v }, func(s string) { n[i] = s })
+				walk(n[i], depth+1, true, func(v []any) { n[i] = v }, func(s string) { n[i] = s })
 			}
 		case map[string]any:
 			for k := range n {
 				k := k
-				walk(n[k], depth+1, func(v []any) { n[k] = v }, func(s string) { n[k] = s })
+				walk(n[k], depth+1, inList, func(v []any) { n[k] = v }, func(s string) { n[k] = s })
 			}
 		case string:
-			if setStr != nil && len(n) > agyLongStringBytes {
-				refs = append(refs, jsonRef{isString: true, depth: depth, size: len(n), setStr: setStr, str: n})
+			if setStr != nil && (len(n) > agyLongStringBytes || (inList && len(n) > agyRecordProseBytes)) {
+				refs = append(refs, jsonRef{isString: true, inList: inList, depth: depth, size: len(n), setStr: setStr, str: n})
 			}
 		}
 	}
-	walk(*root, 0, func(v []any) { *root = v }, nil)
+	walk(*root, 0, false, func(v []any) { *root = v }, nil)
 	if len(refs) == 0 {
 		return false
 	}
-	// Prose before structure: halve the longest long string first.
+	// Prose before structure: halve the longest long string first. A record's
+	// own prose goes from the first level on, before anything nested in the
+	// record is thinned; a document-sized string (an instruction sheet) waits
+	// for the prose level.
 	var longest *jsonRef
 	for i := range refs {
-		if !refs[i].isString || level < agyLevelProse {
+		r := &refs[i]
+		if !r.isString {
 			continue
 		}
-		if longest == nil || refs[i].size > longest.size {
-			longest = &refs[i]
+		recordProse := r.inList && r.size > agyRecordProseBytes && level >= agyLevelHistory
+		if !recordProse && (r.size <= agyLongStringBytes || level < agyLevelProse) {
+			continue
+		}
+		if longest == nil || r.size > longest.size {
+			longest = r
 		}
 	}
 	if longest != nil {
-		keep := longest.size / 2
-		if keep < agyMinStringBytes {
-			keep = agyMinStringBytes
+		// Cut the text itself, never a marker an earlier pass left, and keep
+		// one running count.
+		text, dropped := longest.str, 0
+		if m := agyProseMarkerRe.FindStringSubmatchIndex(text); m != nil {
+			dropped, _ = strconv.Atoi(text[m[2]:m[3]])
+			text = text[:m[0]]
 		}
-		if keep < longest.size {
-			for keep > 0 && keep < len(longest.str) && (longest.str[keep]&0xC0) == 0x80 {
+		record := longest.size <= agyLongStringBytes || level < agyLevelProse
+		keep := len(text) / 2
+		floor := agyMinStringBytes
+		if record {
+			floor = agyRecordProseFloor
+		}
+		if keep < floor {
+			keep = floor
+		}
+		if keep < len(text) {
+			for keep > 0 && keep < len(text) && (text[keep]&0xC0) == 0x80 {
 				keep-- // never split a UTF-8 rune
 			}
-			longest.setStr(fmt.Sprintf("%s… [system note: %d characters dropped by the system to fit the context window]", longest.str[:keep], longest.size-keep))
+			note := "%s… [system note: %d characters dropped by the system to fit the context window]"
+			if record {
+				note = "%s… [system note: %d characters dropped]"
+			}
+			longest.setStr(fmt.Sprintf(note, text[:keep], dropped+len(text)-keep))
 			return true
 		}
+	}
+	// Prose that is still too much once shortened goes as a column, before
+	// anything nested in the records is thinned.
+	if level >= agyLevelHistory && dropProseColumn(refs) {
+		return true
 	}
 	// Before any record is dropped, take the heaviest column off the record
 	// list: 25 packages each keeping their id and name are worth far more to
@@ -1571,6 +1618,63 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 
 // agyDroppedFieldsKey names the field that records which columns were removed.
 const agyDroppedFieldsKey = "_fields_dropped_by_the_system"
+
+// dropProseColumn removes, from one list of records, a text column that the
+// record-prose pass has already shortened in most of its records — a
+// description, a note — choosing the heaviest such column. What a record IS
+// (its ids, prices, branches and the lists nested in it) outlasts what it says
+// about itself.
+func dropProseColumn(refs []jsonRef) bool {
+	bestRef, bestName, bestWeight := -1, "", 0
+	for i, r := range refs {
+		if r.isString || len(r.arr) < 2 {
+			continue
+		}
+		shortened, total, weight := map[string]int{}, map[string]int{}, map[string]int{}
+		for _, item := range r.arr {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			for k, v := range obj {
+				s, ok := v.(string)
+				if !ok || k == agyDroppedFieldsKey {
+					continue
+				}
+				total[k]++
+				weight[k] += len(s)
+				if agyProseMarkerRe.MatchString(s) {
+					shortened[k]++
+				}
+			}
+		}
+		for k, n := range shortened {
+			if n*2 >= total[k] && weight[k] > bestWeight {
+				bestRef, bestName, bestWeight = i, k, weight[k]
+			}
+		}
+	}
+	if bestRef < 0 {
+		return false
+	}
+	arr := refs[bestRef].arr
+	for _, item := range arr {
+		if obj, ok := item.(map[string]any); ok {
+			delete(obj, bestName)
+		}
+	}
+	for _, item := range arr {
+		if obj, ok := item.(map[string]any); ok {
+			note, _ := obj[agyDroppedFieldsKey].(string)
+			if note != "" {
+				note += ", "
+			}
+			obj[agyDroppedFieldsKey] = note + bestName
+			break
+		}
+	}
+	return true
+}
 
 var agyOmissionCountRe = regexp.MustCompile(`^\[system note: (\d+) entries dropped`)
 
