@@ -132,7 +132,7 @@ type config struct {
 	AgyMediaMaxTotal   int64         // max total bytes materialized per request
 	AgyMediaAllowURLs  bool          // allow downloading media from remote URLs
 	AgyMediaRetention  time.Duration // keep materialized files this long for reuse
-	AgyMediaAgent      string        // PROXY_AGY_MEDIA_AGENT — agy agent for a media run whose attachments are all view-eligible (agyMediaViewEligible); "connect-media-view" (default, self-installed, view_file only) or "" for agy's default coding agent (rollback switch, no rebuild needed)
+	AgyMediaAgent      string        // PROXY_AGY_MEDIA_AGENT — agy agent for a media run where every attachment is view-eligible: a directly viewable image (agyMediaViewEligible) or a PDF Ghostscript rendered (agyPDFViewPlan); "connect-media-view" (default, self-installed, view_file only) or "off" (recognized synonyms: empty/none/default/0/false — see parseAgyMediaAgent, fed by os.LookupEnv so "set to empty" is distinguishable from "unset") for agy's default coding agent — the rollback switch, no rebuild needed
 	AgyGS              string        // PROXY_AGY_GS — resolved path to Ghostscript, used to render a PDF's pages to images so it can also go through AgyMediaAgent ("" → PDF rendering disabled, PDFs keep using the default coding agent)
 	AgyPDFMaxPages     int           // PROXY_AGY_PDF_MAX_PAGES — max pages rendered per PDF (clamped 1..50)
 	AgyPDFDPI          int           // PROXY_AGY_PDF_DPI — page render resolution in DPI (clamped 72..300)
@@ -834,7 +834,7 @@ func loadConfig() config {
 		AgyMediaMaxTotal:   parseByteSize(getenv("PROXY_AGY_MEDIA_MAX_TOTAL", "1GB"), 1<<30),
 		AgyMediaAllowURLs:  envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
 		AgyMediaRetention:  parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
-		AgyMediaAgent:      strings.TrimSpace(getenv("PROXY_AGY_MEDIA_AGENT", agyMediaViewAgentName)),
+		AgyMediaAgent:      parseAgyMediaAgent(os.LookupEnv("PROXY_AGY_MEDIA_AGENT")),
 		AgyGS:              resolveAgyGS(getenv("PROXY_AGY_GS", "")),
 		AgyPDFMaxPages:     parseAgyPDFMaxPages(getenv("PROXY_AGY_PDF_MAX_PAGES", "10")),
 		AgyPDFDPI:          parseAgyPDFDPI(getenv("PROXY_AGY_PDF_DPI", "150")),

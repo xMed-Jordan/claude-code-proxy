@@ -119,6 +119,42 @@ func agyAgentArgs(cfg config, media bool) []string {
 	return nil
 }
 
+// parseAgyMediaAgent resolves PROXY_AGY_MEDIA_AGENT from the two values
+// os.LookupEnv returns, distinguishing "unset" from "explicitly set empty" —
+// a distinction the shared getenv() helper (main.go) cannot make, since it
+// treats "" as "unset" and substitutes its fallback. That made the
+// documented rollback value impossible to select: loadDotEnvIntoProcess
+// turns a `.env` line "PROXY_AGY_MEDIA_AGENT=" into the env var set to "",
+// but getenv("PROXY_AGY_MEDIA_AGENT", agyMediaViewAgentName) would still
+// return agyMediaViewAgentName because os.Getenv("PROXY_AGY_MEDIA_AGENT")
+// == "" looks the same as the var never having been set at all.
+//
+//   - set == false (the env var is genuinely absent): the view-only agent
+//     default.
+//   - set == true and the trimmed value is blank, or is one of
+//     off/none/default/0/false (case-insensitive): "" — agy's default coding
+//     agent. This is the rollback switch; document `PROXY_AGY_MEDIA_AGENT=off`
+//     as the primary spelling.
+//   - otherwise: the trimmed value, verbatim.
+//
+// PROXY_AGY_AGENT has this exact same underlying flaw (getenv() can't tell
+// "unset" from "set empty" there either) but is left alone by this fix — it
+// is a separate, pre-existing setting outside this defect's scope.
+func parseAgyMediaAgent(raw string, set bool) string {
+	if !set {
+		return agyMediaViewAgentName
+	}
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	switch strings.ToLower(v) {
+	case "off", "none", "default", "0", "false":
+		return ""
+	}
+	return v
+}
+
 // agyAgentsDir is agy's user-level agents directory.
 func agyAgentsDir() (string, error) {
 	home, err := os.UserHomeDir()

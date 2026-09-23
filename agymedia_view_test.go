@@ -18,6 +18,40 @@ import (
 	"testing"
 )
 
+// TestParseAgyMediaAgent covers defect F1: getenv() cannot distinguish
+// PROXY_AGY_MEDIA_AGENT being unset from it being explicitly set to "" (both
+// read as os.Getenv == ""), which made the documented rollback value
+// impossible to select. parseAgyMediaAgent is fed os.LookupEnv's two return
+// values instead, so it can tell them apart.
+func TestParseAgyMediaAgent(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		set  bool
+		want string
+	}{
+		{"unset", "", false, agyMediaViewAgentName},
+		{"set-empty", "", true, ""},
+		{"set-whitespace-only", "   ", true, ""},
+		{"off", "off", true, ""},
+		{"OFF-case-insensitive", "OFF", true, ""},
+		{"none", "none", true, ""},
+		{"default", "default", true, ""},
+		{"zero", "0", true, ""},
+		{"false", "false", true, ""},
+		{"connect-media-view-explicit", "connect-media-view", true, "connect-media-view"},
+		{"custom-agent", "custom-agent", true, "custom-agent"},
+		{"custom-agent-padded", "  custom-agent  ", true, "custom-agent"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := parseAgyMediaAgent(c.raw, c.set); got != c.want {
+				t.Fatalf("parseAgyMediaAgent(%q, %v) = %q, want %q", c.raw, c.set, got, c.want)
+			}
+		})
+	}
+}
+
 // tinyPNGBase64 returns a small valid PNG, base64-encoded, for mediaPart.B64.
 func tinyPNGBase64(t *testing.T) string {
 	t.Helper()
