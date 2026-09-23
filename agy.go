@@ -517,6 +517,29 @@ func runAgyj(ctx context.Context, cfg config, prompt, model string, addDirs []st
 	return runAgyjAgent(ctx, cfg, prompt, model, addDirs, agyAgentArgs(cfg, len(addDirs) > 0))
 }
 
+// agyjWrapperArgs builds the argv (excluding the agyj binary itself) for the
+// non-stream-json agyj-wrapper invocation, with byte-identical
+// ordering/shape to what runAgyjAgent built inline before this extraction:
+// --model (if set), --dangerously-skip-permissions, agentArgs verbatim,
+// --add-dir per addDirs entry (scoping agy to exactly this request's files
+// so it can read them without an interactive permission prompt, which would
+// hang print mode), then "-p prompt" LAST. Pure — no I/O — so this exact
+// shape can be asserted in a test without spawning agyj.
+func agyjWrapperArgs(model, prompt string, addDirs, agentArgs []string) []string {
+	args := make([]string, 0, 8+2*len(addDirs))
+	if m := strings.TrimSpace(model); m != "" {
+		args = append(args, "--model", m)
+	}
+	// Always allow headless print mode to execute web/network tools and actions
+	args = append(args, "--dangerously-skip-permissions")
+	args = append(args, agentArgs...)
+	for _, d := range addDirs {
+		args = append(args, "--add-dir", d)
+	}
+	args = append(args, "-p", prompt)
+	return args
+}
+
 // runAgyjAgent is runAgyj with an explicit --agent selection (agentArgs; nil
 // = agy's default agent for the run). This is what lets a media run route to
 // the view-only agent (agyMediaViewEligible) while runAgyj's other callers —
@@ -566,21 +589,7 @@ func runAgyjAgent(ctx context.Context, cfg config, prompt, model string, addDirs
 		}
 	}
 
-	args := make([]string, 0, 8+2*len(addDirs))
-	if m := strings.TrimSpace(model); m != "" {
-		args = append(args, "--model", m)
-	}
-	// Always allow headless print mode to execute web/network tools and actions
-	args = append(args, "--dangerously-skip-permissions")
-	args = append(args, agentArgs...)
-	if media {
-		// Scope agy to exactly this request's files and let it read them without
-		// an interactive permission prompt (which would hang print mode).
-		for _, d := range addDirs {
-			args = append(args, "--add-dir", d)
-		}
-	}
-	args = append(args, "-p", prompt)
+	args := agyjWrapperArgs(model, prompt, addDirs, agentArgs)
 
 	cmd := exec.CommandContext(cctx, agyBinPath(cfg), args...)
 	env := os.Environ()
@@ -2095,6 +2104,14 @@ func agyCanUseWarmPool(pool *AgyWorkerPool, addDirs []string) bool {
 	return pool != nil && pool.IsEnabled() && len(addDirs) == 0
 }
 
+// agyRunAgentFn is the seam agyResolve's final (non-warm-pool) agy
+// invocation goes through, on both the view-only and default-agent
+// branches. Production code never touches it beyond this default; tests
+// replace it (restoring the original with defer) to observe exactly which
+// prompt/addDirs/agentArgs agyResolve selected for a given request, without
+// spawning a real agy process.
+var agyRunAgentFn = runAgyjAgent
+
 func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, modelAlias string) (agyResult, error) {
 	if transcript, ok, err := agyAudioTranscript(ctx, cfg, parts); err != nil {
 		return agyResult{}, fmt.Errorf("transcription error: %w", err)
@@ -2128,15 +2145,17 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	}
 	// agentArgs is non-nil only when agyMediaPrep selected the view-only agent
 	// for this run's attachments; everything else (including plain chat, with
-	// no media at all) keeps runAgyj's own --agent selection unchanged. A
-	// failed view-only run is surfaced as-is below — NO automatic retry on the
-	// default coding agent, which would silently reopen the hole this closes.
-	var res agyResult
-	if agentArgs != nil {
-		res, err = runAgyjAgent(ctx, cfg, prompt, requestedModel, addDirs, agentArgs)
-	} else {
-		res, err = runAgyj(ctx, cfg, prompt, requestedModel, addDirs)
+	// no media at all) keeps runAgyj's own --agent selection (agyAgentArgs)
+	// unchanged — that is EXACTLY what runAgyj itself computes, so routing
+	// both branches through the same agyRunAgentFn seam below changes no
+	// behaviour. A failed view-only run is surfaced as-is below — NO
+	// automatic retry on the default coding agent, which would silently
+	// reopen the hole this closes.
+	effectiveAgentArgs := agentArgs
+	if effectiveAgentArgs == nil {
+		effectiveAgentArgs = agyAgentArgs(cfg, len(addDirs) > 0)
 	}
+	res, err := agyRunAgentFn(ctx, cfg, prompt, requestedModel, addDirs, effectiveAgentArgs)
 	if err != nil {
 		return agyResult{}, fmt.Errorf("backend error: %w", err)
 	}
