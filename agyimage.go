@@ -190,6 +190,14 @@ func agyGenerateImages(ctx context.Context, cfg config, userPrompt, model string
 	if err := os.MkdirAll(scratch, 0o700); err != nil {
 		return nil, err
 	}
+	// PROXY_AGY_RUN_AS (agy.go): agy must WRITE the generated image file(s)
+	// into scratch, not just read it — unlike a media addDir this always
+	// needs the write grant regardless of scratch's current mode, so this is
+	// called explicitly rather than relying on runAgyjAgent's generic
+	// (read-only) agyGrantDirs to guess it from the path.
+	if err := agyGrantDirWritable(scratch); err != nil {
+		return nil, err
+	}
 	defer os.RemoveAll(scratch)
 
 	prompt := buildImageGenPrompt(userPrompt, n, sz, scratch)

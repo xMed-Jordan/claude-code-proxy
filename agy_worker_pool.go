@@ -290,6 +290,12 @@ func spawnAgyWorker(poolCtx context.Context, cfg config, id int, model string) (
 		return nil, fmt.Errorf("stdout pipe error: %w", err)
 	}
 
+	if err := agyPrepareCmd(cmd); err != nil {
+		stdin.Close()
+		stdout.Close()
+		return nil, err
+	}
+
 	if err := cmd.Start(); err != nil {
 		stdin.Close()
 		stdout.Close()
@@ -513,11 +519,16 @@ func resolveAgyCLIPath(cfg config) string {
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
-	for _, cand := range []string{
-		"/usr/local/bin/agy",
-		"/root/.local/bin/agy",
-		"/usr/bin/agy",
-	} {
+	// PROXY_AGY_RUN_AS (agy.go): when set and PROXY_AGY_CLI is empty, try the
+	// run-as user's own ~/.local/bin/agy before the root-oriented hardcoded
+	// paths below — /root/.local/bin/agy is exactly the kind of path
+	// agyValidateExecutableBy (agy.go) rejects at startup for that user.
+	var candidates []string
+	if home := strings.TrimSpace(agyRunAsHomeHint); home != "" && strings.TrimSpace(cfg.AgyCLI) == "" {
+		candidates = append(candidates, filepath.Join(home, ".local", "bin", "agy"))
+	}
+	candidates = append(candidates, "/usr/local/bin/agy", "/root/.local/bin/agy", "/usr/bin/agy")
+	for _, cand := range candidates {
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 			return cand
 		}
@@ -576,6 +587,12 @@ func runAgyStreamJSON(ctx context.Context, cfg config, prompt, model string, add
 
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
+
+	if err := agyPrepareCmd(cmd); err != nil {
+		stdin.Close()
+		stdout.Close()
+		return agyResult{}, err
+	}
 
 	if err := cmd.Start(); err != nil {
 		stdin.Close()

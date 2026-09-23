@@ -22,10 +22,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -45,6 +48,7 @@ func initAgy(cfg config) {
 		n = 1
 	}
 	agySem = make(chan struct{}, n)
+	agyResolveRunAs(cfg) // before ensureAgyAgentDefinition: agyAgentsDir() depends on the resolved run-as home
 	ensureAgyAgentDefinition(cfg)
 }
 
@@ -155,8 +159,377 @@ func parseAgyMediaAgent(raw string, set bool) string {
 	return v
 }
 
-// agyAgentsDir is agy's user-level agents directory.
+// ── run agy as a dedicated non-root user (PROXY_AGY_RUN_AS) ────────────────
+//
+// On ai-api1 the proxy (and therefore every agy process it spawns, with
+// --dangerously-skip-permissions) runs as root. The view-only agent's
+// view_file is NOT confined to --add-dir (a direct run printed
+// /etc/hostname on request), and the default coding agent still serves
+// audio/video/office. As root, agy can also read /opt/connect-ai-proxy/.env
+// and every clinic's past agy transcripts under
+// /root/.gemini/antigravity-cli/brain. PROXY_AGY_RUN_AS names a dedicated
+// unprivileged Linux user every agy/agyj child is spawned as instead.
+//
+// parseAgyRunAs uses the same os.LookupEnv "unset vs set-empty"
+// distinction as parseAgyMediaAgent (see its comment for why getenv() alone
+// cannot make this distinction). "root" is an explicit synonym for
+// disabled — asking to run agy as root is the same as not asking at all.
+func parseAgyRunAs(raw string, set bool) string {
+	if !set {
+		return ""
+	}
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	switch strings.ToLower(v) {
+	case "off", "none", "root":
+		return ""
+	}
+	return v
+}
+
+// agyRunAsIdentity is the resolved run-as user, computed once at startup.
+type agyRunAsIdentity struct {
+	Name   string
+	UID    int
+	GID    int
+	Groups []int // every group the user belongs to, INCLUDING the primary gid (user.User.GroupIds()'s documented contract)
+	Home   string
+}
+
+// Package-level run-as state, set exactly once by agyResolveRunAs (called
+// from initAgy before the server starts accepting traffic) and read by
+// agyPrepareCmd (agy_runas_linux.go / agy_runas_other.go), agyGrantDirs,
+// agyGrantDirWritable, agyAgentsDir, and resolveAgyCLIPath
+// (agy_worker_pool.go). Never mutated after startup.
+var (
+	agyRunAsRequested      bool // cfg.AgyRunAs named a user (before resolution/validation)
+	agyRunAsConfiguredName string
+	agyRunAsReady          bool   // requested AND resolved AND validated — safe to use agyRunAsIdentityValue
+	agyRunAsFailReason     string // set when requested but NOT ready; every spawn must fail closed with this
+	agyRunAsIdentityValue  *agyRunAsIdentity
+	agyRunAsHomeHint       string // the resolved user's home, set as soon as it is known (even if validation later fails) — feeds resolveAgyCLIPath's <home>/.local/bin/agy candidate
+)
+
+// agyLookupUserFn resolves name into (uid, gid, groups, home, err) — a
+// single seam covering both os/user.Lookup and the returned User's
+// GroupIds() (which, called for REAL, performs its own OS-specific lookup
+// keyed on the username — so seaming only user.Lookup itself would still
+// leave GroupIds() hitting the real local user/group database in a test).
+// Tests replace this whole var, so a fake username needs no real entry in
+// /etc/passwd or /etc/group on whatever machine runs the test.
+var agyLookupUserFn = func(name string) (uid, gid int, groups []int, home string, err error) {
+	u, lookupErr := user.Lookup(name)
+	if lookupErr != nil {
+		return 0, 0, nil, "", lookupErr
+	}
+	uidN, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, nil, "", fmt.Errorf("user %q has a non-numeric uid %q", name, u.Uid)
+	}
+	gidN, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return 0, 0, nil, "", fmt.Errorf("user %q has a non-numeric gid %q", name, u.Gid)
+	}
+	groupIDs, gerr := u.GroupIds()
+	if gerr != nil {
+		return 0, 0, nil, "", fmt.Errorf("cannot read group memberships for %q: %w", name, gerr)
+	}
+	gs := make([]int, 0, len(groupIDs))
+	for _, g := range groupIDs {
+		if n, err := strconv.Atoi(g); err == nil {
+			gs = append(gs, n)
+		}
+	}
+	h := strings.TrimSpace(u.HomeDir)
+	if h == "" {
+		return 0, 0, nil, "", fmt.Errorf("user %q has no home directory", name)
+	}
+	return uidN, gidN, gs, h, nil
+}
+
+// agyPathStat is the minimal per-path ownership/permission info
+// agyValidateExecutableBy needs. Deliberately NOT os.FileInfo: extracting a
+// real uid/gid needs a *syscall.Stat_t type assertion that only exists on
+// Unix, and this must stay testable on Windows (see agy_runas_linux.go's
+// realAgyStat for the actual Linux implementation, and agy_runas_other.go's
+// stub).
+type agyPathStat struct {
+	Mode fs.FileMode
+	UID  int
+	GID  int
+}
+
+// agyStatFn is the stat seam agyValidateExecutableBy uses; tests replace it.
+var agyStatFn = realAgyStat
+
+// agyResolveRunAs resolves and validates cfg.AgyRunAs into the package-level
+// run-as state above. Called once at startup. NEVER falls back to running
+// agy as root: a resolution or validation failure here leaves
+// agyRunAsReady false, so every later agyPrepareCmd call returns an error
+// instead of starting a process — logged loudly exactly once, here. The
+// user lookup itself (agyLookupUserFn) runs BEFORE the Linux-only check
+// below, so a lookup failure is caught and reported the same way on every
+// platform, not masked by "this OS is not Linux" on the dev box.
+func agyResolveRunAs(cfg config) {
+	agyRunAsConfiguredName = strings.TrimSpace(cfg.AgyRunAs)
+	agyRunAsRequested = agyRunAsConfiguredName != ""
+	agyRunAsReady = false
+	agyRunAsFailReason = ""
+	agyRunAsIdentityValue = nil
+	agyRunAsHomeHint = ""
+	if !agyRunAsRequested {
+		return
+	}
+	fail := func(format string, args ...any) {
+		agyRunAsFailReason = fmt.Sprintf(format, args...)
+		log.Printf("[agy] FATAL run-as config for user %q: %s — every agy spawn will fail closed (never falling back to root) until this is fixed", agyRunAsConfiguredName, agyRunAsFailReason)
+	}
+	uid, gid, groups, home, err := agyLookupUserFn(agyRunAsConfiguredName)
+	if err != nil {
+		fail("user lookup failed: %v", err)
+		return
+	}
+	agyRunAsHomeHint = home // resolveAgyCLIPath can use this even before validation below finishes
+	if runtime.GOOS != "linux" {
+		fail("this OS (%s) is not Linux; running agy as another user is only supported on Linux", runtime.GOOS)
+		return
+	}
+
+	cliPath := resolveAgyCLIPath(cfg)
+	if err := agyValidateExecutableBy(cliPath, uid, gid, groups); err != nil {
+		fail("agy CLI %q is not executable by this user: %v", cliPath, err)
+		return
+	}
+	agyjPath := agyBinPath(cfg)
+	if err := agyValidateExecutableBy(agyjPath, uid, gid, groups); err != nil {
+		fail("agyj wrapper %q is not executable by this user: %v", agyjPath, err)
+		return
+	}
+
+	agyRunAsIdentityValue = &agyRunAsIdentity{Name: agyRunAsConfiguredName, UID: uid, GID: gid, Groups: groups, Home: home}
+	agyRunAsReady = true
+	log.Printf("[agy] run-as: every agy/agyj child will run as user %q (uid=%d gid=%d home=%s)", agyRunAsConfiguredName, uid, gid, home)
+	agyPrepareRunAsDirs(cfg)
+}
+
+// agyValidateExecutableBy walks path component by component from the
+// filesystem root and checks that a process with uid/gid/groups can
+// traverse every directory and execute (or, for the final component, at
+// least read+execute — same bit) the target, purely from stat'd
+// owner/group/other permission bits — no access() syscall, so this is
+// identical in a unit test (agyStatFn faked) and on the real filesystem. A
+// path under a directory like /root (0700, owned by a different uid) fails
+// here, loudly, at startup — not as a mysterious permission-denied from
+// inside an already-isolated spawned process later.
+func agyValidateExecutableBy(target string, uid, gid int, groups []int) error {
+	// Deliberately the "path" package (always forward-slash, POSIX-only),
+	// NOT "path/filepath": run-as only ever runs for real on Linux, but
+	// this logic must behave identically when unit tested on Windows,
+	// where filepath.IsAbs/Join/Clean treat a string like "/root/.local"
+	// as NOT absolute and would silently misjudge every path here.
+	target = path.Clean(strings.TrimSpace(target))
+	if !path.IsAbs(target) {
+		return fmt.Errorf("%q is not an absolute path", target)
+	}
+	inGroups := func(g int) bool {
+		if g == gid {
+			return true
+		}
+		for _, x := range groups {
+			if x == g {
+				return true
+			}
+		}
+		return false
+	}
+	segs := strings.Split(target, "/")
+	cur := "/"
+	for _, seg := range segs {
+		if seg == "" {
+			continue
+		}
+		cur = path.Join(cur, seg)
+		st, err := agyStatFn(cur)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", cur, err)
+		}
+		var need fs.FileMode
+		switch {
+		case st.UID == uid:
+			need = 0o100
+		case inGroups(st.GID):
+			need = 0o010
+		default:
+			need = 0o001
+		}
+		if st.Mode.Perm()&need == 0 {
+			return fmt.Errorf("%s (mode %s, owner uid=%d gid=%d) is not executable by uid=%d", cur, st.Mode.Perm(), st.UID, st.GID, uid)
+		}
+	}
+	return nil
+}
+
+// agyRunAsEnv returns a copy of base with HOME, USER and LOGNAME replaced
+// (or appended, if absent) to home/name/name — the env vars agy, agyj
+// (AGYJ_GEMINI_DIR falls back to $HOME/.gemini/antigravity-cli — see
+// agyj/main.go's geminiCliDir()), and os.UserHomeDir() generally key off.
+// Pure (no I/O), so directly testable without a Linux syscall; never
+// mutates base.
+func agyRunAsEnv(base []string, name, home string) []string {
+	type replacement struct{ key, val string }
+	replacements := []replacement{{"HOME", home}, {"USER", name}, {"LOGNAME", name}}
+	wanted := make(map[string]string, len(replacements))
+	for _, r := range replacements {
+		wanted[r.key] = r.val
+	}
+	seen := make(map[string]bool, len(replacements))
+	out := make([]string, 0, len(base)+len(replacements))
+	for _, e := range base {
+		key := e
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			key = e[:i]
+		}
+		if val, ok := wanted[key]; ok {
+			if seen[key] {
+				continue // drop a duplicate entry of a key we're replacing
+			}
+			out = append(out, key+"="+val)
+			seen[key] = true
+			continue
+		}
+		out = append(out, e)
+	}
+	for _, r := range replacements {
+		if !seen[r.key] {
+			out = append(out, r.key+"="+r.val)
+			seen[r.key] = true
+		}
+	}
+	return out
+}
+
+// agyChownFn is the os.Lchown seam; tests replace it and record calls.
+var agyChownFn = os.Lchown
+
+// agyChownTree walks root (which must already exist) and Lchowns every
+// entry, including root itself, to uid:gid. Lchown, never Chown: it
+// changes a symlink's OWN ownership rather than following it, so a
+// malicious uploaded "file" that is actually a symlink cannot be used to
+// hand ownership of an arbitrary path elsewhere on the filesystem to the
+// agy user.
+func agyChownTree(root string, uid, gid int) error {
+	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return agyChownFn(path, uid, gid)
+	})
+}
+
+// agyGrantDirs makes every dir in dirs (and everything beneath each,
+// recursively) readable and traversable by the resolved run-as user, when
+// run-as is ready — called in runAgyjAgent before every spawn, once per
+// addDir. A dir that is already world-readable+traversable (mode&0o005 ==
+// 0o005 — "a 0755-style dir with 0644 files needs nothing") is left
+// completely alone. Everything this proxy actually creates for media is
+// 0700 and root-owned, so in practice this chowns exactly the ONE
+// content-addressed dir this request needs — a SIBLING request's dir,
+// still 0700 root-owned, stays invisible to the agy user, which is the
+// whole point: root could read every clinic's media and transcripts, the
+// run-as user can only read what THIS request explicitly handed it.
+func agyGrantDirs(dirs []string) error {
+	if !agyRunAsReady || agyRunAsIdentityValue == nil {
+		return nil
+	}
+	id := agyRunAsIdentityValue
+	for _, dir := range dirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		// agyStatFn (not a raw os.Lstat): the SAME seam agyValidateExecutableBy
+		// uses, both for testability and because the real Linux
+		// implementation is the one meaningful "is this already
+		// world-readable" source of truth — Windows' permission model does
+		// not map onto these Unix bits at all.
+		st, err := agyStatFn(dir)
+		if err != nil {
+			continue // nothing to grant on a dir that doesn't exist
+		}
+		if st.Mode.IsDir() && st.Mode.Perm()&0o005 == 0o005 {
+			continue // already world-readable+traversable
+		}
+		if err := agyChownTree(dir, id.UID, id.GID); err != nil {
+			return fmt.Errorf("granting agy read access to %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// agyGrantDirWritable unconditionally chowns dir (and everything beneath
+// it) to the run-as user, for a dir agy must WRITE into — not just read —
+// such as image generation's per-request scratch dir (agyimage.go). Unlike
+// agyGrantDirs it never checks current permissions first: a caller that
+// needs write access already knows it and says so explicitly by calling
+// this function, rather than agyGrantDirs guessing "needs write" from a
+// mode bit pattern alone. A no-op when run-as is not ready.
+func agyGrantDirWritable(dir string) error {
+	if !agyRunAsReady || agyRunAsIdentityValue == nil {
+		return nil
+	}
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil
+	}
+	id := agyRunAsIdentityValue
+	if err := agyChownTree(dir, id.UID, id.GID); err != nil {
+		return fmt.Errorf("granting agy write access to %s: %w", dir, err)
+	}
+	return nil
+}
+
+// agyPrepareRunAsDirs applies one-time startup hardening once run-as is
+// confirmed ready: the shared media and image roots are capped at
+// traverse-without-list (0711) when they are currently the more
+// restrictive 0700 (created that way before run-as existed) — left alone
+// at any OTHER mode (the image root is created 0755 today, so this is
+// presently a no-op for it; see the v0.32.0 report). A per-request
+// subdirectory is still individually chowned to the agy user by
+// agyGrantDirs/agyGrantDirWritable only when it is actually handed to agy,
+// so this startup step alone does not expose any request's content — it
+// only lets the agy user traverse down to the specific subdirectory it was
+// separately granted.
+func agyPrepareRunAsDirs(cfg config) {
+	for _, root := range []string{agyMediaRoot(cfg), agyImageRoot(cfg)} {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		if err := os.MkdirAll(root, 0o711); err != nil {
+			log.Printf("[agy] run-as: cannot create %s: %v", root, err)
+			continue
+		}
+		info, err := os.Stat(root)
+		if err != nil {
+			log.Printf("[agy] run-as: cannot stat %s: %v", root, err)
+			continue
+		}
+		if info.Mode().Perm() == 0o700 {
+			if err := os.Chmod(root, 0o711); err != nil {
+				log.Printf("[agy] run-as: cannot chmod %s to 0711: %v", root, err)
+			}
+		}
+	}
+}
+
+// agyAgentsDir is agy's user-level agents directory: the run-as user's home
+// when run-as is ready, else the proxy's own home (today's behaviour).
 func agyAgentsDir() (string, error) {
+	if agyRunAsReady && agyRunAsIdentityValue != nil {
+		return filepath.Join(agyRunAsIdentityValue.Home, ".gemini", "config", "agents"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
 		return "", fmt.Errorf("home directory unknown: %v", err)
@@ -185,12 +558,14 @@ func installAgyAgentDefinitionIfConfigured(name, definition, configuredName stri
 		log.Printf("[agy] cannot install the %s agent definition: %v", name, err)
 		return
 	}
-	path := filepath.Join(dir, name, "agent.md")
+	agentDir := filepath.Join(dir, name)
+	path := filepath.Join(agentDir, "agent.md")
 	if cur, err := os.ReadFile(path); err == nil && string(cur) == definition {
+		agyChownAgentDir(agentDir) // content unchanged, but ownership might still be stale (run-as just enabled)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		log.Printf("[agy] cannot create %s: %v", filepath.Dir(path), err)
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		log.Printf("[agy] cannot create %s: %v", agentDir, err)
 		return
 	}
 	if err := os.WriteFile(path, []byte(definition), 0o644); err != nil {
@@ -198,6 +573,19 @@ func installAgyAgentDefinitionIfConfigured(name, definition, configuredName stri
 		return
 	}
 	log.Printf("[agy] installed the %s agent definition at %s", name, path)
+	agyChownAgentDir(agentDir)
+}
+
+// agyChownAgentDir chowns an installed agent's directory (and its
+// agent.md) to the run-as user, when run-as is ready — a no-op otherwise.
+func agyChownAgentDir(dir string) {
+	if !agyRunAsReady || agyRunAsIdentityValue == nil {
+		return
+	}
+	id := agyRunAsIdentityValue
+	if err := agyChownTree(dir, id.UID, id.GID); err != nil {
+		log.Printf("[agy] run-as: cannot chown %s: %v", dir, err)
+	}
 }
 
 func parseAgyConcurrency(s string) int {
@@ -565,6 +953,13 @@ func runAgyjAgent(ctx context.Context, cfg config, prompt, model string, addDirs
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Run-as (PROXY_AGY_RUN_AS): agy must be able to READ every addDir it is
+	// about to be handed via --add-dir. A no-op when run-as is disabled or
+	// not ready (in the latter case the spawn below fails closed anyway).
+	if err := agyGrantDirs(addDirs); err != nil {
+		return agyResult{}, err
+	}
+
 	// If prompt is large (> 64KB) or stream-json CLI is available, execute via stream-json over stdin
 	// to avoid Linux kernel E2BIG ("argument list too long") CLI argument limits.
 	if len(prompt) > 64*1024 || resolveAgyCLIPath(cfg) != "" {
@@ -598,6 +993,10 @@ func runAgyjAgent(ctx context.Context, cfg config, prompt, model string, addDirs
 	}
 	env = append(env, "AGYJ_TIMEOUT="+strconv.Itoa(int(timeout/time.Second)))
 	cmd.Env = env
+
+	if err := agyPrepareCmd(cmd); err != nil {
+		return agyResult{}, err
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

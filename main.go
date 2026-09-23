@@ -108,6 +108,7 @@ type config struct {
 	ReasoningEffort    string
 	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
 	AgyCLI             string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
+	AgyRunAs           string        // PROXY_AGY_RUN_AS — dedicated non-root Linux user every agy/agyj child is spawned as (see parseAgyRunAs, agyResolveRunAs, agyPrepareCmd); "" (unset/empty/off/none/root) = disabled, today's behaviour (root). Linux only — set but unresolvable/unvalidated FAILS CLOSED (every agy spawn errors), never silently falls back to root
 	AgyModel           string        // optional global model override forwarded to agy ("" → agy's own default)
 	AgyPromptMode      string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
 	AgyToolResultCap   int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
@@ -810,6 +811,7 @@ func loadConfig() config {
 		ModelRecommended:   modelRecommended,
 		AgyBin:             strings.TrimSpace(getenv("PROXY_AGY_BIN", "")),
 		AgyCLI:             strings.TrimSpace(getenv("PROXY_AGY_CLI", "")),
+		AgyRunAs:           parseAgyRunAs(os.LookupEnv("PROXY_AGY_RUN_AS")),
 		AgyModel:           strings.TrimSpace(getenv("PROXY_AGY_MODEL", "")),
 		AgyPromptMode:      parseAgyPromptMode(getenv("PROXY_AGY_PROMPT_MODE", "v2")),
 		AgyToolResultCap:   parseAgyToolResultCap(getenv("PROXY_AGY_TOOL_RESULT_CAP", "0")),
