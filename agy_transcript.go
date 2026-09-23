@@ -348,6 +348,25 @@ func (t *agyTranscript) currentTurnCalls() []agyTurn {
 	return out
 }
 
+// agyReadToolRe matches the names of tools that only read. Repeating one
+// changes nothing, so it is the one kind of call that may be repeated after it
+// succeeded when its result no longer fits in the prompt. Anything not named
+// like a read is treated as an action and never repeated.
+var agyReadToolRe = regexp.MustCompile(`^(get|list|find|search|check|read|fetch|lookup|view|show)_`)
+
+// identicalCallsThisTurn counts the current turn's calls with the same name
+// and canonical arguments.
+func (t *agyTranscript) identicalCallsThisTurn(name string, args any) int {
+	want := canonicalToolArgs(args)
+	n := 0
+	for _, c := range t.currentTurnCalls() {
+		if c.Tool == name && c.Args == want {
+			n++
+		}
+	}
+	return n
+}
+
 // calledThisTurn reports whether an identical call (name + canonical args)
 // already exists in the current turn.
 func (t *agyTranscript) calledThisTurn(name string, args any) bool {
@@ -411,6 +430,20 @@ func (t *agyTranscript) currentTurnToolStats() map[string]agyToolStat {
 type agyCallOutcome struct {
 	Call    agyTurn
 	Failure string
+	Reduced bool // its result was shortened or dropped to fit the prompt
+}
+
+// reducedNote is appended to a call in the state block whose result the system
+// shortened or dropped, so "do not call these again" never contradicts the
+// transcript's own "call the tool again if you need its data".
+func (c agyCallOutcome) reducedNote() string {
+	if !c.Reduced || c.Failure != "" {
+		return ""
+	}
+	if agyReadToolRe.MatchString(c.Call.Tool) {
+		return " (its result was shortened or dropped to fit — you MAY call it again once if you need what is missing)"
+	}
+	return " (its result was shortened to fit; the action itself is done — do not repeat it)"
 }
 
 var agyResultHTTPErrorRe = regexp.MustCompile(`"status":\s*"?([45]\d\d)`)
@@ -433,6 +466,7 @@ func (t *agyTranscript) currentTurnCallOutcomes() []agyCallOutcome {
 			r := t.Turns[j]
 			if r.Kind == agyTurnToolResult && (r.CallID == tt.CallID || r.CallID == "") {
 				oc.Failure = toolResultFailure(r.Text)
+				oc.Reduced = r.Reduced
 				break
 			}
 			if r.Kind == agyTurnToolCall || r.Kind == agyTurnCustomer {
@@ -1745,6 +1779,24 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 			failure[j] = true
 		}
 	}
+	// A result that offers times (agy_offers.go) is the set of choices the
+	// customer is answering. Dropping it whole leaves the model nothing to offer
+	// or book from: prod 2026-09-23 (conv 60576) the current turn's slots went
+	// 4325→160 bytes and the reply said there were no openings, while the
+	// therapist was free all afternoon. Such results are the last dropped whole,
+	// and the newest of them never is.
+	offer := map[int]bool{}
+	newestOffer := -1
+	for j, tt := range out.Turns {
+		if tt.Kind != agyTurnToolResult {
+			continue
+		}
+		var parsed any
+		if json.Unmarshal([]byte(tt.Text), &parsed) == nil && agyHoldsClockList(parsed) {
+			offer[j] = true
+			newestOffer = j
+		}
+	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
 	// Three phases, and the order is the whole design. What gets spent first is
 	// decided by how reconstructible it is, which needs no knowledge of what any
@@ -1786,9 +1838,17 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 				// oldest. The dialogue itself is never touched — a customer's own
 				// words are the one thing the turn cannot be rebuilt without.
 				if level == agyLevelOldest {
+					// Oldest first, but a result offering times only after every
+					// other one, and the newest offer never (see offer above).
 					dropped := -1
-					for j, tt := range out.Turns {
-						if tt.Kind == agyTurnToolResult && inPhase(j) && len(tt.Text) > len(agyDroppedResultNote) {
+					for pass := 0; pass < 2 && dropped < 0; pass++ {
+						for j, tt := range out.Turns {
+							if tt.Kind != agyTurnToolResult || !inPhase(j) || len(tt.Text) <= len(agyDroppedResultNote) {
+								continue
+							}
+							if offer[j] && (pass == 0 || j == newestOffer) {
+								continue
+							}
 							dropped = j
 							break
 						}
@@ -1988,6 +2048,7 @@ func renderAgyStatePreface(t agyTranscript, hasTools bool) string {
 					line += " → FAILED (" + c.Failure + ")"
 					failed++
 				}
+				line += c.reducedNote()
 				parts = append(parts, line)
 			}
 			b.WriteString(strings.Join(parts, "; "))
@@ -2059,6 +2120,7 @@ func renderAgyNextTurn(t agyTranscript, hasTools bool) string {
 				b.WriteString(c.Failure)
 				b.WriteString(")")
 			}
+			b.WriteString(c.reducedNote())
 			b.WriteString("\n")
 		}
 	}
@@ -2452,7 +2514,13 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				// told to reuse, so calling again is the correct move. Only a
 				// call that already SUCCEEDED as an action is still refused,
 				// since repeating that would perform it twice.
-				if reduced[item.Name] && !in.Transcript.currentTurnCallSucceeded(item.Name, item.Arguments) {
+				// A read may be repeated even after it succeeded: it changes
+				// nothing, and its data is gone from what the model sees. Once —
+				// a second identical re-fetch would only loop (prod 2026-09-23
+				// conv 60576: four refusals of get_customer_packages, whose
+				// result had been dropped, and a reply written from nothing).
+				if reduced[item.Name] && (!in.Transcript.currentTurnCallSucceeded(item.Name, item.Arguments) ||
+					(agyReadToolRe.MatchString(item.Name) && in.Transcript.identicalCallsThisTurn(item.Name, item.Arguments) < 2)) {
 					kept = append(kept, item)
 					continue
 				}
