@@ -739,13 +739,18 @@ func TestFitAgySacrificesStaleResultsBeforeRecords(t *testing.T) {
 // not multiply what the prompt has to carry — production conv ed674543 carried
 // five copies of a 117KB protocol and six of a 28KB package list in a single
 // booking turn, which is what starved the data the booking needed.
+//
+// The copies came back identical: the model re-asked the same sheet with a
+// reworded "context" argument each time. The same answer is a stale copy
+// whatever the arguments said (agySupersededResults).
 func TestFitAgyKeepsOneLiveCopyPerTool(t *testing.T) {
 	var msgs []anthropicMessage
+	sheet := fmt.Sprintf(`{"text":"%s"}`, strings.Repeat("قاعدة من البروتوكول. ", 500))
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("p%d", i)
 		msgs = append(msgs,
-			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "big_protocol", "input": map[string]any{"n": i}}}},
-			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"copy":%d,"text":"%s"}`, i, strings.Repeat("قاعدة من البروتوكول. ", 500))}}},
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "big_protocol", "input": map[string]any{"context": fmt.Sprintf("wording %d", i)}}}},
+			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": sheet}}},
 		)
 	}
 	msgs = append(msgs, anthropicMessage{Role: "user", Content: "اه ثبتيه"})
@@ -759,17 +764,22 @@ func TestFitAgyKeepsOneLiveCopyPerTool(t *testing.T) {
 	}
 	// The newest copy is the live state and keeps real content; the four stale
 	// copies are spent, so the cost does not grow with re-fetching.
-	live := 0
-	for _, tt := range fitted.Turns {
-		if tt.Kind == agyTurnToolResult && len(tt.Text) > 2*agyMinResultBytes {
+	live, liveAt, newest := 0, -1, -1
+	for i, tt := range fitted.Turns {
+		if tt.Kind != agyTurnToolResult {
+			continue
+		}
+		newest = i
+		if len(tt.Text) > 2*agyMinResultBytes {
 			live++
+			liveAt = i
 		}
 	}
 	if live != 1 {
 		t.Fatalf("expected exactly one live copy of the tool, got %d", live)
 	}
-	if !strings.Contains(got, `"copy":4`) {
-		t.Fatalf("the live copy should be the newest one:\n%s", truncateString(got, 700))
+	if liveAt != newest {
+		t.Fatalf("the live copy should be the newest one (turn %d), got turn %d", newest, liveAt)
 	}
 }
 
@@ -835,13 +845,15 @@ func TestCompactJSONDropsColumnsBeforeRecords(t *testing.T) {
 }
 
 func TestFitAgyTranscriptFloorsSupersededLookupsFirst(t *testing.T) {
-	// Six slot lookups and one package list. The stale lookups must be spent
-	// before the record list gives up a single record.
+	// The same slot lookup asked six times, and one package list. The stale
+	// copies must be spent before the record list gives up a single record.
+	// (Lookups for different dates or therapists are different questions and
+	// stay live — TestOnlyTheSameQuestionOrAnswerIsStale.)
 	msgs := []anthropicMessage{{Role: "user", Content: "احجزيلي"}}
 	for i := 0; i < 6; i++ {
 		id := fmt.Sprintf("s%d", i)
 		msgs = append(msgs,
-			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_available_slots", "input": map[string]any{"from_date": fmt.Sprintf("2026-09-%02d", 10+i)}}}},
+			anthropicMessage{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": id, "name": "get_available_slots", "input": map[string]any{"from_date": "2026-09-10"}}}},
 			anthropicMessage{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": fmt.Sprintf(`{"day":%d,"slots":[%s]}`, i, strings.TrimSuffix(strings.Repeat(`{"time_from":"09:00","time_to":"10:00","therapist_name":"اسم الأخصائية الطويل هنا"},`, 60), ","))}}},
 		)
 	}

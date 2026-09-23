@@ -1139,13 +1139,46 @@ const agyDroppedResultNote = "[system note: this result is not shown any more �
 // it claims.
 const agyRecallNote = "\n[system note: this result was shortened by the system to fit the context window, so it is NOT the complete output. If you need what is missing, call the tool again — that is not a repeat call.]"
 
-// agyKeepRecentPerTool is how many results of the same tool are treated as
-// live. One: a tool describes some resource, and its newest result is the
-// current state of that resource — every older result of the same tool is a
-// stale copy of the same thing and is the cheapest byte in the transcript.
-// Production 2026-09-09 (conv ed674543) carried five copies of a 117KB protocol
-// and six of a 28KB package list in one booking turn.
-const agyKeepRecentPerTool = 1
+// agySupersededResults marks the results that are stale copies: an older result
+// is stale when a newer one answers the same question — the same tool asked
+// with the same arguments — or says exactly the same thing. Those are the
+// cheapest bytes in the transcript. Production 2026-09-09 (conv ed674543)
+// carried five copies of a 117KB protocol and six of a 28KB package list in
+// one booking turn; both are caught, the protocol by its identical text
+// (the model re-asked it with reworded arguments) and the list by its identical
+// arguments.
+//
+// It used to be "every older result of the same TOOL", which treated a lookup
+// for another therapist, another date or another tool's instruction sheet as a
+// stale copy of the newest one. Prod 2026-09-21 conv 44671: the model looked up
+// Thursday for all therapists, then for Amani, then for Hiba; the first two were
+// floored as "stale" the moment Hiba's came back empty, so the summary it wrote
+// next paired 16:00 — which only Farah had — with Amani, and the booking failed
+// after the customer had already confirmed it.
+func agySupersededResults(turns []agyTurn) map[int]bool {
+	superseded := map[int]bool{}
+	asked := map[string]bool{}
+	said := map[string]bool{}
+	for i := len(turns) - 1; i >= 0; i-- {
+		tt := turns[i]
+		if tt.Kind != agyTurnToolResult || tt.Tool == "" {
+			continue
+		}
+		question := ""
+		if call, ok := agyCallForResult(turns, i); ok {
+			question = tt.Tool + "\x00" + call.Args
+		}
+		answer := tt.Tool + "\x00" + tt.Text
+		if (question != "" && asked[question]) || said[answer] {
+			superseded[i] = true
+		}
+		if question != "" {
+			asked[question] = true
+		}
+		said[answer] = true
+	}
+	return superseded
+}
 
 func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
 	trimmed := strings.TrimSpace(raw)
@@ -1290,6 +1323,13 @@ func shrinkJSONOnce(root *any, level int) bool {
 		if level < agyLevelRecords && r.depth == minDepth {
 			continue
 		}
+		// A list of offered times, and any record list carrying one, is the
+		// set of choices the result exists to deliver. Halving it leaves a
+		// different, wrong set: the model cannot tell a time the system cut
+		// from a time that is taken (agy_offers.go).
+		if agyHoldsClockList(r.arr) {
+			continue
+		}
 		arrays = append(arrays, r)
 	}
 	refs = arrays
@@ -1371,6 +1411,7 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 	weight := map[string]int{}
 	distinct := map[string]map[string]bool{}
 	scalarCol := map[string]bool{}
+	offersCol := map[string]bool{} // columns carrying a list of offered times: never spent
 	keys := 0
 	for _, item := range refs[best].arr {
 		obj, ok := item.(map[string]any)
@@ -1402,7 +1443,13 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 			case map[string]any, []any:
 				scalarCol[k] = false
 			}
+			if agyHoldsClockList(v) {
+				offersCol[k] = true
+			}
 		}
+	}
+	for k := range offersCol {
+		delete(weight, k)
 	}
 	if keys <= agyMinRecordKeys || len(weight) == 0 {
 		return false
@@ -1515,19 +1562,8 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 	out := t
 	out.Turns = append([]agyTurn(nil), t.Turns...)
 	last := out.lastCustomerIndex()
-	// Which results are superseded: all but the most recent few per tool.
-	superseded := map[int]bool{}
-	seenPerTool := map[string]int{}
-	for i := len(out.Turns) - 1; i >= 0; i-- {
-		tt := out.Turns[i]
-		if tt.Kind != agyTurnToolResult || tt.Tool == "" {
-			continue
-		}
-		seenPerTool[tt.Tool]++
-		if seenPerTool[tt.Tool] > agyKeepRecentPerTool {
-			superseded[i] = true
-		}
-	}
+	// Which results are stale copies of a newer one (agySupersededResults).
+	superseded := agySupersededResults(out.Turns)
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
 	// Three phases, and the order is the whole design. What gets spent first is
 	// decided by how reconstructible it is, which needs no knowledge of what any
@@ -2139,6 +2175,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// Every clock time this conversation's tools have mentioned, so a booking
 	// cannot start at one none of them ever offered (agy_slots.go).
 	offeredTimes := agyTimesToolsMentioned(in.Transcript)
+	// And the times each result listed under each id, so a start offered by one
+	// therapist is not booked with another (agy_offers.go).
+	offersByID := agyCollectOffers(in.Transcript)
 
 	var notes []string
 	var lastResp responsesResponse
@@ -2201,6 +2240,13 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				if bad := agyUnofferedStarts(offeredTimes, item.Arguments); len(bad) > 0 && agyTruthGuard(cfg) {
 					log.Printf("[agy-slots] %s: %s was never offered by any tool result in this conversation; rejecting", item.Name, strings.Join(bad, ", "))
 					problems = append(problems, fmt.Sprintf("you are calling %s with %s, but no tool result in this conversation ever offered that start time. The times the tools did give you are: %s. Do not book a time the customer suggested unless a tool listed it — tell her that time is not free and offer her the ones that are", item.Name, strings.Join(bad, ", "), agySomeOfferedTimes(offeredTimes, 12)))
+					hardProblem = true
+					continue
+				}
+				// The time exists, but under someone else.
+				if bad := agyUnofferedForID(offersByID, item.Arguments); len(bad) > 0 && agyTruthGuard(cfg) {
+					log.Printf("[agy-slots] %s: start not offered under the id it names; rejecting: %s", item.Name, truncateString(strings.Join(bad, " | "), 300))
+					problems = append(problems, bad...)
 					hardProblem = true
 					continue
 				}
