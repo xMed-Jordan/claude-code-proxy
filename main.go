@@ -133,6 +133,10 @@ type config struct {
 	AgyMediaAllowURLs  bool          // allow downloading media from remote URLs
 	AgyMediaRetention  time.Duration // keep materialized files this long for reuse
 	AgyMediaAgent      string        // PROXY_AGY_MEDIA_AGENT — agy agent for a media run whose attachments are all view-eligible (agyMediaViewEligible); "connect-media-view" (default, self-installed, view_file only) or "" for agy's default coding agent (rollback switch, no rebuild needed)
+	AgyGS              string        // PROXY_AGY_GS — resolved path to Ghostscript, used to render a PDF's pages to images so it can also go through AgyMediaAgent ("" → PDF rendering disabled, PDFs keep using the default coding agent)
+	AgyPDFMaxPages     int           // PROXY_AGY_PDF_MAX_PAGES — max pages rendered per PDF (clamped 1..50)
+	AgyPDFDPI          int           // PROXY_AGY_PDF_DPI — page render resolution in DPI (clamped 72..300)
+	AgyPDFTextMax      int           // PROXY_AGY_PDF_TEXT_MAX — max chars of Ghostscript-extracted PDF text appended per request, across all PDFs (clamped 0..200000)
 	AgyImage           bool          // enable the agy image-generation endpoint
 	AgyImageDir        string        // served root for generated images ("" → temp)
 	AgyImageModel      string        // default Antigravity model for image generation
@@ -831,6 +835,10 @@ func loadConfig() config {
 		AgyMediaAllowURLs:  envFlag("PROXY_AGY_MEDIA_ALLOW_URLS", true),
 		AgyMediaRetention:  parseAgyTimeout(getenv("PROXY_AGY_MEDIA_RETENTION", "86400")),
 		AgyMediaAgent:      strings.TrimSpace(getenv("PROXY_AGY_MEDIA_AGENT", agyMediaViewAgentName)),
+		AgyGS:              resolveAgyGS(getenv("PROXY_AGY_GS", "")),
+		AgyPDFMaxPages:     parseAgyPDFMaxPages(getenv("PROXY_AGY_PDF_MAX_PAGES", "10")),
+		AgyPDFDPI:          parseAgyPDFDPI(getenv("PROXY_AGY_PDF_DPI", "150")),
+		AgyPDFTextMax:      parseAgyPDFTextMax(getenv("PROXY_AGY_PDF_TEXT_MAX", "20000")),
 		AgyImage:           envFlag("PROXY_AGY_IMAGE", true),
 		AgyImageDir:        strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
 		AgyImageModel:      strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),

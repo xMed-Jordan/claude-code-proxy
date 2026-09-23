@@ -314,9 +314,26 @@ func agyMediaPrep(ctx context.Context, cfg config, basePrompt string, parts []me
 		return basePrompt, nil, nil, nil
 	}
 
-	if agent := strings.TrimSpace(cfg.AgyMediaAgent); agent != "" && agyMediaViewEligible(items) {
-		log.Printf("[agy-media] view-only agent %s for %d file(s)", agent, len(items))
-		return buildMediaViewPrompt(items, basePrompt), addDirs, []string{"--agent", agent}, nil
+	if agent := strings.TrimSpace(cfg.AgyMediaAgent); agent != "" {
+		if agyMediaViewEligible(items) {
+			log.Printf("[agy-media] view-only agent %s for %d file(s)", agent, len(items))
+			return buildMediaViewPrompt(items, basePrompt), addDirs, []string{"--agent", agent}, nil
+		}
+		// A PDF isn't directly view-eligible, but it can become so by being
+		// rendered to page images first (agyPDFViewPlan). This is a strict
+		// widening of the check above: it never runs when every item was
+		// already an eligible image (that returned already), and it never
+		// lets a non-image/non-pdf attachment (audio, video, office,
+		// archive) slip onto the view-only agent.
+		if hasPDFItem(items) {
+			viewItems, pdfBlocks, ok, reason := agyPDFViewPlan(ctx, cfg, items, agent)
+			if ok {
+				log.Printf("[agy-media] view-only agent %s for %d file(s) (PDF rendered)", agent, len(items))
+				return buildMediaViewPromptWithPDF(viewItems, pdfBlocks, basePrompt, cfg.AgyPDFTextMax), addDirs, []string{"--agent", agent}, nil
+			}
+			log.Printf("[agy-media] default agent (kinds: %s): %s", mediaItemKinds(items), reason)
+			return buildMediaPrompt(items, basePrompt), addDirs, nil, nil
+		}
 	}
 	log.Printf("[agy-media] default agent (kinds: %s)", mediaItemKinds(items))
 	return buildMediaPrompt(items, basePrompt), addDirs, nil, nil
