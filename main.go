@@ -3931,9 +3931,9 @@ func shortID(value string) string {
 }
 
 func estimateAnthropicRequestTokens(in anthropicRequest) int {
-	chars := len(contentToText(in.System)) + len(in.Model)
+	chars := estimateContentChars(in.System) + len(in.Model)
 	for _, msg := range in.Messages {
-		chars += len(contentToText(msg.Content))
+		chars += estimateContentChars(msg.Content)
 	}
 	return estimateTextTokensFromChars(chars)
 }
@@ -3941,13 +3941,13 @@ func estimateAnthropicRequestTokens(in anthropicRequest) int {
 func estimateOpenAIChatRequestTokens(in openAIRequest) int {
 	chars := len(in.Model)
 	for _, msg := range in.Messages {
-		chars += len(msg.Role) + len(msg.Name) + len(msg.ToolCallID) + len(contentToText(msg.Content))
+		chars += len(msg.Role) + len(msg.Name) + len(msg.ToolCallID) + estimateContentChars(msg.Content)
 		for _, call := range msg.ToolCalls {
 			chars += len(call.ID) + len(call.Type) + len(call.Function.Name) + len(call.Function.Arguments)
 		}
 	}
 	for _, tool := range in.Tools {
-		chars += len(tool.Type) + len(tool.Function.Name) + len(tool.Function.Description) + len(contentToText(tool.Function.Parameters))
+		chars += len(tool.Type) + len(tool.Function.Name) + len(tool.Function.Description) + estimateContentChars(tool.Function.Parameters)
 	}
 	return estimateTextTokensFromChars(chars)
 }
@@ -3955,10 +3955,10 @@ func estimateOpenAIChatRequestTokens(in openAIRequest) int {
 func estimateResponsesRequestTokens(in responsesRequest) int {
 	chars := len(in.Model) + len(in.Instructions) + len(in.PromptCacheKey)
 	for _, item := range in.Input {
-		chars += len(contentToText(item))
+		chars += estimateContentChars(item)
 	}
 	for _, tool := range in.Tools {
-		chars += len(tool.Type) + len(tool.Name) + len(tool.Description) + len(contentToText(tool.Parameters))
+		chars += len(tool.Type) + len(tool.Name) + len(tool.Description) + estimateContentChars(tool.Parameters)
 	}
 	return estimateTextTokensFromChars(chars)
 }
@@ -3967,12 +3967,214 @@ func estimateCodexRequestTokens(in responsesRequest) int {
 	return max(estimateResponsesRequestTokens(in), estimateJSONTokens(codexRequestBody(in)))
 }
 
+// estimateContentChars walks v with EXACTLY the same branch order/shape as
+// contentToText (nil / string / []any / map[string]any / default), so for a
+// request with NO media block it returns exactly len(contentToText(v)) for
+// the same v — see TestEstimateContentCharsMatchesContentToTextWithoutMedia.
+// The one addition: in the map[string]any branch, between the "has a text
+// key" check and the JSON-marshal fallback, a block mediaPartFromBlock
+// recognizes (an Anthropic image/document, an OpenAI image_url/input_audio,
+// or a Responses input_image — any shape collectAnthropicMedia /
+// collectOpenAIChatMedia / collectResponsesMedia already extract media
+// from) counts as mediaEstimateTokens(part)*4 chars instead of its
+// json.Marshal length. A base64 image/PDF can be hundreds of KB to
+// megabytes; contentToText's json.Marshal-and-count-it-as-text fallback
+// turned that directly into "input tokens" — real production rows in the
+// metrics DB show 1,139,511 and 1,794,146 "input tokens" for a single image
+// request.
+//
+// A Responses input item is a wrapper ({role, content: [...]}), not a block
+// itself, so a media block inside its nested "content" array is not caught
+// by the per-block check above; dropBase64BlobChars (shared with
+// estimateJSONTokens) is applied to the wrapper's marshaled JSON as a
+// second, coverage net for that case — it is a no-op (returns len(raw)
+// unchanged) whenever there is no base64 blob to find, which is exactly
+// what keeps a text-only Responses request byte-identical to before.
+func estimateContentChars(v any) int {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return len(x)
+	case []any:
+		lens := make([]int, len(x))
+		for i, item := range x {
+			if m, ok := item.(map[string]any); ok && m["type"] == "text" {
+				lens[i] = len(fmt.Sprint(m["text"]))
+				continue
+			}
+			lens[i] = estimateContentChars(item)
+		}
+		total := 0
+		for _, l := range lens {
+			total += l
+		}
+		if n := len(lens); n > 0 {
+			total += n - 1 // matches strings.Join(parts, "\n")'s separator bytes
+		}
+		return total
+	case map[string]any:
+		if text, ok := x["text"]; ok {
+			return len(fmt.Sprint(text))
+		}
+		if p, ok := mediaPartFromBlock(x); ok {
+			return mediaEstimateTokens(p) * 4
+		}
+		b, _ := json.Marshal(x)
+		return dropBase64BlobChars(string(b))
+	default:
+		return len(fmt.Sprint(x))
+	}
+}
+
+// mediaEstimateTokens estimates one media attachment's token cost for a
+// request-SIZE pre-check — never for billing, and never claiming to match
+// any single provider's real tokenizer. All bounds are conservative (never
+// smaller than a real provider's number, so the pre-check never lets a
+// request through that would actually be refused upstream):
+//   - image: 1,600 tokens flat. Claude caps a single image near 1,600
+//     tokens; Gemini 3's default image tiling is roughly 1,120; OpenAI's
+//     "high" detail setting is roughly 1,100. 1,600 is the largest of the
+//     three.
+//   - inline base64 PDF: 1,600 tokens PER PAGE, where the page count is the
+//     number of `/Type /Page` object markers in the DECODED bytes — NOT
+//     `/Type /Pages`, the page-tree ROOT object every real PDF has exactly
+//     one of regardless of how many pages it contains — clamped to
+//     [1, 500]. Decoding is skipped (falls through to the flat rate below)
+//     when the base64 payload exceeds ~70MB (≈52MB decoded), far beyond
+//     anything this proxy should be asked to size.
+//   - PDF referenced by URL (no inline base64 to decode without a fetch
+//     this pre-check must not perform): 1,600 tokens flat, same basis as an
+//     image.
+//   - audio, video, or anything else: 1,600 tokens flat — unmeasured; this
+//     proxy has no cheap way to size these without decoding/transcoding.
+func mediaEstimateTokens(p mediaPart) int {
+	const flatTokens = 1600
+	mt := strings.ToLower(strings.TrimSpace(p.MediaType))
+	if i := strings.Index(mt, ";"); i >= 0 {
+		mt = strings.TrimSpace(mt[:i])
+	}
+	isPDF := mt == "application/pdf" || strings.HasSuffix(strings.ToLower(strings.TrimSpace(p.Filename)), ".pdf")
+	if isPDF {
+		if b64 := strings.TrimSpace(p.B64); b64 != "" {
+			if pages, ok := estimatePDFPagesFromBase64(b64); ok {
+				return flatTokens * pages
+			}
+		}
+	}
+	return flatTokens
+}
+
+// maxPDFBase64CharsToDecode bounds how much base64 text mediaEstimateTokens
+// will decode to count PDF pages (~70MB of base64 ≈ ~52MB decoded).
+const maxPDFBase64CharsToDecode = 70 * 1000 * 1000
+
+// estimatePDFPagesFromBase64 decodes b64 (ok=false, nothing counted, above
+// maxPDFBase64CharsToDecode or on a decode error) and counts `/Type /Page`
+// object markers, clamped to [1, 500].
+func estimatePDFPagesFromBase64(b64 string) (int, bool) {
+	if b64 == "" || len(b64) > maxPDFBase64CharsToDecode {
+		return 0, false
+	}
+	raw, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, newB64CleanReader(b64)))
+	if err != nil || len(raw) == 0 {
+		return 0, false
+	}
+	pages := countPDFPageMarkers(raw)
+	if pages < 1 {
+		pages = 1
+	}
+	if pages > 500 {
+		pages = 500
+	}
+	return pages, true
+}
+
+// countPDFPageMarkers counts `/Type /Page` (PDF allows omitting the
+// whitespace: `/Type/Page` is equally valid) object markers in raw PDF
+// bytes, excluding `/Type /Pages` — the page-tree ROOT object, which every
+// real PDF has exactly one of regardless of its actual page count — and
+// `/Type /PageLabels` or any other name that merely starts with "Page".
+func countPDFPageMarkers(raw []byte) int {
+	const marker = "/Type"
+	count := 0
+	s := raw
+	for {
+		idx := bytes.Index(s, []byte(marker))
+		if idx < 0 {
+			return count
+		}
+		rest := s[idx+len(marker):]
+		i := 0
+		for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\r' || rest[i] == '\n') {
+			i++
+		}
+		rest = rest[i:]
+		if bytes.HasPrefix(rest, []byte("/Page")) {
+			after := rest[len("/Page"):]
+			if len(after) == 0 || !isPDFNameChar(after[0]) {
+				count++
+			}
+		}
+		s = rest
+	}
+}
+
+// isPDFNameChar reports whether b could continue a PDF name object token
+// (so "/Page" followed by a letter/digit, as in "/Pages" or "/PageLabels",
+// is recognized as a DIFFERENT, longer name and not miscounted as "/Page").
+func isPDFNameChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// base64MinBareRunChars is the "pure base64 run" threshold from the spec:
+// at least 1,024 characters. base64BlobRe itself only pre-filters at a
+// lower bound (Go's RE2 engine rejects a literal {1024,} repeat count —
+// "invalid repeat count", its internal limit is 1000); dropBase64BlobChars
+// re-checks each bare-run match against the real 1,024 threshold below.
+const base64MinBareRunChars = 1024
+
+// base64BlobRe matches a data:<mime>;base64,<payload> URL (any length — the
+// data: prefix alone is unambiguous), or a bare run of base64-alphabet
+// characters at least base64BareRunPreFilter long (a cheap pre-filter;
+// dropBase64BlobChars applies the real base64MinBareRunChars threshold to
+// each bare-run match). Both shapes use only JSON-string-safe characters,
+// so this matches directly against already-marshaled bytes without
+// unescaping.
+const base64BareRunPreFilter = 200 // safely under RE2's 1000 repeat-count cap
+
+var base64BlobRe = regexp.MustCompile(`data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+|[A-Za-z0-9+/=]{` + strconv.Itoa(base64BareRunPreFilter) + `,}`)
+
+// base64BlobEquivalentChars is the char-length used in place of a matched
+// base64 blob: 1,600 tokens (mediaEstimateTokens' flat rate) * 4 chars/token.
+const base64BlobEquivalentChars = 1600 * 4
+
+// dropBase64BlobChars re-prices every base64 media blob found in raw (a
+// data: URL of any length, or a bare base64 run of >=1,024 chars) at a flat
+// base64BlobEquivalentChars each instead of its real — often enormous —
+// length, as a pure length adjustment: len(raw) - (sum of matched lengths)
+// + n*base64BlobEquivalentChars. No string is rebuilt, so this costs
+// nothing extra when raw has no such blob: the common, non-media case
+// returns len(raw) completely unchanged.
+func dropBase64BlobChars(raw string) int {
+	total := len(raw)
+	n := 0
+	for _, m := range base64BlobRe.FindAllString(raw, -1) {
+		if !strings.HasPrefix(m, "data:") && len(m) < base64MinBareRunChars {
+			continue // below the real "pure base64 run" threshold — leave it priced as text
+		}
+		total -= len(m)
+		n++
+	}
+	return total + n*base64BlobEquivalentChars
+}
+
 func estimateJSONTokens(v any) int {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return 0
 	}
-	return estimateTextTokensFromChars(len(raw))
+	return estimateTextTokensFromChars(dropBase64BlobChars(string(raw)))
 }
 
 func estimateTextTokens(text string) int {

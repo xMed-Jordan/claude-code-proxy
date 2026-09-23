@@ -2077,6 +2077,46 @@ func agyToResponsesResponse(text, model string, inputTokens int) responsesRespon
 	return resp
 }
 
+// agyTraceUsage sums a v2 generation trace's REAL agy-reported usage across
+// EVERY attempt, not just the final one that produced the returned text — a
+// rejected/retried attempt still consumed real Gemini quota (a correction
+// round is a full extra model call), so it must count too. Returns (0, 0)
+// for a nil trace or when no attempt reported any usage (agy's stream-json
+// usage block was absent/zero for all of them).
+//
+// agy's OutputTokens is Gemini's BILLED output count, which INCLUDES
+// thinking tokens. Evidence from the [agy] journal, 2026-09-23: every
+// logged line has out >= think — "in=16378 out=4860 think=4619" for a
+// receipt read, "out=19 think=10", "out=463 think=437" elsewhere — and
+// Gemini bills thinking as output. So this reports OutputTokens exactly as
+// agy gave it (inclusive of thinking), never OutputTokens-ThinkingTokens.
+func agyTraceUsage(trace *agyGenTrace) (in, out int) {
+	if trace == nil {
+		return 0, 0
+	}
+	for _, a := range trace.Attempts {
+		in += a.Usage.InputTokens
+		out += a.Usage.OutputTokens
+	}
+	return in, out
+}
+
+// agyApplyRealUsage overwrites resp.Usage with real, agy-reported counts
+// when they are known (in/out > 0), leaving today's estimate-derived value
+// in place when a count is unknown (0) — e.g. before agy ever ran, or a
+// legacy agyj argv invocation whose stdout carried no usage block.
+func agyApplyRealUsage(resp *responsesResponse, in, out int) {
+	if resp == nil {
+		return
+	}
+	if in > 0 {
+		resp.Usage.InputTokens = in
+	}
+	if out > 0 {
+		resp.Usage.OutputTokens = out
+	}
+}
+
 func agyNote(alias string, stream bool) string {
 	return "alias=" + alias + " upstream=agy stream=" + strconv.FormatBool(stream)
 }
@@ -2251,7 +2291,10 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 	if agyLegacyPrompt(cfg) {
 		resp, err = agyLegacyAnthropicResponse(ctx, cfg, in, model, inputTokens)
 	} else {
-		resp, _, err = agyGenerate(ctx, cfg, agyGenInputFromAnthropic(in, inputTokens))
+		var trace *agyGenTrace
+		resp, trace, err = agyGenerate(ctx, cfg, agyGenInputFromAnthropic(in, inputTokens))
+		realIn, realOut := agyTraceUsage(trace)
+		agyApplyRealUsage(&resp, realIn, realOut)
 	}
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "agy "+err.Error())
@@ -2265,6 +2308,7 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		}
 	}
 	updateRequestStat(r, func(stat *requestStat) {
+		stat.InputTokens = resp.Usage.InputTokens
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = stopReason
 	})
@@ -2272,7 +2316,7 @@ func serveAgyAnthropic(ctx context.Context, cfg config, in anthropicRequest, w h
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
-		sendAnthropicMessageStart(w, resp.ID, model, inputTokens, 0)
+		sendAnthropicMessageStart(w, resp.ID, model, resp.Usage.InputTokens, 0)
 		writeAnthropicBufferedStreamFrom(ctx, w, resp, 0)
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		if flusher != nil {
@@ -2304,6 +2348,11 @@ func agyLegacyAnthropicResponse(ctx context.Context, cfg config, in anthropicReq
 		return responsesResponse{}, err
 	}
 	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+	agyApplyRealUsage(&resp, res.InputTokens, res.OutputTokens)
+	// Real usage accumulates across every agy call this legacy path makes,
+	// including a retry below that goes on to replace resp — a retry is a
+	// full extra model call, same as an agyGenerate correction attempt.
+	realIn, realOut := res.InputTokens, res.OutputTokens
 
 	var activeCustomerReq string
 	for j := len(in.Messages) - 1; j >= 0; j-- {
@@ -2338,7 +2387,10 @@ func agyLegacyAnthropicResponse(ctx context.Context, cfg config, in anthropicReq
 		retryPb.WriteString("Confirm the booking directly to the customer in natural, warm Jordanian Arabic in 1-2 conversational sentences, clearly stating the date, time, and branch (e.g. 'تم حجز جلستك يوم الثلاثاء 8/9 الساعة 11:00 صباحاً بفرع عمان. أهلاً وسهلاً فيكِ!'). Do NOT call any tools. Do NOT quote technical IDs or JSON.\n")
 
 		if retryRes, retryErr := agyResolve(ctx, cfg, nil, retryPb.String(), in.Model); retryErr == nil && retryRes.Ok {
+			realIn += retryRes.InputTokens
+			realOut += retryRes.OutputTokens
 			retryResp := agyToResponsesResponse(retryRes.Response, model, inputTokens)
+			agyApplyRealUsage(&retryResp, realIn, realOut)
 			if !hasAnyToolCall(retryResp.Output) && len(retryResp.Output) > 0 {
 				resp = retryResp
 				log.Printf("[agy-guard] Successfully recovered booking confirmation into direct Arabic text response.")
@@ -2366,7 +2418,10 @@ func agyLegacyAnthropicResponse(ctx context.Context, cfg config, in anthropicReq
 		retryPb.WriteString("Respond directly to the customer in natural friendly Jordanian Arabic quoting the available appointment times from merged_slots (e.g. for today or tomorrow) in 1-2 conversational sentences and ask which time she prefers. Avoid markdown bullet lists or introductory headings ending in colons.\n")
 
 		if retryRes, retryErr := agyResolve(ctx, cfg, nil, retryPb.String(), in.Model); retryErr == nil && retryRes.Ok {
+			realIn += retryRes.InputTokens
+			realOut += retryRes.OutputTokens
 			retryResp := agyToResponsesResponse(retryRes.Response, model, inputTokens)
+			agyApplyRealUsage(&retryResp, realIn, realOut)
 			hasToolCall := false
 			for _, item := range retryResp.Output {
 				if item.Type == "function_call" {
@@ -2399,10 +2454,11 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 			return
 		}
 		resp = agyToResponsesResponse(res.Response, model, inputTokens)
+		agyApplyRealUsage(&resp, res.InputTokens, res.OutputTokens)
 		streamText = res.Response
 	} else {
 		tr, sysParts := buildAgyTranscriptFromOpenAIChat(in)
-		gen, _, err := agyGenerate(ctx, cfg, agyGenInput{
+		gen, trace, err := agyGenerate(ctx, cfg, agyGenInput{
 			Model:       in.Model,
 			System:      strings.Join(sysParts, "\n\n"),
 			Temperature: in.Temperature,
@@ -2416,9 +2472,12 @@ func serveAgyOpenAIChat(ctx context.Context, cfg config, in openAIRequest, w htt
 			return
 		}
 		resp = gen
+		realIn, realOut := agyTraceUsage(trace)
+		agyApplyRealUsage(&resp, realIn, realOut)
 		streamText = agyResponseText(resp)
 	}
 	updateRequestStat(r, func(stat *requestStat) {
+		stat.InputTokens = resp.Usage.InputTokens
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = "stop"
 	})
@@ -2460,9 +2519,10 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 			return
 		}
 		resp = agyToResponsesResponse(res.Response, model, inputTokens)
+		agyApplyRealUsage(&resp, res.InputTokens, res.OutputTokens)
 		streamText = res.Response
 	} else {
-		gen, _, err := agyGenerate(ctx, cfg, agyGenInput{
+		gen, trace, err := agyGenerate(ctx, cfg, agyGenInput{
 			Model:       in.Model,
 			System:      strings.TrimSpace(in.Instructions),
 			Temperature: in.Temperature,
@@ -2476,9 +2536,12 @@ func serveAgyResponses(ctx context.Context, cfg config, in responsesRequest, w h
 			return
 		}
 		resp = gen
+		realIn, realOut := agyTraceUsage(trace)
+		agyApplyRealUsage(&resp, realIn, realOut)
 		streamText = agyResponseText(resp)
 	}
 	updateRequestStat(r, func(stat *requestStat) {
+		stat.InputTokens = resp.Usage.InputTokens
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = "stop"
 	})
