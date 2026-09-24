@@ -450,13 +450,17 @@ func agyCancelWithBooking(cfg config, in agyGenInput, output []responsesOutputIt
 
 // agyRecordClaimRe matches a first-person report of having recorded, cancelled,
 // or passed something on to the team — the phrasing that slipped past the
-// completion guard: "سجّلت طلبك", "سجّلت عندك طلب إلغاء", "سجّلت عندي رغبتك",
-// "حوّلت الطلب للفريق", "ألغيت موعدك", "تم الإلغاء". Zeina has no tool that
-// hands a conversation to staff, so "I passed it to the team" is never true.
+// completion guard: "سجّلت طلبك", "سجّلت عندك طلب إلغاء", "حوّلت الطلب
+// للفريق", "رفعت ملاحظة للفريق", "بلّغت الفريق", "ألغيت موعدك", "تم الإلغاء".
+// Zeina has no tool that hands a conversation to staff, so "I passed it to the
+// team" is never true. Left alone (a scan of 2,136 replies, 2026-09-21..24):
+// "سجّلت عندي" — I have noted your preference, which the conversation itself
+// keeps; "تم التحويل" — the customer's bank transfer; "تسجلت" — "سجلت" inside
+// another word.
 var agyRecordClaimRe = regexp.MustCompile(
-	`(?i)(سجّ?لت(لك|لكِ)?\s+(عندي|عندك|طلب|رغبت|ملاحظ|موعد|اسم|ال)|سجّ?لتلك|(ألغيت|الغيت|لغيت)(لك|لكِ)?\s|` +
-		`تمّ?\s+(ال)?(إلغاء|الغاء|إرسال|ارسال|تحويل)|` +
-		`(وصّ?لت|حوّ?لت|رفعت|بعثت|بعتت|أرسلت|ارسلت)\s+(ملاحظتك|طلبك|الطلب|رغبتك|الملاحظة|موضوعك)|(بلّ?غت|خبّ?رت)\s+(ال)?فريق|` +
+	`(?i)((?:^|\PL)[وف]?سجّ?لت(لك|لكِ)?\s+(عندك|طلب|ملاحظ|موعد|اسم|ال)|(?:^|\PL)[وف]?سجّ?لتلك|(?:^|\PL)[وف]?(ألغيت|الغيت|لغيت)(لك|لكِ)?\s|` +
+		`تمّ?\s+(ال)?(إلغاء|الغاء|إرسال|ارسال)|تمّ?\s+تحويل\s+(طلبك|الطلب|موضوعك|ملاحظتك)|` +
+		`(?:^|\PL)[وف]?(وصّ?لت|حوّ?لت|رفعت|بعثت|بعتت|أرسلت|ارسلت)\s+(ملاحظتك|ملاحظة|طلبك|الطلب|رغبتك|الملاحظة|موضوعك)|(?:^|\PL)[وف]?(بلّ?غت|خبّ?رت)\s+(ال)?فريق|` +
 		`\bi(?:'ve|\s+have)?\s+(recorded|registered|cancel+ed|logged|noted down|forwarded|passed on)\s+(your|the|it)\b|\bhas\s+been\s+cancel+ed\b)`)
 
 // agyClaimsRecord reports whether a reply claims a recording/cancelling action,
