@@ -192,6 +192,10 @@ func TestARecordingNobodyMadeIsRefused(t *testing.T) {
 		"ألغيت موعدك عزيزتي",
 		"تم الإلغاء عزيزتي",
 		"ووصلت ملاحظتك للفريق حتى يتابعوا إلغاء الموعد",
+		// Conv 61123 (E2E 2026-09-24), after a check failed: a handoff that does not exist.
+		"تكرمي عزيزتي فايزة، سجّلت عندي رغبتك بالموعد يوم الاثنين 28/09/2026 الساعة 3:00 بعد الظهر بفرع إربد، وحوّلت الطلب للفريق بالعيادة ورح يتواصلوا معك",
+		"حوّلت الطلب للفريق بالعيادة",
+		"تم تحويل طلبك للفريق",
 		"I've cancelled your appointment.",
 	} {
 		if !agyUnbackedRecordClaim(gateOn(), in, textReply(s)) {
@@ -203,6 +207,7 @@ func TestARecordingNobodyMadeIsRefused(t *testing.T) {
 		"رح يتم الإلغاء بعد ما توافقي",
 		"لم يتم الإلغاء",
 		"بتحبي ألغيلك الموعد؟",
+		"رح أحوّل طلبك للفريق إذا بتحبي",
 	} {
 		if agyUnbackedRecordClaim(gateOn(), in, textReply(s)) {
 			t.Errorf("an honest reply was refused: %q", s)
