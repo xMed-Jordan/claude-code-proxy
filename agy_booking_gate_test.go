@@ -296,3 +296,20 @@ func TestACheckTakesTheShapesOfTheToolItChecks(t *testing.T) {
 		t.Fatalf("a tool that is not a check inherited a shape: %v", p)
 	}
 }
+
+// Connect sends results from earlier turns wrapped as {"name":..,"result":..}.
+// The documented shapes must be read from those too, or the guard only works
+// in the turn that fetched the instructions (E2E 2026-09-24 conv 61255).
+func TestShapesAreReadFromWrappedEarlierResults(t *testing.T) {
+	wrapped := `{"name":"get_tool_instructions","result":` + multiServiceInstructions() + `}`
+	tr := agyTranscript{Turns: []agyTurn{
+		{Kind: agyTurnCustomer, Text: "الساعة 3"},
+		{Kind: agyTurnToolResult, Tool: "get_tool_instructions", Text: wrapped},
+		{Kind: agyTurnCustomer, Text: "خليه 3:30"},
+	}}
+	kinds := agyDocumentedArgKinds(tr)
+	bad := canonicalToolArgs(map[string]any{"service_packages": "[263663]"})
+	if p := agyArgShapeProblems(kinds, "create_multi_service_reservation", bad); len(p) != 1 {
+		t.Fatalf("the shape in a wrapped earlier result was not read: %v", p)
+	}
+}

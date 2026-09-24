@@ -88,6 +88,15 @@ func agyInstructionPayload(text string) (tool, instructions string, ok bool) {
 	if json.Unmarshal([]byte(text), &body) != nil {
 		return "", "", false
 	}
+	// Connect sends results from earlier turns wrapped as {"name":..,"result":..}.
+	// Reading only the bare form meant the shapes were known only in the turn
+	// that fetched the instructions (E2E 2026-09-24 conv 61255: the list went
+	// through in the next turn).
+	if _, bare := body["tool"]; !bare {
+		if inner, ok := body["result"].(map[string]any); ok {
+			body = inner
+		}
+	}
 	meta, isMap := body["tool"].(map[string]any)
 	if !isMap {
 		return "", "", false
