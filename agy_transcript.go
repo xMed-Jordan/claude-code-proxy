@@ -2548,6 +2548,15 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 			}
 			kept = append(kept, item)
 		}
+		// Cancelling and booking in one step: the cancel lands even when the
+		// booking is refused, and the customer is left with neither
+		// (agy_booking_gate.go).
+		if cancel, book := agyCancelWithBooking(cfg, in, resp.Output); cancel != "" {
+			log.Printf("[agy-gate] draft cancels (%s) and books (%s) in the same step; rejecting", cancel, book)
+			problems = append(problems, fmt.Sprintf("you called %s and %s in the same step. If the booking is refused, the cancellation has already happened and the customer loses the appointment she had. To move a booking use the reschedule tool, which moves it in place. If it really must be cancelled and booked again, check the new booking first with the check tool, and cancel only after the check passed", cancel, book))
+			hardProblem = true
+			kept = kept[:0]
+		}
 		if hardProblem {
 			capOnly = capOnly[:0]
 		}
@@ -2589,6 +2598,16 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 				kept = kept[:0]
 			}
 		}
+		// A booking summary before the booking was checked, a check reported as
+		// a booking, and a recording nobody made (agy_booking_gate.go).
+		if len(problems) == 0 {
+			if gate := agyBookingReplyProblems(cfg, in, resp); len(gate) > 0 {
+				log.Printf("[agy-gate] reply rejected (%d): %s", len(gate), truncateString(strings.Join(strings.Fields(agyResponseText(resp)), " "), 200))
+				problems = append(problems, gate...)
+				hardProblem = true
+				kept = kept[:0]
+			}
+		}
 		trace.Attempts = append(trace.Attempts, agyGenAttempt{Note: strings.Join(notes, " | "), Raw: res.Response, Problems: problems, DurationMs: time.Since(t0).Milliseconds(), Usage: res})
 		trace.FinalPrompt = p
 		if len(problems) == 0 {
@@ -2605,7 +2624,8 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	if haveResp && len(lastResp.Output) > 0 && (hasAnyToolCall(lastResp.Output) || agyResponseText(lastResp) != "") &&
 		!agyReplyBreaksPersona(cfg, in.System, lastResp) &&
 		len(agyReplyClaimsUnperformed(cfg, in.Transcript, lastResp)) == 0 &&
-		len(agyReplyLeaksInternal(cfg, internalOnly, lastResp)) == 0 {
+		len(agyReplyLeaksInternal(cfg, internalOnly, lastResp)) == 0 &&
+		len(agyBookingReplyProblems(cfg, in, lastResp)) == 0 {
 		log.Printf("[agy-loop] retries exhausted; returning the last draft without the rejected calls")
 		return lastResp, trace, nil
 	}
@@ -2625,6 +2645,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	p := prompt + "\n\n### CORRECTION FROM THE SYSTEM (not from the customer)\n\nYour previous drafts only repeated tool calls whose results are already in the transcript. Do NOT call any tool now. Using the tool results above, reply to the customer in plain text, following the system instructions."
 	if unperformed := in.Transcript.unperformedThisTurn(); agyTruthGuard(cfg) && len(unperformed) > 0 {
 		p += fmt.Sprintf(" %s failed in this turn and nothing it would have done was carried out — your reply must not say otherwise.", strings.Join(unperformed, ", "))
+	}
+	if agyBookingGateApplies(cfg, in) && len(agyCheckedSlots(in.Transcript.currentTurnOutcomes())) == 0 {
+		p += " No booking check passed in this turn, so do not show a booking summary: nothing has been checked yet, and nothing is booked."
 	}
 	t0 := time.Now()
 	res, err := agyResolveWithFormatRetry(ctx, cfg, in.Media, p, in.Model)
@@ -2667,6 +2690,13 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 		// serves the turn, and its safety net says nothing rather than a lie.
 		log.Printf("[agy-loop] every attempt claimed an action %s did not perform; failing the request so the caller can fall back", strings.Join(unperformed, ", "))
 		return responsesResponse{}, trace, fmt.Errorf("agy reported %s as completed although it failed in this turn", strings.Join(unperformed, ", "))
+	}
+	if gate := agyBookingReplyProblems(cfg, in, resp); len(gate) > 0 {
+		// Still a summary nobody checked, a check reported as a booking, or a
+		// recording nobody made. The customer would act on it; the caller's
+		// fallback chain serves the turn instead.
+		log.Printf("[agy-gate] every attempt was refused by the booking gate; failing the request so the caller can fall back: %s", truncateString(strings.Join(gate, " | "), 300))
+		return responsesResponse{}, trace, fmt.Errorf("agy reply refused by the booking gate: %s", truncateString(gate[0], 160))
 	}
 	log.Printf("[agy-loop] forced plain-text reply (%d chars)", len(agyResponseText(resp)))
 	return resp, trace, nil

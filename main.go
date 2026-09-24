@@ -106,42 +106,46 @@ type config struct {
 	ModelRecommended   map[string]bool // alias → is the recommended choice
 	ClaudeDefaults     map[string]string
 	ReasoningEffort    string
-	AgyBin             string        // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
-	AgyCLI             string        // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
-	AgyRunAs           string        // PROXY_AGY_RUN_AS — dedicated non-root Linux user every agy/agyj child is spawned as (see parseAgyRunAs, agyResolveRunAs, agyPrepareCmd); "" (unset/empty/off/none/root) = disabled, today's behaviour (root). Linux only — set but unresolvable/unvalidated FAILS CLOSED (every agy spawn errors), never silently falls back to root
-	AgyModel           string        // optional global model override forwarded to agy ("" → agy's own default)
-	AgyPromptMode      string        // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
-	AgyToolResultCap   int           // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
-	AgyReadableResults bool          // PROXY_AGY_READABLE_RESULTS — lay JSON tool results out one member per line in the agy prompt (default false; replays showed no accuracy gain)
-	AgyPromptBudget    int           // PROXY_AGY_PROMPT_BUDGET — byte budget for the rendered agy prompt; agy silently truncates above ~191KB (-1 disables the fitting)
-	AgyCompact         bool          // PROXY_AGY_COMPACT — when even fitting cannot make the prompt fit, summarise the oldest part of the dialogue and continue from the brief
-	AgyTruthGuardOff   bool          // PROXY_AGY_TRUTH_GUARD=false — stop rejecting replies that tell the customer an action happened when the call that would have performed it failed in the same turn
-	AgyPersonaGuardOff bool          // PROXY_AGY_PERSONA_GUARD=false — stop rejecting replies that describe the runtime (agy's coding-agent framing) instead of answering as the caller's assistant
-	AgyToolCallCap     int           // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
-	AgyAgent           string        // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
-	AgyConcurrency     int           // max simultaneous agyj subprocesses
-	AgyTimeout         time.Duration // per-call agy execution timeout
-	AgyWarmWorkers     int           // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
-	AgyWorkerModel     string        // PROXY_AGY_WORKER_MODEL — model to prewarm (default gemini-3.8-flash-medium)
-	AgyWorkerMaxTurns  int           // PROXY_AGY_WORKER_MAX_TURNS — recycle worker after this many turns (default 50)
-	AgyQueueTimeout    time.Duration // PROXY_AGY_QUEUE_TIMEOUT — max duration to wait in queue for an available warm worker
-	AgyMedia           bool          // enable media attachments for agy requests
-	AgyMediaDir        string        // scratch root for materialized media ("" → temp)
-	AgyMediaModel      string        // default Antigravity model for media requests
-	AgyMediaTimeout    time.Duration // per-call timeout for media (heavier) requests
-	AgyMediaMaxBytes   int64         // max bytes per attached/extracted file
-	AgyMediaMaxTotal   int64         // max total bytes materialized per request
-	AgyMediaAllowURLs  bool          // allow downloading media from remote URLs
-	AgyMediaRetention  time.Duration // keep materialized files this long for reuse
-	AgyMediaAgent      string        // PROXY_AGY_MEDIA_AGENT — agy agent for a media run where every attachment is view-eligible: a directly viewable image (agyMediaViewEligible) or a PDF Ghostscript rendered (agyPDFViewPlan); "connect-media-view" (default, self-installed, view_file only) or "off" (recognized synonyms: empty/none/default/0/false — see parseAgyMediaAgent, fed by os.LookupEnv so "set to empty" is distinguishable from "unset") for agy's default coding agent — the rollback switch, no rebuild needed
-	AgyGS              string        // PROXY_AGY_GS — resolved path to Ghostscript, used to render a PDF's pages to images so it can also go through AgyMediaAgent ("" → PDF rendering disabled, PDFs keep using the default coding agent)
-	AgyPDFMaxPages     int           // PROXY_AGY_PDF_MAX_PAGES — max pages rendered per PDF (clamped 1..50)
-	AgyPDFDPI          int           // PROXY_AGY_PDF_DPI — page render resolution in DPI (clamped 72..300)
-	AgyPDFTextMax      int           // PROXY_AGY_PDF_TEXT_MAX — max chars of Ghostscript-extracted PDF text appended per request, across all PDFs (clamped 0..200000)
-	AgyImage           bool          // enable the agy image-generation endpoint
-	AgyImageDir        string        // served root for generated images ("" → temp)
-	AgyImageModel      string        // default Antigravity model for image generation
-	AgyImageRetention  time.Duration // keep generated images this long for reuse
+	AgyBin             string         // path to the agyj wrapper binary ("" → sibling of proxy exe, else PATH)
+	AgyCLI             string         // path to the real agy CLI, injected as AGYJ_AGY_BIN ("" → let agyj self-resolve)
+	AgyRunAs           string         // PROXY_AGY_RUN_AS — dedicated non-root Linux user every agy/agyj child is spawned as (see parseAgyRunAs, agyResolveRunAs, agyPrepareCmd); "" (unset/empty/off/none/root) = disabled, today's behaviour (root). Linux only — set but unresolvable/unvalidated FAILS CLOSED (every agy spawn errors), never silently falls back to root
+	AgyModel           string         // optional global model override forwarded to agy ("" → agy's own default)
+	AgyPromptMode      string         // PROXY_AGY_PROMPT_MODE — "v2" (transcript prompt + generic loop correction, default) or "legacy"
+	AgyToolResultCap   int            // PROXY_AGY_TOOL_RESULT_CAP — max chars kept per tool result from EARLIER turns in the agy prompt (0 = unlimited)
+	AgyReadableResults bool           // PROXY_AGY_READABLE_RESULTS — lay JSON tool results out one member per line in the agy prompt (default false; replays showed no accuracy gain)
+	AgyPromptBudget    int            // PROXY_AGY_PROMPT_BUDGET — byte budget for the rendered agy prompt; agy silently truncates above ~191KB (-1 disables the fitting)
+	AgyCompact         bool           // PROXY_AGY_COMPACT — when even fitting cannot make the prompt fit, summarise the oldest part of the dialogue and continue from the brief
+	AgyTruthGuardOff   bool           // PROXY_AGY_TRUTH_GUARD=false — stop rejecting replies that tell the customer an action happened when the call that would have performed it failed in the same turn
+	AgySummaryGate     string         // PROXY_AGY_SUMMARY_GATE — off (default) | test | on: a booking summary may only go out after a check_* tool passed in the same turn for the quoted slot (agy_booking_gate.go)
+	AgySummaryGateOnly *regexp.Regexp // PROXY_AGY_SUMMARY_GATE_ONLY — in test mode, the gate applies only to conversations whose prompt matches this (e.g. the test phone number)
+	AgySummaryMarker   *regexp.Regexp // PROXY_AGY_SUMMARY_MARKER — how a pre-confirmation booking summary is recognised (nil → agyDefaultSummaryMarker)
+	AgyCheckTools      *regexp.Regexp // PROXY_AGY_CHECK_TOOLS — names of the tools that check a booking without making it (nil → ^check_)
+	AgyPersonaGuardOff bool           // PROXY_AGY_PERSONA_GUARD=false — stop rejecting replies that describe the runtime (agy's coding-agent framing) instead of answering as the caller's assistant
+	AgyToolCallCap     int            // PROXY_AGY_TOOL_CALL_CAP — max calls to one tool within a single turn before further calls are rejected (0 → default 3, -1 = off)
+	AgyAgent           string         // PROXY_AGY_AGENT — agy custom agent for chat (non-media) runs; "connect-chat" (default, self-installed, no built-in tools) or "" for agy's default coding agent
+	AgyConcurrency     int            // max simultaneous agyj subprocesses
+	AgyTimeout         time.Duration  // per-call agy execution timeout
+	AgyWarmWorkers     int            // PROXY_AGY_WARM_WORKERS — number of persistent warm background workers (0 = disabled)
+	AgyWorkerModel     string         // PROXY_AGY_WORKER_MODEL — model to prewarm (default gemini-3.8-flash-medium)
+	AgyWorkerMaxTurns  int            // PROXY_AGY_WORKER_MAX_TURNS — recycle worker after this many turns (default 50)
+	AgyQueueTimeout    time.Duration  // PROXY_AGY_QUEUE_TIMEOUT — max duration to wait in queue for an available warm worker
+	AgyMedia           bool           // enable media attachments for agy requests
+	AgyMediaDir        string         // scratch root for materialized media ("" → temp)
+	AgyMediaModel      string         // default Antigravity model for media requests
+	AgyMediaTimeout    time.Duration  // per-call timeout for media (heavier) requests
+	AgyMediaMaxBytes   int64          // max bytes per attached/extracted file
+	AgyMediaMaxTotal   int64          // max total bytes materialized per request
+	AgyMediaAllowURLs  bool           // allow downloading media from remote URLs
+	AgyMediaRetention  time.Duration  // keep materialized files this long for reuse
+	AgyMediaAgent      string         // PROXY_AGY_MEDIA_AGENT — agy agent for a media run where every attachment is view-eligible: a directly viewable image (agyMediaViewEligible) or a PDF Ghostscript rendered (agyPDFViewPlan); "connect-media-view" (default, self-installed, view_file only) or "off" (recognized synonyms: empty/none/default/0/false — see parseAgyMediaAgent, fed by os.LookupEnv so "set to empty" is distinguishable from "unset") for agy's default coding agent — the rollback switch, no rebuild needed
+	AgyGS              string         // PROXY_AGY_GS — resolved path to Ghostscript, used to render a PDF's pages to images so it can also go through AgyMediaAgent ("" → PDF rendering disabled, PDFs keep using the default coding agent)
+	AgyPDFMaxPages     int            // PROXY_AGY_PDF_MAX_PAGES — max pages rendered per PDF (clamped 1..50)
+	AgyPDFDPI          int            // PROXY_AGY_PDF_DPI — page render resolution in DPI (clamped 72..300)
+	AgyPDFTextMax      int            // PROXY_AGY_PDF_TEXT_MAX — max chars of Ghostscript-extracted PDF text appended per request, across all PDFs (clamped 0..200000)
+	AgyImage           bool           // enable the agy image-generation endpoint
+	AgyImageDir        string         // served root for generated images ("" → temp)
+	AgyImageModel      string         // default Antigravity model for image generation
+	AgyImageRetention  time.Duration  // keep generated images this long for reuse
 	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
 	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
 	// Claude subscription (long-lived OAuth token from `claude setup-token`).
@@ -818,6 +822,10 @@ func loadConfig() config {
 		AgyReadableResults: parseBoolDefault(getenv("PROXY_AGY_READABLE_RESULTS", "false"), false),
 		AgyPromptBudget:    parseIntDefault(getenv("PROXY_AGY_PROMPT_BUDGET", "0"), 0),
 		AgyCompact:         parseBoolDefault(getenv("PROXY_AGY_COMPACT", "true"), true),
+		AgySummaryGate:     strings.TrimSpace(getenv("PROXY_AGY_SUMMARY_GATE", "off")),
+		AgySummaryGateOnly: parseOptionalRegexp("PROXY_AGY_SUMMARY_GATE_ONLY", getenv("PROXY_AGY_SUMMARY_GATE_ONLY", "")),
+		AgySummaryMarker:   parseOptionalRegexp("PROXY_AGY_SUMMARY_MARKER", getenv("PROXY_AGY_SUMMARY_MARKER", "")),
+		AgyCheckTools:      parseOptionalRegexp("PROXY_AGY_CHECK_TOOLS", getenv("PROXY_AGY_CHECK_TOOLS", "")),
 		AgyPersonaGuardOff: !parseBoolDefault(getenv("PROXY_AGY_PERSONA_GUARD", "true"), true),
 		AgyTruthGuardOff:   !parseBoolDefault(getenv("PROXY_AGY_TRUTH_GUARD", "true"), true),
 		AgyToolCallCap:     parseAgyToolCallCap(getenv("PROXY_AGY_TOOL_CALL_CAP", "0")),
