@@ -509,3 +509,40 @@ func agyBookingReplyProblems(cfg config, in agyGenInput, resp responsesResponse)
 	}
 	return out
 }
+
+// agyInheritCheckShapes lets a check tool carry the parameter shapes of the
+// tool it checks. A check takes exactly the arguments of the real call, but the
+// model may call it before (or without) reading its own instructions, and then
+// only the real tool's instructions document the shapes. E2E 2026-09-24 conv
+// 61255: check_multi_service_reservation was called with service_packages
+// "[263663]" — the list capi reads positionally — and passed, because the
+// object shape was documented only under create_multi_service_reservation.
+//
+// The checked tool is the catalogue tool the check's own description names
+// (the longest such name). A shape the check's instructions document itself
+// always wins; no other tool ever inherits anything.
+func agyInheritCheckShapes(cfg config, tools []agyToolCatalog, kinds map[string]map[string]string) {
+	re := agyCheckToolRe(cfg)
+	for _, c := range tools {
+		if !re.MatchString(c.Name) {
+			continue
+		}
+		checked := ""
+		for _, t := range tools {
+			if t.Name != c.Name && !re.MatchString(t.Name) && strings.Contains(c.Description, t.Name) && len(t.Name) > len(checked) {
+				checked = t.Name
+			}
+		}
+		if checked == "" || len(kinds[checked]) == 0 {
+			continue
+		}
+		if kinds[c.Name] == nil {
+			kinds[c.Name] = map[string]string{}
+		}
+		for field, kind := range kinds[checked] {
+			if _, own := kinds[c.Name][field]; !own {
+				kinds[c.Name][field] = kind
+			}
+		}
+	}
+}

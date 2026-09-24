@@ -2427,6 +2427,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// shortening the prompt fitter may apply to those same results
 	// (agy_truth.go).
 	argKinds := agyDocumentedArgKinds(in.Transcript)
+	// A check tool takes the real call's arguments, so it takes its shapes
+	// too (agy_booking_gate.go).
+	agyInheritCheckShapes(cfg, in.Tools, argKinds)
 	// Values that exist in this conversation only inside a staff annotation, so
 	// a reply carrying one is reading the clinic's own records to the customer
 	// (agy_disclosure.go).

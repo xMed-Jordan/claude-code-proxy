@@ -269,3 +269,30 @@ func TestAgyGenerateNeverLetsAnUncheckedSummaryOut(t *testing.T) {
 		t.Fatal("the forced reply was not told why")
 	}
 }
+
+// E2E 2026-09-24 conv 61255: the check was called before its own instructions
+// were read, with the list capi reads positionally, and passed. It takes the
+// shapes of the tool it names; nothing else inherits anything.
+func TestACheckTakesTheShapesOfTheToolItChecks(t *testing.T) {
+	tr := agyTranscript{Turns: []agyTurn{
+		{Kind: agyTurnToolResult, Tool: "get_tool_instructions", CallID: "i1", Text: multiServiceInstructions()},
+	}}
+	tools := []agyToolCatalog{
+		{Name: "create_multi_service_reservation", Description: "Books ONE multi-area appointment"},
+		{Name: "check_multi_service_reservation", Description: "Checks whether create_multi_service_reservation would succeed — BOOKS NOTHING."},
+		{Name: "create_reservation", Description: "Create a reservation"},
+	}
+	kinds := agyDocumentedArgKinds(tr)
+	agyInheritCheckShapes(config{}, tools, kinds)
+	bad := canonicalToolArgs(map[string]any{"service_ids": "[3]", "service_packages": "[263663]"})
+	if p := agyArgShapeProblems(kinds, "check_multi_service_reservation", bad); len(p) != 1 || !strings.Contains(p[0], "service_packages") {
+		t.Fatalf("the check did not take the real tool's shape: %v", p)
+	}
+	good := canonicalToolArgs(map[string]any{"service_ids": "[10]", "service_packages": `{"10":263663}`})
+	if p := agyArgShapeProblems(kinds, "check_multi_service_reservation", good); len(p) != 0 {
+		t.Fatalf("the right shape was refused: %v", p)
+	}
+	if p := agyArgShapeProblems(kinds, "create_reservation", bad); len(p) != 0 {
+		t.Fatalf("a tool that is not a check inherited a shape: %v", p)
+	}
+}
