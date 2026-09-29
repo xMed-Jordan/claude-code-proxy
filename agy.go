@@ -2563,7 +2563,14 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	}
 	requestedModel := agyModelForRequest(cfg, modelAlias, len(addDirs) > 0)
 	pool := getAgyWorkerPool()
-	if agyCanUseWarmPool(pool, addDirs) {
+	// A plain chat turn under a persona agent (agy_persona_agent.go) is a cold
+	// run: warm workers were started with --agent connect-chat, which does not
+	// carry this persona.
+	personaAgent := cfg.agyPersonaAgent != "" && len(addDirs) == 0
+	if personaAgent {
+		log.Printf("[agy] persona agent %s: cold run (warm pool skipped)", cfg.agyPersonaAgent)
+	}
+	if !personaAgent && agyCanUseWarmPool(pool, addDirs) {
 		t0 := time.Now()
 		res, poolErr := pool.Execute(ctx, prompt, requestedModel)
 		switch {
@@ -2591,6 +2598,9 @@ func agyResolve(ctx context.Context, cfg config, parts []mediaPart, basePrompt, 
 	// automatic retry on the default coding agent, which would silently
 	// reopen the hole this closes.
 	effectiveAgentArgs := agentArgs
+	if effectiveAgentArgs == nil && personaAgent {
+		effectiveAgentArgs = []string{"--agent", cfg.agyPersonaAgent}
+	}
 	if effectiveAgentArgs == nil {
 		effectiveAgentArgs = agyAgentArgs(cfg, len(addDirs) > 0)
 	}

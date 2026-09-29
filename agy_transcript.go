@@ -2251,6 +2251,12 @@ func renderAgyPromptFittedTranscript(cfg config, system string, temp *float64, t
 		return t.Turns[0].Text, t
 	}
 
+	// With the persona delivered through a per-persona agent definition
+	// (agy_persona_agent.go) the message carries a pointer to it instead of the
+	// persona itself. With cfg.agyPersonaAgent empty, which is the default, this
+	// is exactly the message the proxy has always sent.
+	personaInAgent := cfg.agyPersonaAgent != "" && system != ""
+
 	var sysBlock strings.Builder
 	if system != "" || tempDirective != "" {
 		sysBlock.WriteString("### SYSTEM INSTRUCTIONS & POLICIES\n\n")
@@ -2258,7 +2264,9 @@ func renderAgyPromptFittedTranscript(cfg config, system string, temp *float64, t
 			sysBlock.WriteString(tempDirective)
 			sysBlock.WriteString("\n\n")
 		}
-		if system != "" {
+		if personaInAgent {
+			sysBlock.WriteString(agyPersonaPointer)
+		} else if system != "" {
 			sysBlock.WriteString(system)
 			sysBlock.WriteString("\n\n")
 		}
@@ -2268,9 +2276,17 @@ func renderAgyPromptFittedTranscript(cfg config, system string, temp *float64, t
 	// (as a "user request"). Say up front what this message is, so the model
 	// adopts the role defined here instead of treating the content as pasted
 	// material to comment on.
-	const howToRead = "### HOW TO READ THIS MESSAGE\n\n" +
-		"This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules), its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. " +
-		"You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.\n\n"
+	const (
+		howToReadHead = "### HOW TO READ THIS MESSAGE\n\n" +
+			"This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, "
+		howToReadSystem = "the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules)"
+		howToReadTail   = ", its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. " +
+			"You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.\n\n"
+	)
+	howToRead := howToReadHead + howToReadSystem + howToReadTail
+	if personaInAgent {
+		howToRead = howToReadHead + agyPersonaHowToReadSystem + howToReadTail
+	}
 
 	// Everything except the tool catalog and the transcript is fixed cost: the
 	// persona is the caller's and is never trimmed. What is left of the budget
@@ -2460,6 +2476,13 @@ var agyResolveFn = agyResolve
 //
 // Nothing here knows about bookings, slots or any business rule.
 func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResponse, *agyGenTrace, error) {
+	// With PROXY_AGY_PERSONA_IN_AGENT on, a plain chat turn runs under an agent
+	// definition that carries the persona, and the message only points to it
+	// (agy_persona_agent.go). cfg is this call's own copy; every step below —
+	// the compaction check, the rendering, each resolve — sees the field through it.
+	if name := agyPersonaAgentFor(cfg, in); name != "" {
+		cfg.agyPersonaAgent = name
+	}
 	// When the dialogue itself has outgrown the window, replace its oldest part
 	// with a written brief and carry on from there (agy_compact.go).
 	if compacted, did := agyCompactIfNeeded(ctx, cfg, in); did {

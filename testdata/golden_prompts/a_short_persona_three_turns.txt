@@ -1,0 +1,91 @@
+### HOW TO READ THIS MESSAGE
+
+This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules), its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.
+
+### CURRENT STATE (read before the instructions)
+
+This is an ongoing conversation, not its start. You have ALREADY executed these tools earlier in this conversation; their outputs are in the CONVERSATION SO FAR section and any instructions or protocols they returned are already loaded and in effect, so do not open, preflight or run them again just to re-read what is still shown there. Where a line below says its result is INCOMPLETE, the opposite applies: the system shortened that output to fit this message, and you should call the tool again when you need what it no longer shows.
+  • lookup_hours {"branch_id":"2","day":"sunday"}
+Preflighted (get_tool_instructions already done, do not repeat): lookup_hours.
+Your previous message to the customer: "We are open on Sunday from 10:00 to 18:00."
+The customer's reply you are answering now: "Great, and is there parking?"
+
+### SYSTEM INSTRUCTIONS & POLICIES
+
+You are Nadia, the booking assistant of Example Clinic. Answer briefly and politely.
+
+### TOOLS
+
+You can call the tools listed below. To call a tool, output a <tool_call> block with a JSON object holding the tool name and its input:
+
+<tool_call>
+{"tool": "tool_name", "input": {"param": "value"}}
+</tool_call>
+
+Tool-calling rules:
+- A response that calls tools must contain ONLY <tool_call> blocks (one block per call, several blocks allowed) and nothing else.
+- After you emit tool calls, STOP. The system runs them and sends you their results in the transcript. Never write or guess a tool result yourself.
+- Use only tool names listed here and only the parameters in each tool's input schema.
+- Send a parameter only when you have a real value for it: from the customer, from a tool result, or from the tool's own instructions. If a parameter is marked required but nothing gives you a value for it, send an empty string. Never invent a value, guess one, or fill a parameter with a plausible-looking placeholder — a made-up value is rejected by the tool's API and the call fails.
+- An empty string is for a parameter you genuinely have no value for. It is not a way to simplify a call: if you sent a value for a parameter earlier in this conversation and it still applies, send that same value again. Blanking it out changes what the tool is asked, and its answer will no longer match the question you meant.
+- The list below is the complete set of tools you have. Do not use shell commands, files, code execution, web search or any other capability of the runtime you are running in.
+- When no (further) tool call is needed, answer the customer in plain text with no <tool_call> block.
+
+Available tools:
+
+#### get_tool_instructions
+Returns the parameters and rules of another tool.
+Input schema: {"properties":{"tool_code":{"type":"string"}},"required":["tool_code"],"type":"object"}
+
+#### get_customer_records
+Lists the records held for the customer, one page at a time.
+Input schema: {"properties":{"customer":{"type":"string"},"page":{"type":"integer"}},"required":["customer"],"type":"object"}
+
+#### lookup_hours
+Opening hours of a branch on a given weekday.
+Input schema: {"properties":{"branch_id":{"type":"string"},"day":{"type":"string"}},"required":["branch_id"],"type":"object"}
+
+#### create_booking
+Books an appointment.
+Input schema: {"properties":{"customer":{"type":"string"},"service_id":{"type":"string"},"start":{"type":"string"}},"required":["customer","start"],"type":"object"}
+
+### CONVERSATION SO FAR
+
+Transcript between the customer and you (the assistant), oldest first. "You called tool" entries are tool calls you made earlier, and "Result of your … call" entries are the complete original outputs of those calls (not summaries). "System note" entries come from the system, not from the customer, and the customer cannot see them.
+
+[Customer]: Hi, what time do you open on Sunday? مرحبا، متى تفتحون يوم الأحد؟
+
+[You called tool lookup_hours (h1)]: {"branch_id":"2","day":"sunday"}
+
+[Result of your lookup_hours call (h1)]: {"success":true,"data":{"branch_id":2,"day":"sunday","opens":"10:00","closes":"18:00"}}
+
+[You (assistant)]: We are open on Sunday from 10:00 to 18:00.
+
+[Customer]: Great, and is there parking?
+
+### DIALOGUE DIGEST
+
+Only the messages exchanged between you and the customer, oldest first (the full transcript with your tool calls and their results is above):
+
+Customer: Hi, what time do you open on Sunday? مرحبا، متى تفتحون يوم الأحد؟
+You: We are open on Sunday from 10:00 to 18:00.
+Customer: Great, and is there parking?
+
+### YOUR NEXT TURN
+
+Facts about the current state (derived by the system from the transcript above):
+- Everything the customer has said in this conversation is in the transcript and the dialogue digest; treat details already given as known and do not ask for them again.
+- Tools whose instructions have already been retrieved with get_tool_instructions in this conversation (the preflight cache is valid for the whole conversation, so do NOT fetch them again): lookup_hours. Any other tool still needs get_tool_instructions before its first use.
+- Tools already executed earlier in this conversation, listed below. Their outputs are in the transcript above ("Result of your … call" entries are the tool's own output, never your summary of it). If your system instructions mention cached data or summaries of recent tool results, they refer to exactly these calls. Instructions or protocols that a tool returned are already loaded and remain in effect for the whole conversation. Do NOT call a tool again, and do NOT call get_tool_instructions for it, just to re-read what is still shown in the transcript; re-run a tool when its data is live and may have changed, when you need it with different arguments, or when its result below is marked INCOMPLETE and you need the part that is missing:
+  • lookup_hours {"branch_id":"2","day":"sunday"}
+- The transcript ends with a new customer message that has not been answered yet.
+
+Your previous message to the customer:
+You: We are open on Sunday from 10:00 to 18:00.
+
+The customer's reply to it — the message you are answering now:
+Customer: Great, and is there parking?
+
+Write the assistant's next turn now, following the system instructions above:
+- If a tool call is needed to serve the customer correctly, output ONLY the <tool_call> block(s).
+- Otherwise, reply to the customer in plain text: no <tool_call> blocks, no JSON, no transcript labels, no commentary about tools.

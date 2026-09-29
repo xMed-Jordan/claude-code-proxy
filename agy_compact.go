@@ -99,7 +99,12 @@ func agyCompactIfNeeded(ctx context.Context, cfg config, in agyGenInput) (agyTra
 	if strings.TrimSpace(material) == "" {
 		return in.Transcript, false
 	}
-	brief, cached, err := agyConversationBrief(ctx, cfg, in.Model, material)
+	// The brief is written by a neutral summariser, not by the customer-facing
+	// assistant, so this one call runs WITHOUT the persona agent. The decision
+	// above measured the prompt exactly as it will be sent and keeps cfg as passed.
+	briefCfg := cfg
+	briefCfg.agyPersonaAgent = ""
+	brief, cached, err := agyConversationBrief(ctx, briefCfg, in.Model, material)
 	if err != nil || strings.TrimSpace(brief) == "" {
 		log.Printf("[agy-compact] could not write the brief (%v); continuing without compaction", err)
 		return in.Transcript, false

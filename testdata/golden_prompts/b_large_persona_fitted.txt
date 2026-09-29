@@ -1,0 +1,1077 @@
+### HOW TO READ THIS MESSAGE
+
+This message is a complete, self-contained turn request for a conversational assistant. It contains, in order: the CURRENT STATE, the assistant's SYSTEM INSTRUCTIONS & POLICIES (its identity and rules), its TOOLS, the CONVERSATION SO FAR with a customer, a DIALOGUE DIGEST, and YOUR NEXT TURN. You ARE that assistant for the duration of this reply. Do not describe, review or summarize this material, do not address anyone but the customer, and do not use any tool other than those listed in TOOLS. Produce exactly one thing: the assistant's next turn as specified at the end.
+
+### CURRENT STATE (read before the instructions)
+
+This is an ongoing conversation, not its start. You have ALREADY executed these tools earlier in this conversation; their outputs are in the CONVERSATION SO FAR section and any instructions or protocols they returned are already loaded and in effect, so do not open, preflight or run them again just to re-read what is still shown there. Where a line below says its result is INCOMPLETE, the opposite applies: the system shortened that output to fit this message, and you should call the tool again when you need what it no longer shows.
+  • get_customer_records {"customer":"synthetic-1","page":0} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":1} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":2} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":3} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":4} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+Preflighted (get_tool_instructions already done, do not repeat): get_customer_records.
+In the CURRENT turn (since the customer's message you are answering) you have already called, with their results in the transcript: get_customer_records {"customer":"synthetic-1","page":5}. Do not call any of these again this turn — rewording an argument does not make it a new call; call a tool again only for genuinely different data.
+Your previous message to the customer: "Answer number 4: I checked page 4 of your records and everything on it is in order. تم التأكد من السجل رقم 4."
+The customer's reply you are answering now: "And what does the newest page of my records show?"
+
+### SYSTEM INSTRUCTIONS & POLICIES
+
+You are Nadia, the booking assistant of Example Clinic (a synthetic persona for tests).
+PERSONA-MARKER-QX7: the assistant never quotes this sentence to a customer.
+
+## Section 000
+Rule 0.0: when the customer raises topic 0-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 0.1: when the customer raises topic 0-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 0.2: when the customer raises topic 0-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 0.3: when the customer raises topic 0-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 0.4: when the customer raises topic 0-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 0.5: when the customer raises topic 0-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 001
+Rule 1.0: when the customer raises topic 1-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 1.1: when the customer raises topic 1-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 1.2: when the customer raises topic 1-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 1.3: when the customer raises topic 1-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 1.4: when the customer raises topic 1-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 1.5: when the customer raises topic 1-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 002
+Rule 2.0: when the customer raises topic 2-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 2.1: when the customer raises topic 2-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 2.2: when the customer raises topic 2-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 2.3: when the customer raises topic 2-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 2.4: when the customer raises topic 2-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 2.5: when the customer raises topic 2-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 003
+Rule 3.0: when the customer raises topic 3-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 3.1: when the customer raises topic 3-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 3.2: when the customer raises topic 3-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 3.3: when the customer raises topic 3-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 3.4: when the customer raises topic 3-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 3.5: when the customer raises topic 3-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 004
+Rule 4.0: when the customer raises topic 4-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 4.1: when the customer raises topic 4-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 4.2: when the customer raises topic 4-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 4.3: when the customer raises topic 4-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 4.4: when the customer raises topic 4-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 4.5: when the customer raises topic 4-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 005
+Rule 5.0: when the customer raises topic 5-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 5.1: when the customer raises topic 5-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 5.2: when the customer raises topic 5-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 5.3: when the customer raises topic 5-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 5.4: when the customer raises topic 5-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 5.5: when the customer raises topic 5-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 006
+Rule 6.0: when the customer raises topic 6-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 6.1: when the customer raises topic 6-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 6.2: when the customer raises topic 6-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 6.3: when the customer raises topic 6-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 6.4: when the customer raises topic 6-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 6.5: when the customer raises topic 6-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 007
+Rule 7.0: when the customer raises topic 7-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 7.1: when the customer raises topic 7-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 7.2: when the customer raises topic 7-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 7.3: when the customer raises topic 7-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 7.4: when the customer raises topic 7-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 7.5: when the customer raises topic 7-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 008
+Rule 8.0: when the customer raises topic 8-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 8.1: when the customer raises topic 8-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 8.2: when the customer raises topic 8-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 8.3: when the customer raises topic 8-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 8.4: when the customer raises topic 8-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 8.5: when the customer raises topic 8-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 009
+Rule 9.0: when the customer raises topic 9-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 9.1: when the customer raises topic 9-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 9.2: when the customer raises topic 9-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 9.3: when the customer raises topic 9-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 9.4: when the customer raises topic 9-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 9.5: when the customer raises topic 9-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 010
+Rule 10.0: when the customer raises topic 10-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 10.1: when the customer raises topic 10-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 10.2: when the customer raises topic 10-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 10.3: when the customer raises topic 10-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 10.4: when the customer raises topic 10-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 10.5: when the customer raises topic 10-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 011
+Rule 11.0: when the customer raises topic 11-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 11.1: when the customer raises topic 11-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 11.2: when the customer raises topic 11-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 11.3: when the customer raises topic 11-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 11.4: when the customer raises topic 11-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 11.5: when the customer raises topic 11-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 012
+Rule 12.0: when the customer raises topic 12-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 12.1: when the customer raises topic 12-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 12.2: when the customer raises topic 12-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 12.3: when the customer raises topic 12-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 12.4: when the customer raises topic 12-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 12.5: when the customer raises topic 12-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 013
+Rule 13.0: when the customer raises topic 13-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 13.1: when the customer raises topic 13-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 13.2: when the customer raises topic 13-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 13.3: when the customer raises topic 13-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 13.4: when the customer raises topic 13-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 13.5: when the customer raises topic 13-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 014
+Rule 14.0: when the customer raises topic 14-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 14.1: when the customer raises topic 14-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 14.2: when the customer raises topic 14-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 14.3: when the customer raises topic 14-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 14.4: when the customer raises topic 14-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 14.5: when the customer raises topic 14-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 015
+Rule 15.0: when the customer raises topic 15-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 15.1: when the customer raises topic 15-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 15.2: when the customer raises topic 15-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 15.3: when the customer raises topic 15-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 15.4: when the customer raises topic 15-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 15.5: when the customer raises topic 15-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 016
+Rule 16.0: when the customer raises topic 16-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 16.1: when the customer raises topic 16-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 16.2: when the customer raises topic 16-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 16.3: when the customer raises topic 16-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 16.4: when the customer raises topic 16-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 16.5: when the customer raises topic 16-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 017
+Rule 17.0: when the customer raises topic 17-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 17.1: when the customer raises topic 17-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 17.2: when the customer raises topic 17-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 17.3: when the customer raises topic 17-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 17.4: when the customer raises topic 17-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 17.5: when the customer raises topic 17-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 018
+Rule 18.0: when the customer raises topic 18-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 18.1: when the customer raises topic 18-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 18.2: when the customer raises topic 18-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 18.3: when the customer raises topic 18-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 18.4: when the customer raises topic 18-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 18.5: when the customer raises topic 18-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 019
+Rule 19.0: when the customer raises topic 19-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 19.1: when the customer raises topic 19-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 19.2: when the customer raises topic 19-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 19.3: when the customer raises topic 19-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 19.4: when the customer raises topic 19-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 19.5: when the customer raises topic 19-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 020
+Rule 20.0: when the customer raises topic 20-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 20.1: when the customer raises topic 20-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 20.2: when the customer raises topic 20-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 20.3: when the customer raises topic 20-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 20.4: when the customer raises topic 20-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 20.5: when the customer raises topic 20-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 021
+Rule 21.0: when the customer raises topic 21-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 21.1: when the customer raises topic 21-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 21.2: when the customer raises topic 21-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 21.3: when the customer raises topic 21-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 21.4: when the customer raises topic 21-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 21.5: when the customer raises topic 21-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 022
+Rule 22.0: when the customer raises topic 22-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 22.1: when the customer raises topic 22-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 22.2: when the customer raises topic 22-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 22.3: when the customer raises topic 22-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 22.4: when the customer raises topic 22-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 22.5: when the customer raises topic 22-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 023
+Rule 23.0: when the customer raises topic 23-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 23.1: when the customer raises topic 23-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 23.2: when the customer raises topic 23-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 23.3: when the customer raises topic 23-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 23.4: when the customer raises topic 23-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 23.5: when the customer raises topic 23-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 024
+Rule 24.0: when the customer raises topic 24-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 24.1: when the customer raises topic 24-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 24.2: when the customer raises topic 24-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 24.3: when the customer raises topic 24-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 24.4: when the customer raises topic 24-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 24.5: when the customer raises topic 24-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 025
+Rule 25.0: when the customer raises topic 25-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 25.1: when the customer raises topic 25-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 25.2: when the customer raises topic 25-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 25.3: when the customer raises topic 25-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 25.4: when the customer raises topic 25-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 25.5: when the customer raises topic 25-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 026
+Rule 26.0: when the customer raises topic 26-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 26.1: when the customer raises topic 26-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 26.2: when the customer raises topic 26-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 26.3: when the customer raises topic 26-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 26.4: when the customer raises topic 26-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 26.5: when the customer raises topic 26-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 027
+Rule 27.0: when the customer raises topic 27-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 27.1: when the customer raises topic 27-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 27.2: when the customer raises topic 27-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 27.3: when the customer raises topic 27-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 27.4: when the customer raises topic 27-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 27.5: when the customer raises topic 27-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 028
+Rule 28.0: when the customer raises topic 28-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 28.1: when the customer raises topic 28-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 28.2: when the customer raises topic 28-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 28.3: when the customer raises topic 28-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 28.4: when the customer raises topic 28-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 28.5: when the customer raises topic 28-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 029
+Rule 29.0: when the customer raises topic 29-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 29.1: when the customer raises topic 29-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 29.2: when the customer raises topic 29-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 29.3: when the customer raises topic 29-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 29.4: when the customer raises topic 29-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 29.5: when the customer raises topic 29-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 030
+Rule 30.0: when the customer raises topic 30-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 30.1: when the customer raises topic 30-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 30.2: when the customer raises topic 30-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 30.3: when the customer raises topic 30-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 30.4: when the customer raises topic 30-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 30.5: when the customer raises topic 30-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 031
+Rule 31.0: when the customer raises topic 31-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 31.1: when the customer raises topic 31-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 31.2: when the customer raises topic 31-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 31.3: when the customer raises topic 31-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 31.4: when the customer raises topic 31-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 31.5: when the customer raises topic 31-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 032
+Rule 32.0: when the customer raises topic 32-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 32.1: when the customer raises topic 32-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 32.2: when the customer raises topic 32-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 32.3: when the customer raises topic 32-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 32.4: when the customer raises topic 32-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 32.5: when the customer raises topic 32-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 033
+Rule 33.0: when the customer raises topic 33-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 33.1: when the customer raises topic 33-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 33.2: when the customer raises topic 33-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 33.3: when the customer raises topic 33-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 33.4: when the customer raises topic 33-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 33.5: when the customer raises topic 33-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 034
+Rule 34.0: when the customer raises topic 34-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 34.1: when the customer raises topic 34-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 34.2: when the customer raises topic 34-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 34.3: when the customer raises topic 34-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 34.4: when the customer raises topic 34-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 34.5: when the customer raises topic 34-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 035
+Rule 35.0: when the customer raises topic 35-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 35.1: when the customer raises topic 35-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 35.2: when the customer raises topic 35-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 35.3: when the customer raises topic 35-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 35.4: when the customer raises topic 35-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 35.5: when the customer raises topic 35-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 036
+Rule 36.0: when the customer raises topic 36-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 36.1: when the customer raises topic 36-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 36.2: when the customer raises topic 36-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 36.3: when the customer raises topic 36-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 36.4: when the customer raises topic 36-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 36.5: when the customer raises topic 36-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 037
+Rule 37.0: when the customer raises topic 37-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 37.1: when the customer raises topic 37-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 37.2: when the customer raises topic 37-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 37.3: when the customer raises topic 37-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 37.4: when the customer raises topic 37-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 37.5: when the customer raises topic 37-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 038
+Rule 38.0: when the customer raises topic 38-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 38.1: when the customer raises topic 38-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 38.2: when the customer raises topic 38-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 38.3: when the customer raises topic 38-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 38.4: when the customer raises topic 38-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 38.5: when the customer raises topic 38-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 039
+Rule 39.0: when the customer raises topic 39-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 39.1: when the customer raises topic 39-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 39.2: when the customer raises topic 39-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 39.3: when the customer raises topic 39-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 39.4: when the customer raises topic 39-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 39.5: when the customer raises topic 39-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 040
+Rule 40.0: when the customer raises topic 40-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 40.1: when the customer raises topic 40-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 40.2: when the customer raises topic 40-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 40.3: when the customer raises topic 40-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 40.4: when the customer raises topic 40-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 40.5: when the customer raises topic 40-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 041
+Rule 41.0: when the customer raises topic 41-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 41.1: when the customer raises topic 41-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 41.2: when the customer raises topic 41-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 41.3: when the customer raises topic 41-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 41.4: when the customer raises topic 41-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 41.5: when the customer raises topic 41-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 042
+Rule 42.0: when the customer raises topic 42-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 42.1: when the customer raises topic 42-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 42.2: when the customer raises topic 42-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 42.3: when the customer raises topic 42-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 42.4: when the customer raises topic 42-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 42.5: when the customer raises topic 42-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 043
+Rule 43.0: when the customer raises topic 43-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 43.1: when the customer raises topic 43-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 43.2: when the customer raises topic 43-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 43.3: when the customer raises topic 43-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 43.4: when the customer raises topic 43-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 43.5: when the customer raises topic 43-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 044
+Rule 44.0: when the customer raises topic 44-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 44.1: when the customer raises topic 44-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 44.2: when the customer raises topic 44-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 44.3: when the customer raises topic 44-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 44.4: when the customer raises topic 44-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 44.5: when the customer raises topic 44-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 045
+Rule 45.0: when the customer raises topic 45-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 45.1: when the customer raises topic 45-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 45.2: when the customer raises topic 45-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 45.3: when the customer raises topic 45-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 45.4: when the customer raises topic 45-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 45.5: when the customer raises topic 45-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 046
+Rule 46.0: when the customer raises topic 46-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 46.1: when the customer raises topic 46-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 46.2: when the customer raises topic 46-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 46.3: when the customer raises topic 46-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 46.4: when the customer raises topic 46-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 46.5: when the customer raises topic 46-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 047
+Rule 47.0: when the customer raises topic 47-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 47.1: when the customer raises topic 47-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 47.2: when the customer raises topic 47-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 47.3: when the customer raises topic 47-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 47.4: when the customer raises topic 47-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 47.5: when the customer raises topic 47-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 048
+Rule 48.0: when the customer raises topic 48-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 48.1: when the customer raises topic 48-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 48.2: when the customer raises topic 48-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 48.3: when the customer raises topic 48-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 48.4: when the customer raises topic 48-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 48.5: when the customer raises topic 48-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 049
+Rule 49.0: when the customer raises topic 49-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 49.1: when the customer raises topic 49-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 49.2: when the customer raises topic 49-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 49.3: when the customer raises topic 49-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 49.4: when the customer raises topic 49-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 49.5: when the customer raises topic 49-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 050
+Rule 50.0: when the customer raises topic 50-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 50.1: when the customer raises topic 50-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 50.2: when the customer raises topic 50-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 50.3: when the customer raises topic 50-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 50.4: when the customer raises topic 50-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 50.5: when the customer raises topic 50-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 051
+Rule 51.0: when the customer raises topic 51-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 51.1: when the customer raises topic 51-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 51.2: when the customer raises topic 51-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 51.3: when the customer raises topic 51-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 51.4: when the customer raises topic 51-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 51.5: when the customer raises topic 51-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 052
+Rule 52.0: when the customer raises topic 52-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 52.1: when the customer raises topic 52-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 52.2: when the customer raises topic 52-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 52.3: when the customer raises topic 52-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 52.4: when the customer raises topic 52-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 52.5: when the customer raises topic 52-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 053
+Rule 53.0: when the customer raises topic 53-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 53.1: when the customer raises topic 53-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 53.2: when the customer raises topic 53-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 53.3: when the customer raises topic 53-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 53.4: when the customer raises topic 53-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 53.5: when the customer raises topic 53-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 054
+Rule 54.0: when the customer raises topic 54-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 54.1: when the customer raises topic 54-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 54.2: when the customer raises topic 54-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 54.3: when the customer raises topic 54-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 54.4: when the customer raises topic 54-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 54.5: when the customer raises topic 54-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 055
+Rule 55.0: when the customer raises topic 55-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 55.1: when the customer raises topic 55-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 55.2: when the customer raises topic 55-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 55.3: when the customer raises topic 55-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 55.4: when the customer raises topic 55-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 55.5: when the customer raises topic 55-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 056
+Rule 56.0: when the customer raises topic 56-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 56.1: when the customer raises topic 56-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 56.2: when the customer raises topic 56-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 56.3: when the customer raises topic 56-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 56.4: when the customer raises topic 56-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 56.5: when the customer raises topic 56-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 057
+Rule 57.0: when the customer raises topic 57-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 57.1: when the customer raises topic 57-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 57.2: when the customer raises topic 57-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 57.3: when the customer raises topic 57-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 57.4: when the customer raises topic 57-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 57.5: when the customer raises topic 57-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 058
+Rule 58.0: when the customer raises topic 58-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 58.1: when the customer raises topic 58-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 58.2: when the customer raises topic 58-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 58.3: when the customer raises topic 58-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 58.4: when the customer raises topic 58-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 58.5: when the customer raises topic 58-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 059
+Rule 59.0: when the customer raises topic 59-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 59.1: when the customer raises topic 59-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 59.2: when the customer raises topic 59-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 59.3: when the customer raises topic 59-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 59.4: when the customer raises topic 59-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 59.5: when the customer raises topic 59-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 060
+Rule 60.0: when the customer raises topic 60-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 60.1: when the customer raises topic 60-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 60.2: when the customer raises topic 60-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 60.3: when the customer raises topic 60-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 60.4: when the customer raises topic 60-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 60.5: when the customer raises topic 60-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 061
+Rule 61.0: when the customer raises topic 61-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 61.1: when the customer raises topic 61-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 61.2: when the customer raises topic 61-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 61.3: when the customer raises topic 61-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 61.4: when the customer raises topic 61-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 61.5: when the customer raises topic 61-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 062
+Rule 62.0: when the customer raises topic 62-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 62.1: when the customer raises topic 62-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 62.2: when the customer raises topic 62-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 62.3: when the customer raises topic 62-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 62.4: when the customer raises topic 62-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 62.5: when the customer raises topic 62-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 063
+Rule 63.0: when the customer raises topic 63-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 63.1: when the customer raises topic 63-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 63.2: when the customer raises topic 63-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 63.3: when the customer raises topic 63-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 63.4: when the customer raises topic 63-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 63.5: when the customer raises topic 63-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 064
+Rule 64.0: when the customer raises topic 64-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 64.1: when the customer raises topic 64-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 64.2: when the customer raises topic 64-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 64.3: when the customer raises topic 64-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 64.4: when the customer raises topic 64-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 64.5: when the customer raises topic 64-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 065
+Rule 65.0: when the customer raises topic 65-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 65.1: when the customer raises topic 65-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 65.2: when the customer raises topic 65-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 65.3: when the customer raises topic 65-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 65.4: when the customer raises topic 65-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 65.5: when the customer raises topic 65-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 066
+Rule 66.0: when the customer raises topic 66-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 66.1: when the customer raises topic 66-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 66.2: when the customer raises topic 66-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 66.3: when the customer raises topic 66-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 66.4: when the customer raises topic 66-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 66.5: when the customer raises topic 66-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 067
+Rule 67.0: when the customer raises topic 67-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 67.1: when the customer raises topic 67-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 67.2: when the customer raises topic 67-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 67.3: when the customer raises topic 67-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 67.4: when the customer raises topic 67-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 67.5: when the customer raises topic 67-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 068
+Rule 68.0: when the customer raises topic 68-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 68.1: when the customer raises topic 68-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 68.2: when the customer raises topic 68-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 68.3: when the customer raises topic 68-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 68.4: when the customer raises topic 68-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 68.5: when the customer raises topic 68-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 069
+Rule 69.0: when the customer raises topic 69-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 69.1: when the customer raises topic 69-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 69.2: when the customer raises topic 69-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 69.3: when the customer raises topic 69-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 69.4: when the customer raises topic 69-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 69.5: when the customer raises topic 69-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 070
+Rule 70.0: when the customer raises topic 70-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 70.1: when the customer raises topic 70-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 70.2: when the customer raises topic 70-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 70.3: when the customer raises topic 70-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 70.4: when the customer raises topic 70-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 70.5: when the customer raises topic 70-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 071
+Rule 71.0: when the customer raises topic 71-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 71.1: when the customer raises topic 71-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 71.2: when the customer raises topic 71-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 71.3: when the customer raises topic 71-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 71.4: when the customer raises topic 71-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 71.5: when the customer raises topic 71-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 072
+Rule 72.0: when the customer raises topic 72-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 72.1: when the customer raises topic 72-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 72.2: when the customer raises topic 72-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 72.3: when the customer raises topic 72-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 72.4: when the customer raises topic 72-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 72.5: when the customer raises topic 72-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 073
+Rule 73.0: when the customer raises topic 73-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 73.1: when the customer raises topic 73-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 73.2: when the customer raises topic 73-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 73.3: when the customer raises topic 73-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 73.4: when the customer raises topic 73-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 73.5: when the customer raises topic 73-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 074
+Rule 74.0: when the customer raises topic 74-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 74.1: when the customer raises topic 74-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 74.2: when the customer raises topic 74-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 74.3: when the customer raises topic 74-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 74.4: when the customer raises topic 74-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 74.5: when the customer raises topic 74-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 075
+Rule 75.0: when the customer raises topic 75-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 75.1: when the customer raises topic 75-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 75.2: when the customer raises topic 75-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 75.3: when the customer raises topic 75-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 75.4: when the customer raises topic 75-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 75.5: when the customer raises topic 75-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 076
+Rule 76.0: when the customer raises topic 76-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 76.1: when the customer raises topic 76-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 76.2: when the customer raises topic 76-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 76.3: when the customer raises topic 76-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 76.4: when the customer raises topic 76-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 76.5: when the customer raises topic 76-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 077
+Rule 77.0: when the customer raises topic 77-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 77.1: when the customer raises topic 77-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 77.2: when the customer raises topic 77-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 77.3: when the customer raises topic 77-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 77.4: when the customer raises topic 77-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 77.5: when the customer raises topic 77-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 078
+Rule 78.0: when the customer raises topic 78-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 78.1: when the customer raises topic 78-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 78.2: when the customer raises topic 78-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 78.3: when the customer raises topic 78-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 78.4: when the customer raises topic 78-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 78.5: when the customer raises topic 78-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 079
+Rule 79.0: when the customer raises topic 79-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 79.1: when the customer raises topic 79-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 79.2: when the customer raises topic 79-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 79.3: when the customer raises topic 79-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 79.4: when the customer raises topic 79-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 79.5: when the customer raises topic 79-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 080
+Rule 80.0: when the customer raises topic 80-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 80.1: when the customer raises topic 80-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 80.2: when the customer raises topic 80-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 80.3: when the customer raises topic 80-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 80.4: when the customer raises topic 80-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 80.5: when the customer raises topic 80-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 081
+Rule 81.0: when the customer raises topic 81-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 81.1: when the customer raises topic 81-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 81.2: when the customer raises topic 81-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 81.3: when the customer raises topic 81-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 81.4: when the customer raises topic 81-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 81.5: when the customer raises topic 81-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 082
+Rule 82.0: when the customer raises topic 82-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 82.1: when the customer raises topic 82-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 82.2: when the customer raises topic 82-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 82.3: when the customer raises topic 82-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 82.4: when the customer raises topic 82-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 82.5: when the customer raises topic 82-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 083
+Rule 83.0: when the customer raises topic 83-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 83.1: when the customer raises topic 83-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 83.2: when the customer raises topic 83-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 83.3: when the customer raises topic 83-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 83.4: when the customer raises topic 83-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 83.5: when the customer raises topic 83-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 084
+Rule 84.0: when the customer raises topic 84-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 84.1: when the customer raises topic 84-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 84.2: when the customer raises topic 84-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 84.3: when the customer raises topic 84-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 84.4: when the customer raises topic 84-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 84.5: when the customer raises topic 84-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 085
+Rule 85.0: when the customer raises topic 85-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 85.1: when the customer raises topic 85-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 85.2: when the customer raises topic 85-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 85.3: when the customer raises topic 85-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 85.4: when the customer raises topic 85-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 85.5: when the customer raises topic 85-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 086
+Rule 86.0: when the customer raises topic 86-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 86.1: when the customer raises topic 86-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 86.2: when the customer raises topic 86-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 86.3: when the customer raises topic 86-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 86.4: when the customer raises topic 86-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 86.5: when the customer raises topic 86-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 087
+Rule 87.0: when the customer raises topic 87-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 87.1: when the customer raises topic 87-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 87.2: when the customer raises topic 87-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 87.3: when the customer raises topic 87-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 87.4: when the customer raises topic 87-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 87.5: when the customer raises topic 87-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 088
+Rule 88.0: when the customer raises topic 88-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 88.1: when the customer raises topic 88-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 88.2: when the customer raises topic 88-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 88.3: when the customer raises topic 88-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 88.4: when the customer raises topic 88-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 88.5: when the customer raises topic 88-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 089
+Rule 89.0: when the customer raises topic 89-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 89.1: when the customer raises topic 89-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 89.2: when the customer raises topic 89-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 89.3: when the customer raises topic 89-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 89.4: when the customer raises topic 89-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 89.5: when the customer raises topic 89-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 090
+Rule 90.0: when the customer raises topic 90-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 90.1: when the customer raises topic 90-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 90.2: when the customer raises topic 90-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 90.3: when the customer raises topic 90-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 90.4: when the customer raises topic 90-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 90.5: when the customer raises topic 90-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 091
+Rule 91.0: when the customer raises topic 91-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 91.1: when the customer raises topic 91-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 91.2: when the customer raises topic 91-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 91.3: when the customer raises topic 91-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 91.4: when the customer raises topic 91-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 91.5: when the customer raises topic 91-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 092
+Rule 92.0: when the customer raises topic 92-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 92.1: when the customer raises topic 92-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 92.2: when the customer raises topic 92-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 92.3: when the customer raises topic 92-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 92.4: when the customer raises topic 92-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 92.5: when the customer raises topic 92-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 093
+Rule 93.0: when the customer raises topic 93-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 93.1: when the customer raises topic 93-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 93.2: when the customer raises topic 93-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 93.3: when the customer raises topic 93-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 93.4: when the customer raises topic 93-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 93.5: when the customer raises topic 93-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 094
+Rule 94.0: when the customer raises topic 94-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 94.1: when the customer raises topic 94-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 94.2: when the customer raises topic 94-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 94.3: when the customer raises topic 94-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 94.4: when the customer raises topic 94-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 94.5: when the customer raises topic 94-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 095
+Rule 95.0: when the customer raises topic 95-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 95.1: when the customer raises topic 95-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 95.2: when the customer raises topic 95-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 95.3: when the customer raises topic 95-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 95.4: when the customer raises topic 95-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 95.5: when the customer raises topic 95-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 096
+Rule 96.0: when the customer raises topic 96-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 96.1: when the customer raises topic 96-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 96.2: when the customer raises topic 96-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 96.3: when the customer raises topic 96-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 96.4: when the customer raises topic 96-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 96.5: when the customer raises topic 96-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 097
+Rule 97.0: when the customer raises topic 97-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 97.1: when the customer raises topic 97-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 97.2: when the customer raises topic 97-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 97.3: when the customer raises topic 97-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 97.4: when the customer raises topic 97-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 97.5: when the customer raises topic 97-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 098
+Rule 98.0: when the customer raises topic 98-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 98.1: when the customer raises topic 98-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 98.2: when the customer raises topic 98-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 98.3: when the customer raises topic 98-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 98.4: when the customer raises topic 98-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 98.5: when the customer raises topic 98-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 099
+Rule 99.0: when the customer raises topic 99-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 99.1: when the customer raises topic 99-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 99.2: when the customer raises topic 99-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 99.3: when the customer raises topic 99-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 99.4: when the customer raises topic 99-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 99.5: when the customer raises topic 99-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 100
+Rule 100.0: when the customer raises topic 100-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 100.1: when the customer raises topic 100-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 100.2: when the customer raises topic 100-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 100.3: when the customer raises topic 100-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 100.4: when the customer raises topic 100-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 100.5: when the customer raises topic 100-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 101
+Rule 101.0: when the customer raises topic 101-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 101.1: when the customer raises topic 101-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 101.2: when the customer raises topic 101-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 101.3: when the customer raises topic 101-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 101.4: when the customer raises topic 101-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 101.5: when the customer raises topic 101-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 102
+Rule 102.0: when the customer raises topic 102-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 102.1: when the customer raises topic 102-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 102.2: when the customer raises topic 102-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 102.3: when the customer raises topic 102-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 102.4: when the customer raises topic 102-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 102.5: when the customer raises topic 102-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 103
+Rule 103.0: when the customer raises topic 103-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 103.1: when the customer raises topic 103-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 103.2: when the customer raises topic 103-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 103.3: when the customer raises topic 103-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 103.4: when the customer raises topic 103-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 103.5: when the customer raises topic 103-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 104
+Rule 104.0: when the customer raises topic 104-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 104.1: when the customer raises topic 104-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 104.2: when the customer raises topic 104-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 104.3: when the customer raises topic 104-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 104.4: when the customer raises topic 104-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 104.5: when the customer raises topic 104-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 105
+Rule 105.0: when the customer raises topic 105-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 105.1: when the customer raises topic 105-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 105.2: when the customer raises topic 105-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 105.3: when the customer raises topic 105-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 105.4: when the customer raises topic 105-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 105.5: when the customer raises topic 105-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 106
+Rule 106.0: when the customer raises topic 106-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 106.1: when the customer raises topic 106-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 106.2: when the customer raises topic 106-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 106.3: when the customer raises topic 106-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 106.4: when the customer raises topic 106-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 106.5: when the customer raises topic 106-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 107
+Rule 107.0: when the customer raises topic 107-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 107.1: when the customer raises topic 107-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 107.2: when the customer raises topic 107-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 107.3: when the customer raises topic 107-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 107.4: when the customer raises topic 107-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 107.5: when the customer raises topic 107-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 108
+Rule 108.0: when the customer raises topic 108-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 108.1: when the customer raises topic 108-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 108.2: when the customer raises topic 108-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 108.3: when the customer raises topic 108-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 108.4: when the customer raises topic 108-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 108.5: when the customer raises topic 108-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 109
+Rule 109.0: when the customer raises topic 109-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 109.1: when the customer raises topic 109-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 109.2: when the customer raises topic 109-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 109.3: when the customer raises topic 109-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 109.4: when the customer raises topic 109-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 109.5: when the customer raises topic 109-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 110
+Rule 110.0: when the customer raises topic 110-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 110.1: when the customer raises topic 110-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 110.2: when the customer raises topic 110-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 110.3: when the customer raises topic 110-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 110.4: when the customer raises topic 110-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 110.5: when the customer raises topic 110-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 111
+Rule 111.0: when the customer raises topic 111-0, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 111.1: when the customer raises topic 111-1, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 111.2: when the customer raises topic 111-2, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 111.3: when the customer raises topic 111-3, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 111.4: when the customer raises topic 111-4, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 111.5: when the customer raises topic 111-5, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 112
+Rule 112.0: when the customer raises topic 112-0, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 112.1: when the customer raises topic 112-1, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 112.2: when the customer raises topic 112-2, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 112.3: when the customer raises topic 112-3, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 112.4: when the customer raises topic 112-4, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 112.5: when the customer raises topic 112-5, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 113
+Rule 113.0: when the customer raises topic 113-0, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 113.1: when the customer raises topic 113-1, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 113.2: when the customer raises topic 113-2, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 113.3: when the customer raises topic 113-3, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 113.4: when the customer raises topic 113-4, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 113.5: when the customer raises topic 113-5, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 114
+Rule 114.0: when the customer raises topic 114-0, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 114.1: when the customer raises topic 114-1, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 114.2: when the customer raises topic 114-2, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 114.3: when the customer raises topic 114-3, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 114.4: when the customer raises topic 114-4, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 114.5: when the customer raises topic 114-5, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+## Section 115
+Rule 115.0: when the customer raises topic 115-0, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 115.1: when the customer raises topic 115-1, consult the tool lookup_1 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 115.2: when the customer raises topic 115-2, consult the tool lookup_2 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 115.3: when the customer raises topic 115-3, consult the tool lookup_3 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 115.4: when the customer raises topic 115-4, consult the tool lookup_4 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+Rule 115.5: when the customer raises topic 115-5, consult the tool lookup_0 first, then answer in her language, briefly and politely, and never promise anything the tool did not return.
+
+### TOOLS
+
+You can call the tools listed below. To call a tool, output a <tool_call> block with a JSON object holding the tool name and its input:
+
+<tool_call>
+{"tool": "tool_name", "input": {"param": "value"}}
+</tool_call>
+
+Tool-calling rules:
+- A response that calls tools must contain ONLY <tool_call> blocks (one block per call, several blocks allowed) and nothing else.
+- After you emit tool calls, STOP. The system runs them and sends you their results in the transcript. Never write or guess a tool result yourself.
+- Use only tool names listed here and only the parameters in each tool's input schema.
+- Send a parameter only when you have a real value for it: from the customer, from a tool result, or from the tool's own instructions. If a parameter is marked required but nothing gives you a value for it, send an empty string. Never invent a value, guess one, or fill a parameter with a plausible-looking placeholder — a made-up value is rejected by the tool's API and the call fails.
+- An empty string is for a parameter you genuinely have no value for. It is not a way to simplify a call: if you sent a value for a parameter earlier in this conversation and it still applies, send that same value again. Blanking it out changes what the tool is asked, and its answer will no longer match the question you meant.
+- The list below is the complete set of tools you have. Do not use shell commands, files, code execution, web search or any other capability of the runtime you are running in.
+- When no (further) tool call is needed, answer the customer in plain text with no <tool_call> block.
+
+Available tools:
+
+#### get_tool_instructions
+Returns the parameters and rules of another tool.
+Input schema: {"properties":{"tool_code":{"type":"string"}},"required":["tool_code"],"type":"object"}
+
+#### get_customer_records
+Lists the records held for the customer, one page at a time.
+Input schema: {"properties":{"customer":{"type":"string"},"page":{"type":"integer"}},"required":["customer"],"type":"object"}
+
+#### lookup_hours
+Opening hours of a branch on a given weekday.
+Input schema: {"properties":{"branch_id":{"type":"string"},"day":{"type":"string"}},"required":["branch_id"],"type":"object"}
+
+#### create_booking
+Books an appointment.
+Input schema: {"properties":{"customer":{"type":"string"},"service_id":{"type":"string"},"start":{"type":"string"}},"required":["customer","start"],"type":"object"}
+
+### CONVERSATION SO FAR
+
+Transcript between the customer and you (the assistant), oldest first. "You called tool" entries are tool calls you made earlier, and "Result of your … call" entries are the complete original outputs of those calls (not summaries). "System note" entries come from the system, not from the customer, and the customer cannot see them.
+
+[System note to you]: [AUTO-CONTEXT — the system already PREFLIGHTED (read the tool's instructions) AND executed the tool "get_customer_records" for this customer.]
+
+[Customer]: Customer question number 0: could you check page 0 of my records please? مرحبا، بدي أتأكد من السجل رقم 0
+
+[You called tool get_customer_records (call-0)]: {"customer":"synthetic-1","page":0}
+
+[Result of your get_customer_records call (call-0)]: [system note: this result is not shown any more — it was dropped to fit the context window. The call above did run; call the tool again if you need its data.]
+
+[You (assistant)]: Answer number 0: I checked page 0 of your records and everything on it is in order. تم التأكد من السجل رقم 0.
+
+[Customer]: Customer question number 1: could you check page 1 of my records please? مرحبا، بدي أتأكد من السجل رقم 1
+
+[You called tool get_customer_records (call-1)]: {"customer":"synthetic-1","page":1}
+
+[Result of your get_customer_records call (call-1)]: {"data":{"body":{"data":{"items":{"columns":["branch_id","item_id","label"],"rows":[[1,70000,"page 1 item 0"],[2,70001,"page 1 item 1"],[3,70002,"page 1 item 2"],[1,70003,"page 1 item 3"],[2,70004,"page 1 item 4"],[3,70005,"page 1 item 5"],[1,70006,"page 1 item 6"],[2,70007,"page 1 item 7"],[3,70008,"page 1 item 8"],[1,70009,"page 1 item 9"],[2,70010,"page 1 item 10"],[3,70011,"page 1 item 11"],[1,70012,"page 1 item 12"],[2,70013,"page 1 item 13"],[3,70014,"page 1 item 14"],[1,70015,"page 1 item 15"],[2,70016,"page 1 item 16"],[3,70017,"page 1 item 17"],[1,70018,"page 1 item 18"],[2,70019,"page 1 item 19"],[3,70020,"page 1 item 20"],[1,70021,"page 1 item 21"],[2,70022,"page 1 item 22"],[3,70023,"page 1 item 23"],[1,70024,"page 1 item 24"],[2,70025,"page 1 item 25"],[3,70026,"page 1 item 26"],[1,70027,"page 1 item 27"],[2,70028,"page 1 item 28"],[3,70029,"page 1 item 29"],[1,70030,"page 1 item 30"],[2,70031,"page 1 item 31"],[3,70032,"page 1 item 32"],[1,70033,"page 1 item 33"],[2,70034,"page 1 item 34"],[3,70035,"page 1 item 35"],[1,70036,"page 1 item 36"],[2,70037,"page 1 item 37"],[3,70038,"page 1 item 38"],[1,70039,"page 1 item 39"],[2,70040,"page 1 item 40"],[3,70041,"page 1 item 41"],[1,70042,"page 1 item 42"],[2,70043,"page 1 item 43"],[3,70044,"page 1 item 44"],[1,70045,"page 1 item 45"],[2,70046,"page 1 item 46"],[3,70047,"page 1 item 47"],[1,70048,"page 1 item 48"],[2,70049,"page 1 item 49"],[3,70050,"page 1 item 50"],[1,70051,"page 1 item 51"],[2,70052,"page 1 item 52"],[3,70053,"page 1 item 53"],[1,70054,"page 1 item 54"],[2,70055,"page 1 item 55"],[3,70056,"page 1 item 56"],[1,70057,"page 1 item 57"],[2,70058,"page 1 item 58"],[3,70059,"page 1 item 59"],[1,70060,"page 1 item 60"],[2,70061,"page 1 item 61"],[3,70062,"page 1 item 62"],[1,70063,"page 1 item 63"],[2,70064,"page 1 item 64"],[3,70065,"page 1 item 65"],[1,70066,"page 1 item 66"],[2,70067,"page 1 item 67"],[3,70068,"page 1 item 68"],[1,70069,"page 1 item 69"],[2,70070,"page 1 item 70"],[3,70071,"page 1 item 71"],[1,70072,"page 1 item 72"],[2,70073,"page 1 item 73"],[3,70074,"page 1 item 74"],[1,70075,"page 1 item 75"],[2,70076,"page 1 item 76"],[3,70077,"page 1 item 77"],[1,70078,"page 1 item 78"],[2,70079,"page 1 item 79"],[3,70080,"page 1 item 80"],[1,70081,"page 1 item 81"],[2,70082,"page 1 item 82"],[3,70083,"page 1 item 83"],[1,70084,"page 1 item 84"],[2,70085,"page 1 item 85"],[3,70086,"page 1 item 86"],[1,70087,"page 1 item 87"],[2,70088,"page 1 item 88"],[3,70089,"page 1 item 89"],[1,70090,"page 1 item 90"],[2,70091,"page 1 item 91"],[3,70092,"page 1 item 92"],[1,70093,"page 1 item 93"],[2,70094,"page 1 item 94"],[3,70095,"page 1 item 95"],[1,70096,"page 1 item 96"],[2,70097,"page 1 item 97"],[3,70098,"page 1 item 98"],[1,70099,"page 1 item 99"],[2,70100,"page 1 item 100"],[3,70101,"page 1 item 101"],[1,70102,"page 1 item 102"],[2,70103,"page 1 item 103"],[3,70104,"page 1 item 104"],[1,70105,"page 1 item 105"],[2,70106,"page 1 item 106"],[3,70107,"page 1 item 107"],[1,70108,"page 1 item 108"],[2,70109,"page 1 item 109"],[3,70110,"page 1 item 110"],[1,70111,"page 1 item 111"],[2,70112,"page 1 item 112"],[3,70113,"page 1 item 113"],[1,70114,"page 1 item 114"],[2,70115,"page 1 item 115"],[3,70116,"page 1 item 116"],[1,70117,"page 1 item 117"],[2,70118,"page 1 item 118"],[3,70119,"page 1 item 119"],[1,70120,"page 1 item 120"],[2,70121,"page 1 item 121"],[3,70122,"page 1 item 122"],[1,70123,"page 1 item 123"],[2,70124,"page 1 item 124"],[3,70125,"page 1 item 125"],[1,70126,"page 1 item 126"],[2,70127,"page 1 item 127"],[3,70128,"page 1 item 128"],[1,70129,"page 1 item 129"],[2,70130,"page 1 item 130"],[3,70131,"page 1 item 131"],[1,70132,"page 1 item 132"],[2,70133,"page 1 item 133"],[3,70134,"page 1 item 134"]],"same_in_every_row":{"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text ","status":"Active"}}}}},"success":true}
+
+[You (assistant)]: Answer number 1: I checked page 1 of your records and everything on it is in order. تم التأكد من السجل رقم 1.
+
+[Customer]: Customer question number 2: could you check page 2 of my records please? مرحبا، بدي أتأكد من السجل رقم 2
+
+[You called tool get_customer_records (call-2)]: {"customer":"synthetic-1","page":2}
+
+[Result of your get_customer_records call (call-2)]: {"data":{"body":{"data":{"items":{"columns":["branch_id","item_id","label"],"rows":[[1,70000,"page 2 item 0"],[2,70001,"page 2 item 1"],[3,70002,"page 2 item 2"],[1,70003,"page 2 item 3"],[2,70004,"page 2 item 4"],[3,70005,"page 2 item 5"],[1,70006,"page 2 item 6"],[2,70007,"page 2 item 7"],[3,70008,"page 2 item 8"],[1,70009,"page 2 item 9"],[2,70010,"page 2 item 10"],[3,70011,"page 2 item 11"],[1,70012,"page 2 item 12"],[2,70013,"page 2 item 13"],[3,70014,"page 2 item 14"],[1,70015,"page 2 item 15"],[2,70016,"page 2 item 16"],[3,70017,"page 2 item 17"],[1,70018,"page 2 item 18"],[2,70019,"page 2 item 19"],[3,70020,"page 2 item 20"],[1,70021,"page 2 item 21"],[2,70022,"page 2 item 22"],[3,70023,"page 2 item 23"],[1,70024,"page 2 item 24"],[2,70025,"page 2 item 25"],[3,70026,"page 2 item 26"],[1,70027,"page 2 item 27"],[2,70028,"page 2 item 28"],[3,70029,"page 2 item 29"],[1,70030,"page 2 item 30"],[2,70031,"page 2 item 31"],[3,70032,"page 2 item 32"],[1,70033,"page 2 item 33"],[2,70034,"page 2 item 34"],[3,70035,"page 2 item 35"],[1,70036,"page 2 item 36"],[2,70037,"page 2 item 37"],[3,70038,"page 2 item 38"],[1,70039,"page 2 item 39"],[2,70040,"page 2 item 40"],[3,70041,"page 2 item 41"],[1,70042,"page 2 item 42"],[2,70043,"page 2 item 43"],[3,70044,"page 2 item 44"],[1,70045,"page 2 item 45"],[2,70046,"page 2 item 46"],[3,70047,"page 2 item 47"],[1,70048,"page 2 item 48"],[2,70049,"page 2 item 49"],[3,70050,"page 2 item 50"],[1,70051,"page 2 item 51"],[2,70052,"page 2 item 52"],[3,70053,"page 2 item 53"],[1,70054,"page 2 item 54"],[2,70055,"page 2 item 55"],[3,70056,"page 2 item 56"],[1,70057,"page 2 item 57"],[2,70058,"page 2 item 58"],[3,70059,"page 2 item 59"],[1,70060,"page 2 item 60"],[2,70061,"page 2 item 61"],[3,70062,"page 2 item 62"],[1,70063,"page 2 item 63"],[2,70064,"page 2 item 64"],[3,70065,"page 2 item 65"],[1,70066,"page 2 item 66"],[2,70067,"page 2 item 67"],[3,70068,"page 2 item 68"],[1,70069,"page 2 item 69"],[2,70070,"page 2 item 70"],[3,70071,"page 2 item 71"],[1,70072,"page 2 item 72"],[2,70073,"page 2 item 73"],[3,70074,"page 2 item 74"],[1,70075,"page 2 item 75"],[2,70076,"page 2 item 76"],[3,70077,"page 2 item 77"],[1,70078,"page 2 item 78"],[2,70079,"page 2 item 79"],[3,70080,"page 2 item 80"],[1,70081,"page 2 item 81"],[2,70082,"page 2 item 82"],[3,70083,"page 2 item 83"],[1,70084,"page 2 item 84"],[2,70085,"page 2 item 85"],[3,70086,"page 2 item 86"],[1,70087,"page 2 item 87"],[2,70088,"page 2 item 88"],[3,70089,"page 2 item 89"],[1,70090,"page 2 item 90"],[2,70091,"page 2 item 91"],[3,70092,"page 2 item 92"],[1,70093,"page 2 item 93"],[2,70094,"page 2 item 94"],[3,70095,"page 2 item 95"],[1,70096,"page 2 item 96"],[2,70097,"page 2 item 97"],[3,70098,"page 2 item 98"],[1,70099,"page 2 item 99"],[2,70100,"page 2 item 100"],[3,70101,"page 2 item 101"],[1,70102,"page 2 item 102"],[2,70103,"page 2 item 103"],[3,70104,"page 2 item 104"],[1,70105,"page 2 item 105"],[2,70106,"page 2 item 106"],[3,70107,"page 2 item 107"],[1,70108,"page 2 item 108"],[2,70109,"page 2 item 109"],[3,70110,"page 2 item 110"],[1,70111,"page 2 item 111"],[2,70112,"page 2 item 112"],[3,70113,"page 2 item 113"],[1,70114,"page 2 item 114"],[2,70115,"page 2 item 115"],[3,70116,"page 2 item 116"],[1,70117,"page 2 item 117"],[2,70118,"page 2 item 118"],[3,70119,"page 2 item 119"],[1,70120,"page 2 item 120"],[2,70121,"page 2 item 121"],[3,70122,"page 2 item 122"],[1,70123,"page 2 item 123"],[2,70124,"page 2 item 124"],[3,70125,"page 2 item 125"],[1,70126,"page 2 item 126"],[2,70127,"page 2 item 127"],[3,70128,"page 2 item 128"],[1,70129,"page 2 item 129"],[2,70130,"page 2 item 130"],[3,70131,"page 2 item 131"],[1,70132,"page 2 item 132"],[2,70133,"page 2 item 133"],[3,70134,"page 2 item 134"]],"same_in_every_row":{"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text ","status":"Active"}}}}},"success":true}
+
+[You (assistant)]: Answer number 2: I checked page 2 of your records and everything on it is in order. تم التأكد من السجل رقم 2.
+
+[Customer]: Customer question number 3: could you check page 3 of my records please? مرحبا، بدي أتأكد من السجل رقم 3
+
+[You called tool get_customer_records (call-3)]: {"customer":"synthetic-1","page":3}
+
+[Result of your get_customer_records call (call-3)]: {"data":{"body":{"data":{"items":{"columns":["branch_id","item_id","label"],"rows":[[1,70000,"page 3 item 0"],[2,70001,"page 3 item 1"],[3,70002,"page 3 item 2"],[1,70003,"page 3 item 3"],[2,70004,"page 3 item 4"],[3,70005,"page 3 item 5"],[1,70006,"page 3 item 6"],[2,70007,"page 3 item 7"],[3,70008,"page 3 item 8"],[1,70009,"page 3 item 9"],[2,70010,"page 3 item 10"],[3,70011,"page 3 item 11"],[1,70012,"page 3 item 12"],[2,70013,"page 3 item 13"],[3,70014,"page 3 item 14"],[1,70015,"page 3 item 15"],[2,70016,"page 3 item 16"],[3,70017,"page 3 item 17"],[1,70018,"page 3 item 18"],[2,70019,"page 3 item 19"],[3,70020,"page 3 item 20"],[1,70021,"page 3 item 21"],[2,70022,"page 3 item 22"],[3,70023,"page 3 item 23"],[1,70024,"page 3 item 24"],[2,70025,"page 3 item 25"],[3,70026,"page 3 item 26"],[1,70027,"page 3 item 27"],[2,70028,"page 3 item 28"],[3,70029,"page 3 item 29"],[1,70030,"page 3 item 30"],[2,70031,"page 3 item 31"],[3,70032,"page 3 item 32"],[1,70033,"page 3 item 33"],[2,70034,"page 3 item 34"],[3,70035,"page 3 item 35"],[1,70036,"page 3 item 36"],[2,70037,"page 3 item 37"],[3,70038,"page 3 item 38"],[1,70039,"page 3 item 39"],[2,70040,"page 3 item 40"],[3,70041,"page 3 item 41"],[1,70042,"page 3 item 42"],[2,70043,"page 3 item 43"],[3,70044,"page 3 item 44"],[1,70045,"page 3 item 45"],[2,70046,"page 3 item 46"],[3,70047,"page 3 item 47"],[1,70048,"page 3 item 48"],[2,70049,"page 3 item 49"],[3,70050,"page 3 item 50"],[1,70051,"page 3 item 51"],[2,70052,"page 3 item 52"],[3,70053,"page 3 item 53"],[1,70054,"page 3 item 54"],[2,70055,"page 3 item 55"],[3,70056,"page 3 item 56"],[1,70057,"page 3 item 57"],[2,70058,"page 3 item 58"],[3,70059,"page 3 item 59"],[1,70060,"page 3 item 60"],[2,70061,"page 3 item 61"],[3,70062,"page 3 item 62"],[1,70063,"page 3 item 63"],[2,70064,"page 3 item 64"],[3,70065,"page 3 item 65"],[1,70066,"page 3 item 66"],[2,70067,"page 3 item 67"],[3,70068,"page 3 item 68"],[1,70069,"page 3 item 69"],[2,70070,"page 3 item 70"],[3,70071,"page 3 item 71"],[1,70072,"page 3 item 72"],[2,70073,"page 3 item 73"],[3,70074,"page 3 item 74"],[1,70075,"page 3 item 75"],[2,70076,"page 3 item 76"],[3,70077,"page 3 item 77"],[1,70078,"page 3 item 78"],[2,70079,"page 3 item 79"],[3,70080,"page 3 item 80"],[1,70081,"page 3 item 81"],[2,70082,"page 3 item 82"],[3,70083,"page 3 item 83"],[1,70084,"page 3 item 84"],[2,70085,"page 3 item 85"],[3,70086,"page 3 item 86"],[1,70087,"page 3 item 87"],[2,70088,"page 3 item 88"],[3,70089,"page 3 item 89"],[1,70090,"page 3 item 90"],[2,70091,"page 3 item 91"],[3,70092,"page 3 item 92"],[1,70093,"page 3 item 93"],[2,70094,"page 3 item 94"],[3,70095,"page 3 item 95"],[1,70096,"page 3 item 96"],[2,70097,"page 3 item 97"],[3,70098,"page 3 item 98"],[1,70099,"page 3 item 99"],[2,70100,"page 3 item 100"],[3,70101,"page 3 item 101"],[1,70102,"page 3 item 102"],[2,70103,"page 3 item 103"],[3,70104,"page 3 item 104"],[1,70105,"page 3 item 105"],[2,70106,"page 3 item 106"],[3,70107,"page 3 item 107"],[1,70108,"page 3 item 108"],[2,70109,"page 3 item 109"],[3,70110,"page 3 item 110"],[1,70111,"page 3 item 111"],[2,70112,"page 3 item 112"],[3,70113,"page 3 item 113"],[1,70114,"page 3 item 114"],[2,70115,"page 3 item 115"],[3,70116,"page 3 item 116"],[1,70117,"page 3 item 117"],[2,70118,"page 3 item 118"],[3,70119,"page 3 item 119"],[1,70120,"page 3 item 120"],[2,70121,"page 3 item 121"],[3,70122,"page 3 item 122"],[1,70123,"page 3 item 123"],[2,70124,"page 3 item 124"],[3,70125,"page 3 item 125"],[1,70126,"page 3 item 126"],[2,70127,"page 3 item 127"],[3,70128,"page 3 item 128"],[1,70129,"page 3 item 129"],[2,70130,"page 3 item 130"],[3,70131,"page 3 item 131"],[1,70132,"page 3 item 132"],[2,70133,"page 3 item 133"],[3,70134,"page 3 item 134"]],"same_in_every_row":{"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text ","status":"Active"}}}}},"success":true}
+
+[You (assistant)]: Answer number 3: I checked page 3 of your records and everything on it is in order. تم التأكد من السجل رقم 3.
+
+[Customer]: Customer question number 4: could you check page 4 of my records please? مرحبا، بدي أتأكد من السجل رقم 4
+
+[You called tool get_customer_records (call-4)]: {"customer":"synthetic-1","page":4}
+
+[Result of your get_customer_records call (call-4)]: {"data":{"body":{"data":{"items":{"columns":["branch_id","item_id","label"],"rows":[[1,70000,"page 4 item 0"],[2,70001,"page 4 item 1"],[3,70002,"page 4 item 2"],[1,70003,"page 4 item 3"],[2,70004,"page 4 item 4"],[3,70005,"page 4 item 5"],[1,70006,"page 4 item 6"],[2,70007,"page 4 item 7"],[3,70008,"page 4 item 8"],[1,70009,"page 4 item 9"],[2,70010,"page 4 item 10"],[3,70011,"page 4 item 11"],[1,70012,"page 4 item 12"],[2,70013,"page 4 item 13"],[3,70014,"page 4 item 14"],[1,70015,"page 4 item 15"],[2,70016,"page 4 item 16"],[3,70017,"page 4 item 17"],[1,70018,"page 4 item 18"],[2,70019,"page 4 item 19"],[3,70020,"page 4 item 20"],[1,70021,"page 4 item 21"],[2,70022,"page 4 item 22"],[3,70023,"page 4 item 23"],[1,70024,"page 4 item 24"],[2,70025,"page 4 item 25"],[3,70026,"page 4 item 26"],[1,70027,"page 4 item 27"],[2,70028,"page 4 item 28"],[3,70029,"page 4 item 29"],[1,70030,"page 4 item 30"],[2,70031,"page 4 item 31"],[3,70032,"page 4 item 32"],[1,70033,"page 4 item 33"],[2,70034,"page 4 item 34"],[3,70035,"page 4 item 35"],[1,70036,"page 4 item 36"],[2,70037,"page 4 item 37"],[3,70038,"page 4 item 38"],[1,70039,"page 4 item 39"],[2,70040,"page 4 item 40"],[3,70041,"page 4 item 41"],[1,70042,"page 4 item 42"],[2,70043,"page 4 item 43"],[3,70044,"page 4 item 44"],[1,70045,"page 4 item 45"],[2,70046,"page 4 item 46"],[3,70047,"page 4 item 47"],[1,70048,"page 4 item 48"],[2,70049,"page 4 item 49"],[3,70050,"page 4 item 50"],[1,70051,"page 4 item 51"],[2,70052,"page 4 item 52"],[3,70053,"page 4 item 53"],[1,70054,"page 4 item 54"],[2,70055,"page 4 item 55"],[3,70056,"page 4 item 56"],[1,70057,"page 4 item 57"],[2,70058,"page 4 item 58"],[3,70059,"page 4 item 59"],[1,70060,"page 4 item 60"],[2,70061,"page 4 item 61"],[3,70062,"page 4 item 62"],[1,70063,"page 4 item 63"],[2,70064,"page 4 item 64"],[3,70065,"page 4 item 65"],[1,70066,"page 4 item 66"],[2,70067,"page 4 item 67"],[3,70068,"page 4 item 68"],[1,70069,"page 4 item 69"],[2,70070,"page 4 item 70"],[3,70071,"page 4 item 71"],[1,70072,"page 4 item 72"],[2,70073,"page 4 item 73"],[3,70074,"page 4 item 74"],[1,70075,"page 4 item 75"],[2,70076,"page 4 item 76"],[3,70077,"page 4 item 77"],[1,70078,"page 4 item 78"],[2,70079,"page 4 item 79"],[3,70080,"page 4 item 80"],[1,70081,"page 4 item 81"],[2,70082,"page 4 item 82"],[3,70083,"page 4 item 83"],[1,70084,"page 4 item 84"],[2,70085,"page 4 item 85"],[3,70086,"page 4 item 86"],[1,70087,"page 4 item 87"],[2,70088,"page 4 item 88"],[3,70089,"page 4 item 89"],[1,70090,"page 4 item 90"],[2,70091,"page 4 item 91"],[3,70092,"page 4 item 92"],[1,70093,"page 4 item 93"],[2,70094,"page 4 item 94"],[3,70095,"page 4 item 95"],[1,70096,"page 4 item 96"],[2,70097,"page 4 item 97"],[3,70098,"page 4 item 98"],[1,70099,"page 4 item 99"],[2,70100,"page 4 item 100"],[3,70101,"page 4 item 101"],[1,70102,"page 4 item 102"],[2,70103,"page 4 item 103"],[3,70104,"page 4 item 104"],[1,70105,"page 4 item 105"],[2,70106,"page 4 item 106"],[3,70107,"page 4 item 107"],[1,70108,"page 4 item 108"],[2,70109,"page 4 item 109"],[3,70110,"page 4 item 110"],[1,70111,"page 4 item 111"],[2,70112,"page 4 item 112"],[3,70113,"page 4 item 113"],[1,70114,"page 4 item 114"],[2,70115,"page 4 item 115"],[3,70116,"page 4 item 116"],[1,70117,"page 4 item 117"],[2,70118,"page 4 item 118"],[3,70119,"page 4 item 119"],[1,70120,"page 4 item 120"],[2,70121,"page 4 item 121"],[3,70122,"page 4 item 122"],[1,70123,"page 4 item 123"],[2,70124,"page 4 item 124"],[3,70125,"page 4 item 125"],[1,70126,"page 4 item 126"],[2,70127,"page 4 item 127"],[3,70128,"page 4 item 128"],[1,70129,"page 4 item 129"],[2,70130,"page 4 item 130"],[3,70131,"page 4 item 131"],[1,70132,"page 4 item 132"],[2,70133,"page 4 item 133"],[3,70134,"page 4 item 134"]],"same_in_every_row":{"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text ","status":"Active"}}}}},"success":true}
+
+[You (assistant)]: Answer number 4: I checked page 4 of your records and everything on it is in order. تم التأكد من السجل رقم 4.
+
+[Customer]: And what does the newest page of my records show?
+
+[You called tool get_customer_records (call-5)]: {"customer":"synthetic-1","page":5}
+
+[Result of your get_customer_records call (call-5)]: {"success":true,"data":{"body":{"data":{"items":[{"item_id":70000,"label":"page 5 item 0","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70001,"label":"page 5 item 1","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70002,"label":"page 5 item 2","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70003,"label":"page 5 item 3","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70004,"label":"page 5 item 4","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70005,"label":"page 5 item 5","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70006,"label":"page 5 item 6","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70007,"label":"page 5 item 7","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70008,"label":"page 5 item 8","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70009,"label":"page 5 item 9","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70010,"label":"page 5 item 10","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70011,"label":"page 5 item 11","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70012,"label":"page 5 item 12","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70013,"label":"page 5 item 13","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70014,"label":"page 5 item 14","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70015,"label":"page 5 item 15","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70016,"label":"page 5 item 16","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70017,"label":"page 5 item 17","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70018,"label":"page 5 item 18","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70019,"label":"page 5 item 19","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70020,"label":"page 5 item 20","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70021,"label":"page 5 item 21","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70022,"label":"page 5 item 22","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70023,"label":"page 5 item 23","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70024,"label":"page 5 item 24","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70025,"label":"page 5 item 25","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70026,"label":"page 5 item 26","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70027,"label":"page 5 item 27","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70028,"label":"page 5 item 28","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70029,"label":"page 5 item 29","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70030,"label":"page 5 item 30","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70031,"label":"page 5 item 31","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70032,"label":"page 5 item 32","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70033,"label":"page 5 item 33","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70034,"label":"page 5 item 34","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70035,"label":"page 5 item 35","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70036,"label":"page 5 item 36","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70037,"label":"page 5 item 37","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70038,"label":"page 5 item 38","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70039,"label":"page 5 item 39","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70040,"label":"page 5 item 40","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70041,"label":"page 5 item 41","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70042,"label":"page 5 item 42","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70043,"label":"page 5 item 43","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70044,"label":"page 5 item 44","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70045,"label":"page 5 item 45","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70046,"label":"page 5 item 46","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70047,"label":"page 5 item 47","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70048,"label":"page 5 item 48","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70049,"label":"page 5 item 49","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70050,"label":"page 5 item 50","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70051,"label":"page 5 item 51","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70052,"label":"page 5 item 52","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70053,"label":"page 5 item 53","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70054,"label":"page 5 item 54","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70055,"label":"page 5 item 55","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70056,"label":"page 5 item 56","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70057,"label":"page 5 item 57","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70058,"label":"page 5 item 58","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70059,"label":"page 5 item 59","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70060,"label":"page 5 item 60","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70061,"label":"page 5 item 61","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70062,"label":"page 5 item 62","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70063,"label":"page 5 item 63","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70064,"label":"page 5 item 64","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70065,"label":"page 5 item 65","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70066,"label":"page 5 item 66","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70067,"label":"page 5 item 67","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70068,"label":"page 5 item 68","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70069,"label":"page 5 item 69","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70070,"label":"page 5 item 70","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70071,"label":"page 5 item 71","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70072,"label":"page 5 item 72","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70073,"label":"page 5 item 73","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70074,"label":"page 5 item 74","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70075,"label":"page 5 item 75","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70076,"label":"page 5 item 76","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70077,"label":"page 5 item 77","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70078,"label":"page 5 item 78","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70079,"label":"page 5 item 79","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70080,"label":"page 5 item 80","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70081,"label":"page 5 item 81","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70082,"label":"page 5 item 82","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70083,"label":"page 5 item 83","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70084,"label":"page 5 item 84","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70085,"label":"page 5 item 85","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70086,"label":"page 5 item 86","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70087,"label":"page 5 item 87","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70088,"label":"page 5 item 88","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70089,"label":"page 5 item 89","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70090,"label":"page 5 item 90","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70091,"label":"page 5 item 91","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70092,"label":"page 5 item 92","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70093,"label":"page 5 item 93","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70094,"label":"page 5 item 94","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70095,"label":"page 5 item 95","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70096,"label":"page 5 item 96","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70097,"label":"page 5 item 97","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70098,"label":"page 5 item 98","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70099,"label":"page 5 item 99","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70100,"label":"page 5 item 100","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70101,"label":"page 5 item 101","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70102,"label":"page 5 item 102","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70103,"label":"page 5 item 103","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70104,"label":"page 5 item 104","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70105,"label":"page 5 item 105","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70106,"label":"page 5 item 106","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70107,"label":"page 5 item 107","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70108,"label":"page 5 item 108","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70109,"label":"page 5 item 109","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70110,"label":"page 5 item 110","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70111,"label":"page 5 item 111","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70112,"label":"page 5 item 112","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70113,"label":"page 5 item 113","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70114,"label":"page 5 item 114","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70115,"label":"page 5 item 115","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70116,"label":"page 5 item 116","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70117,"label":"page 5 item 117","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70118,"label":"page 5 item 118","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70119,"label":"page 5 item 119","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70120,"label":"page 5 item 120","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70121,"label":"page 5 item 121","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70122,"label":"page 5 item 122","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70123,"label":"page 5 item 123","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70124,"label":"page 5 item 124","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70125,"label":"page 5 item 125","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70126,"label":"page 5 item 126","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70127,"label":"page 5 item 127","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70128,"label":"page 5 item 128","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70129,"label":"page 5 item 129","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70130,"label":"page 5 item 130","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70131,"label":"page 5 item 131","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70132,"label":"page 5 item 132","status":"Active","branch_id":1,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70133,"label":"page 5 item 133","status":"Active","branch_id":2,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "},{"item_id":70134,"label":"page 5 item 134","status":"Active","branch_id":3,"note":"synthetic note text synthetic note text synthetic note text synthetic note text synthetic note text "}]}}}}
+
+### DIALOGUE DIGEST
+
+Only the messages exchanged between you and the customer, oldest first (the full transcript with your tool calls and their results is above):
+
+Customer: Customer question number 0: could you check page 0 of my records please? مرحبا، بدي أتأكد من السجل رقم 0
+You: Answer number 0: I checked page 0 of your records and everything on it is in order. تم التأكد من السجل رقم 0.
+Customer: Customer question number 1: could you check page 1 of my records please? مرحبا، بدي أتأكد من السجل رقم 1
+You: Answer number 1: I checked page 1 of your records and everything on it is in order. تم التأكد من السجل رقم 1.
+Customer: Customer question number 2: could you check page 2 of my records please? مرحبا، بدي أتأكد من السجل رقم 2
+You: Answer number 2: I checked page 2 of your records and everything on it is in order. تم التأكد من السجل رقم 2.
+Customer: Customer question number 3: could you check page 3 of my records please? مرحبا، بدي أتأكد من السجل رقم 3
+You: Answer number 3: I checked page 3 of your records and everything on it is in order. تم التأكد من السجل رقم 3.
+Customer: Customer question number 4: could you check page 4 of my records please? مرحبا، بدي أتأكد من السجل رقم 4
+You: Answer number 4: I checked page 4 of your records and everything on it is in order. تم التأكد من السجل رقم 4.
+Customer: And what does the newest page of my records show?
+
+### YOUR NEXT TURN
+
+Facts about the current state (derived by the system from the transcript above):
+- Everything the customer has said in this conversation is in the transcript and the dialogue digest; treat details already given as known and do not ask for them again.
+- Tools whose instructions have already been retrieved with get_tool_instructions in this conversation (the preflight cache is valid for the whole conversation, so do NOT fetch them again): get_customer_records. Any other tool still needs get_tool_instructions before its first use.
+- Tools already executed earlier in this conversation, listed below. Their outputs are in the transcript above ("Result of your … call" entries are the tool's own output, never your summary of it). If your system instructions mention cached data or summaries of recent tool results, they refer to exactly these calls. Instructions or protocols that a tool returned are already loaded and remain in effect for the whole conversation. Do NOT call a tool again, and do NOT call get_tool_instructions for it, just to re-read what is still shown in the transcript; re-run a tool when its data is live and may have changed, when you need it with different arguments, or when its result below is marked INCOMPLETE and you need the part that is missing:
+  • get_customer_records {"customer":"synthetic-1","page":0} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":1} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":2} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":3} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+  • get_customer_records {"customer":"synthetic-1","page":4} — its result in the transcript is INCOMPLETE (shortened or dropped by the system to fit this message); call it again whenever you need data it no longer shows
+- Tool calls already made since the customer's message you are answering (their results are in the transcript; do NOT call any of them again this turn — a reworded argument is the same call; use their results). A call marked FAILED returned an error, not data — you do not have that data; fix the arguments and call again, or tell the customer, but never answer as if it had succeeded:
+  • get_customer_records {"customer":"synthetic-1","page":5}
+- The transcript ends with a tool result: you are in the middle of handling the customer's latest message. Continue from that result.
+
+Your previous message to the customer:
+You: Answer number 4: I checked page 4 of your records and everything on it is in order. تم التأكد من السجل رقم 4.
+
+The customer's reply to it — the message you are answering now:
+Customer: And what does the newest page of my records show?
+
+Write the assistant's next turn now, following the system instructions above:
+- If a tool call is needed to serve the customer correctly, output ONLY the <tool_call> block(s).
+- Otherwise, reply to the customer in plain text: no <tool_call> blocks, no JSON, no transcript labels, no commentary about tools.

@@ -146,6 +146,11 @@ type config struct {
 	AgyImageDir        string         // served root for generated images ("" → temp)
 	AgyImageModel      string         // default Antigravity model for image generation
 	AgyImageRetention  time.Duration  // keep generated images this long for reuse
+	// Persona in the agent definition (agy_persona_agent.go). OFF by default: a plain
+	// chat turn then carries the caller's system prompt inside the prompt message, as always.
+	AgyPersonaInAgent     bool   // PROXY_AGY_PERSONA_IN_AGENT — deliver the caller's system prompt through a per-persona agy agent definition instead of the prompt message (agy silently cuts the message at ~191KB; a definition's body is delivered whole)
+	AgyPersonaAgentPrefix string // PROXY_AGY_PERSONA_AGENT_PREFIX — name prefix of those agents (default "connect-chat-p")
+	agyPersonaAgent       string // per-request, never read from env: the persona agent serving THIS request ("" = the persona travels in the message); set by agyGenerate
 	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
 	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
 	// Claude subscription (long-lived OAuth token from `claude setup-token`).
@@ -853,6 +858,9 @@ func loadConfig() config {
 		AgyImageDir:        strings.TrimSpace(getenv("PROXY_AGY_IMAGE_DIR", "")),
 		AgyImageModel:      strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
 		AgyImageRetention:  parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
+
+		AgyPersonaInAgent:     parseBoolDefault(getenv("PROXY_AGY_PERSONA_IN_AGENT", "false"), false),
+		AgyPersonaAgentPrefix: strings.TrimSpace(getenv("PROXY_AGY_PERSONA_AGENT_PREFIX", agyPersonaAgentDefaultPrefix)),
 
 		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
 		ClaudeModel:        strings.TrimSpace(getenv("PROXY_CLAUDE_MODEL", "")),
