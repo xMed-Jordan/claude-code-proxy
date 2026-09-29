@@ -35,13 +35,14 @@ func TestAnOfferKeepsItsPackagesBeforeItsDescriptions(t *testing.T) {
 	if !ok || len(got) > len(raw)*60/100 {
 		t.Fatalf("did not fit: %d of %d bytes", len(got), len(raw))
 	}
-	if n := len(packageBranchRe.FindAllString(got, -1)); n != want {
+	records := agyAsRecords(t, got)
+	if n := len(packageBranchRe.FindAllString(records, -1)); n != want {
 		t.Fatalf("%d of %d package branch lists survived", n, want)
 	}
-	if strings.Contains(got, "entries dropped") {
+	if strings.Contains(got, "entries dropped") || strings.Contains(got, agyStubKey) {
 		t.Fatal("a packages list was thinned while descriptions could still go")
 	}
-	if !strings.Contains(got, `"price":"160.0000"`) {
+	if !strings.Contains(records, `"price":"160.0000"`) {
 		t.Fatal("the offer's prices were lost")
 	}
 }

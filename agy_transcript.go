@@ -1213,9 +1213,10 @@ func marshalJSONNoHTML(v any) ([]byte, error) {
 // Compaction levels, applied across the whole transcript in order, so the
 // cheapest information is always spent first:
 //
-//	agyLevelHistory — thin the arrays nested inside records (a package's past
-//	                  reservations, a therapist's shifts). Records and prose intact.
-//	agyLevelProse   — additionally shorten long strings (instruction sheets).
+//	agyLevelHistory — shorten the prose inside records, then let a list's
+//	                  trailing records give up their details (agy_records.go).
+//	agyLevelProse   — additionally shorten long strings (instruction sheets),
+//	                  then thin the arrays nested inside records.
 //	agyLevelRecords — additionally drop records. Last resort.
 const (
 	agyLevelSuperseded = iota // older results of a tool that has been called again since
@@ -1280,28 +1281,43 @@ func agySupersededResults(turns []agyTurn) map[int]bool {
 }
 
 func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
+	out, ok, _ := compactJSONForPromptLossy(raw, maxBytes, level)
+	return out, ok
+}
+
+// compactJSONForPromptLossy is compactJSONForPrompt also reporting whether the
+// result gave up anything. Only its layout may have changed when lossy is
+// false (flat record lists written as tables), and such a result must not tell
+// the model to fetch it again.
+func compactJSONForPromptLossy(raw string, maxBytes, level int) (string, bool, bool) {
 	trimmed := strings.TrimSpace(raw)
 	if maxBytes <= 0 || len(raw) <= maxBytes || len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
-		return raw, false
+		return raw, false, false
 	}
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return raw, false
+		return raw, false, false
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return raw, false
+		return raw, false, false
 	}
-	best := raw
-	changed := false
+	best, bestLossy := raw, false
+	// The passes below work on records; what is measured and kept is written
+	// with every flat record list as a table, which loses nothing
+	// (agy_records.go). A result shortened earlier arrives as tables and is read
+	// back into records first.
+	v = agyUntabulate(v)
+	shrunk := false
 	for i := 0; i < 500; i++ {
-		out, err := marshalJSONNoHTML(v)
+		written, tabulated := agyTabulated(v)
+		out, err := marshalJSONNoHTML(written)
 		if err != nil {
 			break
 		}
-		if changed && len(out) < len(best) {
-			best = string(out)
+		if (shrunk || tabulated) && len(out) < len(best) {
+			best, bestLossy = string(out), shrunk
 		}
 		if len(out) <= maxBytes {
 			break
@@ -1309,12 +1325,12 @@ func compactJSONForPrompt(raw string, maxBytes, level int) (string, bool) {
 		if !shrinkJSONOnce(&v, level) {
 			break
 		}
-		changed = true
+		shrunk = true
 	}
-	if !changed || len(best) >= len(raw) {
-		return raw, false
+	if len(best) >= len(raw) {
+		return raw, false, false
 	}
-	return best, true
+	return best, true, bestLossy
 }
 
 // jsonRef locates one shrinkable node inside a decoded JSON document.
@@ -1440,6 +1456,12 @@ func shrinkJSONOnce(root *any, level int) bool {
 	if level >= agyLevelHistory && dropProseColumn(refs) {
 		return true
 	}
+	// Then the trailing records of a list give up their nested lists, so the
+	// leading ones stay whole rather than every record going hollow
+	// (agy_records.go).
+	if level >= agyLevelHistory && stubTrailingRecords(refs) {
+		return true
+	}
 	// Before any record is dropped, take the heaviest column off the record
 	// list: 25 packages each keeping their id and name are worth far more to
 	// the next tool call than 12 packages keeping every field.
@@ -1449,9 +1471,18 @@ func shrinkJSONOnce(root *any, level int) bool {
 		}
 	}
 
-	// No prose left to shorten: fall back to thinning arrays. Below the record
-	// level the shallowest array is the record list itself and is left alone,
-	// so only the history nested inside records is thinned.
+	// No prose left to shorten: fall back to thinning arrays. Not before the
+	// prose level, so that across the transcript every instruction sheet has
+	// been shortened before any record's nested list is thinned. Prod 2026-09-29
+	// (conv 61411): the current turn's Botox packages — the prices the customer
+	// asked to confirm — were thinned three times over while a 9KB instruction
+	// sheet fetched in the same turn waited for the prose level; one cut of it
+	// would have made room for them. Below the record level the shallowest
+	// array is the record list itself and is left alone, so only the lists
+	// nested inside records are thinned.
+	if level < agyLevelProse {
+		return false
+	}
 	minDepth := -1
 	for _, r := range refs {
 		if r.isString {
@@ -1481,6 +1512,11 @@ func shrinkJSONOnce(root *any, level int) bool {
 	refs = arrays
 	if len(refs) == 0 {
 		return false
+	}
+	// A nested list whose trailing records already gave up their details loses
+	// those before the whole record ahead of them is thinned (agy_records.go).
+	if dropTrailingStubs(refs) {
+		return true
 	}
 	// Deepest first, then heaviest: nested history goes before top-level records.
 	sort.SliceStable(refs, func(i, j int) bool {
@@ -1565,15 +1601,17 @@ func dropHeaviestColumn(refs []jsonRef) bool {
 			continue
 		}
 		n := len(obj)
-		if _, marked := obj[agyDroppedFieldsKey]; marked {
-			n--
+		for _, note := range agyRecordNoteKeys {
+			if _, marked := obj[note]; marked {
+				n--
+			}
 		}
 		if n > keys {
 			keys = n
 		}
 		for k, v := range obj {
-			if k == agyDroppedFieldsKey {
-				continue // never drop the note about what was dropped
+			if agyIsRecordNoteKey(k) {
+				continue // never drop a note about what was dropped
 			}
 			raw, err := marshalJSONNoHTML(v)
 			if err != nil {
@@ -1798,6 +1836,15 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 		}
 	}
 	shrunk := map[int][2]int{} // turn index → {original, current} bytes
+	// Lossless, before any phase: a record that a later result of the same tool
+	// carries byte for byte becomes a pointer to it (agy_records.go). Not marked
+	// reduced — nothing is missing, so nothing should be fetched again.
+	if len(renderAgyTranscript(out, oldResultCap, readable)) > budget {
+		for j, text := range agyDedupeRepeatedRecords(out.Turns) {
+			shrunk[j] = [2]int{len(out.Turns[j].Text), len(text)}
+			out.Turns[j].Text = text
+		}
+	}
 	// Three phases, and the order is the whole design. What gets spent first is
 	// decided by how reconstructible it is, which needs no knowledge of what any
 	// tool returns:
@@ -1906,10 +1953,10 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 					out.Turns[idx].Reduced = true
 					continue
 				}
-				text, ok := compactJSONForPrompt(out.Turns[idx].Text, target, level)
+				text, ok, lossy := compactJSONForPromptLossy(out.Turns[idx].Text, target, level)
 				if (!ok || len(text) >= len(out.Turns[idx].Text)) && level == agyLevelRecords {
 					// Not JSON, or JSON that cannot give up anything else.
-					text = truncateToolResult(out.Turns[idx].Text, target)
+					text, lossy = truncateToolResult(out.Turns[idx].Text, target), true
 				}
 				if len(text) >= len(out.Turns[idx].Text) {
 					exhausted[idx] = true
@@ -1921,7 +1968,9 @@ func fitAgyTranscript(t agyTranscript, oldResultCap int, readable bool, budget i
 					shrunk[idx] = [2]int{shrunk[idx][0], len(text)}
 				}
 				out.Turns[idx].Text = text
-				out.Turns[idx].Reduced = true
+				// Written as tables and nothing else: the model has all of it and
+				// must not be told to fetch it again (agy_records.go).
+				out.Turns[idx].Reduced = out.Turns[idx].Reduced || lossy
 			}
 		}
 	}
@@ -2185,13 +2234,21 @@ func agyToolsInPlay(t agyTranscript) map[string]bool {
 // window, and reports which tools had their results shortened or dropped in the
 // process — the caller must exempt those from its "do not repeat a call" rules.
 func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) (string, map[string]bool) {
+	prompt, fitted := renderAgyPromptFittedTranscript(cfg, system, temp, tools, t)
+	return prompt, fitted.reducedTools()
+}
+
+// renderAgyPromptFittedTranscript is renderAgyPromptFitted returning the fitted
+// transcript itself — turn for turn the same turns, with the results the
+// fitting shortened — so a caller can see what the prompt lost.
+func renderAgyPromptFittedTranscript(cfg config, system string, temp *float64, tools []agyToolCatalog, t agyTranscript) (string, agyTranscript) {
 	system = strings.TrimSpace(system)
 	tempDirective := buildAgyTempDirective(temp)
 	toolsPrompt := renderAgyToolCatalog(tools, nil, false)
 
 	// Bare single-turn chat with no system/tools keeps the raw prompt (Test page).
 	if system == "" && toolsPrompt == "" && tempDirective == "" && len(t.Turns) == 1 && t.Turns[0].Kind == agyTurnCustomer {
-		return t.Turns[0].Text, nil
+		return t.Turns[0].Text, t
 	}
 
 	var sysBlock strings.Builder
@@ -2263,7 +2320,7 @@ func renderAgyPromptFitted(cfg config, system string, temp *float64, tools []agy
 		}
 	}
 
-	return assembleAgyPrompt(howToRead, sysBlock.String(), toolsPrompt, t, cfg), t.reducedTools()
+	return assembleAgyPrompt(howToRead, sysBlock.String(), toolsPrompt, t, cfg), t
 }
 
 // assembleAgyPrompt writes the sections in their fixed order. Order matters

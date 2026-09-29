@@ -56,21 +56,43 @@ type agyBriefEntry struct {
 const agyBriefCacheTTL = 6 * time.Hour
 const agyBriefCacheMax = 256
 
+// agyCompactMinGainBytes is how much dialogue must precede the recent turns
+// before the proxy spends a model call summarising it by choice rather than by
+// necessity.
+const agyCompactMinGainBytes = 6000
+
 // agyCompactIfNeeded returns a transcript that fits, compacting the dialogue
-// only when fitting alone cannot get the prompt inside the budget. The second
-// result reports whether a brief was produced.
+// when fitting alone cannot get the prompt inside the budget — or when it can
+// only by gutting the results the current turn is acting on while older
+// dialogue sits intact. The second result reports whether a brief was produced.
+//
+// The second case is the common one. Fitting can always make the prompt fit by
+// spending tool results, so "still over budget" almost never fired, and older
+// dialogue was never touched while the turn's own data went. Prod 2026-09-29
+// (conv 61411, the owner's test number): ~60 staff notices preceded the
+// customer's four messages, fitting emptied every catalog lookup of the turn,
+// and the model quoted a price its persona uses as an example.
 func agyCompactIfNeeded(ctx context.Context, cfg config, in agyGenInput) (agyTranscript, bool) {
 	budget := agyPromptBudget(cfg)
 	if budget <= 0 || !cfg.AgyCompact {
 		return in.Transcript, false
 	}
-	prompt, _ := renderAgyPromptFitted(cfg, in.System, in.Temperature, in.Tools, in.Transcript)
-	if len(prompt) <= budget {
-		return in.Transcript, false
-	}
-	cut := agyCompactCutIndex(in.Transcript, agyCompactKeepCustomerTurns)
-	if cut <= 0 {
-		log.Printf("[agy-compact] prompt is %d bytes over the %d-byte budget but there is nothing older to summarise", len(prompt)-budget, budget)
+	prompt, fitted := renderAgyPromptFittedTranscript(cfg, in.System, in.Temperature, in.Tools, in.Transcript)
+	var cut int
+	switch {
+	case len(prompt) > budget:
+		cut = agyCompactCutIndex(in.Transcript, agyCompactKeepCustomerTurns)
+		if cut <= 0 {
+			log.Printf("[agy-compact] prompt is %d bytes over the %d-byte budget but there is nothing older to summarise", len(prompt)-budget, budget)
+			return in.Transcript, false
+		}
+	case agyRecentResultsStarved(in.Transcript, fitted, agyCompactStepCutIndex(in.Transcript, agyCompactKeepCustomerTurns)):
+		cut = agyCompactStepCutIndex(in.Transcript, agyCompactKeepCustomerTurns)
+		if cut <= 0 || agyDialogueBytes(in.Transcript.Turns[:cut]) < agyCompactMinGainBytes {
+			return in.Transcript, false
+		}
+		log.Printf("[agy-compact] results in the recent dialogue had to be cut to fit; summarising the %d turns before it", cut)
+	default:
 		return in.Transcript, false
 	}
 	material := renderAgyCompactionMaterial(in.Transcript.Turns[:cut])
@@ -84,6 +106,15 @@ func agyCompactIfNeeded(ctx context.Context, cfg config, in agyGenInput) (agyTra
 	}
 	out := agyTranscript{Turns: make([]agyTurn, 0, len(in.Transcript.Turns)-cut+1)}
 	out.Turns = append(out.Turns, agyTurn{Kind: agyTurnSystemNote, Text: agyBriefMarker + "\n\n" + strings.TrimSpace(brief)})
+	// System notes are the system's own context, not dialogue — the customer
+	// record Connect looked up before the first message, which tools are already
+	// preflighted — and a brief would paraphrase the identifiers in them. They
+	// stay verbatim.
+	for _, tt := range in.Transcript.Turns[:cut] {
+		if tt.Kind == agyTurnSystemNote {
+			out.Turns = append(out.Turns, tt)
+		}
+	}
 	out.Turns = append(out.Turns, in.Transcript.Turns[cut:]...)
 	log.Printf("[agy-compact] summarised the first %d turns into %d bytes (cached=%v); transcript %d→%d turns",
 		cut, len(brief), cached, len(in.Transcript.Turns), len(out.Turns))
@@ -97,17 +128,83 @@ func agyCompactCutIndex(t agyTranscript, keep int) int {
 	if keep < 1 {
 		keep = 1
 	}
-	seen := 0
+	seen, first := 0, -1
 	for i := len(t.Turns) - 1; i >= 0; i-- {
 		if t.Turns[i].Kind != agyTurnCustomer {
 			continue
 		}
 		seen++
+		first = i
 		if seen > keep {
 			return i + 1 // everything strictly before this customer message
 		}
 	}
+	// No more than keep customer messages: what precedes the first of them —
+	// messages the business sent before the customer ever wrote — is still
+	// older than all of the dialogue.
+	if first > 0 {
+		return first
+	}
 	return 0
+}
+
+// agyCompactStepCutIndex is the cut for summarising by choice: the verbatim
+// tail keeps between keep and 2·keep−1 customer messages, and the cut moves in
+// steps of keep, so the brief — cached by the exact material it covers — is
+// written once every keep messages instead of on every turn. With fewer than
+// 2·keep customer messages only what precedes the first of them is covered.
+func agyCompactStepCutIndex(t agyTranscript, keep int) int {
+	if keep < 1 {
+		keep = 1
+	}
+	var customers []int
+	for i, tt := range t.Turns {
+		if tt.Kind == agyTurnCustomer {
+			customers = append(customers, i)
+		}
+	}
+	if len(customers) == 0 {
+		return 0
+	}
+	steps := (len(customers) - keep) / keep
+	if steps <= 0 {
+		return customers[0]
+	}
+	return customers[steps*keep]
+}
+
+// agyRecentResultsStarved reports whether fitting cut a result inside the
+// recent dialogue — from index from on, the part a brief would leave verbatim —
+// to less than half of itself, or dropped it. That covers the turn being
+// answered and the ones just before it: a customer who asks "and in Amman?"
+// is asking about the previous turn's lookup. Only lossy cuts count: a stale
+// copy and a record shown in full in a later result lose nothing.
+func agyRecentResultsStarved(orig, fitted agyTranscript, from int) bool {
+	if len(orig.Turns) != len(fitted.Turns) || from < 0 {
+		return false
+	}
+	superseded := agySupersededResults(orig.Turns)
+	for j := from; j < len(orig.Turns); j++ {
+		if orig.Turns[j].Kind != agyTurnToolResult || superseded[j] || !fitted.Turns[j].Reduced {
+			continue
+		}
+		if len(fitted.Turns[j].Text)*2 < len(orig.Turns[j].Text) {
+			return true
+		}
+	}
+	return false
+}
+
+// agyDialogueBytes is the size of the messages themselves in turns — what a
+// brief would replace, as opposed to tool results the fitter can already spend.
+func agyDialogueBytes(turns []agyTurn) int {
+	n := 0
+	for _, tt := range turns {
+		if tt.Kind == agyTurnCustomer || tt.Kind == agyTurnAssistant {
+			n += len(tt.Text)
+		}
+	}
+	return n
 }
 
 // renderAgyCompactionMaterial renders the turns to be summarised: the dialogue
@@ -124,8 +221,7 @@ func renderAgyCompactionMaterial(turns []agyTurn) string {
 			b.WriteString("Assistant: ")
 			b.WriteString(strings.Join(strings.Fields(tt.Text), " "))
 		case agyTurnSystemNote:
-			b.WriteString("System note: ")
-			b.WriteString(truncateString(strings.Join(strings.Fields(tt.Text), " "), 600))
+			continue // carried over verbatim (agyCompactIfNeeded)
 		case agyTurnToolCall:
 			b.WriteString("Assistant called tool ")
 			b.WriteString(tt.Tool)

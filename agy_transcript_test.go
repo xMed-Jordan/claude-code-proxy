@@ -429,16 +429,18 @@ func TestCompactJSONForPromptKeepsRecordsDropsHistory(t *testing.T) {
 		t.Fatalf("compacted to %d bytes, want <= 9000", len(out))
 	}
 	// Every record id and name must survive: those are what the next call needs.
+	records := agyAsRecords(t, out)
 	for i := 0; i < 24; i++ {
-		if !strings.Contains(out, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+		if !strings.Contains(records, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
 			t.Fatalf("record %d lost:\n%s", 263660+i, truncateString(out, 1500))
 		}
-		if !strings.Contains(out, fmt.Sprintf(`"name_en":"Package %d"`, i)) {
+		if !strings.Contains(records, fmt.Sprintf(`"name_en":"Package %d"`, i)) {
 			t.Fatalf("name of record %d lost", i)
 		}
 	}
-	// Something must say what was given up: thinned history, or dropped columns.
-	if !strings.Contains(out, agyOmissionMarker) && !strings.Contains(out, agyDroppedFieldsKey) {
+	// Something must say what was given up: thinned history, records that gave
+	// up their details, or dropped columns.
+	if !strings.Contains(out, agyOmissionMarker) && !strings.Contains(out, agyDroppedFieldsKey) && !strings.Contains(out, agyStubKey) {
 		t.Fatalf("nothing records what was dropped:\n%s", truncateString(out, 800))
 	}
 	// Valid JSON out.
@@ -466,8 +468,9 @@ func TestCompactJSONForPromptShortensProseBeforeRecords(t *testing.T) {
 	if !ok || len(out) > 6000 {
 		t.Fatalf("compaction ok=%v size=%d (from %d)", ok, len(out), len(raw))
 	}
+	records := agyAsRecords(t, out)
 	for _, want := range []string{`"user_package_id":263669`, `"Full Body - Shalabi Pro"`, `"user_package_id":263661`, `"user_package_id":263662`} {
-		if !strings.Contains(out, want) {
+		if !strings.Contains(records, want) {
 			t.Fatalf("record data %q lost while prose was available to cut:\n%s", want, truncateString(out, 900))
 		}
 	}
@@ -655,12 +658,16 @@ func TestReducedResultsAreAnnouncedAndRecallable(t *testing.T) {
 
 // Under pressure the nested arrays that carry a lookup's actual answer are
 // thinned like any other nesting. This test pins that behaviour so the
-// trade-off is visible rather than assumed.
+// trade-off is visible rather than assumed. Thinning starts at the prose
+// level, once every instruction sheet has been shortened.
 func TestCompactJSONThinsBulkiestNestingFirst(t *testing.T) {
 	slots := `{"data":{"slots":[{"date":"2026-09-10","merged_starts":["13:00"],"merged_slots":[{"time_from":"13:00","time_to":"14:00"}],` +
 		`"therapists":[{"therapist_id":53722,"therapist_name":"هبة","available_starts":["13:00"]}]}],` +
 		`"therapists_summary":{"53010":{"therapist_id":53010,"services":[` + strings.TrimSuffix(strings.Repeat("101,", 300), ",") + `]}}}}`
-	out, ok := compactJSONForPrompt(slots, len(slots)/2, agyLevelHistory)
+	if _, ok := compactJSONForPrompt(slots, len(slots)/2, agyLevelHistory); ok {
+		t.Fatal("a nested list was thinned below the prose level")
+	}
+	out, ok := compactJSONForPrompt(slots, len(slots)/2, agyLevelProse)
 	if !ok {
 		t.Fatal("expected compaction")
 	}
@@ -795,18 +802,20 @@ func TestCompactJSONIsIndependentOfFieldNames(t *testing.T) {
 	if !ok {
 		t.Fatal("expected compaction")
 	}
+	records := agyAsRecords(t, out)
 	for i := 0; i < 20; i++ {
-		if !strings.Contains(out, fmt.Sprintf(`"kode":"KX-%03d"`, i)) {
+		if !strings.Contains(records, fmt.Sprintf(`"kode":"KX-%03d"`, i)) {
 			t.Fatalf("the identifying column was dropped although it is the most distinguishing one:\n%s", truncateString(out, 700))
 		}
-		if !strings.Contains(out, fmt.Sprintf(`"صنف رقم %d"`, i)) {
+		if !strings.Contains(records, fmt.Sprintf(`"صنف رقم %d"`, i)) {
 			t.Fatalf("the label column was dropped:\n%s", truncateString(out, 700))
 		}
 	}
-	// The columns that are identical in every record carry no information.
-	for _, gone := range []string{`"status"`, `"tenant"`} {
-		if strings.Contains(out, gone) {
-			t.Fatalf("a constant column %s survived while informative ones were at risk", gone)
+	// The columns that are identical in every record carry no information: at
+	// most they are stated once, never per record.
+	for _, gone := range []string{`"status"`, `"tenant"`, `"blob"`} {
+		if strings.Count(out, gone) > 1 {
+			t.Fatalf("a constant column %s is repeated per record while informative ones were at risk", gone)
 		}
 	}
 	var v any
@@ -827,15 +836,34 @@ func TestCompactJSONDropsColumnsBeforeRecords(t *testing.T) {
 	if !ok {
 		t.Fatal("expected compaction")
 	}
+	records := agyAsRecords(t, out)
 	for i := 0; i < 25; i++ {
-		if !strings.Contains(out, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+		if !strings.Contains(records, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
+			t.Fatalf("record %d dropped although columns were still available:\n%s", 263660+i, truncateString(out, 800))
+		}
+	}
+	// A column with one value in every record is stated once, not dropped.
+	if strings.Count(out, "the notes are for internal use") > 1 {
+		t.Fatalf("a constant column is repeated per record:\n%s", truncateString(out, 600))
+	}
+	if !strings.Contains(records, `"name_en":"Package 24"`) {
+		t.Fatalf("names should outlive the bulky columns:\n%s", truncateString(out, 600))
+	}
+	// Squeezed until columns must go, a note says which.
+	out, ok = compactJSONForPrompt(raw, len(raw)/8, agyLevelFields)
+	if !ok || len(out) > len(raw)/8 {
+		t.Fatalf("did not fit: ok=%v %d of %d", ok, len(out), len(raw)/8)
+	}
+	records = agyAsRecords(t, out)
+	for i := 0; i < 25; i++ {
+		if !strings.Contains(records, fmt.Sprintf(`"user_package_id":%d`, 263660+i)) {
 			t.Fatalf("record %d dropped although columns were still available:\n%s", 263660+i, truncateString(out, 800))
 		}
 	}
 	if !strings.Contains(out, agyDroppedFieldsKey) {
 		t.Fatalf("no note about the dropped columns:\n%s", truncateString(out, 600))
 	}
-	if !strings.Contains(out, `"name_en":"Package 24"`) {
+	if !strings.Contains(records, `"name_en":"Package 24"`) {
 		t.Fatalf("names should outlive the bulky columns:\n%s", truncateString(out, 600))
 	}
 	var v any
