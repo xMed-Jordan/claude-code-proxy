@@ -23,6 +23,19 @@ package main
 // other agents, and an empty PROXY_AGY_AGENT means agy's default coding agent is
 // configured on purpose. Anything that goes wrong installing the agent falls back
 // to today's behaviour: the persona travels in the message.
+//
+// Who gets it. The switch is a rollout, so it also needs an allowlist of customer
+// numbers (PROXY_AGY_PERSONA_IN_AGENT_NUMBERS): with the switch on, only a
+// conversation whose number is listed (or any conversation, with "*") takes the
+// agent path; everyone else keeps path A, the prompt exactly as it is with the
+// switch off. The number is read from the "User identifier:" line of the "##
+// Platform Context" section Connect writes into the system prompt
+// (agyConversationIdentifier) and nowhere else: the persona itself is full of
+// other numbers (tool docs, examples). An empty list means no one.
+//
+// Every call made with the switch on logs exactly one [agy-persona] line: which
+// path the turn took and why, and a short hash of the number (never the number,
+// never the persona). With the switch off nothing is logged and nothing is read.
 
 import (
 	"crypto/sha256"
@@ -32,6 +45,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -172,20 +186,166 @@ func ensureAgyPersonaAgent(cfg config, persona string) (string, error) {
 	return name, nil
 }
 
-// agyPersonaAgentFor returns the name of the persona agent that should serve
-// this generation, or "" when the persona stays in the message: the switch is
-// off, there is no persona, the run carries attachments (media runs use other
-// agents and keep the persona in the message), no chat agent is configured
-// (an empty PROXY_AGY_AGENT means agy's default coding agent, on purpose), or the
-// agent could not be installed.
-func agyPersonaAgentFor(cfg config, in agyGenInput) string {
-	if !cfg.AgyPersonaInAgent || strings.TrimSpace(in.System) == "" || len(in.Media) != 0 || strings.TrimSpace(cfg.AgyAgent) == "" {
+// ---------------------------------------------------------------------------
+// Whose conversation: the allowlist
+// ---------------------------------------------------------------------------
+
+// agyPersonaMinSuffixDigits is how many digits the shorter of two numbers needs
+// before it may match by being the tail of the longer one: a local form
+// ("790000001") matches the international one ("962790000001"), a fragment does not.
+const agyPersonaMinSuffixDigits = 8
+
+var (
+	// agyUserIdentifierRe matches the "User identifier:" line of Connect's Platform
+	// Context section and captures its value. Only spaces and tabs may sit between
+	// the colon and the value, so a line with an empty value can never take the
+	// next line for its value.
+	agyUserIdentifierRe = regexp.MustCompile(`(?m)^[ \t]*User identifier:[ \t]*(.*?)[ \t\r]*$`)
+	// agyPlatformContextRe matches the "## Platform Context" heading.
+	agyPlatformContextRe = regexp.MustCompile(`(?m)^[ \t]*#{1,6}[ \t]*Platform Context[ \t\r]*$`)
+)
+
+// agyNormalizePhone reduces a number to a comparable form: digits only; a leading
+// international "00" dropped; then leading zeros (the local form) stripped. So
+// "+962 79-000-0001", "00962790000001" and "962790000001" are one value, and
+// "0790000001" is its local tail "790000001".
+func agyNormalizePhone(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= '0' && c <= '9' {
+			b.WriteByte(c)
+		}
+	}
+	return strings.TrimLeft(strings.TrimPrefix(b.String(), "00"), "0")
+}
+
+// agyPhoneMatches reports whether two NORMALISED numbers (agyNormalizePhone) are
+// the same customer: equal, or the shorter is the tail of the longer and has at
+// least agyPersonaMinSuffixDigits digits. An empty value matches nothing.
+func agyPhoneMatches(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	short, long := a, b
+	if len(short) > len(long) {
+		short, long = long, short
+	}
+	return len(short) >= agyPersonaMinSuffixDigits && strings.HasSuffix(long, short)
+}
+
+// agyConversationIdentifier returns the value of the "User identifier:" line of
+// the system prompt's Platform Context section, trimmed ("" when there is none):
+//
+//	## Platform Context
+//	Platform: whatsapp
+//	Speaking with: <name>
+//	User identifier: <number>
+//
+// The first such line after a "## Platform Context" heading; with no such heading
+// the first such line anywhere. With a heading but no line after it the answer is
+// "" — the persona's own examples are never a stand-in. The persona carries other
+// numbers (tool docs, examples); none of them is ever read.
+func agyConversationIdentifier(system string) string {
+	if !strings.Contains(system, "User identifier:") {
 		return ""
+	}
+	scope := system
+	if loc := agyPlatformContextRe.FindStringIndex(system); loc != nil {
+		scope = system[loc[1]:]
+	}
+	if m := agyUserIdentifierRe.FindStringSubmatch(scope); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// agyParsePersonaNumbers reads PROXY_AGY_PERSONA_IN_AGENT_NUMBERS: a
+// comma-separated list; each entry is normalised (agyNormalizePhone) and entries
+// that carry no digits are dropped; an entry "*" sets all. Empty means no one.
+func agyParsePersonaNumbers(raw string) (numbers []string, all bool) {
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" {
+			all = true
+			continue
+		}
+		n := agyNormalizePhone(part)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		numbers = append(numbers, n)
+	}
+	return numbers, all
+}
+
+// agyPersonaNumberListed reports whether the NORMALISED number matches any entry
+// of the allowlist.
+func agyPersonaNumberListed(numbers []string, id string) bool {
+	for _, n := range numbers {
+		if agyPhoneMatches(n, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// agyPersonaIDTag is what the log says about a customer instead of the number:
+// the first 8 hex chars of sha256 of the normalised number, "-" when there is none.
+func agyPersonaIDTag(id string) string {
+	if id == "" {
+		return "-"
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// agyPersonaAgentFor returns the name of the persona agent that should serve
+// this generation, or "" when the persona stays in the message (path A): the
+// switch is off, there is no persona, the run carries attachments (media runs use
+// other agents and keep the persona in the message), no chat agent is configured
+// (an empty PROXY_AGY_AGENT means agy's default coding agent, on purpose), the
+// conversation's number is not on the allowlist (PROXY_AGY_PERSONA_IN_AGENT_NUMBERS;
+// "*" lists everyone, an empty list no one), or the agent could not be installed.
+//
+// With the switch on it logs exactly one [agy-persona] line per call, naming the
+// path taken and a hash of the number; never the number, never the persona. With
+// the switch off it logs nothing and reads nothing.
+func agyPersonaAgentFor(cfg config, in agyGenInput) string {
+	if !cfg.AgyPersonaInAgent {
+		return ""
+	}
+	id := agyNormalizePhone(agyConversationIdentifier(in.System))
+	tag := agyPersonaIDTag(id)
+	pathA := func(reason string) string {
+		log.Printf("[agy-persona] path=A reason=%s id#%s", reason, tag)
+		return ""
+	}
+	switch {
+	case strings.TrimSpace(in.System) == "":
+		return pathA("no-persona")
+	case len(in.Media) != 0:
+		return pathA("media")
+	case strings.TrimSpace(cfg.AgyAgent) == "":
+		return pathA("no-chat-agent")
+	}
+	if !cfg.AgyPersonaInAgentAll {
+		if id == "" {
+			return pathA("no-identifier")
+		}
+		if !agyPersonaNumberListed(cfg.AgyPersonaInAgentNumbers, id) {
+			return pathA("not-allowlisted")
+		}
 	}
 	name, err := ensureAgyPersonaAgent(cfg, in.System)
 	if err != nil {
 		log.Printf("[agy] persona agent unavailable (%v); the persona travels in the message", err)
-		return ""
+		return pathA("install-error")
 	}
+	log.Printf("[agy-persona] path=B agent=%s id#%s", name, tag)
 	return name
 }

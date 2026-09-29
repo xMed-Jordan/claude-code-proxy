@@ -148,9 +148,11 @@ type config struct {
 	AgyImageRetention  time.Duration  // keep generated images this long for reuse
 	// Persona in the agent definition (agy_persona_agent.go). OFF by default: a plain
 	// chat turn then carries the caller's system prompt inside the prompt message, as always.
-	AgyPersonaInAgent     bool   // PROXY_AGY_PERSONA_IN_AGENT — deliver the caller's system prompt through a per-persona agy agent definition instead of the prompt message (agy silently cuts the message at ~191KB; a definition's body is delivered whole)
-	AgyPersonaAgentPrefix string // PROXY_AGY_PERSONA_AGENT_PREFIX — name prefix of those agents (default "connect-chat-p")
-	agyPersonaAgent       string // per-request, never read from env: the persona agent serving THIS request ("" = the persona travels in the message); set by agyGenerate
+	AgyPersonaInAgent        bool     // PROXY_AGY_PERSONA_IN_AGENT — deliver the caller's system prompt through a per-persona agy agent definition instead of the prompt message (agy silently cuts the message at ~191KB; a definition's body is delivered whole)
+	AgyPersonaAgentPrefix    string   // PROXY_AGY_PERSONA_AGENT_PREFIX — name prefix of those agents (default "connect-chat-p")
+	AgyPersonaInAgentNumbers []string // PROXY_AGY_PERSONA_IN_AGENT_NUMBERS — comma-separated allowlist of customer numbers the switch applies to (matched against the "User identifier:" line of the system prompt's Platform Context, never against numbers inside the persona); each entry is stored normalised (digits only, no 00 prefix, no leading zeros) and matches an identifier that equals it or ends with it when it has 8+ digits; empty/unset = NO ONE, even with the switch on (agyPersonaAgentFor); a customer who is not listed keeps the persona in the message
+	AgyPersonaInAgentAll     bool     // true when that list contains "*": the switch applies to every customer (no identifier needed)
+	agyPersonaAgent          string   // per-request, never read from env: the persona agent serving THIS request ("" = the persona travels in the message); set by agyGenerate
 	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
 	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
 	// Claude subscription (long-lived OAuth token from `claude setup-token`).
@@ -783,6 +785,7 @@ func loadConfig() config {
 		host = "127.0.0.1"
 	}
 	publicURL := normalizePublicBaseURL(getenv("PROXY_PUBLIC_URL", getenv("PUBLIC_BASE_URL", "")))
+	personaInAgentNumbers, personaInAgentAll := agyParsePersonaNumbers(getenv("PROXY_AGY_PERSONA_IN_AGENT_NUMBERS", ""))
 	baseURL := strings.TrimRight(getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/")
 	codexAuthFile := os.Getenv("CODEX_AUTH_FILE")
 	if codexAuthFile == "" {
@@ -859,8 +862,10 @@ func loadConfig() config {
 		AgyImageModel:      strings.TrimSpace(getenv("PROXY_AGY_IMAGE_MODEL", "Gemini 3.6 Flash (Low)")),
 		AgyImageRetention:  parseAgyTimeout(getenv("PROXY_AGY_IMAGE_RETENTION", "86400")),
 
-		AgyPersonaInAgent:     parseBoolDefault(getenv("PROXY_AGY_PERSONA_IN_AGENT", "false"), false),
-		AgyPersonaAgentPrefix: strings.TrimSpace(getenv("PROXY_AGY_PERSONA_AGENT_PREFIX", agyPersonaAgentDefaultPrefix)),
+		AgyPersonaInAgent:        parseBoolDefault(getenv("PROXY_AGY_PERSONA_IN_AGENT", "false"), false),
+		AgyPersonaAgentPrefix:    strings.TrimSpace(getenv("PROXY_AGY_PERSONA_AGENT_PREFIX", agyPersonaAgentDefaultPrefix)),
+		AgyPersonaInAgentNumbers: personaInAgentNumbers,
+		AgyPersonaInAgentAll:     personaInAgentAll,
 
 		ClaudeBin:          strings.TrimSpace(getenv("PROXY_CLAUDE_BIN", "")),
 		ClaudeModel:        strings.TrimSpace(getenv("PROXY_CLAUDE_MODEL", "")),

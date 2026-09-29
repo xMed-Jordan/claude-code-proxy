@@ -14,6 +14,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -344,6 +346,61 @@ func stubPersonaResolve(t *testing.T, reply func(prompt string) string) *[]perso
 }
 
 func constantReply(s string) func(string) string { return func(string) string { return s } }
+
+// The customers of the allowlist tests. FAKE numbers only; nothing here is a real
+// person's. personaTestNumber is the customer the switch is meant for (given in
+// each of its three spellings below), personaTestOtherNumber is one who is not
+// listed, and personaTestDocNumber is a fictional number that appears inside a
+// persona's tool docs, which must never be read as the customer's.
+const (
+	personaTestNumber      = "+962790000001"
+	personaTestOtherNumber = "+962790000002"
+	personaTestDocNumber   = "+1 555 010 0199"
+)
+
+// personaTestForms are three spellings of personaTestNumber that must all be the
+// same customer: international with punctuation, 00-prefixed, and local.
+var personaTestForms = []string{"+962 79-000-0001", "00962790000001", "0790000001"}
+
+// personaTestSystem is a persona followed by the Platform Context section Connect
+// writes into its system prompts, naming identifier as the customer.
+func personaTestSystem(persona, identifier string) string {
+	return persona + "\n\n## Platform Context\nPlatform: whatsapp\nSpeaking with: Test Customer\nUser identifier: " + identifier + "\n"
+}
+
+// personaCustomerInput is agyGenInputFromAnthropic with the customer named in the
+// system prompt (a request without a system prompt, or with no identifier given,
+// is left as it is).
+func personaCustomerInput(req anthropicRequest, identifier string) agyGenInput {
+	in := agyGenInputFromAnthropic(req, 0)
+	if identifier != "" && in.System != "" {
+		in.System = personaTestSystem(in.System, identifier)
+	}
+	return in
+}
+
+// personaTestAllowlist sets cfg's allowlist from a PROXY_AGY_PERSONA_IN_AGENT_NUMBERS value.
+func personaTestAllowlist(cfg config, list string) config {
+	cfg.AgyPersonaInAgentNumbers, cfg.AgyPersonaInAgentAll = agyParsePersonaNumbers(list)
+	return cfg
+}
+
+// personaTestOnConfig is a config with the switch on and personaTestNumber
+// allowlisted.
+func personaTestOnConfig() config {
+	return personaTestAllowlist(config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix}, personaTestNumber)
+}
+
+// personaLogLines returns the [agy-persona] lines of a captured log.
+func personaLogLines(logs string) []string {
+	var out []string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "[agy-persona]") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
 
 // resetAgyBriefCache empties the process-wide cache of written briefs, so a test
 // that counts summariser calls does not depend on what ran before it.
@@ -683,8 +740,8 @@ func TestEnsureAgyPersonaAgentConcurrentInstalls(t *testing.T) {
 func TestAgyPersonaAgentForConditions(t *testing.T) {
 	home := personaTestHome(t)
 	captureLog(t)
-	on := config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix}
-	in := agyGenInputFromAnthropic(syntheticLongRequest(3000, 1, 500), 0)
+	on := personaTestOnConfig()
+	in := personaCustomerInput(syntheticLongRequest(3000, 1, 500), personaTestNumber)
 
 	png := []mediaPart{{B64: tinyPNGBase64(t), MediaType: "image/png", Filename: "x.png"}}
 	for _, c := range []struct {
@@ -733,9 +790,10 @@ func TestAgyPersonaAgentInstallFailureFallsBack(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".gemini"), []byte("not a directory"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix, AgyPromptBudget: 186000}
+	cfg := personaTestOnConfig()
+	cfg.AgyPromptBudget = 186000
 	req := syntheticLongRequest(3000, 1, 500)
-	in := agyGenInputFromAnthropic(req, 0)
+	in := personaCustomerInput(req, personaTestNumber)
 	if _, err := ensureAgyPersonaAgent(cfg, in.System); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -919,8 +977,9 @@ func TestAgyGenerateDeliversThePersonaThroughTheAgent(t *testing.T) {
 	home := personaTestHome(t)
 	captureLog(t)
 	req := syntheticLongRequest(130000, 5, 25000)
-	in := agyGenInputFromAnthropic(req, 0)
-	cfg := config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix, AgyPromptBudget: 186000}
+	in := personaCustomerInput(req, personaTestNumber)
+	cfg := personaTestOnConfig()
+	cfg.AgyPromptBudget = 186000
 	reply := "Your newest page of records shows only active items."
 	calls := stubPersonaResolve(t, constantReply(reply))
 
@@ -976,9 +1035,9 @@ func TestAgyGenerateDeliversThePersonaThroughTheAgent(t *testing.T) {
 func TestAgyGenerateKeepsThePersonaInTheMessageForMediaRuns(t *testing.T) {
 	home := personaTestHome(t)
 	captureLog(t)
-	in := agyGenInputFromAnthropic(syntheticLongRequest(20000, 1, 500), 0)
+	in := personaCustomerInput(syntheticLongRequest(20000, 1, 500), personaTestNumber)
 	in.Media = []mediaPart{{B64: tinyPNGBase64(t), MediaType: "image/png", Filename: "x.png"}}
-	cfg := config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix}
+	cfg := personaTestOnConfig()
 	calls := stubPersonaResolve(t, constantReply("It shows a receipt."))
 
 	if _, _, err := agyGenerate(context.Background(), cfg, in); err != nil {
@@ -1005,10 +1064,12 @@ func TestAgyCompactionBriefRunsWithoutThePersonaAgent(t *testing.T) {
 	personaTestHome(t)
 	captureLog(t)
 	resetAgyBriefCache(t)
-	persona := syntheticPersona(3000)
+	persona := personaTestSystem(syntheticPersona(3000), personaTestNumber)
 	req := uniquePersonaDialogue("briefcall", persona, 20, 1000)
 	in := agyGenInputFromAnthropic(req, 0)
-	cfg := config{AgyPersonaInAgent: true, AgyAgent: agyChatAgentName, AgyPersonaAgentPrefix: agyPersonaAgentDefaultPrefix, AgyCompact: true, AgyPromptBudget: 30000}
+	cfg := personaTestOnConfig()
+	cfg.AgyCompact = true
+	cfg.AgyPromptBudget = 30000
 	calls := stubPersonaResolve(t, func(prompt string) string {
 		if strings.HasPrefix(prompt, "### TASK") {
 			return "- the customer asked several questions and every one was answered"
@@ -1125,5 +1186,491 @@ func TestLoadConfigPersonaAgentSwitch(t *testing.T) {
 	t.Setenv("AGY_PERSONA_AGENT", "sneaky")
 	if got := loadConfig().agyPersonaAgent; got != "" {
 		t.Fatalf("the per-request field came from the environment: %q", got)
+	}
+}
+
+func TestLoadConfigPersonaAgentNumbers(t *testing.T) {
+	const key = "PROXY_AGY_PERSONA_IN_AGENT_NUMBERS"
+	t.Setenv(key, "") // registers the restore
+	os.Unsetenv(key)
+
+	cfg := loadConfig()
+	if len(cfg.AgyPersonaInAgentNumbers) != 0 || cfg.AgyPersonaInAgentAll {
+		t.Fatalf("unset: numbers %v, all %v; want an empty list", cfg.AgyPersonaInAgentNumbers, cfg.AgyPersonaInAgentAll)
+	}
+
+	for _, c := range []struct {
+		name, value string
+		numbers     []string
+		all         bool
+	}{
+		{"empty", "", nil, false},
+		{"blanks and junk", " , ,abc, 00 ,+", nil, false},
+		{"two numbers and a star", "+962790000001, 0790000002 ,*", []string{"962790000001", "790000002"}, true},
+		{"star alone", " * ", nil, true},
+		{"one number in three spellings", "+962790000001,00962790000001, 962-79-000-0001", []string{"962790000001"}, false},
+		{"order kept", "0790000003,+962790000001", []string{"790000003", "962790000001"}, false},
+	} {
+		t.Setenv(key, c.value)
+		got := loadConfig()
+		if !reflect.DeepEqual(got.AgyPersonaInAgentNumbers, c.numbers) || got.AgyPersonaInAgentAll != c.all {
+			t.Errorf("%s: %q -> numbers %v, all %v; want %v, %v", c.name, c.value, got.AgyPersonaInAgentNumbers, got.AgyPersonaInAgentAll, c.numbers, c.all)
+		}
+	}
+
+	// The allowlist and the switch are independent settings.
+	t.Setenv(key, personaTestNumber)
+	t.Setenv("PROXY_AGY_PERSONA_IN_AGENT", "false")
+	if cfg := loadConfig(); cfg.AgyPersonaInAgent || len(cfg.AgyPersonaInAgentNumbers) != 1 {
+		t.Fatalf("switch %v, numbers %v", cfg.AgyPersonaInAgent, cfg.AgyPersonaInAgentNumbers)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The allowlist: whose conversation gets a persona agent
+// ---------------------------------------------------------------------------
+
+func TestAgyNormalizePhone(t *testing.T) {
+	for in, want := range map[string]string{
+		"+962 79-000-0001":  "962790000001",
+		"00962790000001":    "962790000001",
+		"+00962790000001":   "962790000001",
+		"962790000001":      "962790000001",
+		"(962) 79 000 0001": "962790000001",
+		"0790000001":        "790000001",
+		"790000001":         "790000001",
+		"000123":            "123",
+		"":                  "",
+		"abc":               "",
+		"+":                 "",
+		"0":                 "",
+		"00":                "",
+		"0000":              "",
+	} {
+		if got := agyNormalizePhone(in); got != want {
+			t.Errorf("agyNormalizePhone(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestAgyPhoneMatches(t *testing.T) {
+	// The three spellings of one number are the same customer, whichever way round.
+	var same []string
+	for _, form := range personaTestForms {
+		same = append(same, agyNormalizePhone(form))
+	}
+	if same[0] != "962790000001" || same[1] != "962790000001" || same[2] != "790000001" {
+		t.Fatalf("fixture: normalised forms = %v", same)
+	}
+	for _, a := range same {
+		for _, b := range same {
+			if !agyPhoneMatches(a, b) {
+				t.Errorf("agyPhoneMatches(%q, %q) = false, want true", a, b)
+			}
+		}
+	}
+
+	// A different number is a different customer, in every spelling.
+	for _, other := range []string{agyNormalizePhone(personaTestOtherNumber), agyNormalizePhone("0790000002")} {
+		for _, a := range same {
+			if agyPhoneMatches(a, other) || agyPhoneMatches(other, a) {
+				t.Errorf("%q matches the different number %q", a, other)
+			}
+		}
+	}
+
+	// A tail matches only from 8 digits: 7 digits are a fragment, not a number.
+	long := agyNormalizePhone("+962791234567")
+	if agyPhoneMatches(long, "1234567") || agyPhoneMatches("1234567", long) {
+		t.Error("a 7-digit tail matched")
+	}
+	if !agyPhoneMatches(long, "91234567") || !agyPhoneMatches("91234567", long) {
+		t.Error("an 8-digit tail did not match")
+	}
+	// It has to be the tail: the same digits from the middle are not the number.
+	if agyPhoneMatches(long, "62791234") || agyPhoneMatches("96279123", long) {
+		t.Error("digits from the middle or the head matched")
+	}
+
+	// Empty never matches, not even itself.
+	for _, c := range [][2]string{{"", ""}, {"", long}, {long, ""}, {"", "1"}} {
+		if agyPhoneMatches(c[0], c[1]) {
+			t.Errorf("agyPhoneMatches(%q, %q) = true, want false", c[0], c[1])
+		}
+	}
+}
+
+func TestAgyConversationIdentifier(t *testing.T) {
+	persona := syntheticPersona(2000)
+	// Tool docs and examples inside a persona carry other numbers, some of them
+	// even on a "User identifier:" line.
+	docs := "\n\n## Tool docs\nlookup_customer(phone): e.g. lookup_customer(\"" + personaTestDocNumber + "\") returns the record of " + personaTestNumber + ".\n"
+	section := "## Platform Context\nPlatform: whatsapp\nSpeaking with: Test Customer\nUser identifier: " + personaTestOtherNumber + "\n"
+
+	for _, c := range []struct {
+		name, system, want string
+	}{
+		{"platform context section", persona + "\n\n" + section, personaTestOtherNumber},
+		{"section first, persona after", section + "\n" + persona + docs, personaTestOtherNumber},
+		{"extra spaces and a CRLF", persona + "\n\n## Platform Context\r\nPlatform: whatsapp\r\n   User identifier:    +962 79-000-0002  \t\r\nNext: x\r\n", "+962 79-000-0002"},
+		{"tail of the prompt without a newline", persona + "\n\n" + strings.TrimSuffix(section, "\n"), personaTestOtherNumber},
+		{"deeper heading", persona + "\n\n### Platform Context\nUser identifier: 0790000002\n", "0790000002"},
+		{"absent", persona + docs, ""},
+		{"empty system", "", ""},
+		{"numbers in tool docs are never the identifier", persona + docs + "\n## Platform Context\nPlatform: whatsapp\nSpeaking with: " + personaTestDocNumber + "\n", ""},
+		{"empty value does not take the next line", persona + "\n\n## Platform Context\nUser identifier:\nSpeaking with: " + personaTestNumber + "\n", ""},
+		{"blank value", persona + "\n\n## Platform Context\nUser identifier:   \nSpeaking with: " + personaTestNumber + "\n", ""},
+		{"not at the start of a line", persona + "\n\n## Platform Context\nSee the User identifier: " + personaTestNumber + " line\n", ""},
+		// The line after the heading wins over an example that came before it.
+		{"an earlier example is not the customer", persona + "\nExample:\nUser identifier: " + personaTestNumber + "\n\n" + section, personaTestOtherNumber},
+		{"heading with nothing after it", persona + "\nExample:\nUser identifier: " + personaTestNumber + "\n\n## Platform Context\nPlatform: whatsapp\n", ""},
+		// No heading at all: the first such line anywhere.
+		{"no heading", persona + "\nUser identifier: " + personaTestOtherNumber + "\n", personaTestOtherNumber},
+		{"no heading, first of two", "User identifier: " + personaTestOtherNumber + "\nUser identifier: " + personaTestNumber + "\n", personaTestOtherNumber},
+	} {
+		if got := agyConversationIdentifier(c.system); got != c.want {
+			t.Errorf("%s: identifier = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestAgyPersonaAgentForAllowlist(t *testing.T) {
+	base := syntheticLongRequest(3000, 1, 500)
+	prefix := agyPersonaAgentDefaultPrefix
+
+	// path B: the agent is named after the system prompt and installed.
+	wantAgent := func(t *testing.T, home string, cfg config, in agyGenInput) {
+		t.Helper()
+		got := agyPersonaAgentFor(cfg, in)
+		want := agyPersonaAgentName(prefix, in.System)
+		if got != want {
+			t.Fatalf("persona agent = %q, want %q", got, want)
+		}
+		if def, err := os.ReadFile(personaAgentFile(home, got)); err != nil || string(def) != personaWantDefinition(got, in.System) {
+			t.Fatalf("agent %s not installed with the persona: %v", got, err)
+		}
+	}
+	// path A: no agent, nothing installed.
+	wantNone := func(t *testing.T, home string, cfg config, in agyGenInput) {
+		t.Helper()
+		if got := agyPersonaAgentFor(cfg, in); got != "" {
+			t.Fatalf("persona agent = %q, want none", got)
+		}
+		if _, err := os.Stat(personaAgentsDir(home)); err == nil {
+			t.Fatal("a request on path A must not install a persona agent")
+		}
+	}
+
+	t.Run("allowlisted, in each of the three spellings", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		for _, listed := range personaTestForms {
+			cfg := personaTestAllowlist(personaTestOnConfig(), listed)
+			for _, identifier := range personaTestForms {
+				wantAgent(t, home, cfg, personaCustomerInput(base, identifier))
+			}
+		}
+		// And the international form with the list holding a comma-separated mix.
+		cfg := personaTestAllowlist(personaTestOnConfig(), personaTestOtherNumber+", 0790000009 ,"+personaTestNumber)
+		wantAgent(t, home, cfg, personaCustomerInput(base, "00962790000001"))
+	})
+
+	t.Run("not on the list", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		for _, identifier := range []string{personaTestOtherNumber, "0790000002", "0000001", "790000", "90000001x2"} {
+			wantNone(t, home, personaTestOnConfig(), personaCustomerInput(base, identifier))
+		}
+	})
+
+	t.Run("empty list means no one", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		cfg := personaTestOnConfig()
+		cfg.AgyPersonaInAgentNumbers = nil
+		wantNone(t, home, cfg, personaCustomerInput(base, personaTestNumber))
+		wantNone(t, home, personaTestAllowlist(cfg, ""), personaCustomerInput(base, personaTestNumber))
+		wantNone(t, home, personaTestAllowlist(cfg, " , ,abc"), personaCustomerInput(base, personaTestNumber))
+		wantNone(t, home, cfg, personaCustomerInput(base, ""))
+	})
+
+	t.Run("star lists everyone", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		cfg := personaTestAllowlist(personaTestOnConfig(), "*")
+		if len(cfg.AgyPersonaInAgentNumbers) != 0 || !cfg.AgyPersonaInAgentAll {
+			t.Fatalf("fixture: numbers %v, all %v", cfg.AgyPersonaInAgentNumbers, cfg.AgyPersonaInAgentAll)
+		}
+		wantAgent(t, home, cfg, personaCustomerInput(base, personaTestNumber))
+		wantAgent(t, home, cfg, personaCustomerInput(base, personaTestOtherNumber))
+		wantAgent(t, home, cfg, personaCustomerInput(base, "")) // not even an identifier line is needed
+		// The other conditions still hold with a star: no persona, or attachments, is path A.
+		x := personaCustomerInput(base, personaTestNumber)
+		x.System = ""
+		if got := agyPersonaAgentFor(cfg, x); got != "" {
+			t.Fatalf("star with no persona: %q", got)
+		}
+		x = personaCustomerInput(base, personaTestNumber)
+		x.Media = []mediaPart{{B64: tinyPNGBase64(t), MediaType: "image/png", Filename: "x.png"}}
+		if got := agyPersonaAgentFor(cfg, x); got != "" {
+			t.Fatalf("star with attachments: %q", got)
+		}
+		// And a switch that is off stays off, whatever the list says.
+		cfg.AgyPersonaInAgent = false
+		if got := agyPersonaAgentFor(cfg, personaCustomerInput(base, personaTestNumber)); got != "" {
+			t.Fatalf("star with the switch off: %q", got)
+		}
+	})
+
+	t.Run("no identifier line", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		wantNone(t, home, personaTestOnConfig(), personaCustomerInput(base, ""))
+		// An identifier line with nothing to compare.
+		wantNone(t, home, personaTestOnConfig(), personaCustomerInput(base, "n/a"))
+		blank := personaCustomerInput(base, "")
+		blank.System += "\n\n## Platform Context\nUser identifier:\n"
+		wantNone(t, home, personaTestOnConfig(), blank)
+	})
+
+	t.Run("numbers inside the persona are never the customer", func(t *testing.T) {
+		home := personaTestHome(t)
+		captureLog(t)
+		docs := "\n\n## Tool docs\nExample: lookup_customer(\"" + personaTestNumber + "\") and lookup_customer(\"" + personaTestDocNumber + "\"); the owner is 0790000001.\n"
+		cfg := personaTestAllowlist(personaTestOnConfig(), personaTestNumber+","+personaTestDocNumber)
+
+		// The docs mention the listed numbers, the customer is somebody else: path A.
+		in := agyGenInputFromAnthropic(base, 0)
+		in.System = personaTestSystem(in.System+docs, personaTestOtherNumber)
+		wantNone(t, home, cfg, in)
+
+		// A listed number in an earlier "User identifier:" example is no better.
+		in = agyGenInputFromAnthropic(base, 0)
+		in.System = personaTestSystem(in.System+docs+"\nUser identifier: "+personaTestNumber+"\n", personaTestOtherNumber)
+		wantNone(t, home, cfg, in)
+
+		// The customer is listed and the docs carry only other numbers: the customer decides.
+		cfg = personaTestAllowlist(personaTestOnConfig(), personaTestNumber)
+		in = agyGenInputFromAnthropic(base, 0)
+		in.System = personaTestSystem(in.System+"\n\nExample: "+personaTestDocNumber+"\n", personaTestNumber)
+		wantAgent(t, home, cfg, in)
+	})
+}
+
+// A customer who is not on the allowlist gets exactly the request they get with
+// the switch off: the same prompt byte for byte, the same agy arguments, no
+// agent installed. Checked over the golden prompts' inputs.
+func TestAgyPersonaNotAllowlistedRequestIsByteIdenticalToSwitchOff(t *testing.T) {
+	home := personaTestHome(t)
+	logs := captureLog(t)
+
+	// What one agyGenerate call sends, and the agy arguments a real agyResolve
+	// builds from the config it was given.
+	type sent struct {
+		call   personaResolveCall
+		argv   []string
+		prompt string
+		lines  []string
+	}
+	run := func(t *testing.T, cfg config, in agyGenInput) sent {
+		t.Helper()
+		calls := stubPersonaResolve(t, constantReply("Everything is in order."))
+		logs.Reset()
+		if _, _, err := agyGenerate(context.Background(), cfg, in); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("resolve called %d times, want 1", len(*calls))
+		}
+		s := sent{call: (*calls)[0], lines: personaLogLines(logs.String())}
+		initAgyWorkerPool(config{AgyWarmWorkers: 0})
+		rec := fakeAgyRunAgentFn(t)
+		if _, err := agyResolve(context.Background(), s.call.cfg, nil, s.call.prompt, "some-alias"); err != nil {
+			t.Fatal(err)
+		}
+		if !rec.Called {
+			t.Fatal("agyResolve did not reach the runner")
+		}
+		s.argv, s.prompt = rec.AgentArgs, rec.Prompt
+		return s
+	}
+
+	for _, c := range personaGoldenCases() {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			golden, err := os.ReadFile(goldenPath(c.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			off := c.cfg
+			off.AgyAgent = agyChatAgentName
+			on := personaTestAllowlist(off, personaTestNumber)
+			on.AgyPersonaInAgent = true
+			on.AgyPersonaAgentPrefix = agyPersonaAgentDefaultPrefix
+			wantArgv := []string{"--agent", agyChatAgentName}
+
+			// The golden inputs as they are: the switch off sends the golden prompt,
+			// and so does the switch on when the request names no customer.
+			plain := agyGenInputFromAnthropic(c.req, 0)
+			offPlain := run(t, off, plain)
+			onPlain := run(t, on, plain)
+			for label, s := range map[string]sent{"switch off": offPlain, "switch on, no identifier": onPlain} {
+				if s.call.prompt != string(golden) {
+					t.Fatalf("%s: prompt differs from the golden\n%s", label, firstDiff(string(golden), s.call.prompt))
+				}
+				if s.call.cfg.agyPersonaAgent != "" || s.prompt != s.call.prompt || !reflect.DeepEqual(s.argv, wantArgv) {
+					t.Fatalf("%s: persona agent %q, argv %v", label, s.call.cfg.agyPersonaAgent, s.argv)
+				}
+			}
+			if len(offPlain.lines) != 0 || len(onPlain.lines) != 1 || !strings.Contains(onPlain.lines[0], "path=A reason=") {
+				t.Fatalf("log lines: switch off %v, switch on %v", offPlain.lines, onPlain.lines)
+			}
+
+			// The same inputs for a customer who is named in the system prompt and is
+			// not on the list: the switch on and the switch off send the same request.
+			named := personaCustomerInput(c.req, personaTestOtherNumber)
+			offNamed := run(t, off, named)
+			onNamed := run(t, on, named)
+			if onNamed.call.prompt != offNamed.call.prompt {
+				t.Fatalf("not allowlisted: prompt differs from the switch-off prompt\n%s", firstDiff(offNamed.call.prompt, onNamed.call.prompt))
+			}
+			if onNamed.call.cfg.agyPersonaAgent != "" || onNamed.prompt != offNamed.prompt || !reflect.DeepEqual(onNamed.argv, offNamed.argv) || !reflect.DeepEqual(onNamed.argv, wantArgv) {
+				t.Fatalf("not allowlisted: persona agent %q, argv %v (switch off %v)", onNamed.call.cfg.agyPersonaAgent, onNamed.argv, offNamed.argv)
+			}
+			if named.System != "" && !strings.Contains(onNamed.call.prompt, strings.TrimSpace(named.System)) {
+				t.Fatal("not allowlisted: the persona is not in the message")
+			}
+			if len(onNamed.lines) != 1 || len(offNamed.lines) != 0 {
+				t.Fatalf("log lines: switch on %v, switch off %v", onNamed.lines, offNamed.lines)
+			}
+			if _, err := os.Stat(personaAgentsDir(home)); err == nil {
+				t.Fatal("a customer on path A must not get a persona agent installed")
+			}
+
+			// Control: the listed customer, same inputs, does get the agent and the pointer.
+			if named.System == "" {
+				return // a bare chat has no persona to move
+			}
+			listed := personaCustomerInput(c.req, personaTestForms[2])
+			onListed := run(t, on, listed)
+			if onListed.call.cfg.agyPersonaAgent == "" || onListed.call.prompt == offNamed.call.prompt {
+				t.Fatal("control: the listed customer did not take path B")
+			}
+			if !strings.Contains(onListed.call.prompt, wantPersonaPointer) || strings.Contains(onListed.call.prompt, personaTestMarker) || strings.Contains(onListed.call.prompt, strings.TrimSpace(listed.System)) {
+				t.Fatalf("control: the listed customer's message should carry the pointer, not the persona:\n%s", truncateString(onListed.call.prompt, 1500))
+			}
+			if want := []string{"--agent", onListed.call.cfg.agyPersonaAgent}; !reflect.DeepEqual(onListed.argv, want) {
+				t.Fatalf("control: argv = %v, want %v", onListed.argv, want)
+			}
+			if len(onListed.lines) != 1 || !strings.Contains(onListed.lines[0], "path=B agent="+onListed.call.cfg.agyPersonaAgent+" ") {
+				t.Fatalf("control: log lines %v", onListed.lines)
+			}
+			if err := os.RemoveAll(personaAgentsDir(home)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
+	home := personaTestHome(t)
+	logs := captureLog(t)
+	base := syntheticLongRequest(3000, 1, 500)
+	png := []mediaPart{{B64: tinyPNGBase64(t), MediaType: "image/png", Filename: "x.png"}}
+	tagOf := func(id string) string {
+		sum := sha256.Sum256([]byte(id))
+		return hex.EncodeToString(sum[:])[:8]
+	}
+	listedTag, otherTag := tagOf("962790000001"), tagOf("962790000002")
+	on := personaTestOnConfig()
+	nameOf := func(in agyGenInput) string { return agyPersonaAgentName(agyPersonaAgentDefaultPrefix, in.System) }
+
+	listed := personaCustomerInput(base, personaTestForms[0])
+	listedLocal := personaCustomerInput(base, personaTestForms[2])
+	other := personaCustomerInput(base, personaTestOtherNumber)
+	noID := personaCustomerInput(base, "")
+	noDigits := personaCustomerInput(base, "n/a")
+	withMedia := personaCustomerInput(base, personaTestNumber)
+	withMedia.Media = png
+	noPersona := personaCustomerInput(base, personaTestNumber)
+	noPersona.System = ""
+	noAgent := on
+	noAgent.AgyAgent = ""
+	star := personaTestAllowlist(on, "*")
+
+	for _, c := range []struct {
+		name string
+		cfg  config
+		in   agyGenInput
+		want string
+	}{
+		{"listed", on, listed, "path=B agent=" + nameOf(listed) + " id#" + listedTag},
+		{"listed, local spelling (the tag is of the normalised spelling it was given)", on, listedLocal, "path=B agent=" + nameOf(listedLocal) + " id#" + tagOf("790000001")},
+		{"star", star, other, "path=B agent=" + nameOf(other) + " id#" + otherTag},
+		{"star, no identifier", star, noID, "path=B agent=" + nameOf(noID) + " id#-"},
+		{"not allowlisted", on, other, "path=A reason=not-allowlisted id#" + otherTag},
+		{"empty list", personaTestAllowlist(on, ""), listed, "path=A reason=not-allowlisted id#" + listedTag},
+		{"no identifier", on, noID, "path=A reason=no-identifier id#-"},
+		{"identifier without digits", on, noDigits, "path=A reason=no-identifier id#-"},
+		{"media", on, withMedia, "path=A reason=media id#" + listedTag},
+		{"no persona", on, noPersona, "path=A reason=no-persona id#-"},
+		{"no chat agent", noAgent, listed, "path=A reason=no-chat-agent id#" + listedTag},
+	} {
+		logs.Reset()
+		agyPersonaAgentFor(c.cfg, c.in)
+		lines := personaLogLines(logs.String())
+		if len(lines) != 1 {
+			t.Errorf("%s: %d [agy-persona] lines, want 1:\n%s", c.name, len(lines), logs.String())
+			continue
+		}
+		if !strings.HasSuffix(lines[0], "[agy-persona] "+c.want) {
+			t.Errorf("%s: log line %q, want it to end with %q", c.name, lines[0], "[agy-persona] "+c.want)
+		}
+		if !strings.Contains(lines[0], "path=") || !strings.Contains(lines[0], "id#") {
+			t.Errorf("%s: the line lacks path= or id#: %q", c.name, lines[0])
+		}
+		// Neither the number (in any spelling) nor the persona is ever logged.
+		for _, secret := range []string{"962790000001", "790000001", "962790000002", "790000002", "79-000-0001", personaTestMarker, "Rule 1.0", personaTestDocNumber} {
+			if strings.Contains(logs.String(), secret) {
+				t.Errorf("%s: the log contains %q:\n%s", c.name, secret, logs.String())
+			}
+		}
+	}
+
+	// An install that fails is path A, once, with its own reason.
+	logs.Reset()
+	fresh := t.TempDir()
+	t.Setenv("HOME", fresh)
+	t.Setenv("USERPROFILE", fresh)
+	if err := os.WriteFile(filepath.Join(fresh, ".gemini"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := agyPersonaAgentFor(on, listed); got != "" {
+		t.Fatalf("install failure: persona agent %q", got)
+	}
+	if lines := personaLogLines(logs.String()); len(lines) != 1 || !strings.HasSuffix(lines[0], "[agy-persona] path=A reason=install-error id#"+listedTag) {
+		t.Errorf("install failure: log lines %v", lines)
+	}
+	if strings.Contains(logs.String(), "962790000001") || strings.Contains(logs.String(), personaTestMarker) {
+		t.Errorf("install failure: the log contains the number or the persona:\n%s", logs.String())
+	}
+	_ = home
+
+	// With the switch off nothing is logged at all, for any customer.
+	off := on
+	off.AgyPersonaInAgent = false
+	for _, in := range []agyGenInput{listed, other, noID, withMedia, noPersona} {
+		logs.Reset()
+		if got := agyPersonaAgentFor(off, in); got != "" {
+			t.Fatalf("switch off: persona agent %q", got)
+		}
+		if logs.Len() != 0 {
+			t.Errorf("switch off: something was logged:\n%s", logs.String())
+		}
+	}
+	off.AgyPersonaInAgentAll = true
+	logs.Reset()
+	if got := agyPersonaAgentFor(off, listed); got != "" || logs.Len() != 0 {
+		t.Errorf("switch off with a star: persona agent %q, log %q", got, logs.String())
 	}
 }
