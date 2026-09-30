@@ -53,6 +53,7 @@ func initMuse(cfg config) {
 		n = 1
 	}
 	museSem = make(chan struct{}, n)
+	fmt.Printf("[muse] concurrency %d (max simultaneous `muse` subprocesses)\n", n)
 }
 
 func museAcquire(ctx context.Context) error {
