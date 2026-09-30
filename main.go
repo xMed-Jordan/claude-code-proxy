@@ -177,18 +177,21 @@ type config struct {
 	ClaudeRetries      int           // PROXY_CLAUDE_RETRIES — outer retries on transient errors (5xx/overloaded/timeout)
 	ClaudeTotalTimeout time.Duration // PROXY_CLAUDE_TOTAL_TIMEOUT — wall-clock cap on the whole retry sequence (keep < Connect's HTTP timeout)
 	// Muse (Meta) upstream — when a model alias's forward_to == "muse",
-	// the request is served by the local Muse CLI (`muse exec`) backed by a
-	// Meta API key.
-	// Chat-only, stateless, tools disabled. See muse.go.
+	// the request is served by the local Muse CLI (`muse exec`) using the
+	// service user's `muse login` (PROXY_MUSE_API_KEY only overrides it).
+	// Chat-only by default, stateless; tool loop when enabled. See muse.go.
 	MuseBin          string        // path to the `muse` CLI ("" → "muse" on PATH)
 	MuseModel        string        // optional global model override ("" → alias Real, passed through verbatim)
 	MuseProvider     string        // startup provider override ("" → CLI default "meta"; "echo" for offline tests)
 	MuseConcurrency  int           // max simultaneous muse subprocesses
 	MuseTimeout      time.Duration // per-call muse execution timeout
-	MuseAPIKey       string        // Meta API key, injected as META_API_KEY
+	MuseAPIKey       string        // optional Meta API key override ("" → service user's muse login)
 	MuseWorkDir      string        // working dir for the child ("" → temp; keeps ambient project files out)
 	MuseRetries      int           // PROXY_MUSE_RETRIES — outer retries on transient errors (5xx/overloaded/timeout)
 	MuseTotalTimeout time.Duration // PROXY_MUSE_TOTAL_TIMEOUT — wall-clock cap on the whole retry sequence (keep < the caller's HTTP timeout)
+	MuseToolsEnabled bool          // PROXY_MUSE_TOOLS_ENABLED (master switch for the MCP tool loop)
+	MuseToolMaxTurns int           // PROXY_MUSE_TOOL_MAX_TURNS (CLI --max-model-steps for tool loops)
+	MuseToolTimeout  time.Duration // PROXY_MUSE_TOOL_TIMEOUT (longer than chat; loops do many round-trips)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -905,6 +908,9 @@ func loadConfig() config {
 		MuseWorkDir:      strings.TrimSpace(getenv("PROXY_MUSE_WORKDIR", "")),
 		MuseRetries:      parseMuseRetries(getenv("PROXY_MUSE_RETRIES", "3")),
 		MuseTotalTimeout: parseAgyTimeout(getenv("PROXY_MUSE_TOTAL_TIMEOUT", "480")),
+		MuseToolsEnabled: envFlag("PROXY_MUSE_TOOLS_ENABLED", false),
+		MuseToolMaxTurns: parseMuseToolMaxTurns(getenv("PROXY_MUSE_TOOL_MAX_TURNS", "20")),
+		MuseToolTimeout:  parseAgyTimeout(getenv("PROXY_MUSE_TOOL_TIMEOUT", "600")),
 
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
 		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),
@@ -2295,7 +2301,7 @@ func handleMessages(cfg config) http.HandlerFunc {
 			return
 		}
 		// Forwarded-to = Muse: serve this alias from the local Muse CLI
-		// (`muse exec`) backed by a Meta API key, instead of codex/openai.
+		// (`muse exec`) using the service user's `muse login`, instead of codex/openai.
 		if forwardForAlias(cfg, in.Model) == "muse" {
 			if museIsDisabled() {
 				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))

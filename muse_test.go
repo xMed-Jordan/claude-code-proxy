@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -583,5 +584,243 @@ func TestMuseDisabledRefusesRequests(t *testing.T) {
 	}
 	if body := w.Body.String(); !strings.Contains(body, "muse") || !strings.Contains(strings.ToLower(body), "disabled") {
 		t.Fatalf("body=%s, want a muse-disabled refusal", body)
+	}
+}
+
+// museToolTestSpec builds a minimal tool spec for settings/prompt tests.
+func museToolTestSpec() *museToolSpec {
+	return &museToolSpec{
+		CallbackURL:   "https://connect.test/api/tools/cbuid123",
+		CallbackToken: "tok-abc",
+		Conversation:  "cbuid123",
+		Agent:         "auid456",
+		Tools: []connectToolDef{
+			{Name: "get_bookings", Description: "List bookings.", InputSchema: json.RawMessage(`{"type":"object","properties":{"date":{"type":"string"}}}`)},
+			{Name: "cancel_booking", Description: "", InputSchema: nil},
+			{Name: "  ", Description: "nameless, must be skipped"},
+		},
+	}
+}
+
+func TestParseMuseToolMaxTurns(t *testing.T) {
+	cases := map[string]int{"": 20, "0": 20, "-3": 20, "abc": 20, "5": 5, "20": 20, "60": 60, "99": 60}
+	for in, want := range cases {
+		if got := parseMuseToolMaxTurns(in); got != want {
+			t.Errorf("parseMuseToolMaxTurns(%q)=%d, want %d", in, got, want)
+		}
+	}
+	if got := museToolMaxTurns(config{}); got != 20 {
+		t.Errorf("museToolMaxTurns(zero)=%d, want 20", got)
+	}
+	if got := museToolTimeout(config{}); got != 600*time.Second {
+		t.Errorf("museToolTimeout(zero)=%v, want 600s", got)
+	}
+}
+
+func TestMuseToolSpecFromRequest(t *testing.T) {
+	catalog := json.RawMessage(`[{"name":"a","description":"d","input_schema":{"type":"object"}}]`)
+	withHeaders := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
+		r.Header.Set("X-Connect-Callback-Url", "https://connect.test/cb")
+		r.Header.Set("X-Connect-Callback-Token", "tok")
+		r.Header.Set("X-Connect-Conversation", "c1")
+		r.Header.Set("X-Connect-Agent", "a1")
+		return r
+	}
+	spec := museToolSpecFromRequest(config{MuseToolsEnabled: true}, catalog, withHeaders())
+	if spec == nil {
+		t.Fatal("enabled+full request returned nil spec")
+	}
+	if spec.CallbackURL != "https://connect.test/cb" || spec.CallbackToken != "tok" || len(spec.Tools) != 1 || spec.Tools[0].Name != "a" {
+		t.Fatalf("spec=%+v, want url/token/1 tool", spec)
+	}
+	if got := museToolSpecFromRequest(config{}, catalog, withHeaders()); got != nil {
+		t.Errorf("disabled switch returned %+v, want nil", got)
+	}
+	if got := museToolSpecFromRequest(config{MuseToolsEnabled: true}, catalog, nil); got != nil {
+		t.Errorf("nil request returned %+v, want nil", got)
+	}
+	if got := museToolSpecFromRequest(config{MuseToolsEnabled: true}, nil, withHeaders()); got != nil {
+		t.Errorf("empty catalog returned %+v, want nil", got)
+	}
+	if got := museToolSpecFromRequest(config{MuseToolsEnabled: true}, json.RawMessage(`[]`), withHeaders()); got != nil {
+		t.Errorf("empty tools array returned %+v, want nil", got)
+	}
+	if got := museToolSpecFromRequest(config{MuseToolsEnabled: true}, json.RawMessage(`{bad`), withHeaders()); got != nil {
+		t.Errorf("bad JSON returned %+v, want nil", got)
+	}
+	noToken := withHeaders()
+	noToken.Header.Del("X-Connect-Callback-Token")
+	if got := museToolSpecFromRequest(config{MuseToolsEnabled: true}, catalog, noToken); got != nil {
+		t.Errorf("missing token returned %+v, want nil", got)
+	}
+}
+
+func TestMuseToolSystemPrompt(t *testing.T) {
+	out := museToolSystemPrompt(museToolTestSpec())
+	for _, want := range []string{"connect_execute_tool", "get_bookings", "List bookings.", `"date":{"type":"string"}`, "cancel_booking"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "nameless, must be skipped") {
+		t.Errorf("nameless tool leaked into prompt:\n%s", out)
+	}
+}
+
+func TestWriteMuseToolSettingsWithAPIKey(t *testing.T) {
+	cfg := config{MuseAPIKey: "test-key-not-real"}
+	dir, cleanup, err := writeMuseToolSettings(cfg, museToolTestSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	raw, err := os.ReadFile(filepath.Join(dir, "muse", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conf map[string]any
+	if err := json.Unmarshal(raw, &conf); err != nil {
+		t.Fatalf("settings.json invalid: %v", err)
+	}
+	if conf["schema_version"] != float64(1) {
+		t.Errorf("schema_version=%v, want 1", conf["schema_version"])
+	}
+	servers, _ := conf["mcp_servers"].(map[string]any)
+	srv, _ := servers["connect"].(map[string]any)
+	if srv["transport"] != "stdio" || srv["enabled"] != true {
+		t.Errorf("server=%v, want stdio+enabled", srv)
+	}
+	if cmd, _ := srv["command"].(string); cmd == "" {
+		t.Error("empty MCP command")
+	}
+	args, _ := srv["args"].([]any)
+	if len(args) != 1 || args[0] != "claude-mcp-gateway" {
+		t.Errorf("args=%v, want [claude-mcp-gateway]", args)
+	}
+	env, _ := srv["env"].(map[string]any)
+	if env["CONNECT_CALLBACK_URL"] != "https://connect.test/api/tools/cbuid123" || env["CONNECT_CALLBACK_TOKEN"] != "tok-abc" {
+		t.Errorf("env=%v, want callback url+token", env)
+	}
+	var names []string
+	allowedStr, _ := env["CONNECT_ALLOWED_TOOLS"].(string)
+	if err := json.Unmarshal([]byte(allowedStr), &names); err != nil || len(names) != 2 {
+		t.Errorf("allowed=%v/%v, want the 2 named tools", allowedStr, err)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, _ := os.Stat(filepath.Join(dir, "muse", "settings.json")); fi.Mode().Perm() != 0o600 {
+			t.Errorf("settings.json perms=%o, want 600", fi.Mode().Perm())
+		}
+		if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+			t.Errorf("xdg dir perms=%o, want 700", fi.Mode().Perm())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "muse", "auth.json")); !os.IsNotExist(err) {
+		t.Error("auth.json linked despite API key being set")
+	}
+	cleanup()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("cleanup did not remove the xdg dir")
+	}
+}
+
+func TestWriteMuseToolSettingsLinksAmbientLogin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows; covered on Linux CI")
+	}
+	home := t.TempDir()
+	museDir := filepath.Join(home, ".config", "muse")
+	if err := os.MkdirAll(museDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(museDir, "auth.json"), []byte(`{"fake":"auth"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	dir, cleanup, err := writeMuseToolSettings(config{}, museToolTestSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	got, err := os.ReadFile(filepath.Join(dir, "muse", "auth.json"))
+	if err != nil {
+		t.Fatalf("auth link unreadable: %v", err)
+	}
+	if string(got) != `{"fake":"auth"}` {
+		t.Errorf("auth link content=%q, want the fixture", got)
+	}
+}
+
+func TestWriteMuseToolSettingsNoAuthFailsClean(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("USERPROFILE", empty)
+	_, _, err := writeMuseToolSettings(config{}, museToolTestSpec())
+	if err == nil || !strings.Contains(err.Error(), "PROXY_MUSE_API_KEY") {
+		t.Errorf("err=%v, want the login-or-key error", err)
+	}
+}
+
+func TestMuseToolArgs(t *testing.T) {
+	args := museToolArgs(config{MuseToolMaxTurns: 7}, "muse-spark-1.3", "/tmp/p.txt")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--json", "--prompt-file /tmp/p.txt", "--max-model-steps 7", "--disable-write", "--disable-shell", "--disable-web-tools", "--approval-mode never", "--model muse-spark-1.3"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args %q missing %q", joined, want)
+		}
+	}
+	if args[0] != "exec" {
+		t.Errorf("args[0]=%q, want exec", args[0])
+	}
+}
+
+func TestMuseToolJSONLGolden(t *testing.T) {
+	// Unknown tool-event record types must not break parsing; the terminal
+	// record stays authoritative (shape from the live spike capture).
+	raw := []byte("{\"payload_type\":\"run.tool.invoked\",\"payload\":{\"kind\":\"x\"}}\n" +
+		"{\"payload_type\":\"run.output.delta\",\"payload\":{\"kind\":\"run_output_delta\",\"text\":\"STUB-ECHO:hi\"}}\n" +
+		"{\"payload_type\":\"run.terminal.completed\",\"payload\":{\"kind\":\"run_terminal\",\"terminal\":\"completed\",\"text\":\"STUB-ECHO:hi\",\"reason\":null}}\n")
+	res, err := parseMuseJSONL(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Ok || res.Response != "STUB-ECHO:hi" {
+		t.Errorf("res=%+v, want Ok with the terminal text", res)
+	}
+}
+
+func TestMuseAnthropicToolsHandlerViaStub(t *testing.T) {
+	stub := buildMuseStub(t)
+	museStubEnv(t, "ok")
+	cfg := museStubConfig(t, stub)
+	cfg.MuseAPIKey = "test-key-not-real" // skip the ambient-login symlink
+	cfg.MuseToolsEnabled = true
+	in := anthropicRequest{
+		Model:        "muse-stub-tools-test",
+		MaxTokens:    64,
+		Messages:     []anthropicMessage{{Role: "user", Content: "book me"}},
+		ConnectTools: json.RawMessage(`[{"name":"get_bookings","description":"d","input_schema":{"type":"object"}}]`),
+	}
+	r := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
+	r.Header.Set("X-Connect-Callback-Url", "https://connect.test/cb")
+	r.Header.Set("X-Connect-Callback-Token", "tok")
+	w := httptest.NewRecorder()
+	serveMuseAnthropic(context.Background(), cfg, in, w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	content, _ := body["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("empty content; body=%s", w.Body.String())
+	}
+	first, _ := content[0].(map[string]any)
+	text, _ := first["text"].(string)
+	if !strings.Contains(text, "connect_execute_tool") || !strings.Contains(text, "get_bookings") {
+		t.Errorf("text=%q, want the catalog instructions echoed by the stub", text)
 	}
 }
