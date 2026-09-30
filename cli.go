@@ -121,6 +121,7 @@ func runServe() error {
 	initAgyWorkerPool(cfg)              // initialize persistent warm agy worker pool if configured
 	initCodexWorkerPool(cfg)            // initialize persistent standby codex worker pool if configured
 	initClaude(cfg)                     // size the Claude Code CLI subprocess concurrency cap
+	initMuse(cfg)                       // size the Muse CLI subprocess concurrency cap
 	applyUpstreamSwitches(cfg)          // seed the live codex/claude/agy enable switches
 	initVT(cfg)                         // seed VirusTotal runtime keys/enabled from config
 	startMediaReaper(cfg)               // reap retained media scratch older than the window
