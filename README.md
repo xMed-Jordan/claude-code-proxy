@@ -244,7 +244,7 @@ The proxy dynamically routes request payloads to the correct upstream backend (C
 - **Route to Codex (ChatGPT)**: If the resolved model name contains `"codex"` or `"gpt-5"`, the request is routed to Codex.
 - **Global Default**: If the model name doesn't match these keywords, the request routes to the global default upstream specified by `UPSTREAM` in the `.env` file (which can be `codex`, `openai`, or `antigravity`).
 - **Model Aliases**: You can configure custom aliases in the local control panel at `http://127.0.0.1:4000/` or by updating the `PROXY_MODEL_ALIASES` variable in your `.env` file.
-- **Per-alias "Forwarded to"**: A model alias can be routed to a non-default backend via its `forward_to` setting (Models page or `PROXY_MODEL_ALIASES`): `agy` serves it from the local Antigravity CLI, and `claude` serves it from the local Claude Code CLI backed by a Claude subscription.
+- **Per-alias "Forwarded to"**: A model alias can be routed to a non-default backend via its `forward_to` setting (Models page or `PROXY_MODEL_ALIASES`): `agy` serves it from the local Antigravity CLI, `claude` serves it from the local Claude Code CLI backed by a Claude subscription, and `muse` serves it from the local Muse CLI backed by a Meta API key.
 
 ### Available Upstreams & Models
 
@@ -265,6 +265,9 @@ Supports direct Gemini models (e.g., `gemini-2.5-flash`, `gemini-2.5-pro`).
 
 #### 3. Claude (Anthropic subscription Upstream)
 Set a model alias's "Forwarded to" to `Claude` to serve it from the local Claude Code CLI (`claude -p`) backed by a Claude Max/Pro subscription, instead of Codex/OpenAI. Authenticate once with `claude setup-token` and set `PROXY_CLAUDE_OAUTH_TOKEN` (the installer offers to do this). Chat-only: built-in tools are disabled and the run is single-turn and stateless, so caller-defined tools are not honored (the CLI uses its own). Responses stream token-by-token. **Images and PDFs** in a request are forwarded to the model natively (inline via stream-json); audio/video are dropped (use agy for those). See the `PROXY_CLAUDE_*` variables in `.env.example`.
+
+#### 4. Muse (Meta Upstream)
+Set a model alias's "Forwarded to" to `Muse` to serve it from the local Muse CLI (`muse exec`) backed by a Meta API key, instead of Codex/OpenAI. Set `PROXY_MUSE_API_KEY` (forwarded to the child as `META_API_KEY`). Chat-only: writes, shell, and web tools are disabled and the run is a single model step and stateless, so caller-defined tools are not honored. Responses stream token-by-token. See the `PROXY_MUSE_*` variables in `.env.example`.
 
 ## Live Server + Local Browser Mode
 

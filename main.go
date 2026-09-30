@@ -81,6 +81,7 @@ type config struct {
 	CodexDisabled    bool // PROXY_CODEX_ENABLED=0 → refuse codex routing (zero value = enabled)
 	ClaudeDisabled   bool // PROXY_CLAUDE_ENABLED=0 → refuse the claude upstream
 	AgyDisabled      bool // PROXY_AGY_ENABLED=0 → refuse the agy upstream
+	MuseDisabled     bool // PROXY_MUSE_ENABLED=0 → refuse the muse upstream
 	CodexBaseURL     string
 	CodexAuthFile    string
 	CodexVersion     string // PROXY_CODEX_VERSION — Codex CLI version advertised upstream; newer models are gated on it
@@ -175,6 +176,19 @@ type config struct {
 	ClaudeToolTimeout  time.Duration // PROXY_CLAUDE_TOOL_TIMEOUT (longer than chat; loops do many round-trips)
 	ClaudeRetries      int           // PROXY_CLAUDE_RETRIES — outer retries on transient errors (5xx/overloaded/timeout)
 	ClaudeTotalTimeout time.Duration // PROXY_CLAUDE_TOTAL_TIMEOUT — wall-clock cap on the whole retry sequence (keep < Connect's HTTP timeout)
+	// Muse (Meta) upstream — when a model alias's forward_to == "muse",
+	// the request is served by the local Muse CLI (`muse exec`) backed by a
+	// Meta API key.
+	// Chat-only, stateless, tools disabled. See muse.go.
+	MuseBin          string        // path to the `muse` CLI ("" → "muse" on PATH)
+	MuseModel        string        // optional global model override ("" → alias Real, passed through verbatim)
+	MuseProvider     string        // startup provider override ("" → CLI default "meta"; "echo" for offline tests)
+	MuseConcurrency  int           // max simultaneous muse subprocesses
+	MuseTimeout      time.Duration // per-call muse execution timeout
+	MuseAPIKey       string        // Meta API key, injected as META_API_KEY
+	MuseWorkDir      string        // working dir for the child ("" → temp; keeps ambient project files out)
+	MuseRetries      int           // PROXY_MUSE_RETRIES — outer retries on transient errors (5xx/overloaded/timeout)
+	MuseTotalTimeout time.Duration // PROXY_MUSE_TOTAL_TIMEOUT — wall-clock cap on the whole retry sequence (keep < the caller's HTTP timeout)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -882,9 +896,20 @@ func loadConfig() config {
 		ClaudeRetries:      parseClaudeRetries(getenv("PROXY_CLAUDE_RETRIES", "3")),
 		ClaudeTotalTimeout: parseAgyTimeout(getenv("PROXY_CLAUDE_TOTAL_TIMEOUT", "480")),
 
+		MuseBin:          strings.TrimSpace(getenv("PROXY_MUSE_BIN", "")),
+		MuseModel:        strings.TrimSpace(getenv("PROXY_MUSE_MODEL", "")),
+		MuseProvider:     strings.TrimSpace(getenv("PROXY_MUSE_PROVIDER", "")),
+		MuseConcurrency:  parseMuseConcurrency(getenv("PROXY_MUSE_CONCURRENCY", "2")),
+		MuseTimeout:      parseAgyTimeout(getenv("PROXY_MUSE_TIMEOUT", "180")),
+		MuseAPIKey:       strings.TrimSpace(getenv("PROXY_MUSE_API_KEY", "")),
+		MuseWorkDir:      strings.TrimSpace(getenv("PROXY_MUSE_WORKDIR", "")),
+		MuseRetries:      parseMuseRetries(getenv("PROXY_MUSE_RETRIES", "3")),
+		MuseTotalTimeout: parseAgyTimeout(getenv("PROXY_MUSE_TOTAL_TIMEOUT", "480")),
+
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
 		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),
 		AgyDisabled:    !envFlag("PROXY_AGY_ENABLED", true),
+		MuseDisabled:   !envFlag("PROXY_MUSE_ENABLED", true),
 
 		GroqAPIKey:      strings.TrimSpace(getenv("PROXY_GROQ_API_KEY", "")),
 		GroqSTTModel:    strings.TrimSpace(getenv("PROXY_GROQ_STT_MODEL", "whisper-large-v3")),
@@ -1212,7 +1237,7 @@ func modelAliasesFromValues(env envValueFunc) (map[string]string, map[string]str
 // knownForwardTargets is the set of backends a model alias may forward to.
 // Only "codex" routes today; "agy", "claude" and "opencode" are reserved and
 // take effect once their backends are wired (see requestUpstream).
-var knownForwardTargets = map[string]bool{"codex": true, "agy": true, "claude": true, "opencode": true}
+var knownForwardTargets = map[string]bool{"codex": true, "agy": true, "claude": true, "muse": true, "opencode": true}
 
 func normalizeForwardTarget(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
@@ -1229,6 +1254,7 @@ var (
 	upstreamOffCodex  atomic.Bool
 	upstreamOffClaude atomic.Bool
 	upstreamOffAgy    atomic.Bool
+	upstreamOffMuse   atomic.Bool
 	// codexFastModeSwitch mirrors PROXY_CODEX_FAST_MODE. It lives beside the kill
 	// switches (rather than being read from cfg) so that turning fast mode on or
 	// off in the control panel stops/starts the 1.5x spend on the very next
@@ -1241,6 +1267,7 @@ func applyUpstreamSwitches(cfg config) {
 	upstreamOffCodex.Store(cfg.CodexDisabled)
 	upstreamOffClaude.Store(cfg.ClaudeDisabled)
 	upstreamOffAgy.Store(cfg.AgyDisabled)
+	upstreamOffMuse.Store(cfg.MuseDisabled)
 	setFastModeSwitch(normalizeFastMode(cfg.CodexFastMode) == fastModeOn)
 }
 
@@ -1257,6 +1284,7 @@ func applyUpstreamSwitchesFromEnvMap(m map[string]string) {
 	upstreamOffCodex.Store(off("PROXY_CODEX_ENABLED"))
 	upstreamOffClaude.Store(off("PROXY_CLAUDE_ENABLED"))
 	upstreamOffAgy.Store(off("PROXY_AGY_ENABLED"))
+	upstreamOffMuse.Store(off("PROXY_MUSE_ENABLED"))
 	// A .env without the key at all means off — the safe, non-spending default.
 	setFastModeSwitch(normalizeFastMode(m["PROXY_CODEX_FAST_MODE"]) == fastModeOn)
 }
@@ -1264,6 +1292,7 @@ func applyUpstreamSwitchesFromEnvMap(m map[string]string) {
 func codexIsDisabled() bool  { return upstreamOffCodex.Load() }
 func claudeIsDisabled() bool { return upstreamOffClaude.Load() }
 func agyIsDisabled() bool    { return upstreamOffAgy.Load() }
+func museIsDisabled() bool   { return upstreamOffMuse.Load() }
 
 // upstreamDisabledMsg is the client-facing error when a request is routed to an
 // upstream that has been switched off in the proxy's configuration.
@@ -2265,6 +2294,16 @@ func handleMessages(cfg config) http.HandlerFunc {
 			serveClaudeAnthropic(ctx, cfg, in, w, r)
 			return
 		}
+		// Forwarded-to = Muse: serve this alias from the local Muse CLI
+		// (`muse exec`) backed by a Meta API key, instead of codex/openai.
+		if forwardForAlias(cfg, in.Model) == "muse" {
+			if museIsDisabled() {
+				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
+				return
+			}
+			serveMuseAnthropic(ctx, cfg, in, w, r)
+			return
+		}
 
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
@@ -2382,6 +2421,14 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			serveClaudeOpenAIChat(r.Context(), cfg, in, w, r)
 			return
 		}
+		if forwardForAlias(cfg, in.Model) == "muse" {
+			if museIsDisabled() {
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
+				return
+			}
+			serveMuseOpenAIChat(r.Context(), cfg, in, w, r)
+			return
+		}
 		if _, ok := requestProviderRoute(r); !ok {
 			upstreamType := requestUpstream(cfg, r, in.Model)
 			if upstreamType == "antigravity" {
@@ -2465,6 +2512,14 @@ func handleResponses(cfg config) http.HandlerFunc {
 				return
 			}
 			serveClaudeResponses(r.Context(), cfg, in, w, r)
+			return
+		}
+		if forwardForAlias(cfg, in.Model) == "muse" {
+			if museIsDisabled() {
+				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
+				return
+			}
+			serveMuseResponses(r.Context(), cfg, in, w, r)
 			return
 		}
 		in.Model = resolveModel(cfg, in.Model)
@@ -8487,6 +8542,7 @@ func handleUIValidate(cfg config) http.HandlerFunc {
 			{"codex", codexIsDisabled(), "gpt-5.4-mini"},
 			{"claude", claudeIsDisabled(), validationClaudeModel(cfg)},
 			{"agy", agyIsDisabled(), validationAgyModel(cfg)},
+			{"muse", museIsDisabled(), validationMuseModel(cfg)},
 		}
 		used := []string{}
 		for _, t := range targets {
@@ -8540,6 +8596,12 @@ func validationClaudeModel(cfg config) string {
 // (preferring the cheapest Flash/Low model), or "" if none is configured.
 func validationAgyModel(cfg config) string {
 	return firstAliasForwardingTo(cfg, "agy", []string{"flash", "low", "medium"})
+}
+
+// validationMuseModel returns a registered alias that routes to the muse
+// upstream, or "" if none is configured.
+func validationMuseModel(cfg config) string {
+	return firstAliasForwardingTo(cfg, "muse", []string{"muse", "spark"})
 }
 
 // firstAliasForwardingTo finds a model alias whose forward target is `target`,
@@ -9079,6 +9141,17 @@ var antigravityModels = map[string]bool{
 	"gpt-oss 120b (medium)":        true,
 }
 
+// museModels is the Muse model catalog (from https://dev.meta.ai/docs/models),
+// lowercased. Used so a Muse-forwarded alias shows "Available" rather than
+// "Untested" for a recognized Muse model.
+var museModels = map[string]bool{
+	"muse-spark-1.3":             true,
+	"muse-spark-1.3-contributor": true,
+	"muse-spark-1.2":             true,
+	"muse-spark-1.2-contributor": true,
+	"muse-spark-1.1":             true,
+}
+
 // modelVerified tracks aliases that have served at least one successful request
 // this process lifetime, so "I tested it and it works" is reflected as Available.
 // In-memory only — resets on restart and re-verifies on the next success.
@@ -9119,6 +9192,16 @@ func modelStatusForRow(cfg config, alias, real string) string {
 			low = strings.TrimSpace(low[:i])
 		}
 		if low == "sonnet" || low == "opus" || low == "haiku" || low == "fable" || strings.HasPrefix(low, "claude") {
+			return "ok"
+		}
+		return "untested"
+	}
+	if forwardForAlias(cfg, alias) == "muse" {
+		low := strings.ToLower(strings.TrimSpace(real))
+		if i := strings.Index(low, "["); i > 0 {
+			low = strings.TrimSpace(low[:i])
+		}
+		if museModels[low] || strings.HasPrefix(low, "muse-spark") || strings.HasPrefix(low, "muse-") {
 			return "ok"
 		}
 		return "untested"

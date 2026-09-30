@@ -56,17 +56,29 @@
     "claude-haiku-4-5",
   ];
 
+  // Models the Muse CLI accepts via --model when a row's "Forwarded to"
+  // = Muse (from https://dev.meta.ai/docs/models). First entry is the
+  // default on switch.
+  const MUSE_MODEL_OPTIONS = [
+    "muse-spark-1.3",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.1",
+  ];
+
   function modelStatusFor(real) {
     if (!real) return "unsupported";
-    return (CODEX_MODEL_OPTIONS.includes(real) || AGY_MODEL_OPTIONS.includes(real) || CLAUDE_MODEL_OPTIONS.includes(real)) ? "available" : "untested";
+    return (CODEX_MODEL_OPTIONS.includes(real) || AGY_MODEL_OPTIONS.includes(real) || CLAUDE_MODEL_OPTIONS.includes(real) || MUSE_MODEL_OPTIONS.includes(real)) ? "available" : "untested";
   }
 
-  // Where each alias forwards to. Codex, Agy and Claude route today (Agy and
-  // Claude are text-only: no caller tool calls). Alphabetical.
+  // Where each alias forwards to. Codex, Agy, Claude and Muse route today (Agy,
+  // Claude and Muse are text-only: no caller tool calls). Alphabetical.
   const FORWARD_OPTIONS = [
     { value: "agy", label: "Agy" },
     { value: "claude", label: "Claude" },
     { value: "codex", label: "Codex" },
+    { value: "muse", label: "Muse" },
   ];
   const FORWARD_VALUES = FORWARD_OPTIONS.map(o => o.value);
   function normalizeForward(v) {
@@ -321,6 +333,7 @@
               { key: "PROXY_CODEX_ENABLED", name: "Codex (ChatGPT)", hint: "OpenAI Codex via your ChatGPT subscription." },
               { key: "PROXY_CLAUDE_ENABLED", name: "Claude Code", hint: "Anthropic Claude via the local Claude Code CLI." },
               { key: "PROXY_AGY_ENABLED", name: "Antigravity (Gemini)", hint: "Google Antigravity via the local agy CLI." },
+              { key: "PROXY_MUSE_ENABLED", name: "Muse", hint: "Meta Muse via the local muse CLI." },
             ].map(svc => {
               const on = (cfg[svc.key] || "1") !== "0";
               return (
@@ -537,6 +550,11 @@
         if (key === "forward_to" && val === "claude" && !CLAUDE_MODEL_OPTIONS.includes((next.real || "").trim())) {
           next.real = CLAUDE_MODEL_OPTIONS[0];
         }
+        // Switching a row to Muse: if its upstream model isn't a known Muse
+        // name, prefill a sensible default so the CLI gets a valid --model.
+        if (key === "forward_to" && val === "muse" && !MUSE_MODEL_OPTIONS.includes((next.real || "").trim())) {
+          next.real = MUSE_MODEL_OPTIONS[0];
+        }
         if (key === "real" || key === "forward_to") next.status = modelStatusFor((next.real || "").trim());
         return next;
       }));
@@ -740,6 +758,9 @@
             <datalist id="models-claude-options">
               {CLAUDE_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
             </datalist>
+            <datalist id="models-muse-options">
+              {MUSE_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
+            </datalist>
             {filtered.length === 0 ? (
               <EmptyState
                 icon="models"
@@ -801,7 +822,7 @@
                           <td>
                             <input
                               className={cx("input models-inline-input mono", invalid && !m.real.trim() && "invalid")}
-                              list={m.forward_to === "agy" ? "models-agy-options" : m.forward_to === "claude" ? "models-claude-options" : "models-codex-options"}
+                              list={m.forward_to === "agy" ? "models-agy-options" : m.forward_to === "claude" ? "models-claude-options" : m.forward_to === "muse" ? "models-muse-options" : "models-codex-options"}
                               value={m.real}
                               onChange={e => updateModel(m.id, "real", e.target.value)}
                               placeholder={m.forward_to === "agy" ? "Gemini 3.1 Pro (High)" : "gpt-5.5"}
