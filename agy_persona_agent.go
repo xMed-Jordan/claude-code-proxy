@@ -46,8 +46,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // agyPersonaAgentDefaultPrefix is the name prefix of persona agents
@@ -67,6 +69,51 @@ const (
 	// POLICIES (its identity and rules)" in the HOW TO READ THIS MESSAGE section.
 	agyPersonaHowToReadSystem = "a SYSTEM INSTRUCTIONS & POLICIES pointer (its identity and rules are its own agent instructions)"
 )
+
+// agyPersonaVolatileHeadings are the headings where Connect's per-TURN state
+// begins: the date and time, the platform context, the user's context, the
+// earlier conversations and the cached summaries. Everything from the EARLIEST
+// of them to the end of the system prompt changes between two turns of the same
+// conversation; everything before it is the persona, and does not.
+//
+// Measured on 25 real Connect system prompts of one agent, 25 different turns
+// across different customers (2026-10-02): the text before the first of these
+// headings hashed IDENTICALLY in all 25 (127,152 B), while the text from the
+// first to the end was 6,541-9,449 B and carried every difference between two
+// turns of one conversation. That is the whole of the split.
+var agyPersonaVolatileHeadings = []string{
+	"## Current Date & Time",
+	"## Platform Context",
+	"## User Context",
+	"## Previous Conversations with This Contact",
+	"## Available Cached Data (Summaries)",
+}
+
+// agyPersonaSplit divides a system prompt into the stable persona and the
+// volatile per-turn tail that follows it. The tail runs from the earliest
+// volatile heading to the end, so stable+tail is the original prompt, in order,
+// byte for byte — the model still reads every byte of it, just from the message
+// instead of the agent file.
+//
+// Without a split the whole prompt is the persona, which is exactly what this
+// feature did before: correct, but a new agent directory per turn, because the
+// date alone changes the hash. So a missing heading degrades to the old
+// behaviour rather than to a wrong one.
+func agyPersonaSplit(system string) (stable, volatile string) {
+	s := strings.TrimSpace(system)
+	at := -1
+	for _, h := range agyPersonaVolatileHeadings {
+		if i := strings.Index(s, h); i >= 0 && (at < 0 || i < at) {
+			at = i
+		}
+	}
+	// at <= 0 covers both "no heading" and "nothing before the heading", and an
+	// empty persona is not an agent definition.
+	if at <= 0 {
+		return s, ""
+	}
+	return strings.TrimRight(s[:at], " \t\r\n"), strings.TrimLeft(s[at:], " \t\r\n")
+}
 
 // agyPersonaAgentFrontmatter is the frontmatter of a persona agent: the key set
 // of agyChatAgentDefinition (agy 1.1.27), under the persona agent's own name.
@@ -304,26 +351,114 @@ func agyPersonaIDTag(id string) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+// agyPersonaAgentMaxAge is how old a persona agent directory must be before
+// agyPersonaAgentCleanup may remove it.
+const agyPersonaAgentMaxAge = 24 * time.Hour
+
+// agyPersonaAgentCleanup runs at most once per process, after a persona agent
+// has been installed, and removes the persona agent directories this proxy
+// wrote that are older than agyPersonaAgentMaxAge and are not the agent serving
+// this turn. It exists because the name is derived from content: every distinct
+// persona — and, before the split, every distinct turn — leaves a directory
+// behind, and none of them is ever read again.
+//
+// It is a DRY RUN unless PROXY_AGY_PERSONA_AGENT_CLEANUP says "enforce", and it
+// only ever looks inside the proxy's own agents directory at entries named
+// connect-chat-p-<12 hex>. Nothing an operator put there by another name, and no
+// directory of any other agent, is touched.
+func agyPersonaAgentCleanup(cfg config, keep string) {
+	agyPersonaCleanupOnce.Do(func() {
+		dir, err := agyAgentsDir()
+		if err != nil {
+			log.Printf("[agy] persona agent cleanup skipped: %v", err)
+			return
+		}
+		enforce := strings.EqualFold(strings.TrimSpace(cfg.AgyPersonaAgentCleanup), "enforce")
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			log.Printf("[agy] persona agent cleanup skipped: cannot read %s: %v", dir, err)
+			return
+		}
+		cutoff := time.Now().Add(-agyPersonaAgentMaxAge)
+		var stale []string
+		for _, e := range entries {
+			name := e.Name()
+			if !e.IsDir() || name == keep || !agyPersonaAgentNameIsOurs(cfg.AgyPersonaAgentPrefix, name) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			stale = append(stale, name)
+		}
+		if len(stale) == 0 {
+			return
+		}
+		sort.Strings(stale)
+		if !enforce {
+			log.Printf("[agy] persona agent cleanup (dry run): %d director(ies) older than %v would be removed: %s", len(stale), agyPersonaAgentMaxAge, strings.Join(stale, ", "))
+			return
+		}
+		for _, name := range stale {
+			path := filepath.Join(dir, name)
+			if err := os.RemoveAll(path); err != nil {
+				log.Printf("[agy] persona agent cleanup: cannot remove %s: %v", path, err)
+				continue
+			}
+			log.Printf("[agy] persona agent cleanup: removed %s", path)
+		}
+	})
+}
+
+// agyPersonaAgentCleanupOnce keeps the scan off the request path: it runs on the
+// first install of a process and never again.
+var agyPersonaCleanupOnce sync.Once
+
+// agyPersonaAgentNameIsOurs reports whether name is a persona agent directory
+// this feature writes: the agent prefix, a dash, and exactly 12 hex characters.
+// Nothing else qualifies — not the built-in connect-chat / connect-media-view
+// agents, not an operator's own agent, not a directory with any other name.
+func agyPersonaAgentNameIsOurs(prefix, name string) bool {
+	want := agyPersonaAgentSafePrefix(prefix) + "-"
+	if !strings.HasPrefix(name, want) {
+		return false
+	}
+	suffix := name[len(want):]
+	if len(suffix) != 12 {
+		return false
+	}
+	_, err := hex.DecodeString(suffix)
+	return err == nil
+}
+
 // agyPersonaAgentFor returns the name of the persona agent that should serve
-// this generation, or "" when the persona stays in the message (path A): the
-// switch is off, there is no persona, the run carries attachments (media runs use
-// other agents and keep the persona in the message), no chat agent is configured
-// (an empty PROXY_AGY_AGENT means agy's default coding agent, on purpose), the
-// conversation's number is not on the allowlist (PROXY_AGY_PERSONA_IN_AGENT_NUMBERS;
-// "*" lists everyone, an empty list no one), or the agent could not be installed.
+// this generation and the volatile tail that travels in the message beside the
+// pointer to it; both are empty when the persona stays in the message (path A):
+// the switch is off, there is no persona, the run carries attachments (media runs
+// use other agents and keep the persona in the message), no chat agent is
+// configured (an empty PROXY_AGY_AGENT means agy's default coding agent, on
+// purpose), the conversation's number is not on the allowlist
+// (PROXY_AGY_PERSONA_IN_AGENT_NUMBERS; "*" lists everyone, an empty list no one),
+// or the agent could not be installed.
+//
+// Only the STABLE part of the system prompt reaches the agent file and its name
+// (agyPersonaSplit), so two turns of one conversation that differ only in the
+// date and the cached summaries reuse the same agent, and the ~136 KB file is
+// written once per persona instead of once per turn.
 //
 // With the switch on it logs exactly one [agy-persona] line per call, naming the
 // path taken and a hash of the number; never the number, never the persona. With
 // the switch off it logs nothing and reads nothing.
-func agyPersonaAgentFor(cfg config, in agyGenInput) string {
+func agyPersonaAgentFor(cfg config, in agyGenInput) (name, volatile string) {
 	if !cfg.AgyPersonaInAgent {
-		return ""
+		return "", ""
 	}
 	id := agyNormalizePhone(agyConversationIdentifier(in.System))
 	tag := agyPersonaIDTag(id)
-	pathA := func(reason string) string {
+	pathA := func(reason string) (string, string) {
 		log.Printf("[agy-persona] path=A reason=%s id#%s", reason, tag)
-		return ""
+		return "", ""
 	}
 	switch {
 	case strings.TrimSpace(in.System) == "":
@@ -341,11 +476,13 @@ func agyPersonaAgentFor(cfg config, in agyGenInput) string {
 			return pathA("not-allowlisted")
 		}
 	}
-	name, err := ensureAgyPersonaAgent(cfg, in.System)
+	stable, volatile := agyPersonaSplit(in.System)
+	installed, err := ensureAgyPersonaAgent(cfg, stable)
 	if err != nil {
 		log.Printf("[agy] persona agent unavailable (%v); the persona travels in the message", err)
 		return pathA("install-error")
 	}
-	log.Printf("[agy-persona] path=B agent=%s id#%s", name, tag)
-	return name
+	agyPersonaAgentCleanup(cfg, installed)
+	log.Printf("[agy-persona] path=B agent=%s id#%s", installed, tag)
+	return installed, volatile
 }

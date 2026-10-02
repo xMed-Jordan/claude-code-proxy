@@ -2266,6 +2266,14 @@ func renderAgyPromptFittedTranscript(cfg config, system string, temp *float64, t
 		}
 		if personaInAgent {
 			sysBlock.WriteString(agyPersonaPointer)
+			// The agent file carries only the stable persona; the per-turn tail
+			// (the date and time, the platform context, the cached summaries)
+			// travels here, unchanged and in its original order, so the model
+			// still reads exactly the prompt it would have read today.
+			if v := cfg.agyPersonaVolatile; v != "" {
+				sysBlock.WriteString(v)
+				sysBlock.WriteString("\n\n")
+			}
 		} else if system != "" {
 			sysBlock.WriteString(system)
 			sysBlock.WriteString("\n\n")
@@ -2480,8 +2488,9 @@ func agyGenerate(ctx context.Context, cfg config, in agyGenInput) (responsesResp
 	// definition that carries the persona, and the message only points to it
 	// (agy_persona_agent.go). cfg is this call's own copy; every step below —
 	// the compaction check, the rendering, each resolve — sees the field through it.
-	if name := agyPersonaAgentFor(cfg, in); name != "" {
+	if name, volatile := agyPersonaAgentFor(cfg, in); name != "" {
 		cfg.agyPersonaAgent = name
+		cfg.agyPersonaVolatile = volatile
 	}
 	// When the dialogue itself has outgrown the window, replace its oldest part
 	// with a written brief and carry on from there (agy_compact.go).

@@ -153,7 +153,9 @@ type config struct {
 	AgyPersonaAgentPrefix    string   // PROXY_AGY_PERSONA_AGENT_PREFIX — name prefix of those agents (default "connect-chat-p")
 	AgyPersonaInAgentNumbers []string // PROXY_AGY_PERSONA_IN_AGENT_NUMBERS — comma-separated allowlist of customer numbers the switch applies to (matched against the "User identifier:" line of the system prompt's Platform Context, never against numbers inside the persona); each entry is stored normalised (digits only, no 00 prefix, no leading zeros) and matches an identifier that equals it or ends with it when it has 8+ digits; empty/unset = NO ONE, even with the switch on (agyPersonaAgentFor); a customer who is not listed keeps the persona in the message
 	AgyPersonaInAgentAll     bool     // true when that list contains "*": the switch applies to every customer (no identifier needed)
+	AgyPersonaAgentCleanup   string   // PROXY_AGY_PERSONA_AGENT_CLEANUP — "enforce" removes persona agent directories older than 24h; anything else (the default, including unset) only logs what it would remove
 	agyPersonaAgent          string   // per-request, never read from env: the persona agent serving THIS request ("" = the persona travels in the message); set by agyGenerate
+	agyPersonaVolatile       string   // per-request, never read from env: the volatile tail of THIS request's system prompt (date, platform context, cached summaries), which travels in the message beside the pointer to the agent; set by agyGenerate
 	// Claude (Anthropic) upstream — when a model alias's forward_to == "claude",
 	// the request is served by the local Claude Code CLI (`claude -p`) backed by a
 	// Claude subscription (long-lived OAuth token from `claude setup-token`).
@@ -881,6 +883,7 @@ func loadConfig() config {
 
 		AgyPersonaInAgent:        parseBoolDefault(getenv("PROXY_AGY_PERSONA_IN_AGENT", "false"), false),
 		AgyPersonaAgentPrefix:    strings.TrimSpace(getenv("PROXY_AGY_PERSONA_AGENT_PREFIX", agyPersonaAgentDefaultPrefix)),
+		AgyPersonaAgentCleanup:    strings.TrimSpace(getenv("PROXY_AGY_PERSONA_AGENT_CLEANUP", "")),
 		AgyPersonaInAgentNumbers: personaInAgentNumbers,
 		AgyPersonaInAgentAll:     personaInAgentAll,
 

@@ -104,6 +104,7 @@ func agyCompactIfNeeded(ctx context.Context, cfg config, in agyGenInput) (agyTra
 	// above measured the prompt exactly as it will be sent and keeps cfg as passed.
 	briefCfg := cfg
 	briefCfg.agyPersonaAgent = ""
+	briefCfg.agyPersonaVolatile = ""
 	brief, cached, err := agyConversationBrief(ctx, briefCfg, in.Model, material)
 	if err != nil || strings.TrimSpace(brief) == "" {
 		log.Printf("[agy-compact] could not write the brief (%v); continuing without compaction", err)

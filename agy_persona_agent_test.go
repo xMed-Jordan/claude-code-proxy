@@ -301,6 +301,22 @@ func personaAgentFile(home, name string) string {
 	return filepath.Join(personaAgentsDir(home), name, "agent.md")
 }
 
+// personaStableOf is the part of a request's system prompt that reaches the
+// agent file and its name: the persona, without the per-turn date, platform
+// context and cached summaries (agyPersonaSplit).
+func personaStableOf(in agyGenInput) string {
+	stable, _ := agyPersonaSplit(in.System)
+	return stable
+}
+
+// personaWantName is the agent name this request must be served under. It is
+// derived from the STABLE part only, so two turns of one conversation that
+// differ only in the date and the cached summaries share one name — which is
+// the whole point of the split.
+func personaWantName(prefix string, in agyGenInput) string {
+	return agyPersonaAgentName(prefix, personaStableOf(in))
+}
+
 // personaWantDefinition is the agent.md the design describes, spelled out.
 func personaWantDefinition(name, persona string) string {
 	return "---\n" +
@@ -760,7 +776,7 @@ func TestAgyPersonaAgentForConditions(t *testing.T) {
 		if c.mutate != nil {
 			c.mutate(&x)
 		}
-		if got := agyPersonaAgentFor(c.cfg, x); got != "" {
+		if got, _ := agyPersonaAgentFor(c.cfg, x); got != "" {
 			t.Errorf("%s: got persona agent %q, want none", c.name, got)
 		}
 	}
@@ -769,11 +785,11 @@ func TestAgyPersonaAgentForConditions(t *testing.T) {
 	}
 
 	// And when every condition holds, it does.
-	name := agyPersonaAgentFor(on, in)
+	name, _ := agyPersonaAgentFor(on, in)
 	if name == "" {
 		t.Fatal("no persona agent although every condition holds")
 	}
-	if name != agyPersonaAgentName(agyPersonaAgentDefaultPrefix, in.System) {
+	if name != personaWantName(agyPersonaAgentDefaultPrefix, in) {
 		t.Fatalf("name = %q", name)
 	}
 	if _, err := os.Stat(personaAgentFile(home, name)); err != nil {
@@ -797,7 +813,7 @@ func TestAgyPersonaAgentInstallFailureFallsBack(t *testing.T) {
 	if _, err := ensureAgyPersonaAgent(cfg, in.System); err == nil {
 		t.Fatal("expected an error")
 	}
-	if got := agyPersonaAgentFor(cfg, in); got != "" {
+	if got, _ := agyPersonaAgentFor(cfg, in); got != "" {
 		t.Fatalf("persona agent %q although the install failed", got)
 	}
 	if !strings.Contains(logs.String(), "persona agent unavailable") {
@@ -994,7 +1010,7 @@ func TestAgyGenerateDeliversThePersonaThroughTheAgent(t *testing.T) {
 		t.Fatalf("resolve called %d times, want 1", len(*calls))
 	}
 	call := (*calls)[0]
-	name := agyPersonaAgentName(agyPersonaAgentDefaultPrefix, in.System)
+	name := personaWantName(agyPersonaAgentDefaultPrefix, in)
 	if call.cfg.agyPersonaAgent != name {
 		t.Fatalf("resolve saw persona agent %q, want %q", call.cfg.agyPersonaAgent, name)
 	}
@@ -1011,7 +1027,7 @@ func TestAgyGenerateDeliversThePersonaThroughTheAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent not installed: %v", err)
 	}
-	if string(got) != personaWantDefinition(name, in.System) || !strings.Contains(string(got), personaTestMarker) {
+	if string(got) != personaWantDefinition(name, personaStableOf(in)) || !strings.Contains(string(got), personaTestMarker) {
 		t.Fatal("the installed agent does not carry the persona")
 	}
 	if cfg.agyPersonaAgent != "" {
@@ -1097,7 +1113,7 @@ func TestAgyCompactionBriefRunsWithoutThePersonaAgent(t *testing.T) {
 	if briefs[0].cfg.AgyAgent != agyChatAgentName {
 		t.Fatal("the brief call lost the configured chat agent")
 	}
-	if want := agyPersonaAgentName(agyPersonaAgentDefaultPrefix, persona); turns[0].cfg.agyPersonaAgent != want {
+	if want := personaWantName(agyPersonaAgentDefaultPrefix, in); turns[0].cfg.agyPersonaAgent != want {
 		t.Fatalf("the turn ran under %q, want %q", turns[0].cfg.agyPersonaAgent, want)
 	}
 	if !strings.Contains(turns[0].prompt, agyBriefMarker) || strings.Contains(turns[0].prompt, personaTestMarker) {
@@ -1341,19 +1357,19 @@ func TestAgyPersonaAgentForAllowlist(t *testing.T) {
 	// path B: the agent is named after the system prompt and installed.
 	wantAgent := func(t *testing.T, home string, cfg config, in agyGenInput) {
 		t.Helper()
-		got := agyPersonaAgentFor(cfg, in)
-		want := agyPersonaAgentName(prefix, in.System)
+		got, _ := agyPersonaAgentFor(cfg, in)
+		want := personaWantName(prefix, in)
 		if got != want {
 			t.Fatalf("persona agent = %q, want %q", got, want)
 		}
-		if def, err := os.ReadFile(personaAgentFile(home, got)); err != nil || string(def) != personaWantDefinition(got, in.System) {
+		if def, err := os.ReadFile(personaAgentFile(home, got)); err != nil || string(def) != personaWantDefinition(got, personaStableOf(in)) {
 			t.Fatalf("agent %s not installed with the persona: %v", got, err)
 		}
 	}
 	// path A: no agent, nothing installed.
 	wantNone := func(t *testing.T, home string, cfg config, in agyGenInput) {
 		t.Helper()
-		if got := agyPersonaAgentFor(cfg, in); got != "" {
+		if got, _ := agyPersonaAgentFor(cfg, in); got != "" {
 			t.Fatalf("persona agent = %q, want none", got)
 		}
 		if _, err := os.Stat(personaAgentsDir(home)); err == nil {
@@ -1407,17 +1423,17 @@ func TestAgyPersonaAgentForAllowlist(t *testing.T) {
 		// The other conditions still hold with a star: no persona, or attachments, is path A.
 		x := personaCustomerInput(base, personaTestNumber)
 		x.System = ""
-		if got := agyPersonaAgentFor(cfg, x); got != "" {
+		if got, _ := agyPersonaAgentFor(cfg, x); got != "" {
 			t.Fatalf("star with no persona: %q", got)
 		}
 		x = personaCustomerInput(base, personaTestNumber)
 		x.Media = []mediaPart{{B64: tinyPNGBase64(t), MediaType: "image/png", Filename: "x.png"}}
-		if got := agyPersonaAgentFor(cfg, x); got != "" {
+		if got, _ := agyPersonaAgentFor(cfg, x); got != "" {
 			t.Fatalf("star with attachments: %q", got)
 		}
 		// And a switch that is off stays off, whatever the list says.
 		cfg.AgyPersonaInAgent = false
-		if got := agyPersonaAgentFor(cfg, personaCustomerInput(base, personaTestNumber)); got != "" {
+		if got, _ := agyPersonaAgentFor(cfg, personaCustomerInput(base, personaTestNumber)); got != "" {
 			t.Fatalf("star with the switch off: %q", got)
 		}
 	})
@@ -1583,7 +1599,7 @@ func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
 	}
 	listedTag, otherTag := tagOf("962790000001"), tagOf("962790000002")
 	on := personaTestOnConfig()
-	nameOf := func(in agyGenInput) string { return agyPersonaAgentName(agyPersonaAgentDefaultPrefix, in.System) }
+	nameOf := func(in agyGenInput) string { return personaWantName(agyPersonaAgentDefaultPrefix, in) }
 
 	listed := personaCustomerInput(base, personaTestForms[0])
 	listedLocal := personaCustomerInput(base, personaTestForms[2])
@@ -1617,7 +1633,7 @@ func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
 		{"no chat agent", noAgent, listed, "path=A reason=no-chat-agent id#" + listedTag},
 	} {
 		logs.Reset()
-		agyPersonaAgentFor(c.cfg, c.in)
+		agyPersonaAgentFor(c.cfg, c.in) //nolint:errcheck
 		lines := personaLogLines(logs.String())
 		if len(lines) != 1 {
 			t.Errorf("%s: %d [agy-persona] lines, want 1:\n%s", c.name, len(lines), logs.String())
@@ -1645,7 +1661,7 @@ func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fresh, ".gemini"), []byte("not a directory"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := agyPersonaAgentFor(on, listed); got != "" {
+	if got, _ := agyPersonaAgentFor(on, listed); got != "" {
 		t.Fatalf("install failure: persona agent %q", got)
 	}
 	if lines := personaLogLines(logs.String()); len(lines) != 1 || !strings.HasSuffix(lines[0], "[agy-persona] path=A reason=install-error id#"+listedTag) {
@@ -1661,7 +1677,7 @@ func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
 	off.AgyPersonaInAgent = false
 	for _, in := range []agyGenInput{listed, other, noID, withMedia, noPersona} {
 		logs.Reset()
-		if got := agyPersonaAgentFor(off, in); got != "" {
+		if got, _ := agyPersonaAgentFor(off, in); got != "" {
 			t.Fatalf("switch off: persona agent %q", got)
 		}
 		if logs.Len() != 0 {
@@ -1670,7 +1686,7 @@ func TestAgyPersonaAgentForLogsOneLinePerCall(t *testing.T) {
 	}
 	off.AgyPersonaInAgentAll = true
 	logs.Reset()
-	if got := agyPersonaAgentFor(off, listed); got != "" || logs.Len() != 0 {
+	if got, _ := agyPersonaAgentFor(off, listed); got != "" || logs.Len() != 0 {
 		t.Errorf("switch off with a star: persona agent %q, log %q", got, logs.String())
 	}
 }
