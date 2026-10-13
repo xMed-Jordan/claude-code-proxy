@@ -771,6 +771,74 @@ func museAPIOpenAIBody(cfg config, raw []byte, alias string) ([]byte, []string, 
 	return b, dropped, err
 }
 
+// museMediaDownloadFailed reports Meta's 400 for an attachment it could not
+// fetch from its URL ("failed to download media at input[0].content[0]: …").
+func museMediaDownloadFailed(status int, body []byte) bool {
+	return status == http.StatusBadRequest && bytes.Contains(bytes.ToLower(body), []byte("download media"))
+}
+
+// museStripURLMedia replaces every URL-sourced attachment (image/document) in
+// the messages with a short text note, so a dead or private media link costs
+// the customer the attachment, not the whole reply. Inline (base64) media is
+// kept. Returns true when something was replaced.
+func museStripURLMedia(m map[string]json.RawMessage) bool {
+	var messages []map[string]json.RawMessage
+	if json.Unmarshal(m["messages"], &messages) != nil {
+		return false
+	}
+	changed := false
+	for _, msg := range messages {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(msg["content"], &blocks) != nil {
+			continue
+		}
+		touched := false
+		for i, b := range blocks {
+			var src struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(b["source"], &src) == nil && src.Type == "url" {
+				blocks[i] = map[string]json.RawMessage{
+					"type": museJSON("text"),
+					"text": museJSON("[The customer sent an attachment here that could not be loaded.]"),
+				}
+				touched = true
+			}
+		}
+		if touched {
+			msg["content"] = museJSON(blocks)
+			changed = true
+		}
+	}
+	if changed {
+		m["messages"] = museJSON(messages)
+	}
+	return changed
+}
+
+// museAPIPostMessages sends a /messages body; when Meta could not download a
+// URL attachment it retries once with those attachments replaced by a note.
+// The response is returned for the caller to read or relay.
+func museAPIPostMessages(ctx context.Context, cfg config, m map[string]json.RawMessage, hdr http.Header, deadline time.Time) (*http.Response, error) {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, hdr, deadline)
+	if err != nil || resp.StatusCode != http.StatusBadRequest {
+		return resp, err
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if museMediaDownloadFailed(resp.StatusCode, raw) && museStripURLMedia(m) {
+		fmt.Printf("[muse-api] attachment URL not downloadable by Meta; retrying without it (%s)\n", truncateString(strings.TrimSpace(string(raw)), 200))
+		body, _ = json.Marshal(m)
+		return museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, hdr, deadline)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	return resp, nil
+}
+
 func museAnthropicHeaders(r *http.Request) http.Header {
 	h := http.Header{}
 	version := ""
@@ -974,8 +1042,7 @@ func serveMuseAPIAnthropic(ctx context.Context, cfg config, in anthropicRequest,
 		return
 	}
 	museTraceDropped(ctx, dropped)
-	body, _ := json.Marshal(m)
-	resp, err := museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, museAnthropicHeaders(r), deadline)
+	resp, err := museAPIPostMessages(ctx, cfg, m, museAnthropicHeaders(r), deadline)
 	if err != nil {
 		fmt.Printf("[muse-api] model=%s err=%s\n", in.Model, truncateString(err.Error(), 300))
 		writeAnthropicError(w, http.StatusBadGateway, "muse "+err.Error())
@@ -1011,11 +1078,43 @@ func serveMuseAPIOpenAI(ctx context.Context, cfg config, alias string, stream bo
 // ----------------------------------------------------------------------------
 
 type museToolLoopResult struct {
-	Text      string
-	Stop      string
-	Turns     int
-	ToolCalls int
-	In, Out   int
+	Text       string
+	Stop       string
+	Turns      int
+	ToolCalls  int
+	Duplicates int // repeated identical calls answered without running the tool
+	In, Out    int
+}
+
+// museDuplicateCallResult answers a tool call the model already made, with the
+// same arguments and a successful result, earlier in this turn. Re-running it
+// would repeat its side effects (a second booking, a second summary…).
+const museDuplicateCallResult = `{"success":false,"error":"duplicate_call: this exact call (same tool, same arguments) already ran successfully earlier in this turn; its result is above. It was NOT run again. Do not repeat it — continue with the next step, or finish."}`
+
+// museCallKey identifies a tool call by name + canonical arguments (Go
+// marshals map keys sorted, so key order does not matter).
+func museCallKey(name string, input json.RawMessage) string {
+	var v any
+	if json.Unmarshal(input, &v) != nil {
+		return name + "\x00" + string(bytes.TrimSpace(input))
+	}
+	if m, ok := v.(map[string]any); ok && len(m) == 0 {
+		v = nil
+	}
+	b, _ := json.Marshal(v)
+	return name + "\x00" + string(b)
+}
+
+// museToolSucceeded reads Connect's {"success": …} flag; a result without it
+// counts as success.
+func museToolSucceeded(result string) bool {
+	var r struct {
+		Success *bool `json:"success"`
+	}
+	if json.Unmarshal([]byte(result), &r) != nil || r.Success == nil {
+		return true
+	}
+	return *r.Success
 }
 
 type museContentBlock struct {
@@ -1036,11 +1135,7 @@ type museMessageResponse struct {
 // non-2xx answer is returned as an error carrying Meta's message.
 func museAPIPostMessage(ctx context.Context, cfg config, m map[string]json.RawMessage, hdr http.Header, deadline time.Time) (museMessageResponse, error) {
 	var out museMessageResponse
-	body, err := json.Marshal(m)
-	if err != nil {
-		return out, err
-	}
-	resp, err := museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, hdr, deadline)
+	resp, err := museAPIPostMessages(ctx, cfg, m, hdr, deadline)
 	if err != nil {
 		return out, err
 	}
@@ -1074,6 +1169,8 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 	httpc := &http.Client{Timeout: 120 * time.Second}
 	maxTurns := museToolMaxTurns(cfg)
 	emptyRetries := 0
+	succeeded := map[string]bool{} // museCallKey → that call already ran successfully
+	forceText := false
 	for turn := 0; ; turn++ {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
@@ -1081,7 +1178,7 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		if time.Until(deadline) <= 0 {
 			return res, fmt.Errorf("tool loop ran out of time after %d turns", res.Turns)
 		}
-		final := turn >= maxTurns
+		final := turn >= maxTurns || forceText
 		m["messages"] = museJSON(messages)
 		if final {
 			m["tool_choice"] = json.RawMessage(`{"type":"none"}`)
@@ -1090,6 +1187,8 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		if err != nil {
 			return res, err
 		}
+		// Keep any attachment fallback for the following turns.
+		_ = json.Unmarshal(m["messages"], &messages)
 		res.Turns++
 		if msg.Usage != nil {
 			res.In += msg.Usage.in()
@@ -1112,12 +1211,26 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		if msg.StopReason == "tool_use" && len(toolUses) > 0 && !final {
 			messages = append(messages, museJSON(map[string]any{"role": "assistant", "content": msg.Content}))
 			results := make([]map[string]any, 0, len(toolUses))
+			onlyRepeats := true
 			for _, tu := range toolUses {
-				out := mcpExecuteTool(httpc, spec.CallbackURL, spec.CallbackToken, allowed, tu.Name, tu.Input)
-				res.ToolCalls++
+				key := museCallKey(tu.Name, tu.Input)
+				var out string
+				if succeeded[key] {
+					out = museDuplicateCallResult
+					res.Duplicates++
+				} else {
+					out = mcpExecuteTool(httpc, spec.CallbackURL, spec.CallbackToken, allowed, tu.Name, tu.Input)
+					res.ToolCalls++
+					succeeded[key] = museToolSucceeded(out)
+					onlyRepeats = false
+				}
 				results = append(results, map[string]any{"type": "tool_result", "tool_use_id": tu.ID, "content": out})
 			}
 			messages = append(messages, museJSON(map[string]any{"role": "user", "content": results}))
+			if onlyRepeats {
+				// The model is looping on calls that already ran: ask for the answer.
+				forceText = true
+			}
 			continue
 		}
 		if strings.TrimSpace(text.String()) == "" && emptyRetries < 2 {
@@ -1145,9 +1258,9 @@ func serveMuseAPIAnthropicTools(ctx context.Context, cfg config, in anthropicReq
 		return
 	}
 	res, err := museAPIToolLoop(ctx, cfg, m, messages, spec, museAnthropicHeaders(r), deadline)
-	note := fmt.Sprintf("%s transport=api tools=%d turns=%d tool_calls=%d", museNote(in.Model, in.Stream), len(spec.Tools), res.Turns, res.ToolCalls)
+	note := fmt.Sprintf("%s transport=api tools=%d turns=%d tool_calls=%d repeats_skipped=%d", museNote(in.Model, in.Stream), len(spec.Tools), res.Turns, res.ToolCalls, res.Duplicates)
 	setRequestNote(r, note)
-	fmt.Printf("[muse-api] model=%s tools=%d turns=%d tool_calls=%d ok=%t\n", in.Model, len(spec.Tools), res.Turns, res.ToolCalls, err == nil)
+	fmt.Printf("[muse-api] model=%s tools=%d turns=%d tool_calls=%d repeats_skipped=%d ok=%t\n", in.Model, len(spec.Tools), res.Turns, res.ToolCalls, res.Duplicates, err == nil)
 	if err != nil {
 		fmt.Printf("[muse-api] model=%s err=%s\n", in.Model, truncateString(err.Error(), 300))
 		writeAnthropicError(w, http.StatusBadGateway, "muse "+err.Error())

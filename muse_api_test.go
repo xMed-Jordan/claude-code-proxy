@@ -419,6 +419,42 @@ func TestMuseAPITransportCLIStillRoutesToCLI(t *testing.T) {
 	}
 }
 
+func TestMuseAPIUndownloadableAttachmentFallsBack(t *testing.T) {
+	resetMuseKeyCache(t)
+	mediaErr := `{"error":{"message":"failed to download media at input[0].content[0]: origin returned HTTP 400","type":"invalid_request_error"},"type":"error"}`
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if strings.Contains(req.Raw, `"type":"url"`) {
+			metaJSON(w, 400, mediaErr)
+			return
+		}
+		metaJSON(w, 200, okMessage)
+	})
+	body := `{"model":"museapitest","messages":[{"role":"user","content":[
+		{"type":"image","source":{"type":"url","url":"https://media.example/expired.jpg"}},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},
+		{"type":"text","text":"what is this?"}]}]}`
+	w := postMessages(t, museAPITestConfig(fm.srv.URL), body, nil)
+	if w.Code != 200 || w.Body.String() != okMessage {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests=%d, want the original + one retry", len(reqs))
+	}
+	retry := reqs[1].Raw
+	if strings.Contains(retry, "expired.jpg") || !strings.Contains(retry, "could not be loaded") || !strings.Contains(retry, `"type":"base64"`) {
+		t.Errorf("retry must drop only the URL attachment: %s", retry)
+	}
+
+	// A 400 that is not about media is passed through untouched, no retry.
+	other := `{"error":{"message":"unknown parameter","type":"invalid_request_error"},"type":"error"}`
+	fm2 := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) { metaJSON(w, 400, other) })
+	w = postMessages(t, museAPITestConfig(fm2.srv.URL), body, nil)
+	if w.Code != 400 || w.Body.String() != other || len(fm2.requests()) != 1 {
+		t.Fatalf("status=%d body=%s requests=%d", w.Code, w.Body.String(), len(fm2.requests()))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Connect tool loop
 // ---------------------------------------------------------------------------
@@ -584,6 +620,68 @@ func TestMuseAPIToolLoopRetryNeverRepeatsATool(t *testing.T) {
 	}
 }
 
+func TestMuseAPIToolLoopRepeatedSuccessfulCallIsNotRerun(t *testing.T) {
+	resetMuseKeyCache(t)
+	fc := newFakeConnect(t)
+	summary := `{"type":"tool_use","id":"s%d","name":"create_booking","input":{"slot":"10:00"}}`
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if tc, ok := req.Body["tool_choice"].(map[string]any); ok && tc["type"] == "none" {
+			metaJSON(w, 200, textMessage("All done."))
+			return
+		}
+		// The model keeps re-submitting the identical call (the scheduled-task loop).
+		metaJSON(w, 200, toolUseMessage(strings.Replace(summary, "%d", strconv.Itoa(n), 1)))
+	})
+	body, hdr := toolRequest(fc, false)
+	w := postMessages(t, museAPITestConfig(fm.srv.URL), body, hdr)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "All done.") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if fc.count() != 1 {
+		t.Fatalf("create_booking ran %d times; an identical successful call must run once", fc.count())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("meta requests=%d, want call → repeat (skipped) → forced text", len(reqs))
+	}
+	if !strings.Contains(reqs[2].Raw, "duplicate_call") {
+		t.Error("the skipped repeat must be answered with the duplicate_call note")
+	}
+
+	// A call that FAILED may be retried with the same arguments.
+	if museCallKey("a", json.RawMessage(`{"x":1,"y":2}`)) != museCallKey("a", json.RawMessage(`{"y":2,"x":1}`)) {
+		t.Error("argument order must not matter")
+	}
+	if museToolSucceeded(`{"success":false,"error":"x"}`) || !museToolSucceeded(`{"success":true}`) || !museToolSucceeded(`not json`) {
+		t.Error("museToolSucceeded")
+	}
+}
+
+func TestMuseAPIToolLoopFailedCallMayBeRetried(t *testing.T) {
+	resetMuseKeyCache(t)
+	var hits atomic.Int32
+	cb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			metaJSON(w, 200, `{"success":false,"error":"slot busy, try again"}`)
+			return
+		}
+		metaJSON(w, 200, `{"success":true,"data":{"booked":true}}`)
+	}))
+	defer cb.Close()
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if n <= 2 {
+			metaJSON(w, 200, toolUseMessage(`{"type":"tool_use","id":"b`+strconv.Itoa(n)+`","name":"create_booking","input":{"slot":"10:00"}}`))
+			return
+		}
+		metaJSON(w, 200, textMessage("Booked."))
+	})
+	body, hdr := toolRequest(&fakeConnect{srv: cb}, false)
+	w := postMessages(t, museAPITestConfig(fm.srv.URL), body, hdr)
+	if w.Code != 200 || hits.Load() != 2 {
+		t.Fatalf("status=%d callback hits=%d, want the failed call retried once", w.Code, hits.Load())
+	}
+}
+
 func TestMuseAPIToolLoopTurnLimitForcesText(t *testing.T) {
 	resetMuseKeyCache(t)
 	fc := newFakeConnect(t)
@@ -592,7 +690,7 @@ func TestMuseAPIToolLoopTurnLimitForcesText(t *testing.T) {
 			metaJSON(w, 200, textMessage("Here is what I found."))
 			return
 		}
-		metaJSON(w, 200, toolUseMessage(`{"type":"tool_use","id":"t`+strings.Repeat("x", n)+`","name":"get_slots","input":{"date":"d"}}`))
+		metaJSON(w, 200, toolUseMessage(`{"type":"tool_use","id":"t`+strings.Repeat("x", n)+`","name":"get_slots","input":{"date":"d`+strconv.Itoa(n)+`"}}`))
 	})
 	cfg := museAPITestConfig(fm.srv.URL)
 	cfg.MuseToolMaxTurns = 3

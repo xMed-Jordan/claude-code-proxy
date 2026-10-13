@@ -104,6 +104,13 @@ and `horizon:terminate` too.
 | `PROXY_MUSE_TOTAL_TIMEOUT` | `480` | whole turn incl. retries; keep below Connect's 500s |
 | `PROXY_MUSE_RETRIES` | `3` | retries on 429/5xx/529/network errors (a tool is never re-run) |
 
+Tool-loop safety (api transport): a call the model repeats with the same arguments
+after it already succeeded in the same turn is NOT run again (the model is told
+`duplicate_call`); a turn made only of such repeats ends with a forced text answer.
+A failed call may be retried. If Meta cannot download a URL attachment
+(`failed to download media`), the request is retried once with that attachment
+replaced by a short note, so a dead media link never costs the customer the reply.
+
 What the api transport sends to Meta: the caller's body with only the fields Meta
 accepts (`model, messages, system, max_tokens, metadata, stream, temperature, top_p,
 top_k, tools, tool_choice, thinking, service_tier, output_config.effort`). Dropped
