@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,25 @@ func TestMuseHelperProcess(t *testing.T) {
 		line, _ := json.Marshal(map[string]any{"payload_type": payloadType, "payload": payload})
 		os.Stdout.Write(append(line, '\n'))
 	}
+	// Key-guard hooks: count runs, run slowly, and (mode "rotate") rewrite the
+	// login file the way a Muse Code login refresh would.
+	if p := os.Getenv("MUSE_STUB_COUNT"); p != "" {
+		if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			f.WriteString("run\n")
+			f.Close()
+		}
+	}
+	if ms, _ := strconv.Atoi(os.Getenv("MUSE_STUB_SLEEP_MS")); ms > 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
 	switch os.Getenv("MUSE_STUB_MODE") {
+	case "rotate":
+		auth := `{"providers":{"meta":{"api_key":"` + os.Getenv("MUSE_STUB_NEW_KEY") + `"}}}`
+		if err := os.WriteFile(os.Getenv("MUSE_STUB_AUTH"), []byte(auth), 0o600); err != nil {
+			os.Exit(5)
+		}
+		emit("run.output.delta", map[string]any{"kind": "run_output_delta", "text": "ok"})
+		emit("run.terminal.completed", map[string]any{"kind": "run_terminal", "terminal": "completed", "text": "ok", "reason": nil})
 	case "ok":
 		full := "stub saw: " + prompt
 		half := len(full) / 2
@@ -325,7 +344,7 @@ func TestMuseArgs(t *testing.T) {
 	got := museArgs(config{MuseProvider: "echo"}, "muse-spark-1.3", pf)
 	want := []string{"exec", "--provider", "echo", "--model", "muse-spark-1.3", "--json",
 		"--prompt-file", pf, "--no-session-log", "--max-model-steps", "1",
-		"--disable-write", "--disable-shell", "--disable-web-tools", "--no-foreign-personal-context"}
+		"--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--no-foreign-personal-context"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %q, want %q", got, want)
 	}

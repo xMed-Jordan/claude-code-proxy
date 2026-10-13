@@ -57,7 +57,8 @@ func initMuse(cfg config) {
 		n = 1
 	}
 	museSem = make(chan struct{}, n)
-	fmt.Printf("[muse] concurrency %d (max simultaneous `muse` subprocesses)\n", n)
+	fmt.Printf("[muse] transport %s; concurrency %d (max simultaneous `muse` subprocesses, cli transport only)\n", museTransport(cfg), n)
+	startMuseKeyGuard(cfg)
 }
 
 func museAcquire(ctx context.Context) error {
@@ -107,8 +108,9 @@ func museHome(cfg config) string {
 //   - strips ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY and
 //     any META_* var that could point the backend CLI back at this proxy (an
 //     infinite loop), and
-//   - sets DISABLE_AUTOUPDATER=1 so a backend run never silently self-updates
-//     the CLI to an unvetted version.
+//   - sets MUSE_NO_AUTO_UPDATE=1 (the switch the muse launcher actually reads;
+//     DISABLE_AUTOUPDATER is kept for older builds) so a backend run never
+//     silently self-updates the CLI to an unvetted version.
 //
 // When an API key is configured it ISOLATES the child's HOME to a clean dir
 // (so ambient user config — which the proxy may rewrite to point tooling at
@@ -135,7 +137,7 @@ func museChildEnv(cfg config) []string {
 		}
 		out = append(out, kv)
 	}
-	out = append(out, "DISABLE_AUTOUPDATER=1")
+	out = append(out, "DISABLE_AUTOUPDATER=1", "MUSE_NO_AUTO_UPDATE=1")
 	if isolate {
 		home := museHome(cfg)
 		out = append(out, "HOME="+home, "USERPROFILE="+home, "META_API_KEY="+key)
@@ -180,6 +182,7 @@ func museArgs(cfg config, model, promptFile string) []string {
 		"--disable-write",               // no workspace filesystem writes
 		"--disable-shell",               // no workspace shell execution
 		"--disable-web-tools",           // no web tools
+		"--disable-reminders",           // no hidden reminder-agent model calls
 		"--no-foreign-personal-context", // exclude foreign personal rules/skills
 	)
 	return args
@@ -778,6 +781,7 @@ func museToolArgs(cfg config, model, promptFile string) []string {
 		"--disable-write",
 		"--disable-shell",
 		"--disable-web-tools",
+		"--disable-reminders",
 		"--no-foreign-personal-context",
 		"--approval-mode", "never",
 	)
@@ -881,26 +885,32 @@ func serveMuseAnthropicTools(ctx context.Context, cfg config, in anthropicReques
 		writeAnthropicError(w, http.StatusBadGateway, "muse "+res.Error)
 		return
 	}
-	resp := agyToResponsesResponse(res.Response, model, inputTokens)
+	writeMuseFinalText(w, r, model, res.Response, inputTokens, in.Stream)
+}
+
+// writeMuseFinalText answers a tool-loop turn with its final text: Anthropic
+// JSON, or — for a stream:true caller — the (already complete) text as one SSE
+// text block. Shared by the CLI and API tool loops.
+func writeMuseFinalText(w http.ResponseWriter, r *http.Request, model, text string, inputTokens int, stream bool) {
+	resp := agyToResponsesResponse(text, model, inputTokens)
 	updateRequestStat(r, func(stat *requestStat) {
 		stat.OutputTokens = resp.Usage.OutputTokens
 		stat.StopReason = "end_turn"
 	})
 
-	if !in.Stream {
+	if !stream {
 		writeJSON(w, http.StatusOK, toAnthropicResponsesResponse(resp, model))
 		return
 	}
 
-	// stream:true → emit the (already complete) final text as one SSE text block.
 	flusher, _ := w.(http.Flusher)
 	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	sendAnthropicMessageStart(w, messageID, model, inputTokens, 0)
 	sendEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
-	if res.Response != "" {
-		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": res.Response}})
+	if text != "" {
+		sendEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
 	}
 	sendEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 	sendAnthropicMessageDeltaStop(w, "end_turn", resp.Usage.OutputTokens)

@@ -333,7 +333,7 @@
               { key: "PROXY_CODEX_ENABLED", name: "Codex (ChatGPT)", hint: "OpenAI Codex via your ChatGPT subscription." },
               { key: "PROXY_CLAUDE_ENABLED", name: "Claude Code", hint: "Anthropic Claude via the local Claude Code CLI." },
               { key: "PROXY_AGY_ENABLED", name: "Antigravity (Gemini)", hint: "Google Antigravity via the local agy CLI." },
-              { key: "PROXY_MUSE_ENABLED", name: "Muse", hint: "Meta Muse via the local muse CLI." },
+              { key: "PROXY_MUSE_ENABLED", name: "Muse", hint: "Meta Muse via the Meta Model API (proxy's own muse login key); PROXY_MUSE_TRANSPORT=cli for the local muse CLI." },
             ].map(svc => {
               const on = (cfg[svc.key] || "1") !== "0";
               return (

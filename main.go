@@ -194,6 +194,13 @@ type config struct {
 	MuseToolsEnabled bool          // PROXY_MUSE_TOOLS_ENABLED (master switch for the MCP tool loop)
 	MuseToolMaxTurns int           // PROXY_MUSE_TOOL_MAX_TURNS (CLI --max-model-steps for tool loops)
 	MuseToolTimeout  time.Duration // PROXY_MUSE_TOOL_TIMEOUT (longer than chat; loops do many round-trips)
+	// Transport: "api" (default) calls Meta's Model API over HTTPS with the key
+	// the proxy resolves itself (see muse_api.go); "cli" is the `muse exec` path.
+	MuseTransport        string        // PROXY_MUSE_TRANSPORT — api | cli
+	MuseAPIBase          string        // PROXY_MUSE_API_BASE ("" → auth.json api_base_url → https://api.meta.ai/v1)
+	MuseAuthPath         string        // PROXY_MUSE_AUTH_PATH ("" → ~/.config/muse/auth.json of the service user)
+	MuseMinMaxTokens     int           // PROXY_MUSE_MIN_MAX_TOKENS — max_tokens floor (thinking counts against it); 0 = off
+	MuseKeyCheckInterval time.Duration // PROXY_MUSE_KEY_CHECK_INTERVAL — how often the key guard opens Muse Code (0 = only on 401)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
 	// we transcribe audio/video with Groq's whisper-large-v3 (free tier, ~1s) before
@@ -728,6 +735,19 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Flush passes flushes through, so streaming handlers that assert
+// http.Flusher actually push each event to the client instead of waiting
+// for the response buffer to fill.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 func main() {
 	loadDotEnvIntoProcess()
 	if handled, err := runCLI(os.Args[1:]); handled {
@@ -914,6 +934,12 @@ func loadConfig() config {
 		MuseToolsEnabled: envFlag("PROXY_MUSE_TOOLS_ENABLED", false),
 		MuseToolMaxTurns: parseMuseToolMaxTurns(getenv("PROXY_MUSE_TOOL_MAX_TURNS", "20")),
 		MuseToolTimeout:  parseAgyTimeout(getenv("PROXY_MUSE_TOOL_TIMEOUT", "600")),
+
+		MuseTransport:        parseMuseTransport(getenv("PROXY_MUSE_TRANSPORT", "api")),
+		MuseAPIBase:          strings.TrimSpace(getenv("PROXY_MUSE_API_BASE", "")),
+		MuseAuthPath:         strings.TrimSpace(getenv("PROXY_MUSE_AUTH_PATH", "")),
+		MuseMinMaxTokens:     parseMuseMinMaxTokens(getenv("PROXY_MUSE_MIN_MAX_TOKENS", "16384")),
+		MuseKeyCheckInterval: parseMuseKeyCheckInterval(getenv("PROXY_MUSE_KEY_CHECK_INTERVAL", "6h")),
 
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),
 		ClaudeDisabled: !envFlag("PROXY_CLAUDE_ENABLED", true),
@@ -2310,6 +2336,10 @@ func handleMessages(cfg config) http.HandlerFunc {
 				writeAnthropicError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
 				return
 			}
+			if museTransport(cfg) == "api" {
+				serveMuseAPIAnthropic(ctx, cfg, in, rawBody, w, r)
+				return
+			}
 			serveMuseAnthropic(ctx, cfg, in, w, r)
 			return
 		}
@@ -2405,8 +2435,13 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
 		var in openAIRequest
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&in); err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -2433,6 +2468,10 @@ func handleChatCompletions(cfg config) http.HandlerFunc {
 		if forwardForAlias(cfg, in.Model) == "muse" {
 			if museIsDisabled() {
 				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
+				return
+			}
+			if museTransport(cfg) == "api" {
+				serveMuseAPIOpenAI(r.Context(), cfg, in.Model, in.Stream, estimateOpenAIChatRequestTokens(in), rawBody, "/chat/completions", w, r)
 				return
 			}
 			serveMuseOpenAIChat(r.Context(), cfg, in, w, r)
@@ -2500,8 +2539,13 @@ func handleResponses(cfg config) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
 		var in responsesRequest
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&in); err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -2526,6 +2570,10 @@ func handleResponses(cfg config) http.HandlerFunc {
 		if forwardForAlias(cfg, in.Model) == "muse" {
 			if museIsDisabled() {
 				writeOpenAIError(w, http.StatusBadRequest, upstreamDisabledMsg("muse"))
+				return
+			}
+			if museTransport(cfg) == "api" {
+				serveMuseAPIOpenAI(r.Context(), cfg, in.Model, in.Stream, estimateCodexRequestTokens(in), rawBody, "/responses", w, r)
 				return
 			}
 			serveMuseResponses(r.Context(), cfg, in, w, r)
