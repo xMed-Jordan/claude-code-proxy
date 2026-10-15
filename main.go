@@ -200,6 +200,7 @@ type config struct {
 	MuseAPIBase          string        // PROXY_MUSE_API_BASE ("" → auth.json api_base_url → https://api.meta.ai/v1)
 	MuseAuthPath         string        // PROXY_MUSE_AUTH_PATH ("" → ~/.config/muse/auth.json of the service user)
 	MuseMinMaxTokens     int           // PROXY_MUSE_MIN_MAX_TOKENS — max_tokens floor (thinking counts against it); 0 = off
+	MusePromptCache      bool          // PROXY_MUSE_PROMPT_CACHE — add cache_control breakpoints (Meta does not cache without them)
 	MuseKeyCheckInterval time.Duration // PROXY_MUSE_KEY_CHECK_INTERVAL — how often the key guard opens Muse Code (0 = only on 401)
 	// Groq Whisper speech-to-text for audio/video on the agy media path. agy's CLI
 	// has no native audio understanding; rather than let it improvise (slow, fragile),
@@ -939,6 +940,7 @@ func loadConfig() config {
 		MuseAPIBase:          strings.TrimSpace(getenv("PROXY_MUSE_API_BASE", "")),
 		MuseAuthPath:         strings.TrimSpace(getenv("PROXY_MUSE_AUTH_PATH", "")),
 		MuseMinMaxTokens:     parseMuseMinMaxTokens(getenv("PROXY_MUSE_MIN_MAX_TOKENS", "16384")),
+		MusePromptCache:      envFlag("PROXY_MUSE_PROMPT_CACHE", true),
 		MuseKeyCheckInterval: parseMuseKeyCheckInterval(getenv("PROXY_MUSE_KEY_CHECK_INTERVAL", "6h")),
 
 		CodexDisabled:  !envFlag("PROXY_CODEX_ENABLED", true),

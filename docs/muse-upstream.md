@@ -111,6 +111,43 @@ A failed call may be retried. If Meta cannot download a URL attachment
 (`failed to download media`), the request is retried once with that attachment
 replaced by a short note, so a dead media link never costs the customer the reply.
 
+Prompt caching (api transport, v0.39.3, `PROXY_MUSE_PROMPT_CACHE`, default on): Meta
+caches nothing unless the request carries `cache_control` (verified 2026-10-15: an
+identical 29k-token prompt sent twice read 0 cached tokens; with a breakpoint the repeat
+read 29,297). The proxy adds `{"type":"ephemeral"}` breakpoints on the last tool, the
+system prompt and the newest user message (within the 4-breakpoint limit, after any the
+caller set), on a copy of the body, so in a tool loop every call reuses the previous
+call's whole prefix. Caching does not change what the model sees. A 400 on a request
+carrying the proxy's breakpoints is retried once without them, so caching can never cost
+a reply; set `PROXY_MUSE_PROMPT_CACHE=0` to switch it off.
+
+### Reading the logs (`journalctl -u connect-ai-proxy -o cat`)
+
+Every Connect tool-loop turn (one customer message) writes, in order:
+
+```
+[muse-call] conv=<connect conversation uuid> turn=1 ms=8123 in=56012 cache_read=0 cache_write=0 out=702 stop=tool_use tool_uses=1 text_chars=0 final_forced=false
+[muse-tool] conv=… turn=1 name=get_tool_instructions ms=310 ok=true bytes=2211
+[muse-call] conv=… turn=2 ms=5410 in=56980 cache_read=55990 … stop=end_turn tool_uses=0 text_chars=184 final_forced=false
+[muse-api] model=muse-spark-1.3-contributor tools=67 turns=2 tool_calls=1 repeats_skipped=0 ok=true ms=13900 meta_ms=13533 tool_ms=310 in=112992 cache_read=55990 cache_write=0 out=1311 effort=xhigh msgs=50 conv=… seq=get_tool_instructions
+```
+
+- `[muse-call]` — one Meta call: its latency, `in` = all input tokens (cached included),
+  `cache_read` = how many of them came from the cache, `out` = output incl. thinking,
+  the stop reason, how many tools it asked for, and whether it was the forced final
+  (tool_choice none) call. `ms=… err=…` instead when the call failed.
+- `[muse-tool]` — one Connect callback: tool name, latency, Connect's `success` flag and
+  result size; `dup=true` when a repeated successful call was answered without running.
+- `[muse-api] … ok=` — the turn summary. The first six fields keep their pre-v0.39.3
+  order. `ms` = whole turn, `meta_ms` / `tool_ms` = time waiting on Meta / Connect,
+  `msgs` = history messages Connect sent, `seq` = tool names in call order.
+- `[muse-api] … passthrough` — a request without Connect's tool loop (status, ms, tokens).
+- `[muse-api] … history repaired: …` — orphan tool pairs fixed before calling Meta.
+
+No arguments, results or message text are logged — names, counts and timings only.
+`conv=` is Connect's conversation uuid (the `X-Connect-Conversation` header): grep it to
+follow one conversation, or join it to Connect's `agent_conversations.uuid`.
+
 History repair (api transport, v0.39.2): Meta rejects the whole request when a
 `tool_result` does not answer a `tool_use` in the assistant message right before it
 (`No function call found for function call output with call_id …`) or a `tool_use`

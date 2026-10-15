@@ -979,7 +979,16 @@ func museStripURLMedia(m map[string]json.RawMessage) bool {
 // URL attachment it retries once with those attachments replaced by a note.
 // The response is returned for the caller to read or relay.
 func museAPIPostMessages(ctx context.Context, cfg config, m map[string]json.RawMessage, hdr http.Header, deadline time.Time) (*http.Response, error) {
-	body, err := json.Marshal(m)
+	// The breakpoints go on a copy: m stays clean, so a tool loop never
+	// accumulates them and the fallback below can send m as it is.
+	withCache := func() (map[string]json.RawMessage, int) {
+		if !cfg.MusePromptCache {
+			return m, 0
+		}
+		return museWithCacheBreakpoints(m)
+	}
+	send, cached := withCache()
+	body, err := json.Marshal(send)
 	if err != nil {
 		return nil, err
 	}
@@ -991,11 +1000,133 @@ func museAPIPostMessages(ctx context.Context, cfg config, m map[string]json.RawM
 	resp.Body.Close()
 	if museMediaDownloadFailed(resp.StatusCode, raw) && museStripURLMedia(m) {
 		fmt.Printf("[muse-api] attachment URL not downloadable by Meta; retrying without it (%s)\n", truncateString(strings.TrimSpace(string(raw)), 200))
+		send, _ = withCache()
+		body, _ = json.Marshal(send)
+		return museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, hdr, deadline)
+	}
+	if cached > 0 {
+		// Never let caching cost a reply: whatever Meta disliked, try once
+		// exactly as the caller sent it.
+		fmt.Printf("[muse-api] 400 with cache breakpoints; retrying once without them (%s)\n", truncateString(strings.TrimSpace(string(raw)), 200))
 		body, _ = json.Marshal(m)
 		return museAPIDo(ctx, cfg, http.MethodPost, "/messages", body, hdr, deadline)
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(raw))
 	return resp, nil
+}
+
+// museCacheMaxBreakpoints is the per-request cache_control limit of the
+// Anthropic Messages API, which Meta mirrors.
+const museCacheMaxBreakpoints = 4
+
+var museEphemeral = json.RawMessage(`{"type":"ephemeral"}`)
+
+// museWithCacheBreakpoints returns a copy of the body with cache_control on
+// the last tool, the system prompt and the newest user message, as far as the
+// 4-breakpoint budget allows after any the caller set. Meta caches nothing
+// without a breakpoint (verified 2026-10-15: an identical 29k-token prompt
+// read 0 cached tokens twice; with a breakpoint the repeat read 29,297). In a
+// tool loop each call then reuses everything up to the previous call's newest
+// message. Caching never changes what the model sees. Returns the copy (or m
+// itself when nothing was added) and how many breakpoints were added.
+func museWithCacheBreakpoints(m map[string]json.RawMessage) (map[string]json.RawMessage, int) {
+	budget := museCacheMaxBreakpoints
+	for _, k := range []string{"tools", "system", "messages"} {
+		budget -= bytes.Count(m[k], []byte(`"cache_control"`))
+	}
+	if budget <= 0 {
+		return m, 0
+	}
+	out := make(map[string]json.RawMessage, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	added := 0
+	mark := func(field string, f func(json.RawMessage) (json.RawMessage, bool)) {
+		if added >= budget || len(bytes.TrimSpace(out[field])) == 0 {
+			return
+		}
+		if v, ok := f(out[field]); ok {
+			out[field] = v
+			added++
+		}
+	}
+	mark("tools", func(raw json.RawMessage) (json.RawMessage, bool) {
+		var tools []map[string]json.RawMessage
+		if json.Unmarshal(raw, &tools) != nil || len(tools) == 0 {
+			return nil, false
+		}
+		last := tools[len(tools)-1]
+		if _, has := last["cache_control"]; has {
+			return nil, false
+		}
+		last["cache_control"] = museEphemeral
+		return museJSON(tools), true
+	})
+	mark("system", museCacheMarkContent)
+	mark("messages", func(raw json.RawMessage) (json.RawMessage, bool) {
+		var msgs []json.RawMessage
+		if json.Unmarshal(raw, &msgs) != nil || len(msgs) == 0 {
+			return nil, false
+		}
+		var last map[string]json.RawMessage
+		if json.Unmarshal(msgs[len(msgs)-1], &last) != nil {
+			return nil, false
+		}
+		var role string
+		_ = json.Unmarshal(last["role"], &role)
+		if role != "user" {
+			return nil, false
+		}
+		content, ok := museCacheMarkContent(last["content"])
+		if !ok {
+			return nil, false
+		}
+		last["content"] = content
+		msgs = append(msgs[:len(msgs)-1:len(msgs)-1], museJSON(last))
+		return museJSON(msgs), true
+	})
+	if added == 0 {
+		return m, 0
+	}
+	return out, added
+}
+
+// museCacheMarkContent puts cache_control on a system prompt or message
+// content: a non-empty string becomes one text block carrying it; for a block
+// list it goes on the last block, unless that block is thinking (not
+// cacheable), empty text, or already marked.
+func museCacheMarkContent(raw json.RawMessage) (json.RawMessage, bool) {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if strings.TrimSpace(s) == "" {
+			return nil, false
+		}
+		return museJSON([]map[string]json.RawMessage{{"type": museJSON("text"), "text": museJSON(s), "cache_control": museEphemeral}}), true
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil || len(blocks) == 0 {
+		return nil, false
+	}
+	last := blocks[len(blocks)-1]
+	if _, has := last["cache_control"]; has {
+		return nil, false
+	}
+	var b struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(museJSON(last), &b)
+	switch b.Type {
+	case "thinking", "redacted_thinking", "":
+		return nil, false
+	case "text":
+		if strings.TrimSpace(b.Text) == "" {
+			return nil, false
+		}
+	}
+	last["cache_control"] = museEphemeral
+	return museJSON(blocks), true
 }
 
 func museAnthropicHeaders(r *http.Request) http.Header {
@@ -1195,6 +1326,7 @@ func serveMuseAPIAnthropic(ctx context.Context, cfg config, in anthropicRequest,
 		return
 	}
 
+	start := time.Now()
 	m, dropped, err := museAPIAnthropicBody(cfg, rawBody, in.Model, nil)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1208,7 +1340,10 @@ func serveMuseAPIAnthropic(ctx context.Context, cfg config, in anthropicRequest,
 		return
 	}
 	defer resp.Body.Close()
-	museAfterRelay(r, in.Model, resp.StatusCode, museRelay(w, resp))
+	rr := museRelay(w, resp)
+	museAfterRelay(r, in.Model, resp.StatusCode, rr)
+	fmt.Printf("[muse-api] model=%s passthrough stream=%t status=%d ms=%d in=%d out=%d stop=%s effort=%s\n",
+		in.Model, in.Stream, resp.StatusCode, time.Since(start).Milliseconds(), rr.Usage.In, rr.Usage.Out, museLogWord(rr.Usage.Stop), museEffort(m))
 }
 
 // serveMuseAPIOpenAI handles /openai/v1/chat/completions (path "/chat/completions")
@@ -1242,7 +1377,32 @@ type museToolLoopResult struct {
 	Turns      int
 	ToolCalls  int
 	Duplicates int // repeated identical calls answered without running the tool
-	In, Out    int
+	In, Out    int // In counts every input token, cached ones included
+	CacheRead  int // of In, read from Meta's prompt cache
+	CacheWrite int
+	MetaMs     int64    // time spent waiting on Meta
+	ToolMs     int64    // time spent in Connect's tool callback
+	Seq        []string // tool names in call order (duplicates included)
+}
+
+// museEffort is the output_config.effort sent to Meta, or "-".
+func museEffort(m map[string]json.RawMessage) string {
+	var oc struct {
+		Effort string `json:"effort"`
+	}
+	if json.Unmarshal(m["output_config"], &oc) != nil {
+		return "-"
+	}
+	return museLogWord(oc.Effort)
+}
+
+// museLogWord makes a model-supplied value safe for a key=value log line.
+func museLogWord(s string) string {
+	s = strings.Join(strings.Fields(s), "_")
+	if s == "" {
+		return "-"
+	}
+	return truncateString(s, 80)
 }
 
 // museDuplicateCallResult answers a tool call the model already made, with the
@@ -1326,6 +1486,7 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		}
 	}
 	httpc := &http.Client{Timeout: 120 * time.Second}
+	conv := museLogWord(spec.Conversation)
 	maxTurns := museToolMaxTurns(cfg)
 	emptyRetries := 0
 	succeeded := map[string]bool{} // museCallKey → that call already ran successfully
@@ -1342,17 +1503,25 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		if final {
 			m["tool_choice"] = json.RawMessage(`{"type":"none"}`)
 		}
+		callStart := time.Now()
 		msg, err := museAPIPostMessage(ctx, cfg, m, hdr, deadline)
+		callMs := time.Since(callStart).Milliseconds()
+		res.MetaMs += callMs
 		if err != nil {
+			fmt.Printf("[muse-call] conv=%s turn=%d ms=%d err=%s\n", conv, res.Turns+1, callMs, museLogWord(truncateString(err.Error(), 160)))
 			return res, err
 		}
 		// Keep any attachment fallback for the following turns.
 		_ = json.Unmarshal(m["messages"], &messages)
 		res.Turns++
+		var usage museUsageJSON
 		if msg.Usage != nil {
-			res.In += msg.Usage.in()
-			res.Out += msg.Usage.out()
+			usage = *msg.Usage
 		}
+		res.In += usage.in()
+		res.Out += usage.out()
+		res.CacheRead += usage.CacheRead
+		res.CacheWrite += usage.CacheCreate
 		var text strings.Builder
 		var toolUses []museContentBlock
 		for _, raw := range msg.Content {
@@ -1367,6 +1536,8 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 				toolUses = append(toolUses, b)
 			}
 		}
+		fmt.Printf("[muse-call] conv=%s turn=%d ms=%d in=%d cache_read=%d cache_write=%d out=%d stop=%s tool_uses=%d text_chars=%d final_forced=%t\n",
+			conv, res.Turns, callMs, usage.in(), usage.CacheRead, usage.CacheCreate, usage.out(), museLogWord(msg.StopReason), len(toolUses), text.Len(), final)
 		if msg.StopReason == "tool_use" && len(toolUses) > 0 && !final {
 			messages = append(messages, museJSON(map[string]any{"role": "assistant", "content": msg.Content}))
 			results := make([]map[string]any, 0, len(toolUses))
@@ -1377,12 +1548,18 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 				if succeeded[key] {
 					out = museDuplicateCallResult
 					res.Duplicates++
+					fmt.Printf("[muse-tool] conv=%s turn=%d name=%s dup=true\n", conv, res.Turns, museLogWord(tu.Name))
 				} else {
+					toolStart := time.Now()
 					out = mcpExecuteTool(httpc, spec.CallbackURL, spec.CallbackToken, allowed, tu.Name, tu.Input)
+					toolMs := time.Since(toolStart).Milliseconds()
+					res.ToolMs += toolMs
 					res.ToolCalls++
 					succeeded[key] = museToolSucceeded(out)
 					onlyRepeats = false
+					fmt.Printf("[muse-tool] conv=%s turn=%d name=%s ms=%d ok=%t bytes=%d\n", conv, res.Turns, museLogWord(tu.Name), toolMs, succeeded[key], len(out))
 				}
+				res.Seq = append(res.Seq, museLogWord(tu.Name))
 				results = append(results, map[string]any{"type": "tool_result", "tool_use_id": tu.ID, "content": out})
 			}
 			messages = append(messages, museJSON(map[string]any{"role": "user", "content": results}))
@@ -1404,6 +1581,7 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 }
 
 func serveMuseAPIAnthropicTools(ctx context.Context, cfg config, in anthropicRequest, rawBody []byte, spec *museToolSpec, model string, inputTokens int, deadline time.Time, w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	m, dropped, err := museAPIAnthropicBody(cfg, rawBody, in.Model, spec.Tools)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1419,7 +1597,12 @@ func serveMuseAPIAnthropicTools(ctx context.Context, cfg config, in anthropicReq
 	res, err := museAPIToolLoop(ctx, cfg, m, messages, spec, museAnthropicHeaders(r), deadline)
 	note := fmt.Sprintf("%s transport=api tools=%d turns=%d tool_calls=%d repeats_skipped=%d", museNote(in.Model, in.Stream), len(spec.Tools), res.Turns, res.ToolCalls, res.Duplicates)
 	setRequestNote(r, note)
-	fmt.Printf("[muse-api] model=%s tools=%d turns=%d tool_calls=%d repeats_skipped=%d ok=%t\n", in.Model, len(spec.Tools), res.Turns, res.ToolCalls, res.Duplicates, err == nil)
+	// One line per customer turn; the leading fields keep their old order so
+	// older greps still work. in counts cached tokens too (cache_read of them).
+	fmt.Printf("[muse-api] model=%s tools=%d turns=%d tool_calls=%d repeats_skipped=%d ok=%t ms=%d meta_ms=%d tool_ms=%d in=%d cache_read=%d cache_write=%d out=%d effort=%s msgs=%d conv=%s seq=%s\n",
+		in.Model, len(spec.Tools), res.Turns, res.ToolCalls, res.Duplicates, err == nil,
+		time.Since(start).Milliseconds(), res.MetaMs, res.ToolMs, res.In, res.CacheRead, res.CacheWrite, res.Out,
+		museEffort(m), len(messages), museLogWord(spec.Conversation), truncateString(strings.Join(res.Seq, ","), 400))
 	if err != nil {
 		fmt.Printf("[muse-api] model=%s err=%s\n", in.Model, truncateString(err.Error(), 300))
 		writeAnthropicError(w, http.StatusBadGateway, "muse "+err.Error())

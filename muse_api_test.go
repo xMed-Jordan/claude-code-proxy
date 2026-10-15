@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -339,6 +340,187 @@ func TestMuseRepairToolPairs(t *testing.T) {
 	for _, in := range []string{``, `null`, `"x"`, `{}`} {
 		if _, _, _, changed := museRepairToolPairs(json.RawMessage(in)); changed {
 			t.Errorf("%q reported changed", in)
+		}
+	}
+}
+
+func TestMuseWithCacheBreakpoints(t *testing.T) {
+	body := func(raw string) map[string]json.RawMessage {
+		t.Helper()
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	// String system + last user message as a string: both become one text
+	// block carrying the breakpoint; the last tool is marked too.
+	m := body(`{"system":"You are Zeina.","tools":[{"name":"a"},{"name":"b"}],
+		"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"slots?"}]}`)
+	out, n := museWithCacheBreakpoints(m)
+	if n != 3 {
+		t.Fatalf("added=%d", n)
+	}
+	if string(out["system"]) != `[{"cache_control":{"type":"ephemeral"},"text":"You are Zeina.","type":"text"}]` {
+		t.Errorf("system=%s", out["system"])
+	}
+	if !strings.Contains(string(out["tools"]), `{"cache_control":{"type":"ephemeral"},"name":"b"}`) || strings.Count(string(out["tools"]), "cache_control") != 1 {
+		t.Errorf("tools=%s", out["tools"])
+	}
+	if !strings.HasSuffix(string(out["messages"]), `{"content":[{"cache_control":{"type":"ephemeral"},"text":"slots?","type":"text"}],"role":"user"}]`) || strings.Count(string(out["messages"]), "cache_control") != 1 {
+		t.Errorf("messages=%s", out["messages"])
+	}
+	if strings.Contains(string(m["system"])+string(m["tools"])+string(m["messages"]), "cache_control") {
+		t.Error("the caller's body must not be modified")
+	}
+
+	// A tool_result is the newest block: it carries the breakpoint.
+	m = body(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"x","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}`)
+	out, n = museWithCacheBreakpoints(m)
+	if n != 1 || !strings.Contains(string(out["messages"]), `"cache_control":{"type":"ephemeral"},"content":"ok","tool_use_id":"t1"`) {
+		t.Errorf("tool_result: added=%d messages=%s", n, out["messages"])
+	}
+
+	// Not cacheable: a last assistant message, a thinking block, empty text.
+	for _, raw := range []string{
+		`{"messages":[{"role":"assistant","content":"x"}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"thinking","thinking":"x"}]}]}`,
+		`{"messages":[{"role":"user","content":"  "}],"system":""}`,
+	} {
+		if _, n := museWithCacheBreakpoints(body(raw)); n != 0 {
+			t.Errorf("%s: added %d", raw, n)
+		}
+	}
+
+	// The caller's own breakpoints count against the limit of 4.
+	m = body(`{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}],
+		"tools":[{"name":"a","cache_control":{"type":"ephemeral"}},{"name":"b"}],"messages":[{"role":"user","content":"hi"}]}`)
+	out, n = museWithCacheBreakpoints(m)
+	if n != 1 || strings.Count(string(out["tools"])+string(out["system"])+string(out["messages"]), "cache_control") != 4 {
+		t.Errorf("budget: added=%d", n)
+	}
+}
+
+func TestMuseAPIToolLoopCacheBreakpoints(t *testing.T) {
+	resetMuseKeyCache(t)
+	fc := newFakeConnect(t)
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if n == 1 {
+			metaJSON(w, 200, toolUseMessage(`{"type":"tool_use","id":"tu_1","name":"get_slots","input":{"date":"2026-10-16"}}`))
+			return
+		}
+		metaJSON(w, 200, textMessage("Tomorrow at 10:00 is free."))
+	})
+	cfg := museAPITestConfig(fm.srv.URL)
+	cfg.MusePromptCache = true
+	body, hdr := toolRequest(fc, false)
+	r := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
+	for k, v := range hdr {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	handleMessages(cfg)(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("meta requests=%d", len(reqs))
+	}
+	for i, req := range reqs {
+		// tools + system + newest message — the previous call's mark is gone.
+		if c := strings.Count(req.Raw, `"cache_control"`); c != 3 {
+			t.Errorf("request %d: %d breakpoints, want 3: %s", i+1, c, req.Raw)
+		}
+	}
+	msgs := reqs[1].Body["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if last["type"] != "tool_result" || last["cache_control"] == nil {
+		t.Errorf("newest message not marked: %v", last)
+	}
+	if first := msgs[0].(map[string]any)["content"]; first != "Any slots tomorrow?" {
+		t.Errorf("an older message kept a breakpoint: %v", first)
+	}
+}
+
+func TestMuseAPICacheBreakpointsRejectedRetriesWithout(t *testing.T) {
+	resetMuseKeyCache(t)
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if strings.Contains(req.Raw, "cache_control") {
+			metaJSON(w, 400, `{"type":"error","error":{"type":"invalid_request_error","message":"cache_control is not supported here"}}`)
+			return
+		}
+		metaJSON(w, 200, okMessage)
+	})
+	cfg := museAPITestConfig(fm.srv.URL)
+	cfg.MusePromptCache = true
+	w := postMessages(t, cfg, `{"model":"museapitest","max_tokens":64,"system":"sys","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "hello") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 2 || !strings.Contains(reqs[0].Raw, "cache_control") || strings.Contains(reqs[1].Raw, "cache_control") {
+		t.Fatalf("want one marked attempt then one clean retry, got %d requests", len(reqs))
+	}
+
+	// Switched off: no breakpoints at all.
+	fm2 := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) { metaJSON(w, 200, okMessage) })
+	cfg = museAPITestConfig(fm2.srv.URL)
+	cfg.MusePromptCache = false
+	postMessages(t, cfg, `{"model":"museapitest","max_tokens":64,"system":"sys","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if strings.Contains(fm2.requests()[0].Raw, "cache_control") {
+		t.Error("PROXY_MUSE_PROMPT_CACHE=0 must send no breakpoints")
+	}
+}
+
+// captureStdout returns what f prints (the [muse-*] lines go to stdout).
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(rd)
+		done <- string(b)
+	}()
+	defer func() { os.Stdout = old }()
+	f()
+	wr.Close()
+	os.Stdout = old
+	return <-done
+}
+
+func TestMuseAPIToolLoopLogs(t *testing.T) {
+	resetMuseKeyCache(t)
+	fc := newFakeConnect(t)
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if n == 1 {
+			metaJSON(w, 200, `{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"get_slots","input":{"date":"d1"}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":20}}`)
+			return
+		}
+		metaJSON(w, 200, textMessage("Tomorrow at 10:00 is free."))
+	})
+	body, hdr := toolRequest(fc, false)
+	r := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
+	for k, v := range hdr {
+		r.Header.Set(k, v)
+	}
+	logs := captureStdout(t, func() { handleMessages(museAPITestConfig(fm.srv.URL))(httptest.NewRecorder(), r) })
+
+	for _, want := range []*regexp.Regexp{
+		regexp.MustCompile(`\[muse-call\] conv=conv1 turn=1 ms=\d+ in=1000 cache_read=900 cache_write=0 out=20 stop=tool_use tool_uses=1 text_chars=0 final_forced=false`),
+		regexp.MustCompile(`\[muse-tool\] conv=conv1 turn=1 name=get_slots ms=\d+ ok=true bytes=\d+`),
+		regexp.MustCompile(`\[muse-call\] conv=conv1 turn=2 ms=\d+ in=150 cache_read=0 cache_write=0 out=30 stop=end_turn tool_uses=0 text_chars=26`),
+		regexp.MustCompile(`\[muse-api\] model=museapitest tools=2 turns=2 tool_calls=1 repeats_skipped=0 ok=true ms=\d+ meta_ms=\d+ tool_ms=\d+ in=1150 cache_read=900 cache_write=0 out=50 effort=xhigh msgs=1 conv=conv1 seq=get_slots\n`),
+	} {
+		if !want.MatchString(logs) {
+			t.Errorf("missing log line %s in:\n%s", want, logs)
 		}
 	}
 }
