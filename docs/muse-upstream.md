@@ -143,6 +143,10 @@ Every Connect tool-loop turn (one customer message) writes, in order:
   `msgs` = history messages Connect sent, `seq` = tool names in call order.
 - `[muse-api] … passthrough` — a request without Connect's tool loop (status, ms, tokens).
 - `[muse-api] … history repaired: …` — orphan tool pairs fixed before calling Meta.
+- `[muse-api] conv=… empty answer at turn N; re-asking with a nudge (k/2)` — the model ended
+  its turn with no text (seen after `send_media`). Since v0.39.4 the re-ask adds a short
+  `[System: …]` instruction to the newest user message instead of resending the identical
+  input, which mostly came back empty again.
 
 No arguments, results or message text are logged — names, counts and timings only.
 `conv=` is Connect's conversation uuid (the `X-Connect-Conversation` header): grep it to

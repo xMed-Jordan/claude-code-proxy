@@ -1410,6 +1410,37 @@ func museLogWord(s string) string {
 // would repeat its side effects (a second booking, a second summary…).
 const museDuplicateCallResult = `{"success":false,"error":"duplicate_call: this exact call (same tool, same arguments) already ran successfully earlier in this turn; its result is above. It was NOT run again. Do not repeat it — continue with the next step, or finish."}`
 
+// museEmptyAnswerNudge is added to the newest user message when the model ends
+// its turn without any text.
+const museEmptyAnswerNudge = "[System: your previous turn ended without any reply text — nothing reached the customer. Write your reply to the customer now, in their language. Call a tool only if something is still missing.]"
+
+// museAppendNudge adds text to the newest message when it is the user's (a
+// text block after its tool_result blocks), else appends a user message.
+func museAppendNudge(messages []json.RawMessage, text string) []json.RawMessage {
+	nudge := map[string]json.RawMessage{"type": museJSON("text"), "text": museJSON(text)}
+	if n := len(messages); n > 0 {
+		var last map[string]json.RawMessage
+		var role string
+		if json.Unmarshal(messages[n-1], &last) == nil && json.Unmarshal(last["role"], &role) == nil && role == "user" {
+			var blocks []json.RawMessage
+			var s string
+			switch {
+			case json.Unmarshal(last["content"], &s) == nil:
+				if strings.TrimSpace(s) != "" {
+					blocks = append(blocks, museJSON(map[string]json.RawMessage{"type": museJSON("text"), "text": museJSON(s)}))
+				}
+			case json.Unmarshal(last["content"], &blocks) == nil:
+			default:
+				blocks = nil
+			}
+			last["content"] = museJSON(append(blocks, museJSON(nudge)))
+			out := append(messages[:n-1:n-1], museJSON(last))
+			return out
+		}
+	}
+	return append(messages, museJSON(map[string]any{"role": "user", "content": []any{nudge}}))
+}
+
 // museCallKey identifies a tool call by name + canonical arguments (Go
 // marshals map keys sorted, so key order does not matter).
 func museCallKey(name string, input json.RawMessage) string {
@@ -1571,6 +1602,12 @@ func museAPIToolLoop(ctx context.Context, cfg config, m map[string]json.RawMessa
 		}
 		if strings.TrimSpace(text.String()) == "" && emptyRetries < 2 {
 			emptyRetries++
+			// Re-asking with the identical input mostly got the identical empty
+			// answer (2026-10-15: after send_media the model ended its turn
+			// silently, three times in a row, and the customer got Connect's
+			// fallback). Say what is missing.
+			messages = museAppendNudge(messages, museEmptyAnswerNudge)
+			fmt.Printf("[muse-api] conv=%s empty answer at turn %d; re-asking with a nudge (%d/2)\n", conv, res.Turns, emptyRetries)
 			turn-- // re-ask the same turn; no tool runs again
 			continue
 		}

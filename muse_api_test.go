@@ -1024,6 +1024,59 @@ func TestMuseAPIToolLoopEmptyTextReasked(t *testing.T) {
 	}
 }
 
+func TestMuseAPIToolLoopEmptyTextReaskedWithNudge(t *testing.T) {
+	resetMuseKeyCache(t)
+	fc := newFakeConnect(t)
+	empty := `{"type":"message","content":[{"type":"redacted_thinking","data":"r"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		switch n {
+		case 1:
+			metaJSON(w, 200, toolUseMessage(`{"type":"tool_use","id":"tu_1","name":"get_slots","input":{"date":"d1"}}`))
+		case 2, 3:
+			metaJSON(w, 200, empty)
+		default:
+			metaJSON(w, 200, textMessage("Tomorrow at 10:00 is free."))
+		}
+	})
+	body, hdr := toolRequest(fc, false)
+	w := postMessages(t, museAPITestConfig(fm.srv.URL), body, hdr)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "Tomorrow at 10:00 is free.") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 4 || fc.count() != 1 {
+		t.Fatalf("meta requests=%d tool runs=%d", len(reqs), fc.count())
+	}
+	lastBlocks := func(req fakeMetaReq) []any {
+		msgs := req.Body["messages"].([]any)
+		return msgs[len(msgs)-1].(map[string]any)["content"].([]any)
+	}
+	// Call 2 is the plain follow-up after the tool result: no nudge yet.
+	if b := lastBlocks(reqs[1]); len(b) != 1 || b[0].(map[string]any)["type"] != "tool_result" {
+		t.Errorf("call 2 last message: %v", b)
+	}
+	// Calls 3 and 4 re-ask: the tool_result stays first, one nudge per empty answer follows.
+	for i, want := range map[int]int{2: 1, 3: 2} {
+		b := lastBlocks(reqs[i])
+		if b[0].(map[string]any)["type"] != "tool_result" || len(b) != 1+want {
+			t.Fatalf("call %d last message: %v", i+1, b)
+		}
+		if txt, _ := b[len(b)-1].(map[string]any)["text"].(string); txt != museEmptyAnswerNudge {
+			t.Errorf("call %d: nudge missing: %v", i+1, b)
+		}
+	}
+
+	// A plain user string becomes [its text, nudge]; an assistant-last history gets a new user message.
+	out := museAppendNudge([]json.RawMessage{json.RawMessage(`{"role":"user","content":"hi"}`)}, "N")
+	if string(out[0]) != `{"content":[{"text":"hi","type":"text"},{"text":"N","type":"text"}],"role":"user"}` {
+		t.Errorf("string content: %s", out[0])
+	}
+	out = museAppendNudge([]json.RawMessage{json.RawMessage(`{"role":"assistant","content":"x"}`)}, "N")
+	if len(out) != 2 || string(out[1]) != `{"content":[{"text":"N","type":"text"}],"role":"user"}` {
+		t.Errorf("assistant last: %s", out)
+	}
+}
+
 func TestMuseAPIToolLoopStreamCaller(t *testing.T) {
 	resetMuseKeyCache(t)
 	fc := newFakeConnect(t)
