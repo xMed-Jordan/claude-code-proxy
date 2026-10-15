@@ -255,6 +255,127 @@ func TestMuseAPIAnthropicBody(t *testing.T) {
 	}
 }
 
+func TestMuseRepairToolPairs(t *testing.T) {
+	type msg = map[string]any
+	decode := func(t *testing.T, raw json.RawMessage) []msg {
+		t.Helper()
+		var out []msg
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Well formed: kept byte for byte, nothing reported.
+	good := `[{"role":"user","content":"hi"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"t1","name":"get_slots","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","cache_control":{"type":"ephemeral"}}]},` +
+		`{"role":"assistant","content":"done"}]`
+	out, o, u, changed := museRepairToolPairs(json.RawMessage(good))
+	if changed || o != 0 || u != 0 || string(out) != good {
+		t.Fatalf("well-formed history changed: o=%d u=%d out=%s", o, u, out)
+	}
+
+	// Connect's proxy-managed history: the assistant tool_use was dropped but
+	// the tool row with its id is still sent — Meta 400s on it.
+	orphan := `[{"role":"assistant","content":"Let me check the slots."},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1789906577530881884_1","content":"{\"slots\":[\"10:00\"]}"}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_x","content":[{"type":"text","text":"booked"},{"type":"image","source":{}}]},{"type":"tool_result","tool_use_id":"call_y","content":""}]},` +
+		`{"role":"user","content":"Any slots tomorrow?"}]`
+	out, o, u, changed = museRepairToolPairs(json.RawMessage(orphan))
+	if !changed || o != 3 || u != 0 {
+		t.Fatalf("orphans: changed=%v o=%d u=%d", changed, o, u)
+	}
+	got := decode(t, out)
+	if len(got) != 4 {
+		t.Fatalf("messages=%d: %s", len(got), out)
+	}
+	if strings.Contains(string(out), `"tool_result"`) {
+		t.Errorf("orphan tool_result left in: %s", out)
+	}
+	b1 := got[1]["content"].([]any)
+	if len(b1) != 1 || b1[0].(map[string]any)["text"] != "[result of an earlier tool call]\n{\"slots\":[\"10:00\"]}" {
+		t.Errorf("orphan not kept as text: %v", b1)
+	}
+	b2 := got[2]["content"].([]any)
+	if len(b2) != 1 || b2[0].(map[string]any)["text"] != "[result of an earlier tool call]\nbooked" {
+		t.Errorf("block-list orphan / empty orphan: %v", b2)
+	}
+	if got[3]["content"] != "Any slots tomorrow?" {
+		t.Errorf("untouched message changed: %v", got[3])
+	}
+
+	// A window that starts between a call and its result, a tool_use left
+	// unanswered, a result for the wrong call and a duplicate result.
+	mixed := `[{"role":"user","content":[{"type":"tool_result","tool_use_id":"gone","content":""}]},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"x","input":{}},{"type":"tool_use","id":"b","name":"y","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"A"},{"type":"tool_result","tool_use_id":"a","content":"A again"},{"type":"tool_result","tool_use_id":"z","content":"Z"}]},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"x","input":{}}]},` +
+		`{"role":"user","content":"next question"}]`
+	out, o, u, changed = museRepairToolPairs(json.RawMessage(mixed))
+	if !changed || o != 3 || u != 2 {
+		t.Fatalf("mixed: changed=%v o=%d u=%d out=%s", changed, o, u, out)
+	}
+	got = decode(t, out)
+	// msg0 (empty orphan only) and msg3 (only an unanswered tool_use) are gone.
+	if len(got) != 3 {
+		t.Fatalf("messages=%d: %s", len(got), out)
+	}
+	asst := got[0]["content"].([]any)
+	if got[0]["role"] != "assistant" || len(asst) != 1 || asst[0].(map[string]any)["id"] != "a" {
+		t.Errorf("assistant should keep only the answered tool_use a: %v", got[0])
+	}
+	res := got[1]["content"].([]any)
+	if len(res) != 3 || res[0].(map[string]any)["tool_use_id"] != "a" ||
+		res[1].(map[string]any)["text"] != "[result of an earlier tool call]\nA again" ||
+		res[2].(map[string]any)["text"] != "[result of an earlier tool call]\nZ" {
+		t.Errorf("results: %v", res)
+	}
+	if got[2]["content"] != "next question" {
+		t.Errorf("last message: %v", got[2])
+	}
+
+	// Not a list / empty: left alone.
+	for _, in := range []string{``, `null`, `"x"`, `{}`} {
+		if _, _, _, changed := museRepairToolPairs(json.RawMessage(in)); changed {
+			t.Errorf("%q reported changed", in)
+		}
+	}
+}
+
+// The request Connect really sends (orphan tool rows, connect_tools) reaches
+// Meta without any tool_result that lacks its tool_use.
+func TestMuseAPIToolLoopRepairsOrphanHistory(t *testing.T) {
+	resetMuseKeyCache(t)
+	fc := newFakeConnect(t)
+	fm := newFakeMeta(t, func(n int, req fakeMetaReq, w http.ResponseWriter) {
+		if strings.Contains(req.Raw, "toolu_old_1") {
+			metaJSON(w, 400, `{"error":{"message":"No function call found for function call output with call_id 'toolu_old_1'","type":"invalid_request_error"},"type":"error"}`)
+			return
+		}
+		metaJSON(w, 200, textMessage("Tomorrow at 10:00 is free."))
+	})
+	body, hdr := toolRequest(fc, false)
+	body = strings.Replace(body, `"messages":[{"role":"user","content":"Any slots tomorrow?"}]`,
+		`"messages":[{"role":"assistant","content":"Let me check."},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_old_1","content":"{\"slots\":[\"09:00\"]}"}]},{"role":"user","content":"Any slots tomorrow?"}]`, 1)
+	r := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
+	for k, v := range hdr {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	handleMessages(museAPITestConfig(fm.srv.URL))(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "Tomorrow at 10:00 is free.") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	reqs := fm.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("meta requests=%d", len(reqs))
+	}
+	if !strings.Contains(reqs[0].Raw, `[result of an earlier tool call]\n{\"slots\":[\"09:00\"]}`) {
+		t.Errorf("orphan result not carried as text: %s", reqs[0].Raw)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Passthrough
 // ---------------------------------------------------------------------------

@@ -111,6 +111,16 @@ A failed call may be retried. If Meta cannot download a URL attachment
 (`failed to download media`), the request is retried once with that attachment
 replaced by a short note, so a dead media link never costs the customer the reply.
 
+History repair (api transport, v0.39.2): Meta rejects the whole request when a
+`tool_result` does not answer a `tool_use` in the assistant message right before it
+(`No function call found for function call output with call_id …`) or a `tool_use`
+is left unanswered. Connect's history can contain both (old tool rows replayed
+without their call; a history window that starts mid-pair). Before calling Meta the
+proxy turns each orphan `tool_result` into a text block
+(`[result of an earlier tool call]` + its text) and drops each unanswered `tool_use`;
+well-formed history is sent byte for byte. Each repair logs
+`[muse-api] model=… history repaired: orphan_tool_results=N unanswered_tool_uses=M`.
+
 What the api transport sends to Meta: the caller's body with only the fields Meta
 accepts (`model, messages, system, max_tokens, metadata, stream, temperature, top_p,
 top_k, tools, tool_choice, thinking, service_tier, output_config.effort`). Dropped

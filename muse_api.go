@@ -674,6 +674,11 @@ func museAPIAnthropicBody(cfg config, raw []byte, alias string, extraTools []con
 		m["tools"] = tools
 	}
 
+	if msgs, orphans, unanswered, changed := museRepairToolPairs(m["messages"]); changed {
+		m["messages"] = msgs
+		fmt.Printf("[muse-api] model=%s history repaired: orphan_tool_results=%d unanswered_tool_uses=%d\n", alias, orphans, unanswered)
+	}
+
 	if floor := museMinMaxTokens(cfg); floor > 0 {
 		var mt int
 		_ = json.Unmarshal(m["max_tokens"], &mt)
@@ -735,6 +740,160 @@ func museAPITools(raw json.RawMessage, extra []connectToolDef) (json.RawMessage,
 		return raw, false
 	}
 	return museJSON(tools), true
+}
+
+// museRepairToolPairs makes the caller's history acceptable to Meta, which
+// rejects the whole request when a tool_result does not answer a tool_use of
+// the assistant message right before it ("No function call found for function
+// call output with call_id …") or when a tool_use is left unanswered. Connect
+// sends exactly that in its proxy-managed mode: it replays old tool rows that
+// carry an id but leaves out the assistant tool_use they answered, and its
+// history window can also start between a call and its result. The old CLI
+// transport flattened history to text, so this never mattered there.
+//
+// An orphan tool_result becomes a text block, so the model still sees what the
+// tool returned; an unanswered tool_use is removed; a message left with no
+// content is removed. Messages that are already well formed are kept byte for
+// byte. Returns the new messages, the two counts, and whether anything changed.
+func museRepairToolPairs(raw json.RawMessage) (json.RawMessage, int, int, bool) {
+	var msgs []json.RawMessage
+	if len(bytes.TrimSpace(raw)) == 0 || json.Unmarshal(raw, &msgs) != nil {
+		return raw, 0, 0, false
+	}
+	type parsed struct {
+		fields  map[string]json.RawMessage
+		role    string
+		blocks  []json.RawMessage // nil when content is a plain string
+		types   []string
+		ids     []string // tool_use id / tool_result tool_use_id per block
+		changed bool
+	}
+	ps := make([]parsed, len(msgs))
+	for i, msg := range msgs {
+		p := &ps[i]
+		if json.Unmarshal(msg, &p.fields) != nil {
+			continue
+		}
+		_ = json.Unmarshal(p.fields["role"], &p.role)
+		if json.Unmarshal(p.fields["content"], &p.blocks) != nil {
+			p.blocks = nil
+			continue
+		}
+		p.types = make([]string, len(p.blocks))
+		p.ids = make([]string, len(p.blocks))
+		for j, b := range p.blocks {
+			var blk struct {
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				ToolUseID string `json:"tool_use_id"`
+			}
+			_ = json.Unmarshal(b, &blk)
+			p.types[j] = blk.Type
+			p.ids[j] = firstNonEmpty(blk.ID, blk.ToolUseID)
+		}
+	}
+	answers := func(i int) map[string]bool { // tool_use ids answered by message i
+		out := map[string]bool{}
+		if i < len(ps) && ps[i].role == "user" {
+			for j, t := range ps[i].types {
+				if t == "tool_result" && ps[i].ids[j] != "" {
+					out[ps[i].ids[j]] = true
+				}
+			}
+		}
+		return out
+	}
+
+	orphans, unanswered := 0, 0
+	open := map[string]bool{} // tool_use ids of the previous assistant message still awaiting a result
+	for i := range ps {
+		p := &ps[i]
+		switch {
+		case p.role == "assistant" && p.blocks != nil:
+			next := answers(i + 1)
+			open = map[string]bool{}
+			kept := p.blocks[:0:0]
+			for j, b := range p.blocks {
+				if p.types[j] == "tool_use" {
+					if !next[p.ids[j]] || open[p.ids[j]] {
+						unanswered++
+						p.changed = true
+						continue
+					}
+					open[p.ids[j]] = true
+				}
+				kept = append(kept, b)
+			}
+			p.blocks = kept
+		case p.role == "user" && p.blocks != nil:
+			kept := p.blocks[:0:0]
+			for j, b := range p.blocks {
+				if p.types[j] == "tool_result" {
+					if open[p.ids[j]] {
+						delete(open, p.ids[j]) // a second result for the same call is an orphan too
+						kept = append(kept, b)
+						continue
+					}
+					orphans++
+					p.changed = true
+					if text := museToolResultText(b); text != "" {
+						kept = append(kept, museJSON(map[string]string{"type": "text", "text": "[result of an earlier tool call]\n" + text}))
+					}
+					continue
+				}
+				kept = append(kept, b)
+			}
+			p.blocks = kept
+			open = map[string]bool{}
+		default:
+			open = map[string]bool{}
+		}
+	}
+	if orphans == 0 && unanswered == 0 {
+		return raw, 0, 0, false
+	}
+	out := make([]json.RawMessage, 0, len(msgs))
+	for i, p := range ps {
+		if !p.changed {
+			out = append(out, msgs[i])
+			continue
+		}
+		if len(p.blocks) == 0 {
+			continue
+		}
+		p.fields["content"] = museJSON(p.blocks)
+		out = append(out, museJSON(p.fields))
+	}
+	return museJSON(out), orphans, unanswered, true
+}
+
+// museToolResultText is the text of a tool_result block's content (a string or
+// a list of blocks, of which only the text ones are kept).
+func museToolResultText(block json.RawMessage) string {
+	var b struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(block, &b) != nil || len(bytes.TrimSpace(b.Content)) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(b.Content, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(b.Content, &parts) != nil {
+		return ""
+	}
+	var texts []string
+	for _, p := range parts {
+		if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+			texts = append(texts, strings.TrimSpace(p.Text))
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 // museAPIOpenAIBody prepares an OpenAI chat / Responses body: the model is
